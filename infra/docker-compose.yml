@@ -1,0 +1,109 @@
+name: rxhive
+
+# One command to run everything:  docker compose -f infra/docker-compose.yml up --build
+# Copy infra/.env.example to infra/.env first and change every secret.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rxhive}
+      POSTGRES_USER: ${POSTGRES_USER:-rxhive}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in infra/.env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rxhive} -d ${POSTGRES_DB:-rxhive}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-rxhive}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set in infra/.env}
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  livekit:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-rxhive-api}: ${LIVEKIT_API_SECRET:?set in infra/.env}"
+    ports:
+      # WebRTC media must be reachable from clients directly.
+      - "7880:7880"       # signal (proxied via Caddy in prod; exposed for dev)
+      - "7881:7881"       # TCP fallback
+      - "50000-50100:50000-50100/udp"  # media
+
+  api:
+    build:
+      context: ../backend
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      RXHIVE_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-rxhive}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rxhive}
+      RXHIVE_REDIS_URL: redis://redis:6379/0
+      RXHIVE_S3_ENDPOINT: http://minio:9000
+      RXHIVE_S3_PUBLIC_ENDPOINT: ${RXHIVE_S3_PUBLIC_ENDPOINT:-/s3}
+      RXHIVE_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-rxhive}
+      RXHIVE_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      RXHIVE_LIVEKIT_URL: ${RXHIVE_LIVEKIT_PUBLIC_URL:-/livekit}
+      RXHIVE_LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-rxhive-api}
+      RXHIVE_LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m app.seed &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${API_WORKERS:-2}"
+
+  web:
+    build:
+      context: ../frontend
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+    depends_on: [api, web, minio, livekit]
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+  caddydata:

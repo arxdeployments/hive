@@ -1,0 +1,328 @@
+"""Message-level routes under /api/conversations.
+
+Wire contract: docs/reference/api-conversations-messages.md. Deliberate fixes
+vs the Mongo build: delete-for-me rows are filtered on every read, search input
+is LIKE-escaped (no regex injection), every message-level action requires
+conversation membership (closes the cross-org IDOR class), and message editing
+(PUT /messages/{msg_id}) is net-new.
+"""
+
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from sqlalchemy import and_, select
+
+from app.core.deps import TenantContext, get_tenant
+from app.db.models import (
+    Conversation,
+    ConversationParticipant,
+    Message,
+    MessageDeletion,
+    MessageType,
+    User,
+)
+from app.services import enrich, messaging
+from app.utils import iso_z, parse_uuid
+
+router = APIRouter(prefix="/api/conversations", tags=["messages"])
+
+_SEARCHABLE_TYPES = (
+    MessageType.text,
+    MessageType.image,
+    MessageType.video,
+    MessageType.audio,
+    MessageType.file,
+)
+
+
+def _escape_like(value: str) -> str:
+    """Escape LIKE wildcards so user input is matched literally."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _conv_uuid(conv_id: str) -> uuid.UUID:
+    parsed = parse_uuid(conv_id)
+    if parsed is None:
+        raise HTTPException(status_code=400, detail="Invalid conversation ID")
+    return parsed
+
+
+def _msg_uuid(msg_id: str) -> uuid.UUID:
+    parsed = parse_uuid(msg_id)
+    if parsed is None:
+        raise HTTPException(status_code=400, detail="Invalid message ID")
+    return parsed
+
+
+def _require_org_access(conv: Conversation, tenant: TenantContext) -> None:
+    # Mirrors the send path: non-cross-org conversations must match the caller's org.
+    if conv.type.value != "cross_org" and conv.org_id != tenant.user.org_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
+class SendMessageRequest(BaseModel):
+    content: str = ""
+    type: str = "text"
+    reply_to: str | None = None
+    temp_id: str | None = None
+    media_url: str | None = None
+    media_urls: list[str] | None = None
+    # Legacy fields, accepted but ignored: media metadata comes from the upload claim.
+    thumbnail_url: str | None = None
+    file_size: int | None = None
+    filename: str | None = None
+
+
+class ReactRequest(BaseModel):
+    emoji: str
+
+
+class ForwardRequest(BaseModel):
+    message_id: str
+    conversation_ids: list[str] = []
+    contact_ids: list[str] = []
+
+
+class EditMessageRequest(BaseModel):
+    content: str
+
+
+@router.get("/{conv_id}/messages")
+async def list_messages(
+    conv_id: str,
+    before: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+    tenant: TenantContext = Depends(get_tenant),
+):
+    conv_uuid = _conv_uuid(conv_id)
+    conv = await tenant.require_membership(conv_uuid)
+    _require_org_access(conv, tenant)
+    db = tenant.db
+
+    stmt = (
+        select(Message)
+        .options(*enrich.MESSAGE_LOAD_OPTIONS)
+        .outerjoin(
+            MessageDeletion,
+            and_(
+                MessageDeletion.message_id == Message.id,
+                MessageDeletion.user_id == tenant.user.id,
+            ),
+        )
+        .where(
+            Message.conversation_id == conv_uuid,
+            # Delete-for-me rows are filtered out; tombstones (deleted_at set)
+            # ARE returned, serialized with is_deleted=true and blank content.
+            MessageDeletion.message_id.is_(None),
+        )
+    )
+    before_uuid = parse_uuid(before)
+    if before_uuid is not None:
+        anchor = await db.get(Message, before_uuid)
+        # Invalid or foreign-conversation anchors are silently ignored (contract).
+        if anchor is not None and anchor.conversation_id == conv_uuid:
+            stmt = stmt.where(Message.created_at < anchor.created_at)
+    stmt = stmt.order_by(Message.created_at.desc()).limit(limit + 1)
+
+    rows = (await db.execute(stmt)).scalars().all()
+    has_more = len(rows) > limit
+    page = list(rows[:limit])
+    page.reverse()  # wire order is oldest-first
+
+    participants = (
+        (
+            await db.execute(
+                select(ConversationParticipant).where(
+                    ConversationParticipant.conversation_id == conv_uuid
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Senders arrive batch-loaded via MESSAGE_LOAD_OPTIONS (one IN query, no N+1).
+    senders: dict[uuid.UUID, User] = {
+        m.sender_id: m.sender for m in page if m.sender_id is not None and m.sender is not None
+    }
+    messages = [
+        await enrich.serialize_message(
+            db,
+            m,
+            conv_participants=participants,
+            sender=senders.get(m.sender_id) if m.sender_id else None,
+            include_reply=True,
+        )
+        for m in page
+    ]
+    return {"messages": messages, "has_more": has_more}
+
+
+@router.post("/{conv_id}/messages")
+async def send_message(
+    conv_id: str,
+    body: SendMessageRequest,
+    tenant: TenantContext = Depends(get_tenant),
+):
+    return await messaging.send_message(
+        tenant.db,
+        conversation_id=_conv_uuid(conv_id),
+        sender=tenant.user,
+        content=body.content,
+        msg_type=body.type,
+        reply_to=body.reply_to,
+        temp_id=body.temp_id,
+        media_url=body.media_url,
+        media_urls=body.media_urls,
+    )
+
+
+@router.post("/{conv_id}/messages/search")
+async def search_messages(
+    conv_id: str,
+    q: str = Query(default=""),
+    tenant: TenantContext = Depends(get_tenant),
+):
+    conv_uuid = _conv_uuid(conv_id)
+    conv = await tenant.require_membership(conv_uuid)
+    _require_org_access(conv, tenant)
+
+    query = q.strip()
+    if not query:
+        return {"matches": [], "total": 0}
+
+    pattern = f"%{_escape_like(query)}%"
+    stmt = (
+        select(Message.id, Message.content, Message.created_at)
+        .outerjoin(
+            MessageDeletion,
+            and_(
+                MessageDeletion.message_id == Message.id,
+                MessageDeletion.user_id == tenant.user.id,
+            ),
+        )
+        .where(
+            Message.conversation_id == conv_uuid,
+            Message.type.in_(_SEARCHABLE_TYPES),
+            Message.deleted_at.is_(None),
+            MessageDeletion.message_id.is_(None),
+            Message.content.ilike(pattern, escape="\\"),
+        )
+        .order_by(Message.created_at.desc())
+        .limit(100)
+    )
+    rows = (await tenant.db.execute(stmt)).all()
+    matches = [
+        {
+            "message_id": str(message_id),
+            "content_snippet": (content or "")[:200],
+            "created_at": iso_z(created_at),
+        }
+        for message_id, content, created_at in rows
+    ]
+    return {"matches": matches, "total": len(matches)}
+
+
+@router.post("/messages/{msg_id}/react")
+async def react_to_message(
+    msg_id: str,
+    body: ReactRequest,
+    tenant: TenantContext = Depends(get_tenant),
+):
+    reactions = await messaging.toggle_reaction(
+        tenant.db, message_id=_msg_uuid(msg_id), actor=tenant.user, emoji=body.emoji
+    )
+    return {"reactions": reactions}
+
+
+@router.post("/messages/forward")
+async def forward_message(
+    body: ForwardRequest,
+    tenant: TenantContext = Depends(get_tenant),
+):
+    forwarded = await messaging.forward_message(
+        tenant.db,
+        actor=tenant.user,
+        message_id=_msg_uuid(body.message_id),
+        conversation_ids=body.conversation_ids,
+        contact_ids=body.contact_ids,
+    )
+    return {"forwarded_to": forwarded}
+
+
+@router.delete("/messages/{msg_id}")
+async def delete_message(
+    msg_id: str,
+    for_everyone: bool = Query(default=False),
+    tenant: TenantContext = Depends(get_tenant),
+):
+    await messaging.delete_message(
+        tenant.db, message_id=_msg_uuid(msg_id), actor=tenant.user, for_everyone=for_everyone
+    )
+    return {"message": "Deleted"}
+
+
+@router.put("/messages/{msg_id}")
+async def edit_message(
+    msg_id: str,
+    body: EditMessageRequest,
+    tenant: TenantContext = Depends(get_tenant),
+):
+    # Net-new endpoint (absent from the Mongo build): returns the edited message doc.
+    return await messaging.edit_message(
+        tenant.db, message_id=_msg_uuid(msg_id), actor=tenant.user, content=body.content
+    )
+
+
+@router.get("/messages/{msg_id}/info")
+async def message_info(msg_id: str, tenant: TenantContext = Depends(get_tenant)):
+    db = tenant.db
+    msg = await db.get(Message, _msg_uuid(msg_id))
+    if msg is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    # Membership before the sender check: outsiders get 404, never a 403 probe.
+    me = await db.get(ConversationParticipant, (msg.conversation_id, tenant.user.id))
+    if me is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.sender_id != tenant.user.id:
+        raise HTTPException(status_code=403, detail="Can only view info for your own messages")
+
+    participants = (
+        (
+            await db.execute(
+                select(ConversationParticipant).where(
+                    ConversationParticipant.conversation_id == msg.conversation_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    other_ids = [p.user_id for p in participants if p.user_id != msg.sender_id]
+    names: dict[uuid.UUID, str] = {}
+    if other_ids:
+        rows = (
+            await db.execute(select(User.id, User.display_name).where(User.id.in_(other_ids)))
+        ).all()
+        names = {user_id: display_name for user_id, display_name in rows}
+
+    read_by: list[dict] = []
+    delivered_to: list[dict] = []
+    pending: list[dict] = []
+    for p in participants:
+        if p.user_id == msg.sender_id:
+            continue  # the sender is excluded from all three lists
+        user_name = names.get(p.user_id, "Unknown")
+        if p.last_read_at is not None and p.last_read_at >= msg.created_at:
+            ts = iso_z(p.last_read_at)
+            read_by.append({"user_name": user_name, "read_at": ts})
+            # Receipts are derived from last_read_at: delivered == read.
+            delivered_to.append({"user_name": user_name, "delivered_at": ts})
+        else:
+            pending.append({"user_name": user_name})
+    return {
+        "sent_at": iso_z(msg.created_at),
+        "delivered_to": delivered_to,
+        "read_by": read_by,
+        "pending": pending,
+    }

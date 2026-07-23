@@ -1,0 +1,118 @@
+import React, { useEffect, useState } from 'react';
+import { motion } from 'framer-motion';
+import { Plus, Pencil, Trash2, Loader2 } from 'lucide-react';
+import { toast } from 'sonner';
+import { PageTransition } from '../../components/common/PageTransition';
+import client from '../../api/client';
+
+export default function OrgAdminDepartments() {
+  const [depts, setDepts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [showModal, setShowModal] = useState(false);
+  const [editDept, setEditDept] = useState(null);
+  const [formName, setFormName] = useState('');
+  const [formDesc, setFormDesc] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  const fetchDepts = async () => {
+    setLoading(true);
+    try { const { data } = await client.get('/api/org-admin/departments'); setDepts(data); }
+    catch {} finally { setLoading(false); }
+  };
+  useEffect(() => { fetchDepts(); }, []);
+
+  const openCreate = () => { setEditDept(null); setFormName(''); setFormDesc(''); setShowModal(true); };
+  const openEdit = (d) => { setEditDept(d); setFormName(d.name); setFormDesc(d.description || ''); setShowModal(true); };
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      if (editDept) {
+        await client.put(`/api/org-admin/departments/${editDept._id}`, { name: formName, description: formDesc || null });
+        toast.success('Department updated');
+      } else {
+        await client.post('/api/org-admin/departments', { name: formName, description: formDesc || null });
+        toast.success('Department created');
+      }
+      setShowModal(false); fetchDepts();
+    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
+    finally { setSaving(false); }
+  };
+
+  const handleDelete = async (dept) => {
+    if (!window.confirm(`Delete department "${dept.name}"?`)) return;
+    try { await client.delete(`/api/org-admin/departments/${dept._id}`); toast.success('Deleted'); fetchDepts(); }
+    catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
+  };
+
+  return (
+    <PageTransition>
+      <div className="max-w-[1200px]">
+        <div className="flex items-center justify-between mb-6">
+          <h2 className="text-lg font-semibold text-[#F5F5F5]">Departments</h2>
+          <button onClick={openCreate}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-[6px] text-sm font-medium border border-[#10B981] text-[#10B981] hover:bg-[#10B981] hover:text-[#0A0A0A] transition-all">
+            <Plus size={16} /> Create Department
+          </button>
+        </div>
+
+        <div className="bg-[#141414] border border-[#1F1F1F] rounded-[8px] overflow-hidden">
+          <table className="w-full">
+            <thead>
+              <tr className="bg-[#0F0F0F] text-[#A3A3A3] text-xs uppercase tracking-wider">
+                <th className="px-6 py-3 text-left">Name</th>
+                <th className="px-6 py-3 text-left">Description</th>
+                <th className="px-6 py-3 text-left">Members</th>
+                <th className="px-6 py-3 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading ? [...Array(3)].map((_, i) => (
+                <tr key={i} className="border-t border-[#1F1F1F]"><td colSpan={4} className="px-6 py-4"><div className="h-4 bg-[#1A1A1A] rounded animate-pulse" /></td></tr>
+              )) : depts.length === 0 ? (
+                <tr><td colSpan={4} className="px-6 py-12 text-center text-sm text-[#A3A3A3]">No departments yet</td></tr>
+              ) : depts.map((dept, idx) => (
+                <motion.tr key={dept._id} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: idx * 0.03 }}
+                  className="border-t border-[#1F1F1F] hover:bg-[#1A1A1A] transition-colors">
+                  <td className="px-6 py-4 text-sm font-medium text-[#F5F5F5]">{dept.name}</td>
+                  <td className="px-6 py-4 text-sm text-[#A3A3A3]">{dept.description || '—'}</td>
+                  <td className="px-6 py-4 text-sm text-[#F5F5F5]">{dept.member_count ?? 0}</td>
+                  <td className="px-6 py-4 text-right">
+                    <div className="flex items-center justify-end gap-2">
+                      <button onClick={() => openEdit(dept)} className="p-2 text-[#A3A3A3] hover:text-[#10B981] rounded transition-colors"><Pencil size={14} /></button>
+                      <button onClick={() => handleDelete(dept)} className="p-2 text-[#A3A3A3] hover:text-[#EF4444] rounded transition-colors"><Trash2 size={14} /></button>
+                    </div>
+                  </td>
+                </motion.tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {showModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={() => setShowModal(false)}>
+            <div className="absolute inset-0 bg-black/60 backdrop-blur-[4px]" />
+            <div className="relative bg-[#141414] border border-[#1F1F1F] rounded-[8px] w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
+              <h3 className="text-lg font-semibold text-[#F5F5F5] mb-4">{editDept ? 'Edit Department' : 'Create Department'}</h3>
+              <div className="space-y-4">
+                <div><label className="text-sm text-[#A3A3A3] mb-1.5 block">Name *</label>
+                  <input value={formName} onChange={e => setFormName(e.target.value)}
+                    className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none" /></div>
+                <div><label className="text-sm text-[#A3A3A3] mb-1.5 block">Description</label>
+                  <textarea value={formDesc} onChange={e => setFormDesc(e.target.value)} rows={2}
+                    className="w-full px-4 py-2 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none resize-none" /></div>
+              </div>
+              <div className="flex justify-end gap-3 mt-6">
+                <button onClick={() => setShowModal(false)} className="px-4 py-2 text-sm text-[#A3A3A3] rounded-[6px]">Cancel</button>
+                <button onClick={handleSave} disabled={!formName.trim() || saving}
+                  className="px-4 py-2 text-sm font-medium bg-[#10B981] text-[#0A0A0A] rounded-[6px] hover:bg-[#059669] disabled:opacity-50 flex items-center gap-2">
+                  {saving && <Loader2 size={14} className="animate-spin" />} {editDept ? 'Save' : 'Create'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </PageTransition>
+  );
+}

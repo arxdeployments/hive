@@ -1,0 +1,28 @@
+# Reverse proxy: one origin for web, API, WebSocket, object storage and LiveKit signal.
+# SITE_ADDRESS=":80" for plain HTTP behind an external LB, or "chat.example.com" for automatic TLS.
+{$SITE_ADDRESS}
+
+encode gzip zstd
+
+# API + WebSocket
+handle /api/* {
+	reverse_proxy api:8000
+}
+handle /ws* {
+	reverse_proxy api:8000
+}
+
+# Presigned object-storage URLs (path-style: /s3/<bucket>/<key>?X-Amz-...)
+handle_path /s3/* {
+	reverse_proxy minio:9000
+}
+
+# LiveKit signal WebSocket
+handle_path /livekit/* {
+	reverse_proxy livekit:7880
+}
+
+# Frontend SPA
+handle {
+	reverse_proxy web:80
+}

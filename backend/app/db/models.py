@@ -1,0 +1,464 @@
+"""SQLAlchemy 2.0 models — the §6 schema.
+
+Every tenant-scoped table carries org_id so the tenant guard can scope every
+query by construction. Embedded Mongo arrays became join tables.
+"""
+
+import datetime as dt
+import enum
+import uuid
+
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
+from sqlalchemy.dialects.postgresql import CITEXT, JSONB, UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    type_annotation_map = {
+        uuid.UUID: UUID(as_uuid=True),
+        dt.datetime: DateTime(timezone=True),
+        dict: JSONB,
+    }
+
+
+def _uuid_pk() -> Mapped[uuid.UUID]:
+    return mapped_column(primary_key=True, default=uuid.uuid4)
+
+
+def _now() -> Mapped[dt.datetime]:
+    return mapped_column(server_default=func.now())
+
+
+class UserRole(str, enum.Enum):
+    superadmin = "superadmin"
+    org_admin = "org_admin"
+    member = "member"
+
+
+class ConversationType(str, enum.Enum):
+    direct = "direct"
+    group = "group"
+    cross_org = "cross_org"
+
+
+class ParticipantRole(str, enum.Enum):
+    creator = "creator"
+    admin = "admin"
+    member = "member"
+
+
+class MessageType(str, enum.Enum):
+    text = "text"
+    image = "image"
+    video = "video"
+    audio = "audio"
+    file = "file"
+    system = "system"
+
+
+class CallType(str, enum.Enum):
+    voice = "voice"
+    video = "video"
+
+
+class CallStatus(str, enum.Enum):
+    ringing = "ringing"
+    connected = "connected"
+    answered = "answered"
+    missed = "missed"
+    declined = "declined"
+    cancelled = "cancelled"
+    busy = "busy"
+    no_answer = "no_answer"
+
+
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(200))
+    slug: Mapped[str] = mapped_column(String(100), unique=True)
+    logo_url: Mapped[str | None]
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[dt.datetime] = _now()
+
+    departments: Mapped[list["Department"]] = relationship(back_populates="organization")
+
+
+class Department(Base):
+    __tablename__ = "departments"
+    __table_args__ = (UniqueConstraint("org_id", "name"),)
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str | None]
+    created_at: Mapped[dt.datetime] = _now()
+
+    organization: Mapped[Organization] = relationship(back_populates="departments")
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="SET NULL")
+    )
+    dept_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("departments.id", ondelete="SET NULL")
+    )
+    email: Mapped[str] = mapped_column(CITEXT(), unique=True)
+    display_name: Mapped[str] = mapped_column(String(200))
+    password_hash: Mapped[str] = mapped_column(String(200))
+    role: Mapped[UserRole] = mapped_column(
+        Enum(UserRole, name="user_role", values_callable=lambda e: [m.value for m in e])
+    )
+    avatar_url: Mapped[str | None]
+    about: Mapped[str | None] = mapped_column(String(200))
+    is_active: Mapped[bool] = mapped_column(default=True)
+    must_change_password: Mapped[bool] = mapped_column(default=False)
+    last_seen_at: Mapped[dt.datetime | None]
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[dt.datetime] = _now()
+
+    organization: Mapped[Organization | None] = relationship()
+    department: Mapped[Department | None] = relationship()
+
+    __table_args__ = (Index("ix_users_org_id", "org_id"),)
+
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    # NULL org_id only for cross-org conversations (created by super-admins).
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE")
+    )
+    type: Mapped[ConversationType] = mapped_column(
+        Enum(
+            ConversationType,
+            name="conversation_type",
+            values_callable=lambda e: [m.value for m in e],
+        )
+    )
+    name: Mapped[str | None] = mapped_column(String(200))
+    description: Mapped[str | None]
+    avatar_url: Mapped[str | None]
+    purpose_tag: Mapped[str | None] = mapped_column(String(100))  # cross_org groups
+    allowed_org_ids: Mapped[dict] = mapped_column(JSONB, default=list)  # [str] for cross_org
+    admin_only_messages: Mapped[bool] = mapped_column(default=False)
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    last_message_at: Mapped[dt.datetime | None]
+    created_at: Mapped[dt.datetime] = _now()
+
+    participants: Mapped[list["ConversationParticipant"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("ix_conversations_org_id", "org_id"),)
+
+
+class ConversationParticipant(Base):
+    __tablename__ = "conversation_participants"
+
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    role: Mapped[ParticipantRole] = mapped_column(
+        Enum(
+            ParticipantRole,
+            name="participant_role",
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        default=ParticipantRole.member,
+    )
+    last_read_at: Mapped[dt.datetime | None]
+    is_pinned: Mapped[bool] = mapped_column(default=False)
+    is_muted: Mapped[bool] = mapped_column(default=False)
+    joined_at: Mapped[dt.datetime] = _now()
+
+    conversation: Mapped[Conversation] = relationship(back_populates="participants")
+    user: Mapped[User] = relationship()
+
+    __table_args__ = (Index("ix_participants_user_id", "user_id"),)
+
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE")
+    )
+    sender_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    type: Mapped[MessageType] = mapped_column(
+        Enum(MessageType, name="message_type", values_callable=lambda e: [m.value for m in e]),
+        default=MessageType.text,
+    )
+    content: Mapped[str] = mapped_column(Text, default="")
+    reply_to_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL")
+    )
+    is_forwarded: Mapped[bool] = mapped_column(default=False)
+    edited_at: Mapped[dt.datetime | None]
+    deleted_at: Mapped[dt.datetime | None]  # delete-for-everyone tombstone
+    created_at: Mapped[dt.datetime] = _now()
+
+    sender: Mapped[User | None] = relationship()
+    reply_to: Mapped["Message | None"] = relationship(remote_side="Message.id")
+    attachments: Mapped[list["MessageAttachment"]] = relationship(
+        back_populates="message", cascade="all, delete-orphan", order_by="MessageAttachment.created_at"
+    )
+    reactions: Mapped[list["MessageReaction"]] = relationship(
+        back_populates="message", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("ix_messages_conversation_created", "conversation_id", "created_at"),)
+
+
+class MessageAttachment(Base):
+    __tablename__ = "message_attachments"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    message_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"))
+    storage_key: Mapped[str] = mapped_column(String(500))
+    thumbnail_key: Mapped[str | None] = mapped_column(String(500))
+    filename: Mapped[str] = mapped_column(String(300))
+    mime_type: Mapped[str] = mapped_column(String(150))
+    file_size: Mapped[int] = mapped_column(BigInteger, default=0)
+    width: Mapped[int | None]
+    height: Mapped[int | None]
+    duration_seconds: Mapped[float | None]
+    created_at: Mapped[dt.datetime] = _now()
+
+    message: Mapped[Message] = relationship(back_populates="attachments")
+
+
+class MessageReaction(Base):
+    __tablename__ = "message_reactions"
+
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    emoji: Mapped[str] = mapped_column(String(32), primary_key=True)
+    created_at: Mapped[dt.datetime] = _now()
+
+    message: Mapped[Message] = relationship(back_populates="reactions")
+    user: Mapped[User] = relationship()
+
+
+class MessageDeletion(Base):
+    """Delete-for-me: rows here are filtered out of that user's reads."""
+
+    __tablename__ = "message_deletions"
+
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[dt.datetime] = _now()
+
+
+class Call(Base):
+    __tablename__ = "call_history"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE")
+    )
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="SET NULL")
+    )
+    initiated_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    type: Mapped[CallType] = mapped_column(
+        Enum(CallType, name="call_type", values_callable=lambda e: [m.value for m in e])
+    )
+    status: Mapped[CallStatus] = mapped_column(
+        Enum(CallStatus, name="call_status", values_callable=lambda e: [m.value for m in e]),
+        default=CallStatus.ringing,
+    )
+    is_group: Mapped[bool] = mapped_column(default=False)
+    room_name: Mapped[str] = mapped_column(String(200), unique=True)
+    started_at: Mapped[dt.datetime] = _now()
+    answered_at: Mapped[dt.datetime | None]
+    ended_at: Mapped[dt.datetime | None]
+
+    participants: Mapped[list["CallParticipant"]] = relationship(
+        back_populates="call", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("ix_calls_org_started", "org_id", "started_at"),)
+
+
+class CallParticipant(Base):
+    __tablename__ = "call_participants"
+
+    call_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("call_history.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    invited_at: Mapped[dt.datetime] = _now()
+    joined_at: Mapped[dt.datetime | None]
+    left_at: Mapped[dt.datetime | None]
+    seen_at: Mapped[dt.datetime | None]  # missed-call badge dismissal
+
+    call: Mapped[Call] = relationship(back_populates="participants")
+    user: Mapped[User] = relationship()
+
+    __table_args__ = (Index("ix_call_participants_user", "user_id"),)
+
+
+class ScheduledCall(Base):
+    __tablename__ = "scheduled_calls"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE")
+    )
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    title: Mapped[str] = mapped_column(String(300))
+    description: Mapped[str | None]
+    call_type: Mapped[CallType] = mapped_column(
+        Enum(CallType, name="call_type", values_callable=lambda e: [m.value for m in e],
+             create_type=False)
+    )
+    call_link_code: Mapped[str | None] = mapped_column(String(64))
+    start_time: Mapped[dt.datetime]
+    end_time: Mapped[dt.datetime | None]
+    reminder_minutes: Mapped[int] = mapped_column(default=15)
+    participant_ids: Mapped[dict] = mapped_column(JSONB, default=list)  # list[str] of user ids
+    status: Mapped[str] = mapped_column(String(30), default="scheduled")
+    created_at: Mapped[dt.datetime] = _now()
+
+
+class CallLink(Base):
+    __tablename__ = "call_links"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE")
+    )
+    creator_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    code: Mapped[str] = mapped_column(String(64), unique=True)
+    call_type: Mapped[CallType] = mapped_column(
+        Enum(CallType, name="call_type", values_callable=lambda e: [m.value for m in e],
+             create_type=False)
+    )
+    is_active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[dt.datetime] = _now()
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="SET NULL")
+    )
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    actor_type: Mapped[str] = mapped_column(String(30), default="superadmin")
+    action: Mapped[str] = mapped_column(String(100))
+    target: Mapped[str | None] = mapped_column(String(300))
+    details: Mapped[dict] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[dt.datetime] = _now()
+
+    __table_args__ = (Index("ix_audit_org_created", "org_id", "created_at"),)
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    type: Mapped[str] = mapped_column(String(50))
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+    is_read: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[dt.datetime] = _now()
+
+    __table_args__ = (Index("ix_notifications_user_created", "user_id", "created_at"),)
+
+
+class RefreshToken(Base):
+    """Persisted, revocable refresh sessions (NEW vs the Mongo build)."""
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    user_agent: Mapped[str | None] = mapped_column(String(300))
+    expires_at: Mapped[dt.datetime]
+    revoked_at: Mapped[dt.datetime | None]
+    created_at: Mapped[dt.datetime] = _now()
+
+    user: Mapped[User] = relationship()
+
+    __table_args__ = (Index("ix_refresh_tokens_user", "user_id"),)
+
+
+class Upload(Base):
+    """Staging record for uploaded files before they're claimed by a message.
+
+    The Mongo build wrote files to disk with no DB record (orphans forever).
+    Here every upload is tracked; a cleanup job can purge unclaimed uploads.
+    """
+
+    __tablename__ = "uploads"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    uploader_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    org_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE")
+    )
+    storage_key: Mapped[str] = mapped_column(String(500))
+    thumbnail_key: Mapped[str | None] = mapped_column(String(500))
+    filename: Mapped[str] = mapped_column(String(300))
+    mime_type: Mapped[str] = mapped_column(String(150))
+    file_type: Mapped[str] = mapped_column(String(20))  # image|video|audio|document
+    file_size: Mapped[int] = mapped_column(BigInteger, default=0)
+    claimed: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[dt.datetime] = _now()
+
+
+class PushSubscription(Base):
+    """Web Push subscriptions (v1 notifications pipeline)."""
+
+    __tablename__ = "push_subscriptions"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
+    endpoint: Mapped[str] = mapped_column(Text, unique=True)
+    keys: Mapped[dict] = mapped_column(JSONB, default=dict)  # {p256dh, auth}
+    created_at: Mapped[dt.datetime] = _now()
+
+
+# Full-text search over messages is a generated tsvector column + GIN index,
+# created in the Alembic migration (see alembic/versions/0001_initial.py):
+#   ALTER TABLE messages ADD COLUMN search_tsv tsvector
+#     GENERATED ALWAYS AS (to_tsvector('simple', coalesce(content, ''))) STORED;
+#   CREATE INDEX ix_messages_search_tsv ON messages USING gin (search_tsv);
+MESSAGES_FTS_SQL = text("SELECT 1")  # placeholder anchor for grep; real DDL lives in the migration

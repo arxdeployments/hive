@@ -1,0 +1,285 @@
+"""Uploads + authenticated media serving.
+
+Replaces the Mongo build's unauthenticated /api/uploads/{filename} disk serving:
+every file lives in object storage under a DB-tracked Upload/MessageAttachment
+row, and every read is auth-checked (uploader or conversation membership) before
+redirecting to a short-lived presigned URL.
+"""
+
+import os
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import RedirectResponse
+from sqlalchemy import and_, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.core.deps import TenantContext, get_current_user, get_tenant
+from app.core.rate_limit import upload_limiter
+from app.db.models import (
+    ConversationParticipant,
+    Message,
+    MessageAttachment,
+    MessageDeletion,
+    MessageType,
+    Upload,
+    User,
+)
+from app.db.session import get_db
+from app.services import storage
+from app.services.enrich import media_url_for, thumb_url_for
+from app.utils import iso_z, parse_uuid, sanitize_text
+
+router = APIRouter(prefix="/api", tags=["media"])
+
+_CHUNK_SIZE = 1024 * 1024
+
+_TOO_LARGE_MESSAGES = {
+    "image": "Image too large (max 16MB)",
+    "video": "File too large (max 200MB)",
+    "audio": "File too large (max 200MB)",
+    "document": "File too large (max 100MB)",
+}
+
+_MEDIA_LIST_TYPES = {"image", "video", "audio", "file"}
+
+_INLINE_MIME_PREFIXES = ("image/", "video/", "audio/")
+
+
+def _not_found() -> HTTPException:
+    return HTTPException(status_code=404, detail="File not found")
+
+
+def _safe_filename(name: str | None) -> str:
+    """Strip HTML and any path components from a client-supplied filename."""
+    cleaned = sanitize_text(name or "").replace("\\", "/").split("/")[-1].strip()
+    return (cleaned or "file")[:300]
+
+
+def _is_inline(mime_type: str) -> bool:
+    return mime_type.startswith(_INLINE_MIME_PREFIXES)
+
+
+@router.post("/upload")
+async def upload_file(
+    file: UploadFile | None = File(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(upload_limiter),
+):
+    if file is None or not (file.filename or "").strip():
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    file_type = storage.classify(ext)
+    if file_type is None:
+        raise HTTPException(status_code=400, detail="File type not supported")
+
+    limit = storage.size_limit_for(file_type)
+    data = bytearray()
+    while True:
+        chunk = await file.read(_CHUNK_SIZE)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > limit:
+            raise HTTPException(status_code=400, detail=_TOO_LARGE_MESSAGES[file_type])
+    payload = bytes(data)
+
+    # Content type from the extension map — the client's Content-Type is never trusted.
+    content_type = storage.MIME_BY_EXT.get(ext, "application/octet-stream")
+
+    key = storage.new_storage_key(user.org_id, ext)
+    await storage.put_object(key, payload, content_type)
+
+    thumbnail_key = None
+    if file_type == "image":
+        thumb = await storage.make_thumbnail(payload)
+        if thumb is not None:
+            thumbnail_key = f"{key}_thumb.jpg"
+            await storage.put_object(thumbnail_key, thumb, "image/jpeg")
+
+    upload = Upload(
+        uploader_id=user.id,
+        org_id=user.org_id,
+        storage_key=key,
+        thumbnail_key=thumbnail_key,
+        filename=_safe_filename(file.filename),
+        mime_type=content_type,
+        file_type=file_type,
+        file_size=len(payload),
+    )
+    db.add(upload)
+    await db.commit()
+
+    file_url = f"/api/media/up/{upload.id}"
+    response = {
+        "file_id": str(upload.id),
+        "filename": upload.filename,
+        "file_url": file_url,
+        "file_type": upload.file_type,
+        "file_size": upload.file_size,
+        "mime_type": upload.mime_type,
+    }
+    if file_type == "image":
+        # Contract: thumbnail_url falls back to the file itself if thumbnailing failed.
+        response["thumbnail_url"] = f"{file_url}/thumb" if thumbnail_key else file_url
+    return response
+
+
+async def _own_upload(db: AsyncSession, upload_id: str, user: User) -> Upload:
+    """Load an upload iff the caller is its uploader (404 otherwise)."""
+    uid = parse_uuid(upload_id)
+    if uid is None:
+        raise _not_found()
+    upload = await db.get(Upload, uid)
+    if upload is None or upload.uploader_id != user.id:
+        raise _not_found()
+    return upload
+
+
+@router.get("/media/up/{upload_id}")
+async def serve_upload(
+    upload_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    upload = await _own_upload(db, upload_id, user)
+    url = await storage.presign_get(upload.storage_key, filename=upload.filename, inline=True)
+    return RedirectResponse(url, status_code=307)
+
+
+@router.get("/media/up/{upload_id}/thumb")
+async def serve_upload_thumb(
+    upload_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    upload = await _own_upload(db, upload_id, user)
+    if not upload.thumbnail_key:
+        raise _not_found()
+    url = await storage.presign_get(upload.thumbnail_key, inline=True)
+    return RedirectResponse(url, status_code=307)
+
+
+async def _member_attachment(db: AsyncSession, attachment_id: str, user: User) -> MessageAttachment:
+    """Load an attachment iff the caller participates in its conversation and
+    the message is not tombstoned (404 otherwise — existence is not revealed)."""
+    att_id = parse_uuid(attachment_id)
+    if att_id is None:
+        raise _not_found()
+    attachment = await db.get(MessageAttachment, att_id)
+    if attachment is None:
+        raise _not_found()
+    msg = await db.get(Message, attachment.message_id)
+    if msg is None or msg.deleted_at is not None:
+        raise _not_found()
+    membership = await db.get(ConversationParticipant, (msg.conversation_id, user.id))
+    if membership is None:
+        raise _not_found()
+    return attachment
+
+
+@router.get("/media/{attachment_id}")
+async def serve_attachment(
+    attachment_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    attachment = await _member_attachment(db, attachment_id, user)
+    url = await storage.presign_get(
+        attachment.storage_key,
+        filename=attachment.filename,
+        inline=_is_inline(attachment.mime_type),
+    )
+    return RedirectResponse(url, status_code=307)
+
+
+@router.get("/media/{attachment_id}/thumb")
+async def serve_attachment_thumb(
+    attachment_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    attachment = await _member_attachment(db, attachment_id, user)
+    if not attachment.thumbnail_key:
+        raise _not_found()
+    url = await storage.presign_get(attachment.thumbnail_key, inline=True)
+    return RedirectResponse(url, status_code=307)
+
+
+@router.get("/conversations/{conv_id}/media")
+async def conversation_media(
+    conv_id: str,
+    media_type: str = Query("image", alias="type"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(30, ge=1, le=100),
+    tenant: TenantContext = Depends(get_tenant),
+):
+    conv_uuid = parse_uuid(conv_id)
+    if conv_uuid is None:
+        raise HTTPException(status_code=400, detail="Invalid conversation ID")
+    if media_type not in _MEDIA_LIST_TYPES:
+        # Deliberate fix vs the Mongo build, which accepted any type string
+        # (type=text returned text messages reshaped as media items).
+        raise HTTPException(status_code=400, detail="Invalid media type")
+    conv = await tenant.require_membership(conv_uuid)
+    db = tenant.db
+
+    filters = [
+        Message.conversation_id == conv.id,
+        Message.type == MessageType(media_type),
+        Message.deleted_at.is_(None),
+        MessageDeletion.message_id.is_(None),  # exclude the caller's delete-for-me
+    ]
+    deletion_join = and_(
+        MessageDeletion.message_id == Message.id,
+        MessageDeletion.user_id == tenant.user.id,
+    )
+
+    total = (
+        await db.execute(
+            select(func.count(Message.id)).outerjoin(MessageDeletion, deletion_join).where(*filters)
+        )
+    ).scalar_one()
+
+    messages = (
+        (
+            await db.execute(
+                select(Message)
+                .options(selectinload(Message.attachments))
+                .outerjoin(MessageDeletion, deletion_join)
+                .where(*filters)
+                .order_by(Message.created_at.desc())
+                .offset((page - 1) * limit)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    sender_ids = {m.sender_id for m in messages if m.sender_id}
+    sender_names: dict = {}
+    if sender_ids:
+        rows = (
+            await db.execute(select(User.id, User.display_name).where(User.id.in_(sender_ids)))
+        ).all()
+        sender_names = {row.id: row.display_name for row in rows}
+
+    data = []
+    for msg in messages:
+        first = msg.attachments[0] if msg.attachments else None
+        data.append(
+            {
+                "message_id": str(msg.id),
+                "media_url": media_url_for(first.id) if first else None,
+                "thumbnail_url": thumb_url_for(first.id) if first and first.thumbnail_key else None,
+                "filename": first.filename if first else "",
+                "file_size": first.file_size if first else 0,
+                "sender_name": sender_names.get(msg.sender_id, "Unknown"),
+                "created_at": iso_z(msg.created_at),
+            }
+        )
+
+    return {"data": data, "total": total, "has_more": page * limit < total}

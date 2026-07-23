@@ -1,0 +1,19 @@
+# 8
+
+COMPLETENESS REVIEW of /Users/adhityasathyakuamr/Documents/HIVE/RxHivexx-main — coverage is close to complete. Genuinely uncovered items, ranked:
+
+1. UNCOVERED ROUTE FILE: backend/app/routes/dev.py (197 lines, registered in app/main.py:71). One endpoint: POST /api/dev/seed-chat-data (superadmin-only demo-data seeder). It is absent from the 12-file covered list. Beyond the endpoint itself, it is valuable rebuild reference: lines 126–177 hand-construct the canonical conversation and message Mongo document shapes (participants[].unread_count, pinned_by, read_by/delivered_to, deleted_for, cross_org/allowed_org_ids), independently of models/schemas.py. Note the arithmetic: the 13 route files contain 80 endpoint decorators; + /api/health (app/main.py:81) + the WS endpoint = 82, which equals the reported 36+19+27 — so the dev endpoint was probably counted but the file was never named/mapped.
+
+2. LIKELY UNCOVERED PAGE: frontend/src/pages/Settings.js — the end-user settings page mounted at /settings (App.js:187, imported as UserSettings). Not obviously inside "shell/chat/calls/admin". It defines the four localStorage preference keys that other covered code consumes: rxhive_notif_sound, rxhive_desktop_notif, rxhive_enter_sends, rxhive_font_size (Settings.js:17–25). rxhive_notif_sound is read by services/callSounds.js (_isMuted) and services/websocket.js; rxhive_enter_sends/font_size affect the composer/bubbles. A rebuild that skips this page silently breaks those toggles.
+
+3. NOTIFICATIONS — document the asymmetry so rebuilders don't invent an API: there is NO server-side notification system. backend/app/database.py:49–50 creates an index on a db.notifications collection that no code anywhere reads or writes (vestigial). Actual notifications are purely client-side in frontend/src/services/websocket.js:612–658 (_playNotificationSound via Web Audio, _showBrowserNotification via the browser Notification API, tag=convId, permission requested from Settings.js:27–32). Verify the chat/websocket mappers captured this block; nothing else implements notifications.
+
+4. server.py vs app/main.py — NO duplication. backend/server.py is a 2-line shim (`from app.main import app`) kept for the supervisor's `uvicorn server:app` entry point. Worth one line in the map, nothing more.
+
+5. Scheduled calls / call links — NOT missing: they live inside the covered calls.py (backend/app/routes/calls.py: POST /api/calls/create-link at line 106, GET /api/calls/link/{code} at line 122, scheduled-call creation writing db.scheduled_calls around lines 152–166, GET /api/calls/scheduled at line 167), with indexes in database.py:56–61. Only worth spot-checking that the calls mapper enumerated all 9 decorators in that file.
+
+6. PWA — does not exist, so nothing to cover: frontend/public/ contains only index.html; the manifest.json mention there (line ~12) is a stock CRA comment, and there is no manifest file or service worker anywhere.
+
+Minor/deliberately skippable (state as such in the map): frontend/plugins/health-check/ (webpack-health-plugin.js, health-endpoints.js — Emergent-platform build/health artifacts, not app features), backend/=10.0.0 (stray pip-redirect artifact), tests/ (empty __init__.py only), .emergent/. Root docs plan.md, design_guidelines.md, test_result.md, backend_test.py, and test_reports/ are behavioral/spec reference for the rebuild but not code to map.
+
+Everything else the mappers claimed is corroborated by the tree: 12 named route files exist, backend core (app/main.py, config.py, database.py, models/schemas.py, auth/{jwt,middleware,passwords}.py, utils/{security,serializers,seed}.py), websocket (app/websocket/{endpoint,manager,call_manager,call_handler}.py), and the frontend shell/chat/calls/admin+org-admin surfaces (pages/admin/*, pages/OrgAdmin/*, components/{chat,calls,layout,shared,common}, services, stores, api/client.js) all exist with no other unaccounted feature directories.
