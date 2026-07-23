@@ -40,9 +40,7 @@ def enforce_password_policy(password: str) -> None:
     """
     settings = get_settings()
     if len(password) < settings.password_min_length:
-        raise PasswordPolicyError(
-            f"Password must be at least {settings.password_min_length} characters"
-        )
+        raise PasswordPolicyError(f"Password must be at least {settings.password_min_length} characters")
     if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
         raise PasswordPolicyError("Password must contain both letters and numbers")
 

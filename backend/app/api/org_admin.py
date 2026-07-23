@@ -109,32 +109,22 @@ async def _load_org_user(db: AsyncSession, admin: User, user_id_raw: str) -> Use
     return target
 
 
-async def _org_department(
-    db: AsyncSession, org_id: uuid.UUID, dept_id: uuid.UUID
-) -> Department | None:
+async def _org_department(db: AsyncSession, org_id: uuid.UUID, dept_id: uuid.UUID) -> Department | None:
     return (
-        await db.execute(
-            select(Department).where(Department.id == dept_id, Department.org_id == org_id)
-        )
+        await db.execute(select(Department).where(Department.id == dept_id, Department.org_id == org_id))
     ).scalar_one_or_none()
 
 
 async def _dept_name_map(db: AsyncSession, org_id: uuid.UUID) -> dict[uuid.UUID, str]:
-    rows = (
-        await db.execute(select(Department.id, Department.name).where(Department.org_id == org_id))
-    ).all()
+    rows = (await db.execute(select(Department.id, Department.name).where(Department.org_id == org_id))).all()
     return {dept_id: name for dept_id, name in rows}
 
 
-async def _single_dept_name(
-    db: AsyncSession, org_id: uuid.UUID, dept_id: uuid.UUID | None
-) -> str:
+async def _single_dept_name(db: AsyncSession, org_id: uuid.UUID, dept_id: uuid.UUID | None) -> str:
     if dept_id is None:
         return "Unknown"
     name = (
-        await db.execute(
-            select(Department.name).where(Department.id == dept_id, Department.org_id == org_id)
-        )
+        await db.execute(select(Department.name).where(Department.id == dept_id, Department.org_id == org_id))
     ).scalar_one_or_none()
     return name or "Unknown"
 
@@ -169,9 +159,7 @@ async def org_stats(
     statuses = await presence.get_statuses(list(active_ids))
     active_today = sum(1 for s in statuses.values() if s == "online")
     total_departments = (
-        await db.execute(
-            select(func.count()).select_from(Department).where(Department.org_id == org_id)
-        )
+        await db.execute(select(func.count()).select_from(Department).where(Department.org_id == org_id))
     ).scalar_one()
     total_conversations = (
         await db.execute(
@@ -242,20 +230,14 @@ async def list_users(
 
     total = (await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
     rows = (
-        (
-            await db.execute(
-                stmt.order_by(User.created_at.desc()).offset((page - 1) * limit).limit(limit)
-            )
-        )
+        (await db.execute(stmt.order_by(User.created_at.desc()).offset((page - 1) * limit).limit(limit)))
         .scalars()
         .all()
     )
     dept_names = await _dept_name_map(db, admin.org_id)
     statuses = await presence.get_statuses([u.id for u in rows])
     data = [
-        _serialize_user(
-            u, dept_names.get(u.dept_id, "Unknown"), statuses.get(str(u.id), "offline")
-        )
+        _serialize_user(u, dept_names.get(u.dept_id, "Unknown"), statuses.get(str(u.id), "offline"))
         for u in rows
     ]
     return {"data": data, "total": total, "page": page, "limit": limit}
@@ -362,9 +344,7 @@ async def update_user(
             raise HTTPException(status_code=400, detail="Invalid department ID")
         dept = await _org_department(db, admin.org_id, dept_uuid)
         if dept is None:
-            raise HTTPException(
-                status_code=400, detail="Department not found in your organization"
-            )
+            raise HTTPException(status_code=400, detail="Department not found in your organization")
         target.dept_id = dept.id
         changes["dept_id"] = str(dept.id)
     if body.role is not None and body.role in _ROLE_MAP:
@@ -455,18 +435,14 @@ async def create_department(
         raise HTTPException(status_code=400, detail="Department name must be at least 2 characters")
     dup = (
         await db.execute(
-            select(Department.id)
-            .where(Department.org_id == admin.org_id, Department.name == name)
-            .limit(1)
+            select(Department.id).where(Department.org_id == admin.org_id, Department.name == name).limit(1)
         )
     ).scalar_one_or_none()
     if dup is not None:
         raise HTTPException(status_code=400, detail="Department already exists")
 
     description = sanitize_text(body.description) if body.description is not None else None
-    dept = Department(
-        org_id=admin.org_id, name=name, description=description, created_at=now_utc()
-    )
+    dept = Department(org_id=admin.org_id, name=name, description=description, created_at=now_utc())
     db.add(dept)
     await db.flush()
     await log_audit(
@@ -553,9 +529,7 @@ async def delete_department(
 
     active_users = (
         await db.execute(
-            select(func.count())
-            .select_from(User)
-            .where(User.dept_id == dept.id, User.is_active.is_(True))
+            select(func.count()).select_from(User).where(User.dept_id == dept.id, User.is_active.is_(True))
         )
     ).scalar_one()
     if active_users:
@@ -623,9 +597,7 @@ async def update_org_settings(
                     )
                 ).scalar_one_or_none()
                 if dup is not None:
-                    raise HTTPException(
-                        status_code=400, detail="Organization name already exists"
-                    )
+                    raise HTTPException(status_code=400, detail="Organization name already exists")
             org.name = cleaned
             org.slug = new_slug
             changes["name"] = cleaned

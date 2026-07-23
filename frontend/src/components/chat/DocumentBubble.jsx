@@ -1,7 +1,12 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { FileText, FileSpreadsheet, File, FileArchive, Download } from 'lucide-react';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
+
+const resolveUrl = (url) => {
+  if (!url) return '';
+  return url.startsWith('http') ? url : `${backendUrl}${url}`;
+};
 
 const FILE_ICONS = {
   pdf: { icon: FileText, color: '#EF4444' },
@@ -24,26 +29,28 @@ const formatFileSize = (bytes) => {
 };
 
 export const DocumentBubble = ({ message, isOwn }) => {
-  const filename = message.content || message.filename || 'Document';
+  // Fall back to a file attachment when the message doesn't carry the fields inline.
+  const attachment = Array.isArray(message.attachments)
+    ? (message.attachments.find(a => !a.type || a.type === 'file' || a.type === 'document') || message.attachments[0])
+    : null;
+
+  const filename = message.filename || attachment?.filename || message.content || 'Document';
+  const fileSize = message.file_size ?? attachment?.file_size;
+  // media_url is already a correct relative path ('/api/media/<id>'); the API
+  // serves it with an attachment disposition, so a plain download anchor works.
+  const mediaUrl = resolveUrl(message.media_url || attachment?.media_url || attachment?.url);
+
   const ext = filename.split('.').pop()?.toLowerCase() || '';
   const fileInfo = FILE_ICONS[ext] || { icon: File, color: '#A3A3A3' };
   const IconComponent = fileInfo.icon;
-  const mediaUrl = message.media_url?.startsWith('http') ? message.media_url : `${backendUrl}${message.media_url}`;
-
-  const handleDownload = () => {
-    if (mediaUrl) {
-      const a = document.createElement('a');
-      a.href = mediaUrl;
-      a.download = filename;
-      a.target = '_blank';
-      a.click();
-    }
-  };
 
   return (
-    <div
-      onClick={handleDownload}
-      className={`w-[280px] flex items-center gap-3 p-3 rounded-[6px] cursor-pointer transition-colors ${
+    <a
+      href={mediaUrl || undefined}
+      download={filename}
+      target="_blank"
+      rel="noopener noreferrer"
+      className={`no-underline w-[280px] flex items-center gap-3 p-3 rounded-[6px] cursor-pointer transition-colors ${
         isOwn ? 'bg-[#059669] hover:bg-[#047857]' : 'bg-[#2D2D2D] hover:bg-[#333333]'
       }`}
       data-testid="document-bubble"
@@ -55,10 +62,10 @@ export const DocumentBubble = ({ message, isOwn }) => {
       <div className="flex-1 min-w-0">
         <p className={`text-sm truncate ${isOwn ? 'text-white' : 'text-[#F5F5F5]'}`}>{filename}</p>
         <p className={`text-xs ${isOwn ? 'text-white/60' : 'text-[#A3A3A3]'}`}>
-          {formatFileSize(message.file_size)}
+          {formatFileSize(fileSize)}
         </p>
       </div>
       <Download size={16} className={isOwn ? 'text-white/60' : 'text-[#A3A3A3]'} />
-    </div>
+    </a>
   );
 };

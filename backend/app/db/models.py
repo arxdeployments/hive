@@ -113,12 +113,8 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    org_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("organizations.id", ondelete="SET NULL")
-    )
-    dept_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("departments.id", ondelete="SET NULL")
-    )
+    org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id", ondelete="SET NULL"))
+    dept_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("departments.id", ondelete="SET NULL"))
     email: Mapped[str] = mapped_column(CITEXT(), unique=True)
     display_name: Mapped[str] = mapped_column(String(200))
     password_hash: Mapped[str] = mapped_column(String(200))
@@ -144,9 +140,7 @@ class Conversation(Base):
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     # NULL org_id only for cross-org conversations (created by super-admins).
-    org_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("organizations.id", ondelete="CASCADE")
-    )
+    org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
     type: Mapped[ConversationType] = mapped_column(
         Enum(
             ConversationType,
@@ -178,9 +172,7 @@ class ConversationParticipant(Base):
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True
     )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
-    )
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     role: Mapped[ParticipantRole] = mapped_column(
         Enum(
             ParticipantRole,
@@ -204,18 +196,14 @@ class Message(Base):
     __tablename__ = "messages"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    conversation_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("conversations.id", ondelete="CASCADE")
-    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
     sender_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     type: Mapped[MessageType] = mapped_column(
         Enum(MessageType, name="message_type", values_callable=lambda e: [m.value for m in e]),
         default=MessageType.text,
     )
     content: Mapped[str] = mapped_column(Text, default="")
-    reply_to_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("messages.id", ondelete="SET NULL")
-    )
+    reply_to_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id", ondelete="SET NULL"))
     is_forwarded: Mapped[bool] = mapped_column(default=False)
     edited_at: Mapped[dt.datetime | None]
     deleted_at: Mapped[dt.datetime | None]  # delete-for-everyone tombstone
@@ -257,9 +245,7 @@ class MessageReaction(Base):
     message_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
     )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
-    )
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     emoji: Mapped[str] = mapped_column(String(32), primary_key=True)
     created_at: Mapped[dt.datetime] = _now()
 
@@ -275,9 +261,7 @@ class MessageDeletion(Base):
     message_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
     )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
-    )
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     created_at: Mapped[dt.datetime] = _now()
 
 
@@ -285,9 +269,7 @@ class Call(Base):
     __tablename__ = "call_history"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    org_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("organizations.id", ondelete="CASCADE")
-    )
+    org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("conversations.id", ondelete="SET NULL")
     )
@@ -318,9 +300,7 @@ class CallParticipant(Base):
     call_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("call_history.id", ondelete="CASCADE"), primary_key=True
     )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
-    )
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
     invited_at: Mapped[dt.datetime] = _now()
     joined_at: Mapped[dt.datetime | None]
     left_at: Mapped[dt.datetime | None]
@@ -336,15 +316,12 @@ class ScheduledCall(Base):
     __tablename__ = "scheduled_calls"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    org_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("organizations.id", ondelete="CASCADE")
-    )
+    org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
     creator_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     title: Mapped[str] = mapped_column(String(300))
     description: Mapped[str | None]
     call_type: Mapped[CallType] = mapped_column(
-        Enum(CallType, name="call_type", values_callable=lambda e: [m.value for m in e],
-             create_type=False)
+        Enum(CallType, name="call_type", values_callable=lambda e: [m.value for m in e], create_type=False)
     )
     call_link_code: Mapped[str | None] = mapped_column(String(64))
     start_time: Mapped[dt.datetime]
@@ -359,14 +336,11 @@ class CallLink(Base):
     __tablename__ = "call_links"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    org_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("organizations.id", ondelete="CASCADE")
-    )
+    org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
     creator_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     code: Mapped[str] = mapped_column(String(64), unique=True)
     call_type: Mapped[CallType] = mapped_column(
-        Enum(CallType, name="call_type", values_callable=lambda e: [m.value for m in e],
-             create_type=False)
+        Enum(CallType, name="call_type", values_callable=lambda e: [m.value for m in e], create_type=False)
     )
     is_active: Mapped[bool] = mapped_column(default=True)
     created_at: Mapped[dt.datetime] = _now()
@@ -376,9 +350,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
-    org_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("organizations.id", ondelete="SET NULL")
-    )
+    org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id", ondelete="SET NULL"))
     actor_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     actor_type: Mapped[str] = mapped_column(String(30), default="superadmin")
     action: Mapped[str] = mapped_column(String(100))
@@ -431,9 +403,7 @@ class Upload(Base):
 
     id: Mapped[uuid.UUID] = _uuid_pk()
     uploader_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
-    org_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("organizations.id", ondelete="CASCADE")
-    )
+    org_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"))
     storage_key: Mapped[str] = mapped_column(String(500))
     thumbnail_key: Mapped[str | None] = mapped_column(String(500))
     filename: Mapped[str] = mapped_column(String(300))

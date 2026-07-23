@@ -53,6 +53,5 @@ async def get_statuses(user_ids: list) -> dict[str, str]:
         pipe.exists(_key(uid))
     results = await pipe.execute()
     return {
-        str(uid): ("online" if exists else "offline")
-        for uid, exists in zip(user_ids, results, strict=True)
+        str(uid): ("online" if exists else "offline") for uid, exists in zip(user_ids, results, strict=True)
     }

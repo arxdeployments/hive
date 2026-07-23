@@ -35,6 +35,20 @@ _UPLOAD_URL_RE = re.compile(r"/api/media/up/([0-9a-f-]{36})")
 DELETE_FOR_EVERYONE_WINDOW_SECONDS = 3600
 
 
+def _push_preview(doc: dict) -> str:
+    t = doc.get("type")
+    if t == "image":
+        return "📷 Photo"
+    if t == "video":
+        return "🎬 Video"
+    if t == "audio":
+        return "🎤 Voice message"
+    if t == "file":
+        return f"📄 {doc.get('filename') or 'Document'}"
+    body = doc.get("content") or ""
+    return body[:120]
+
+
 class SendError(HTTPException):
     pass
 
@@ -45,9 +59,7 @@ async def _require_send_access(
     participants = (
         (
             await db.execute(
-                select(ConversationParticipant).where(
-                    ConversationParticipant.conversation_id == conv.id
-                )
+                select(ConversationParticipant).where(ConversationParticipant.conversation_id == conv.id)
             )
         )
         .scalars()
@@ -175,6 +187,23 @@ async def send_message(
             },
         )
 
+    # Web Push to recipients who are offline (best-effort, never blocks the send).
+    offline = [uid for uid in others if uid not in set(online)]
+    if offline:
+        from app.services.push import push_to_users
+
+        preview = _push_preview(doc)
+        await push_to_users(
+            db,
+            offline,
+            {
+                "title": sender.display_name,
+                "body": preview,
+                "tag": str(conv.id),
+                "url": "/chat",
+            },
+        )
+
     doc["temp_id"] = temp_id
     doc["status"] = "sent"
     return doc
@@ -269,9 +298,7 @@ async def mark_read(
     )
 
 
-async def toggle_reaction(
-    db: AsyncSession, *, message_id: uuid.UUID, actor: User, emoji: str
-) -> list[dict]:
+async def toggle_reaction(db: AsyncSession, *, message_id: uuid.UUID, actor: User, emoji: str) -> list[dict]:
     """Toggle a reaction. Requires conversation membership (closes the IDOR)."""
     msg = await enrich.load_message(db, message_id)
     if msg is None:
@@ -322,9 +349,7 @@ async def toggle_reaction(
     return reactions
 
 
-async def delete_message(
-    db: AsyncSession, *, message_id: uuid.UUID, actor: User, for_everyone: bool
-) -> None:
+async def delete_message(db: AsyncSession, *, message_id: uuid.UUID, actor: User, for_everyone: bool) -> None:
     msg = await db.get(Message, message_id)
     if msg is None:
         raise SendError(status_code=404, detail="Message not found")
@@ -367,9 +392,7 @@ async def delete_message(
         await db.commit()
 
 
-async def edit_message(
-    db: AsyncSession, *, message_id: uuid.UUID, actor: User, content: str
-) -> dict:
+async def edit_message(db: AsyncSession, *, message_id: uuid.UUID, actor: User, content: str) -> dict:
     """Message editing — absent from the Mongo build, built new here."""
     msg = await enrich.load_message(db, message_id)
     if msg is None:
@@ -430,9 +453,7 @@ async def forward_message(
     original = await enrich.load_message(db, message_id)
     if original is None:
         raise SendError(status_code=404, detail="Message not found")
-    src_membership = await db.get(
-        ConversationParticipant, (original.conversation_id, actor.id)
-    )
+    src_membership = await db.get(ConversationParticipant, (original.conversation_id, actor.id))
     if src_membership is None:
         raise SendError(status_code=404, detail="Message not found")
     if original.deleted_at is not None:
@@ -470,9 +491,7 @@ async def forward_message(
             db, loaded, conv_participants=participants, sender=actor, include_reply=False
         )
         others = [p.user_id for p in participants if p.user_id != actor.id]
-        await publish_to_users(
-            others, {"type": "new_message", "message": {**doc, "status": "delivered"}}
-        )
+        await publish_to_users(others, {"type": "new_message", "message": {**doc, "status": "delivered"}})
         forwarded_to.append(str(conv.id))
 
     for cid in conversation_ids or []:
@@ -486,9 +505,7 @@ async def forward_message(
         participants = (
             (
                 await db.execute(
-                    select(ConversationParticipant).where(
-                        ConversationParticipant.conversation_id == conv.id
-                    )
+                    select(ConversationParticipant).where(ConversationParticipant.conversation_id == conv.id)
                 )
             )
             .scalars()
@@ -514,9 +531,7 @@ async def forward_message(
         participants = (
             (
                 await db.execute(
-                    select(ConversationParticipant).where(
-                        ConversationParticipant.conversation_id == conv.id
-                    )
+                    select(ConversationParticipant).where(ConversationParticipant.conversation_id == conv.id)
                 )
             )
             .scalars()

@@ -5,12 +5,19 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.deps import get_current_user
 from app.db.models import Notification, PushSubscription, User
 from app.db.session import get_db
 from app.utils import iso_z
 
 router = APIRouter(prefix="/api/notifications", tags=["notifications"])
+
+
+@router.get("/vapid-key")
+async def vapid_key(_: User = Depends(get_current_user)):
+    """Public VAPID key for the browser Push subscription (empty if unconfigured)."""
+    return {"public_key": get_settings().vapid_public_key}
 
 
 def _serialize_notification(n: Notification) -> dict:
@@ -24,9 +31,7 @@ def _serialize_notification(n: Notification) -> dict:
 
 
 @router.get("")
-async def list_notifications(
-    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
-):
+async def list_notifications(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     rows = (
         (
             await db.execute(

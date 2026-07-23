@@ -86,9 +86,7 @@ class LocalRegistry:
     async def _reader(self) -> None:
         while True:
             try:
-                message = await self._pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=1.0
-                )
+                message = await self._pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -119,9 +117,7 @@ registry = LocalRegistry()
 
 async def _conversation_partner_ids(db, user_id: uuid.UUID) -> list[uuid.UUID]:
     """Distinct users sharing at least one conversation with user_id."""
-    mine = select(ConversationParticipant.conversation_id).where(
-        ConversationParticipant.user_id == user_id
-    )
+    mine = select(ConversationParticipant.conversation_id).where(ConversationParticipant.user_id == user_id)
     stmt = (
         select(ConversationParticipant.user_id)
         .where(
@@ -148,9 +144,7 @@ async def _broadcast_presence(user: User, status: str) -> None:
 
 
 async def _is_participant(db, conversation_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    return (
-        await db.get(ConversationParticipant, (conversation_id, user_id))
-    ) is not None
+    return (await db.get(ConversationParticipant, (conversation_id, user_id))) is not None
 
 
 async def _handle_inbound(user: User, data: dict) -> None:
@@ -289,9 +283,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 break  # no ping for >60s — drop the connection
 
             if len(raw) > MAX_MESSAGE_BYTES:
-                await websocket.send_text(
-                    json.dumps({"type": "error", "detail": "Message too large"})
-                )
+                await websocket.send_text(json.dumps({"type": "error", "detail": "Message too large"}))
                 continue
 
             now = now_utc()
@@ -312,9 +304,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             if data["type"] == "ping":
                 await presence.refresh(user.id)
-                await websocket.send_text(
-                    json.dumps({"type": "pong", "timestamp": iso_z(now_utc())})
-                )
+                await websocket.send_text(json.dumps({"type": "pong", "timestamp": iso_z(now_utc())}))
                 continue
 
             try:
@@ -322,9 +312,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             except Exception:
                 logger.exception("error handling ws frame type=%s", data.get("type"))
                 with contextlib.suppress(Exception):
-                    await websocket.send_text(
-                        json.dumps({"type": "error", "detail": "Internal error"})
-                    )
+                    await websocket.send_text(json.dumps({"type": "error", "detail": "Internal error"}))
     except WebSocketDisconnect:
         pass
     finally:

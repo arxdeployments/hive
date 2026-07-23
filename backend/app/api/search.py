@@ -79,9 +79,7 @@ async def _conversation_partner_ids(db: AsyncSession, user_id: uuid.UUID) -> lis
     Mirrors app.realtime.hub._conversation_partner_ids — kept local so the
     HTTP router does not import the websocket module.
     """
-    mine = select(ConversationParticipant.conversation_id).where(
-        ConversationParticipant.user_id == user_id
-    )
+    mine = select(ConversationParticipant.conversation_id).where(ConversationParticipant.user_id == user_id)
     stmt = (
         select(ConversationParticipant.user_id)
         .where(

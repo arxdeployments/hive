@@ -8,14 +8,44 @@ const resolveUrl = (url) => {
   return url.startsWith('http') ? url : `${backendUrl}${url}`;
 };
 
-// Grid layouts for 1-5 images
-const ImageGrid = ({ images, onImageClick }) => {
-  const count = images.length;
+// Build parallel lists of full-size + thumbnail sources from a message.
+// Media URLs are now relative same-origin paths like '/api/media/<id>' and
+// '/api/media/<id>/thumb' — the API 307-redirects to a presigned URL and
+// cookies flow automatically, so we use the value directly (prefixed by the
+// possibly-empty backendUrl so a cross-origin backend still works).
+const collectImages = (message) => {
+  // Prefer an explicit attachments array (image attachments only).
+  if (Array.isArray(message.attachments) && message.attachments.length > 0) {
+    const imgs = message.attachments.filter(
+      (a) => !a.type || a.type === 'image' || (a.mime_type || '').startsWith('image/')
+    );
+    if (imgs.length > 0) {
+      return imgs.map((a) => ({
+        full: a.media_url || a.url || '',
+        thumb: a.thumbnail_url || a.media_url || a.url || '',
+      }));
+    }
+  }
+  // Legacy multi-image array of URL strings.
+  if (Array.isArray(message.media_urls) && message.media_urls.length > 0) {
+    return message.media_urls.map((u) => ({ full: u, thumb: u }));
+  }
+  // Single image — thumbnail for the grid, full-size for the viewer.
+  if (message.media_url) {
+    return [{ full: message.media_url, thumb: message.thumbnail_url || message.media_url }];
+  }
+  return [];
+};
+
+// Grid layouts for 1-5 images. `items` is [{ full, thumb }]; the grid renders
+// the thumbnail, the fullscreen viewer opens the full-size media.
+const ImageGrid = ({ items, onImageClick }) => {
+  const count = items.length;
 
   if (count === 1) {
     return (
       <div className="max-w-[330px] cursor-pointer" onClick={() => onImageClick(0)}>
-        <img src={resolveUrl(images[0])} alt="" className="w-full rounded-[6px] object-cover max-h-[300px]" loading="lazy" />
+        <img src={resolveUrl(items[0].thumb)} alt="" className="w-full rounded-[6px] object-cover max-h-[300px]" loading="lazy" />
       </div>
     );
   }
@@ -23,9 +53,9 @@ const ImageGrid = ({ images, onImageClick }) => {
   if (count === 2) {
     return (
       <div className="max-w-[330px] grid grid-cols-2 gap-0.5 rounded-[6px] overflow-hidden">
-        {images.map((img, i) => (
+        {items.map((img, i) => (
           <div key={i} className="cursor-pointer aspect-square" onClick={() => onImageClick(i)}>
-            <img src={resolveUrl(img)} alt="" className="w-full h-full object-cover" loading="lazy" />
+            <img src={resolveUrl(img.thumb)} alt="" className="w-full h-full object-cover" loading="lazy" />
           </div>
         ))}
       </div>
@@ -36,14 +66,14 @@ const ImageGrid = ({ images, onImageClick }) => {
     return (
       <div className="max-w-[330px] rounded-[6px] overflow-hidden">
         <div className="grid grid-cols-2 gap-0.5">
-          {images.slice(0, 2).map((img, i) => (
+          {items.slice(0, 2).map((img, i) => (
             <div key={i} className="cursor-pointer aspect-square" onClick={() => onImageClick(i)}>
-              <img src={resolveUrl(img)} alt="" className="w-full h-full object-cover" loading="lazy" />
+              <img src={resolveUrl(img.thumb)} alt="" className="w-full h-full object-cover" loading="lazy" />
             </div>
           ))}
         </div>
         <div className="mt-0.5 cursor-pointer" onClick={() => onImageClick(2)}>
-          <img src={resolveUrl(images[2])} alt="" className="w-full h-[140px] object-cover" loading="lazy" />
+          <img src={resolveUrl(items[2].thumb)} alt="" className="w-full h-[140px] object-cover" loading="lazy" />
         </div>
       </div>
     );
@@ -52,9 +82,9 @@ const ImageGrid = ({ images, onImageClick }) => {
   if (count === 4) {
     return (
       <div className="max-w-[330px] grid grid-cols-2 gap-0.5 rounded-[6px] overflow-hidden">
-        {images.map((img, i) => (
+        {items.map((img, i) => (
           <div key={i} className="cursor-pointer aspect-square" onClick={() => onImageClick(i)}>
-            <img src={resolveUrl(img)} alt="" className="w-full h-full object-cover" loading="lazy" />
+            <img src={resolveUrl(img.thumb)} alt="" className="w-full h-full object-cover" loading="lazy" />
           </div>
         ))}
       </div>
@@ -65,16 +95,16 @@ const ImageGrid = ({ images, onImageClick }) => {
   return (
     <div className="max-w-[330px] rounded-[6px] overflow-hidden">
       <div className="grid grid-cols-2 gap-0.5">
-        {images.slice(0, 2).map((img, i) => (
+        {items.slice(0, 2).map((img, i) => (
           <div key={i} className="cursor-pointer aspect-square" onClick={() => onImageClick(i)}>
-            <img src={resolveUrl(img)} alt="" className="w-full h-full object-cover" loading="lazy" />
+            <img src={resolveUrl(img.thumb)} alt="" className="w-full h-full object-cover" loading="lazy" />
           </div>
         ))}
       </div>
       <div className="grid grid-cols-3 gap-0.5 mt-0.5">
-        {images.slice(2, 5).map((img, i) => (
+        {items.slice(2, 5).map((img, i) => (
           <div key={i + 2} className="cursor-pointer aspect-square" onClick={() => onImageClick(i + 2)}>
-            <img src={resolveUrl(img)} alt="" className="w-full h-full object-cover" loading="lazy" />
+            <img src={resolveUrl(img.thumb)} alt="" className="w-full h-full object-cover" loading="lazy" />
           </div>
         ))}
       </div>
@@ -86,11 +116,10 @@ export const ImageBubble = ({ message, isOwn }) => {
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerIndex, setViewerIndex] = useState(0);
 
-  // Support single or multiple images
-  const images = message.media_urls || (message.media_url ? [message.media_url] : []);
+  const items = collectImages(message);
   const caption = message.caption || (message.type === 'image' && message.content && !message.content.startsWith('/api/') ? message.content : '');
 
-  if (images.length === 0) return null;
+  if (items.length === 0) return null;
 
   const handleImageClick = (index) => {
     setViewerIndex(index);
@@ -100,7 +129,7 @@ export const ImageBubble = ({ message, isOwn }) => {
   return (
     <>
       <div data-testid="image-bubble">
-        <ImageGrid images={images} onImageClick={handleImageClick} />
+        <ImageGrid items={items} onImageClick={handleImageClick} />
         {caption && (
           <p className={`text-sm mt-1 ${isOwn ? 'text-white' : 'text-[#F5F5F5]'}`}>{caption}</p>
         )}
@@ -108,7 +137,8 @@ export const ImageBubble = ({ message, isOwn }) => {
 
       {viewerOpen && (
         <FullscreenImageViewer
-          images={images}
+          images={items.map((i) => i.full)}
+          thumbnails={items.map((i) => i.thumb)}
           initialIndex={viewerIndex}
           onClose={() => setViewerOpen(false)}
           senderName={message.sender_name}

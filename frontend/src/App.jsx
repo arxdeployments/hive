@@ -1,31 +1,42 @@
-import React from 'react';
+import React, { Suspense, lazy } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Toaster } from 'sonner';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { AnimatePresence } from 'framer-motion';
 import { Loader2 } from 'lucide-react';
 
-// Pages
+// Eager: the two hot entry screens.
 import Login from './pages/Login';
 import Chat from './pages/Chat';
-import Dashboard from './pages/admin/Dashboard';
-import Organizations from './pages/admin/Organizations';
-import Departments from './pages/admin/Departments';
-import UsersPage from './pages/admin/Users';
-import SettingsPage from './pages/admin/Settings';
-import CrossOrgGroups from './pages/admin/CrossOrgGroups';
 
-// Org Admin Pages
-import OrgAdminDashboard from './pages/OrgAdmin/OrgAdminDashboard';
-import OrgAdminUsers from './pages/OrgAdmin/OrgAdminUsers';
-import OrgAdminDepartments from './pages/OrgAdmin/OrgAdminDepartments';
-import OrgAdminSettings from './pages/OrgAdmin/OrgAdminSettings';
+// Lazy: the admin & org-admin portals load only when their routes are hit,
+// keeping the messenger's initial bundle lean.
+const Dashboard = lazy(() => import('./pages/admin/Dashboard'));
+const Organizations = lazy(() => import('./pages/admin/Organizations'));
+const Departments = lazy(() => import('./pages/admin/Departments'));
+const UsersPage = lazy(() => import('./pages/admin/Users'));
+const SettingsPage = lazy(() => import('./pages/admin/Settings'));
+const CrossOrgGroups = lazy(() => import('./pages/admin/CrossOrgGroups'));
+const OrgAdminDashboard = lazy(() => import('./pages/OrgAdmin/OrgAdminDashboard'));
+const OrgAdminUsers = lazy(() => import('./pages/OrgAdmin/OrgAdminUsers'));
+const OrgAdminDepartments = lazy(() => import('./pages/OrgAdmin/OrgAdminDepartments'));
+const OrgAdminSettings = lazy(() => import('./pages/OrgAdmin/OrgAdminSettings'));
+const UserSettings = lazy(() => import('./pages/Settings'));
 import NotFound from './pages/NotFound';
-import UserSettings from './pages/Settings';
 
-// Layout
-import { AdminLayout } from './components/layout/AdminLayout';
-import { OrgAdminLayout } from './components/org-admin/OrgAdminLayout';
+// Layout (part of the lazy admin surfaces)
+const AdminLayout = lazy(() =>
+  import('./components/layout/AdminLayout').then((m) => ({ default: m.AdminLayout }))
+);
+const OrgAdminLayout = lazy(() =>
+  import('./components/org-admin/OrgAdminLayout').then((m) => ({ default: m.OrgAdminLayout }))
+);
+
+const RouteFallback = () => (
+  <div className="min-h-screen bg-[#0A0A0A] flex items-center justify-center">
+    <Loader2 className="w-8 h-8 text-[#10B981] animate-spin" />
+  </div>
+);
 
 // Shared
 import { ErrorBoundary } from './components/shared/ErrorBoundary';
@@ -142,6 +153,7 @@ function App() {
           theme="dark"
         />
         <AnimatePresence mode="wait">
+          <Suspense fallback={<RouteFallback />}>
           <Routes>
             <Route path="/login" element={<LoginRedirect />} />
 
@@ -189,6 +201,7 @@ function App() {
             <Route path="/404" element={<NotFound />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
+          </Suspense>
         </AnimatePresence>
       </AuthProvider>
     </BrowserRouter>

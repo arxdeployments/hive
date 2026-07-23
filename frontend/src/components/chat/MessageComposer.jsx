@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Smile, Paperclip, Mic, Image, FileText, X, Loader2, Upload } from 'lucide-react';
+import { Send, Smile, Paperclip, Mic, Image, FileText, Film, X, Loader2, Upload } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
@@ -7,11 +7,44 @@ import EmojiPicker from 'emoji-picker-react';
 import wsClient from '../../services/websocket';
 import client from '../../api/client';
 
-const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
-const MAX_IMAGE_SIZE = 16 * 1024 * 1024; // 16MB
-const MAX_DOC_SIZE = 100 * 1024 * 1024; // 100MB
+// Client-side size hints (server still enforces its own limits).
+const MAX_IMAGE_SIZE = 16 * 1024 * 1024;   // 16MB
+const MAX_MEDIA_SIZE = 200 * 1024 * 1024;  // 200MB (video / audio)
+const MAX_DOC_SIZE = 100 * 1024 * 1024;    // 100MB
 
-export const MessageComposer = ({ conversationId, onSend, disabled }) => {
+const VIDEO_ACCEPT = '.mp4,.mov,.webm,.m4v';
+const AUDIO_ACCEPT = '.mp3,.m4a,.wav,.ogg,.aac';
+const DOC_ACCEPT = '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip';
+
+// Map the upload service's file_type onto the message `type` the API/bubbles expect.
+const mapMessageType = (fileType) => {
+  switch (fileType) {
+    case 'image': return 'image';
+    case 'video': return 'video';
+    case 'audio': return 'audio';
+    default: return 'file'; // 'document' (and anything unknown) -> file
+  }
+};
+
+// Best-effort local categorisation so we can pick the right size limit before upload.
+const categorizeFile = (file) => {
+  const mime = file.type || '';
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime.startsWith('audio/')) return 'audio';
+  const name = (file.name || '').toLowerCase();
+  if (/\.(mp4|mov|webm|m4v)$/.test(name)) return 'video';
+  if (/\.(mp3|m4a|wav|ogg|aac)$/.test(name)) return 'audio';
+  return 'document';
+};
+
+const maxSizeForCategory = (category) => {
+  if (category === 'image') return MAX_IMAGE_SIZE;
+  if (category === 'video' || category === 'audio') return MAX_MEDIA_SIZE;
+  return MAX_DOC_SIZE;
+};
+
+export const MessageComposer = ({ conversationId, onSend, disabled, replyTo }) => {
   const [text, setText] = useState('');
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [showEmoji, setShowEmoji] = useState(false);
@@ -22,6 +55,7 @@ export const MessageComposer = ({ conversationId, onSend, disabled }) => {
   const [previewCaption, setPreviewCaption] = useState('');
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
+  const mediaInputRef = useRef(null);
   const docInputRef = useRef(null);
   const typingRef = useRef(false);
   const typingTimerRef = useRef(null);
@@ -68,150 +102,185 @@ export const MessageComposer = ({ conversationId, onSend, disabled }) => {
     }
   };
 
+  // ── Text send ────────────────────────────────────────────────────────────
   const handleSend = () => {
     if (!text.trim() || disabled || !conversationId) return;
     const tempId = uuidv4();
+    const body = text.trim();
+    const replyId = replyTo?._id || null;
     stopTyping();
-    onSend(text.trim(), tempId);
-    wsClient.sendMessage(conversationId, text.trim(), tempId);
+    // Optimistic bubble (ChatPanel clears replyTo after this).
+    onSend(body, tempId);
+    // Deliver over WS, forwarding reply_to so threaded replies actually persist.
+    wsClient.sendMessage(conversationId, body, tempId, replyId);
     setText('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
   };
 
   const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key !== 'Enter') return;
+    // 'rxhive_enter_sends': unset/'on' => Enter sends, Shift+Enter = newline.
+    //                       'off'        => Enter always newlines; only the button sends.
+    const enterSends = localStorage.getItem('rxhive_enter_sends') !== 'off';
+    if (enterSends && !e.shiftKey) {
       e.preventDefault();
       handleSend();
     }
+    // Otherwise let the newline through.
   };
 
-  const uploadFile = async (file) => {
+  // ── Upload + media send ───────────────────────────────────────────────────
+  const uploadFile = async (file, onProgress) => {
     const formData = new FormData();
     formData.append('file', file);
-    const token = localStorage.getItem('access_token');
-    const response = await fetch(`${backendUrl}/api/upload`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${token}` },
-      body: formData,
+    // Cookie + CSRF auth via the shared axios client (no Bearer token, no raw fetch).
+    const { data } = await client.post('/api/upload', formData, {
+      onUploadProgress: (evt) => {
+        if (onProgress && evt.total) {
+          onProgress(Math.round((evt.loaded / evt.total) * 100));
+        }
+      },
     });
-    if (!response.ok) {
-      const err = await response.json();
-      throw new Error(err.detail || 'Upload failed');
-    }
-    return response.json();
+    return data;
   };
 
-  const sendMediaMessage = async (uploadResult, caption = '') => {
-    const tempId = uuidv4();
-    const msgType = uploadResult.file_type === 'image' ? 'image' : 'file';
-    const content = msgType === 'file' ? uploadResult.filename : (caption || '');
+  const validateSize = (file) => {
+    const category = categorizeFile(file);
+    const max = maxSizeForCategory(category);
+    if (file.size > max) {
+      const mb = Math.round(max / (1024 * 1024));
+      toast.error(`${file.name || 'File'} is too large (max ${mb}MB)`);
+      return false;
+    }
+    return true;
+  };
 
-    // Optimistic message
+  // Upload a single file, then create the message carrying media_url (the fix).
+  const sendMediaFile = async (file, replyId) => {
+    const uploadResult = await uploadFile(file, setUploadProgress);
+    const msgType = mapMessageType(uploadResult.file_type);
+    const content = msgType === 'file' ? (uploadResult.filename || '') : '';
+    const tempId = uuidv4();
+
+    // Optimistic bubble with the real media url + thumbnail.
     onSend(content, tempId, msgType, uploadResult.file_url, uploadResult.thumbnail_url);
 
-    // Send via HTTP (WS doesn't handle file upload directly)
-    try {
-      await client.post(`/api/conversations/${conversationId}/messages`, {
-        content: content,
-        type: msgType,
-        temp_id: tempId,
-      });
-    } catch (err) {
-      toast.error('Failed to send media message');
-    }
+    await client.post(`/api/conversations/${conversationId}/messages`, {
+      content,
+      type: msgType,
+      temp_id: tempId,
+      media_url: uploadResult.file_url,
+      reply_to: replyId,
+    });
   };
 
-  // Image selection
-  const handleImageSelect = (e) => {
-    const files = Array.from(e.target.files || []);
-    if (files.length === 0) return;
-    const validImages = files.filter(f => f.type.startsWith('image/')).slice(0, 5);
-    if (validImages.length === 0) { toast.error('No valid images selected'); return; }
-
-    const previews = validImages.map(f => ({
-      file: f,
-      url: URL.createObjectURL(f),
-      name: f.name
-    }));
-    setPreviewImages(previews);
-    setShowAttachMenu(false);
-    e.target.value = '';
-  };
-
-  // Document selection
-  const handleDocSelect = async (e) => {
-    const files = Array.from(e.target.files || []);
-    setShowAttachMenu(false);
-    if (files.length === 0) return;
+  // Send a batch of non-image files (video / audio / documents) directly.
+  const sendFilesDirectly = async (files) => {
+    if (!conversationId || files.length === 0) return;
+    const valid = files.filter(validateSize);
+    if (valid.length === 0) return;
 
     setUploading(true);
+    // Attach the reply only to the first file in the batch.
+    const replyId = replyTo?._id || null;
     try {
-      for (const file of files) {
-        setUploadProgress(0);
-        const result = await uploadFile(file);
-        await sendMediaMessage(result);
+      for (let i = 0; i < valid.length; i++) {
+        await sendMediaFile(valid[i], i === 0 ? replyId : null);
       }
-      toast.success('Document sent');
     } catch (err) {
-      toast.error(err.message || 'Upload failed');
-    } finally {
-      setUploading(false);
-      e.target.value = '';
-    }
-  };
-
-  // Send preview images
-  const handleSendImages = async () => {
-    if (previewImages.length === 0) return;
-    setUploading(true);
-    try {
-      for (let i = 0; i < previewImages.length; i++) {
-        setUploadProgress(Math.round(((i) / previewImages.length) * 100));
-        const result = await uploadFile(previewImages[i].file);
-        const caption = i === 0 ? previewCaption : '';
-        await sendMediaMessage(result, caption);
-      }
-      setPreviewImages([]);
-      setPreviewCaption('');
-      toast.success('Images sent');
-    } catch (err) {
-      toast.error(err.message || 'Upload failed');
+      toast.error(err?.response?.data?.detail || err.message || 'Upload failed');
     } finally {
       setUploading(false);
       setUploadProgress(0);
     }
   };
 
-  // Drag and drop
+  // ── Image selection (preview strip) ───────────────────────────────────────
+  const handleImageSelect = (e) => {
+    const files = Array.from(e.target.files || []);
+    setShowAttachMenu(false);
+    e.target.value = '';
+    if (files.length === 0) return;
+    const images = files.filter(f => (f.type || '').startsWith('image/'));
+    if (images.length === 0) { toast.error('No valid images selected'); return; }
+    const valid = images.filter(validateSize).slice(0, 5);
+    if (valid.length === 0) return;
+
+    setPreviewImages(valid.map(f => ({
+      file: f,
+      url: URL.createObjectURL(f),
+      name: f.name,
+    })));
+  };
+
+  // ── Media (video / audio) + Document selection — sent directly ────────────
+  const handleDirectSelect = async (e) => {
+    const files = Array.from(e.target.files || []);
+    setShowAttachMenu(false);
+    e.target.value = '';
+    if (files.length === 0) return;
+    await sendFilesDirectly(files);
+  };
+
+  // ── Send preview images ───────────────────────────────────────────────────
+  const handleSendImages = async () => {
+    if (previewImages.length === 0) return;
+    setUploading(true);
+    const replyId = replyTo?._id || null;
+    try {
+      for (let i = 0; i < previewImages.length; i++) {
+        const uploadResult = await uploadFile(previewImages[i].file, setUploadProgress);
+        const msgType = mapMessageType(uploadResult.file_type);
+        const caption = i === 0 ? previewCaption.trim() : '';
+        const tempId = uuidv4();
+
+        onSend(caption, tempId, msgType, uploadResult.file_url, uploadResult.thumbnail_url);
+
+        await client.post(`/api/conversations/${conversationId}/messages`, {
+          content: caption,
+          type: msgType,
+          temp_id: tempId,
+          media_url: uploadResult.file_url,
+          reply_to: i === 0 ? replyId : null,
+        });
+      }
+      setPreviewImages([]);
+      setPreviewCaption('');
+      toast.success(previewImages.length > 1 ? 'Images sent' : 'Image sent');
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || err.message || 'Upload failed');
+    } finally {
+      setUploading(false);
+      setUploadProgress(0);
+    }
+  };
+
+  // ── Drag and drop ─────────────────────────────────────────────────────────
   const handleDragOver = (e) => { e.preventDefault(); e.stopPropagation(); setDragOver(true); };
   const handleDragLeave = (e) => { e.preventDefault(); e.stopPropagation(); setDragOver(false); };
   const handleDrop = (e) => {
     e.preventDefault();
     e.stopPropagation();
     setDragOver(false);
-    const files = Array.from(e.dataTransfer.files);
-    const images = files.filter(f => f.type.startsWith('image/')).slice(0, 5);
-    const docs = files.filter(f => !f.type.startsWith('image/'));
+    const files = Array.from(e.dataTransfer.files || []);
+    if (files.length === 0) return;
+
+    const images = files.filter(f => (f.type || '').startsWith('image/'));
+    const others = files.filter(f => !(f.type || '').startsWith('image/'));
 
     if (images.length > 0) {
-      setPreviewImages(images.map(f => ({ file: f, url: URL.createObjectURL(f), name: f.name })));
+      const valid = images.filter(validateSize).slice(0, 5);
+      if (valid.length > 0) {
+        setPreviewImages(valid.map(f => ({ file: f, url: URL.createObjectURL(f), name: f.name })));
+      }
     }
-    if (docs.length > 0 && images.length === 0) {
-      // Send docs directly
-      (async () => {
-        setUploading(true);
-        try {
-          for (const file of docs) {
-            const result = await uploadFile(file);
-            await sendMediaMessage(result);
-          }
-        } catch (err) { toast.error(err.message); }
-        finally { setUploading(false); }
-      })();
+    if (others.length > 0) {
+      // Video / audio / documents send straight through.
+      sendFilesDirectly(others);
     }
   };
 
-  // Clipboard paste
+  // ── Clipboard paste ───────────────────────────────────────────────────────
   const handlePaste = (e) => {
     const items = e.clipboardData?.items;
     if (!items) return;
@@ -219,13 +288,14 @@ export const MessageComposer = ({ conversationId, onSend, disabled }) => {
     if (imageItems.length > 0) {
       e.preventDefault();
       const files = imageItems.map(item => item.getAsFile()).filter(Boolean);
-      if (files.length > 0) {
-        setPreviewImages(files.map(f => ({ file: f, url: URL.createObjectURL(f), name: f.name || 'Pasted image' })));
+      const valid = files.filter(validateSize);
+      if (valid.length > 0) {
+        setPreviewImages(valid.map(f => ({ file: f, url: URL.createObjectURL(f), name: f.name || 'Pasted image' })));
       }
     }
   };
 
-  // Emoji
+  // ── Emoji ─────────────────────────────────────────────────────────────────
   const handleEmojiClick = (emojiData) => {
     setText(prev => prev + emojiData.emoji);
     textareaRef.current?.focus();
@@ -304,7 +374,7 @@ export const MessageComposer = ({ conversationId, onSend, disabled }) => {
                 onChange={(e) => setPreviewCaption(e.target.value)}
                 placeholder="Add a caption..."
                 className="flex-1 h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#525252] focus:border-[#10B981] focus:outline-none"
-                onKeyDown={(e) => { if (e.key === 'Enter') handleSendImages(); }}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !uploading) handleSendImages(); }}
               />
               <button
                 onClick={handleSendImages}
@@ -391,6 +461,13 @@ export const MessageComposer = ({ conversationId, onSend, disabled }) => {
                       <Image size={16} className="text-[#10B981]" /> Image
                     </button>
                     <button
+                      onClick={() => mediaInputRef.current?.click()}
+                      data-testid="attach-media-btn"
+                      className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-[#F5F5F5] hover:bg-[#2D2D2D] transition-colors"
+                    >
+                      <Film size={16} className="text-[#A855F7]" /> Media
+                    </button>
+                    <button
                       onClick={() => docInputRef.current?.click()}
                       data-testid="attach-doc-btn"
                       className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-[#F5F5F5] hover:bg-[#2D2D2D] transition-colors"
@@ -405,7 +482,8 @@ export const MessageComposer = ({ conversationId, onSend, disabled }) => {
 
           {/* Hidden file inputs */}
           <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden" onChange={handleImageSelect} />
-          <input ref={docInputRef} type="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip" multiple className="hidden" onChange={handleDocSelect} />
+          <input ref={mediaInputRef} type="file" accept={`video/*,audio/*,${VIDEO_ACCEPT},${AUDIO_ACCEPT}`} multiple className="hidden" onChange={handleDirectSelect} />
+          <input ref={docInputRef} type="file" accept={`${DOC_ACCEPT},${VIDEO_ACCEPT},${AUDIO_ACCEPT}`} multiple className="hidden" onChange={handleDirectSelect} />
 
           {/* Text input */}
           <textarea

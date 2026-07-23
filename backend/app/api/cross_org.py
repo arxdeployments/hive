@@ -111,9 +111,7 @@ async def _enrich_groups(db: AsyncSession, convs: list[Conversation]) -> list[di
     orgs: dict[uuid.UUID, Organization] = {}
     if org_ids:
         org_rows = (
-            (await db.execute(select(Organization).where(Organization.id.in_(org_ids))))
-            .scalars()
-            .all()
+            (await db.execute(select(Organization).where(Organization.id.in_(org_ids)))).scalars().all()
         )
         orgs = {o.id: o for o in org_rows}
 
@@ -186,9 +184,7 @@ async def _load_group(
     gid = parse_uuid(group_id)
     if gid is None:
         raise HTTPException(status_code=400, detail=invalid_detail)
-    stmt = select(Conversation).where(
-        Conversation.id == gid, Conversation.type == ConversationType.cross_org
-    )
+    stmt = select(Conversation).where(Conversation.id == gid, Conversation.type == ConversationType.cross_org)
     if active_only:
         stmt = stmt.where(Conversation.is_active.is_(True))
     conv = (await db.execute(stmt)).scalar_one_or_none()
@@ -219,9 +215,7 @@ async def list_groups(
     convs = (
         (
             await db.execute(
-                stmt.order_by(Conversation.created_at.desc())
-                .offset((page - 1) * limit)
-                .limit(limit)
+                stmt.order_by(Conversation.created_at.desc()).offset((page - 1) * limit).limit(limit)
             )
         )
         .scalars()
@@ -265,9 +259,7 @@ async def create_group(
     orgs: dict[uuid.UUID, Organization] = {
         o.id: o
         for o in (
-            (await db.execute(select(Organization).where(Organization.id.in_(org_uuids))))
-            .scalars()
-            .all()
+            (await db.execute(select(Organization).where(Organization.id.in_(org_uuids)))).scalars().all()
         )
     }
     for oid, parsed in zip(body.org_ids, org_uuids, strict=True):
@@ -338,9 +330,7 @@ async def create_group(
     await db.flush()
     for member, role in valid:
         db.add(
-            ConversationParticipant(
-                conversation_id=conv.id, user_id=member.id, role=_participant_role(role)
-            )
+            ConversationParticipant(conversation_id=conv.id, user_id=member.id, role=_participant_role(role))
         )
     await db.commit()
 
@@ -413,9 +403,7 @@ async def update_group(
     await db.commit()
 
     if name_changed:
-        await send_system_message(
-            db, conv.id, f"Group name changed to '{updates['name']}'", broadcast=False
-        )
+        await send_system_message(db, conv.id, f"Group name changed to '{updates['name']}'", broadcast=False)
 
     member_ids = await participant_ids(db, conv.id)
     await publish_to_users(
@@ -485,9 +473,7 @@ async def add_members(
         if str(member.org_id) not in allowed:
             allowed = [*allowed, str(member.org_id)]
         db.add(
-            ConversationParticipant(
-                conversation_id=conv.id, user_id=member.id, role=_participant_role(role)
-            )
+            ConversationParticipant(conversation_id=conv.id, user_id=member.id, role=_participant_role(role))
         )
         added.append(member)
 
@@ -542,9 +528,7 @@ async def remove_member(
         await db.commit()
 
         await send_system_message(db, conv.id, f"Admin removed {display_name}", broadcast=False)
-        await publish_to_users(
-            [uid], {"type": "removed_from_conversation", "conversation_id": str(conv.id)}
-        )
+        await publish_to_users([uid], {"type": "removed_from_conversation", "conversation_id": str(conv.id)})
         remaining = await participant_ids(db, conv.id)
         await publish_to_users(
             remaining,
@@ -597,9 +581,7 @@ async def delete_group(
     conv.is_active = False
     await db.commit()
     member_ids = await participant_ids(db, conv.id)
-    await publish_to_users(
-        member_ids, {"type": "removed_from_conversation", "conversation_id": str(conv.id)}
-    )
+    await publish_to_users(member_ids, {"type": "removed_from_conversation", "conversation_id": str(conv.id)})
     await log_audit(
         db,
         actor_id=actor.id,

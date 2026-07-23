@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { motion } from 'framer-motion';
-import { ArrowLeft, Search, Video, Phone, MoreVertical, ChevronDown } from 'lucide-react';
+import { ArrowLeft, Search, Video, Phone, MoreVertical, ChevronDown, X, Check } from 'lucide-react';
+import { v4 as uuidv4 } from 'uuid';
 import { Virtuoso } from 'react-virtuoso';
 import { MessageBubble } from './MessageBubble';
 import { MessageComposer } from './MessageComposer';
@@ -61,6 +62,8 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   const [showGroupInfo, setShowGroupInfo] = useState(false);
   const [contextMenu, setContextMenu] = useState(null);
   const [replyTo, setReplyTo] = useState(null);
+  const [editingMessage, setEditingMessage] = useState(null);
+  const [editText, setEditText] = useState('');
   const [reactionPicker, setReactionPicker] = useState(null);
   const [forwardMsg, setForwardMsg] = useState(null);
   const [msgInfo, setMsgInfo] = useState(null);
@@ -111,6 +114,13 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     }
   }, [fetchMessages, conversationId, clearUnread]);
 
+  // Reset transient composer state when switching conversations
+  useEffect(() => {
+    setEditingMessage(null);
+    setEditText('');
+    setReplyTo(null);
+  }, [conversationId]);
+
   // Send read receipt when new messages arrive in active conversation
   useEffect(() => {
     if (!conversationId || !convMessages.length) return;
@@ -158,10 +168,15 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     }
   }, [hasMore, loadingMore, conversationId, messages, prependMessages]);
 
-  // Send message - optimistic UI, WS delivery handled by MessageComposer
-  const handleSend = async (content, tempId, msgType = 'text', mediaUrl = null, thumbnailUrl = null) => {
+  // Send message - optimistic UI, WS delivery handled by MessageComposer.
+  // replyOverride: pass explicitly (incl. null) to bypass the live replyTo state (used by retry).
+  const handleSend = async (content, tempId, msgType = 'text', mediaUrl = null, thumbnailUrl = null, replyOverride) => {
     if (!conversationId) return;
     if (msgType === 'text' && (!content || !content.trim())) return;
+
+    // Capture the reply context up-front: replyTo state may be cleared before async work resolves.
+    const activeReply = replyOverride !== undefined ? replyOverride : replyTo;
+    const replyToId = activeReply?._id || null;
 
     const optimisticMsg = {
       _id: tempId,
@@ -173,6 +188,13 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       content: content,
       media_url: mediaUrl,
       thumbnail_url: thumbnailUrl,
+      reply_to: replyToId,
+      reply_to_message: activeReply ? {
+        _id: activeReply._id,
+        sender_name: activeReply.sender_name,
+        content: activeReply.content,
+        type: activeReply.type,
+      } : null,
       created_at: new Date().toISOString(),
       status: 'sending',
       read_by: [],
@@ -191,11 +213,16 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       type: 'text'
     });
 
-    // If WS not connected, fall back to HTTP
+    // If WS not connected, fall back to HTTP (carry the real type/media + reply target)
     if (!wsConnected) {
       try {
         const { data } = await client.post(`/api/conversations/${conversationId}/messages`, {
-          content, type: 'text', temp_id: tempId
+          content,
+          type: msgType,
+          media_url: mediaUrl,
+          thumbnail_url: thumbnailUrl,
+          temp_id: tempId,
+          reply_to: replyToId,
         });
         useChatStore.getState().replaceOptimisticMessage(conversationId, tempId, data);
       } catch (err) {
@@ -208,8 +235,45 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     // If WS connected, MessageComposer already sends via wsClient.sendMessage()
     // The message_ack handler in websocket.js will update the optimistic message
 
-    // Clear reply state after sending
-    setReplyTo(null);
+    // Clear reply state after sending (only when driven by the composer, not a retry override)
+    if (replyOverride === undefined) setReplyTo(null);
+  };
+
+  // Retry a failed send: drop the failed bubble and re-send down the same path as handleSend.
+  const handleRetry = (failedMsg) => {
+    if (!failedMsg || !conversationId) return;
+
+    const store = useChatStore.getState();
+    const removeKey = failedMsg.temp_id || failedMsg._id;
+    store.setMessages(conversationId,
+      (store.messages[conversationId] || []).filter(m => (m.temp_id || m._id) !== removeKey)
+    );
+
+    const newTempId = uuidv4();
+    const msgType = failedMsg.type || 'text';
+    const replyCtx = failedMsg.reply_to_message || null;
+    const replyId = replyCtx?._id || failedMsg.reply_to || null;
+
+    // Re-add the optimistic bubble (+ HTTP fallback when disconnected) via the shared path.
+    handleSend(failedMsg.content, newTempId, msgType, failedMsg.media_url || null, failedMsg.thumbnail_url || null, replyCtx);
+
+    // When connected, deliver over the active transport (mirrors MessageComposer's responsibility).
+    if (wsConnected) {
+      if (msgType === 'text') {
+        wsClient.sendMessage(conversationId, failedMsg.content, newTempId, replyId);
+      } else {
+        client.post(`/api/conversations/${conversationId}/messages`, {
+          content: failedMsg.content,
+          type: msgType,
+          media_url: failedMsg.media_url || null,
+          thumbnail_url: failedMsg.thumbnail_url || null,
+          temp_id: newTempId,
+          reply_to: replyId,
+        }).catch(() => {
+          useChatStore.getState().replaceOptimisticMessage(conversationId, newTempId, { status: 'failed' });
+        });
+      }
+    }
   };
 
   // Context menu handler
@@ -224,6 +288,14 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     switch (action) {
       case 'reply':
         setReplyTo(msg);
+        break;
+      case 'edit':
+        // Only own, non-deleted, text/media messages are editable
+        if (msg.sender_id === user?.id && !msg.is_deleted && ['text', 'image', 'file'].includes(msg.type)) {
+          setReplyTo(null);
+          setEditingMessage(msg);
+          setEditText(msg.content || '');
+        }
         break;
       case 'react':
         setReactionPicker({ message: msg, position: { x: 300, y: 300 } });
@@ -279,6 +351,37 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       toast.error(err.response?.data?.detail || 'Failed to delete');
     }
     setDeleteConfirm(null);
+  };
+
+  // Cancel an in-progress edit
+  const cancelEdit = () => {
+    setEditingMessage(null);
+    setEditText('');
+  };
+
+  // Save an edited message: optimistic store update + PUT (WS 'message_edited' reconciles)
+  const handleSaveEdit = async () => {
+    if (!editingMessage) return;
+    const trimmed = editText.trim();
+    const msgId = editingMessage._id;
+    if (!trimmed || trimmed === (editingMessage.content || '')) {
+      cancelEdit();
+      return;
+    }
+    // Optimistic content update
+    const store = useChatStore.getState();
+    const editedAt = new Date().toISOString();
+    store.setMessages(conversationId,
+      (store.messages[conversationId] || []).map(m =>
+        m._id === msgId ? { ...m, content: trimmed, edited_at: editedAt } : m
+      )
+    );
+    try {
+      await client.put(`/api/conversations/messages/${msgId}`, { content: trimmed });
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to edit message');
+    }
+    cancelEdit();
   };
 
   // Reply click -> scroll to original message
@@ -463,6 +566,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
                   onContextMenu={handleContextMenu}
                   onReactionClick={handleReactionClick}
                   onReplyClick={handleReplyBlockClick}
+                  onRetry={handleRetry}
                 />
               );
             }}
@@ -490,19 +594,73 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         )}
       </div>
 
-      {/* Reply Preview */}
-      {replyTo && (
-        <ReplyPreview message={replyTo} onClose={() => setReplyTo(null)} />
-      )}
+      {/* Edit banner + inline editor, else reply preview + composer */}
+      {editingMessage ? (
+        <div className="bg-[#141414] border-t border-[#1F1F1F]" data-testid="edit-message-bar">
+          {/* Edit banner (mirrors ReplyPreview) */}
+          <div className="px-4 py-2 flex items-center gap-3">
+            <div className="w-1 h-10 bg-[#10B981] rounded-full flex-shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="text-[13px] font-medium text-[#10B981]">Editing message</p>
+              <p className="text-[13px] text-[#A3A3A3] truncate">
+                {editingMessage.type === 'image'
+                  ? '📷 Photo'
+                  : (editingMessage.content || '').substring(0, 100)}
+              </p>
+            </div>
+            <button
+              onClick={cancelEdit}
+              data-testid="edit-cancel-btn"
+              className="p-1.5 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded transition-colors flex-shrink-0"
+            >
+              <X size={16} />
+            </button>
+          </div>
 
-      {/* Composer or admin-only banner */}
-      {conversation?.admin_only_messages && conversation?.type === 'group' &&
-        !['creator', 'admin'].includes(conversation?.participants?.find(p => p.user_id === user?.id)?.role) ? (
-        <div className="bg-[#0F0F0F] border-t border-[#1F1F1F] px-4 py-3 text-center">
-          <p className="text-sm text-[#A3A3A3]">Only admins can send messages in this group</p>
+          {/* Inline edit input */}
+          <div className="bg-[#0F0F0F] border-t border-[#1F1F1F] px-3 sm:px-4 py-3 safe-bottom">
+            <div className="flex items-end gap-2">
+              <input
+                autoFocus
+                type="text"
+                value={editText}
+                onChange={(e) => setEditText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSaveEdit(); }
+                  else if (e.key === 'Escape') { e.preventDefault(); cancelEdit(); }
+                }}
+                placeholder="Edit message"
+                data-testid="edit-message-input"
+                className="flex-1 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[8px] px-4 py-2.5 text-sm text-[#F5F5F5] placeholder:text-[#525252] focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all"
+              />
+              <button
+                onClick={handleSaveEdit}
+                data-testid="edit-save-btn"
+                title="Save"
+                className="p-2.5 rounded-full flex-shrink-0 mb-0.5 bg-[#10B981] text-white hover:bg-[#059669] active:scale-[0.95] transition-all duration-150"
+              >
+                <Check size={18} />
+              </button>
+            </div>
+          </div>
         </div>
       ) : (
-        <MessageComposer conversationId={conversationId} onSend={handleSend} replyTo={replyTo} />
+        <>
+          {/* Reply Preview */}
+          {replyTo && (
+            <ReplyPreview message={replyTo} onClose={() => setReplyTo(null)} />
+          )}
+
+          {/* Composer or admin-only banner */}
+          {conversation?.admin_only_messages && conversation?.type === 'group' &&
+            !['creator', 'admin'].includes(conversation?.participants?.find(p => p.user_id === user?.id)?.role) ? (
+            <div className="bg-[#0F0F0F] border-t border-[#1F1F1F] px-4 py-3 text-center">
+              <p className="text-sm text-[#A3A3A3]">Only admins can send messages in this group</p>
+            </div>
+          ) : (
+            <MessageComposer conversationId={conversationId} onSend={handleSend} replyTo={replyTo} />
+          )}
+        </>
       )}
 
       {/* Context Menu */}

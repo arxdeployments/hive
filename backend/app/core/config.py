@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     seed_superadmin_email: str = "admin@rhythmrx.ai"
     seed_superadmin_password: str = ""
 
+    # Web Push (VAPID). Generate a keypair with `python -m app.tools.vapid`.
+    vapid_public_key: str = ""
+    vapid_private_key: str = ""
+    vapid_subject: str = "mailto:admin@rhythmrx.ai"
+
     @field_validator("secret_key")
     @classmethod
     def _no_default_secret_in_prod(cls, v: str, info):

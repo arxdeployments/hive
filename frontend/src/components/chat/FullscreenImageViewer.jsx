@@ -4,29 +4,53 @@ import { X, Download, ChevronLeft, ChevronRight } from 'lucide-react';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 
-export const FullscreenImageViewer = ({ images, initialIndex = 0, onClose, senderName, timestamp }) => {
+const resolveUrl = (url) => {
+  if (!url) return '';
+  return url.startsWith('http') ? url : `${backendUrl}${url}`;
+};
+
+export const FullscreenImageViewer = ({ images, thumbnails, initialIndex = 0, onClose, senderName, timestamp }) => {
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
 
   if (!images || images.length === 0) return null;
 
   const currentImage = images[currentIndex];
-  const imageUrl = currentImage?.startsWith('http') ? currentImage : `${backendUrl}${currentImage}`;
+  const imageUrl = resolveUrl(currentImage);
+  // Prefer explicit thumbnail sources for the strip; fall back to full images.
+  const thumbList = Array.isArray(thumbnails) && thumbnails.length === images.length ? thumbnails : images;
 
   const handlePrev = (e) => { e.stopPropagation(); setCurrentIndex(i => Math.max(0, i - 1)); };
   const handleNext = (e) => { e.stopPropagation(); setCurrentIndex(i => Math.min(images.length - 1, i + 1)); };
 
   const handleDownload = async (e) => {
     e.stopPropagation();
+    const filename = ((currentImage || '').split('?')[0].split('/').pop()) || 'image';
     try {
-      const response = await fetch(imageUrl);
+      // Cookie-based auth — credentials ride along, no Authorization header,
+      // no localStorage token. The relative /api/media/* path is same-origin.
+      const response = await fetch(imageUrl, { credentials: 'include' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = currentImage.split('/').pop() || 'image';
+      a.download = filename;
+      document.body.appendChild(a);
       a.click();
+      a.remove();
       URL.revokeObjectURL(url);
-    } catch (err) { console.error('Download failed:', err); }
+    } catch (err) {
+      // Fallback: let the browser fetch the media URL directly. The API sets an
+      // attachment disposition and cookies flow automatically.
+      const a = document.createElement('a');
+      a.href = imageUrl;
+      a.download = filename;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
   };
 
   const handleKeyDown = (e) => {
@@ -92,15 +116,12 @@ export const FullscreenImageViewer = ({ images, initialIndex = 0, onClose, sende
             )}
             {/* Thumbnails */}
             <div className="flex items-center justify-center gap-2 pb-4">
-              {images.map((img, idx) => {
-                const thumbUrl = img?.startsWith('http') ? img : `${backendUrl}${img}`;
-                return (
-                  <button key={idx} onClick={(e) => { e.stopPropagation(); setCurrentIndex(idx); }}
-                    className={`w-14 h-14 rounded-lg overflow-hidden border-2 transition-colors ${idx === currentIndex ? 'border-[#10B981]' : 'border-transparent opacity-60 hover:opacity-100'}`}>
-                    <img src={thumbUrl} alt="" className="w-full h-full object-cover" />
-                  </button>
-                );
-              })}
+              {images.map((img, idx) => (
+                <button key={idx} onClick={(e) => { e.stopPropagation(); setCurrentIndex(idx); }}
+                  className={`w-14 h-14 rounded-lg overflow-hidden border-2 transition-colors ${idx === currentIndex ? 'border-[#10B981]' : 'border-transparent opacity-60 hover:opacity-100'}`}>
+                  <img src={resolveUrl(thumbList[idx])} alt="" className="w-full h-full object-cover" />
+                </button>
+              ))}
             </div>
           </>
         )}

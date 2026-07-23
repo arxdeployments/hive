@@ -4,11 +4,12 @@ import { PhoneOff, ChevronDown, UserPlus, Lock } from 'lucide-react';
 import useCallStore from '../../stores/callStore';
 import callSounds from '../../services/callSounds';
 import wsClient from '../../services/websocket';
+import livekitClient from '../../services/livekitClient';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 
 export const OutgoingCallScreen = () => {
-  const { callState, callId, callType, showCallUI, incomingCaller } = useCallStore();
+  const { callState, callId, callType, showCallUI, incomingCaller, isGroupCall } = useCallStore();
 
   const isVisible = callState === 'outgoing_ringing' && showCallUI;
 
@@ -22,15 +23,20 @@ export const OutgoingCallScreen = () => {
 
   if (!isVisible) return null;
 
-  const name = incomingCaller?.display_name || 'Calling';
+  const dialingName = incomingCaller?.display_name
+    || incomingCaller?.group_name
+    || incomingCaller?.conversation_name
+    || (isGroupCall ? 'Group call' : 'Calling');
+  const name = dialingName;
   const initial = name.charAt(0).toUpperCase();
   const avatarUrl = incomingCaller?.avatar_url;
   const typeLabel = callType === 'video' ? 'Video calling' : 'Calling';
 
   const handleEnd = () => {
-    wsClient.send({ type: 'call:cancel', call_id: callId });
     callSounds.stopAll();
-    useCallStore.getState().endCall();
+    wsClient.send({ type: 'call:cancel', call_id: callId });
+    livekitClient.leave();
+    useCallStore.getState().resetCall();
   };
 
   return (

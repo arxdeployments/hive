@@ -16,9 +16,7 @@ from app.core.security import ACCESS_COOKIE, decode_access_token
 from app.db.models import Conversation, ConversationParticipant, User, UserRole
 from app.db.session import get_db
 
-_credentials_error = HTTPException(
-    status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated"
-)
+_credentials_error = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
 
 def _token_from_request(request: Request) -> str | None:
@@ -99,9 +97,7 @@ class TenantContext:
         conv = await self.db.get(Conversation, conversation_id)
         if conv is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
-        membership = await self.db.get(
-            ConversationParticipant, (conversation_id, self.user.id)
-        )
+        membership = await self.db.get(ConversationParticipant, (conversation_id, self.user.id))
         if membership is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return conv

@@ -1,11 +1,12 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Reply, SmilePlus, Forward, Copy, Star, Info, Trash, Trash2 } from 'lucide-react';
+import { Reply, SmilePlus, Forward, Copy, Star, Info, Trash, Trash2, Pencil } from 'lucide-react';
 import { toast } from 'sonner';
 
 const MENU_ITEMS = [
   { key: 'reply', icon: Reply, label: 'Reply', showFor: 'all' },
   { key: 'react', icon: SmilePlus, label: 'React', showFor: 'all' },
+  { key: 'edit', icon: Pencil, label: 'Edit', showFor: 'own_editable' },
   { key: 'forward', icon: Forward, label: 'Forward', showFor: 'all' },
   { key: 'copy', icon: Copy, label: 'Copy', showFor: 'text' },
   { key: 'star', icon: Star, label: 'Star', showFor: 'all' },
@@ -24,6 +25,8 @@ export const MessageContextMenu = ({ message, isOwn, position, onAction, onClose
     if (item.showFor === 'text' && message.type !== 'text') return false;
     if (item.showFor === 'own' && !isOwn) return false;
     if (item.showFor === 'own_recent' && (!isOwn || !isRecent)) return false;
+    // Edit: own, non-deleted, non-system messages only.
+    if (item.showFor === 'own_editable' && (!isOwn || message.is_deleted || message.type === 'system')) return false;
     return true;
   });
 

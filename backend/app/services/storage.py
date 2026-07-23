@@ -21,8 +21,19 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".m4v"}
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".aac", ".opus"}
 DOC_EXTS = {
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".txt", ".csv", ".zip", ".md", ".json", ".rtf",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".txt",
+    ".csv",
+    ".zip",
+    ".md",
+    ".json",
+    ".rtf",
 }
 
 MAX_IMAGE_BYTES = 16 * 1024 * 1024
@@ -30,14 +41,27 @@ MAX_MEDIA_BYTES = 200 * 1024 * 1024
 MAX_DOC_BYTES = 100 * 1024 * 1024
 
 MIME_BY_EXT = {
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-    ".gif": "image/gif", ".webp": "image/webp",
-    ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
     ".m4v": "video/x-m4v",
-    ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav",
-    ".ogg": "audio/ogg", ".aac": "audio/aac", ".opus": "audio/opus",
-    ".pdf": "application/pdf", ".txt": "text/plain", ".csv": "text/csv",
-    ".zip": "application/zip", ".md": "text/markdown", ".json": "application/json",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".aac": "audio/aac",
+    ".opus": "audio/opus",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".zip": "application/zip",
+    ".md": "text/markdown",
+    ".json": "application/json",
     ".doc": "application/msword",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xls": "application/vnd.ms-excel",
@@ -100,9 +124,7 @@ async def put_object(key: str, data: bytes, content_type: str) -> None:
     settings = get_settings()
 
     def _put() -> None:
-        _client().put_object(
-            settings.s3_bucket, key, io.BytesIO(data), len(data), content_type=content_type
-        )
+        _client().put_object(settings.s3_bucket, key, io.BytesIO(data), len(data), content_type=content_type)
 
     await anyio.to_thread.run_sync(_put)
 

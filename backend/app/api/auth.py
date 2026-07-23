@@ -67,12 +67,8 @@ def set_auth_cookies(response: Response, access: str, refresh: str) -> None:
         "domain": settings.cookie_domain,
         "path": "/",
     }
-    response.set_cookie(
-        ACCESS_COOKIE, access, max_age=settings.access_token_minutes * 60, **common
-    )
-    response.set_cookie(
-        REFRESH_COOKIE, refresh, max_age=settings.refresh_token_days * 86400, **common
-    )
+    response.set_cookie(ACCESS_COOKIE, access, max_age=settings.access_token_minutes * 60, **common)
+    response.set_cookie(REFRESH_COOKIE, refresh, max_age=settings.refresh_token_days * 86400, **common)
 
 
 def clear_auth_cookies(response: Response) -> None:
@@ -81,9 +77,7 @@ def clear_auth_cookies(response: Response) -> None:
         response.delete_cookie(name, domain=settings.cookie_domain, path="/")
 
 
-async def _issue_session(
-    db: AsyncSession, user: User, response: Response, request: Request
-) -> None:
+async def _issue_session(db: AsyncSession, user: User, response: Response, request: Request) -> None:
     settings = get_settings()
     access = create_access_token(user.id, wire_role(user.role), user.org_id)
     raw_refresh, token_hash = new_refresh_token()
@@ -130,9 +124,7 @@ async def refresh(
     if not raw:
         raise HTTPException(status_code=401, detail="Refresh token required")
     token = (
-        await db.execute(
-            select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw))
-        )
+        await db.execute(select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw)))
     ).scalar_one_or_none()
     if token is None or token.revoked_at is not None:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
@@ -162,9 +154,7 @@ async def logout(
     raw = request.cookies.get(REFRESH_COOKIE)
     if raw:
         token = (
-            await db.execute(
-                select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw))
-            )
+            await db.execute(select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw)))
         ).scalar_one_or_none()
         if token and token.user_id == user.id:
             token.revoked_at = now_utc()
@@ -210,9 +200,7 @@ async def change_password(
     # Revoke every other session on password change.
     tokens = (
         await db.execute(
-            select(RefreshToken).where(
-                RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None)
-            )
+            select(RefreshToken).where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
         )
     ).scalars()
     for t in tokens:

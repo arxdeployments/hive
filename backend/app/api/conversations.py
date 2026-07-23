@@ -80,9 +80,7 @@ async def list_conversations(
     stmt = (
         select(Conversation)
         .join(my_cp, and_(my_cp.conversation_id == Conversation.id, my_cp.user_id == user.id))
-        .options(
-            selectinload(Conversation.participants).selectinload(ConversationParticipant.user)
-        )
+        .options(selectinload(Conversation.participants).selectinload(ConversationParticipant.user))
         .where(
             Conversation.is_active.is_(True),
             or_(
@@ -170,9 +168,7 @@ async def create_direct_conversation(
     if other is None or not other.is_active:
         raise HTTPException(status_code=404, detail="User not found")
     if other.org_id != user.org_id:
-        raise HTTPException(
-            status_code=403, detail="Cannot message users from a different organization"
-        )
+        raise HTTPException(status_code=403, detail="Cannot message users from a different organization")
 
     conv = await get_or_create_direct(db, user, other, notify=True)
     loaded = await enrich.load_conversation_with_participants(db, conv.id)
@@ -206,13 +202,11 @@ async def delete_conversation(conv_id: str, tenant: TenantContext = Depends(get_
         MessageDeletion.user_id == tenant.user.id,
         MessageDeletion.message_id == Message.id,
     )
-    to_hide = select(
-        Message.id, literal(tenant.user.id, type_=PG_UUID(as_uuid=True))
-    ).where(Message.conversation_id == conv_uuid, ~already_deleted.exists())
+    to_hide = select(Message.id, literal(tenant.user.id, type_=PG_UUID(as_uuid=True))).where(
+        Message.conversation_id == conv_uuid, ~already_deleted.exists()
+    )
     insert_stmt = (
-        pg_insert(MessageDeletion)
-        .from_select(["message_id", "user_id"], to_hide)
-        .on_conflict_do_nothing()
+        pg_insert(MessageDeletion).from_select(["message_id", "user_id"], to_hide).on_conflict_do_nothing()
     )
     await db.execute(insert_stmt)
     await db.commit()

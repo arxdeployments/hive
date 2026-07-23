@@ -68,11 +68,7 @@ async def call_history(
 
     total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
     calls = (
-        (
-            await db.execute(
-                base.order_by(Call.started_at.desc()).offset((page - 1) * limit).limit(limit)
-            )
-        )
+        (await db.execute(base.order_by(Call.started_at.desc()).offset((page - 1) * limit).limit(limit)))
         .scalars()
         .all()
     )
@@ -81,9 +77,7 @@ async def call_history(
 
 
 @router.get("/missed-count")
-async def missed_count(
-    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
-):
+async def missed_count(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     stmt = (
         select(func.count())
         .select_from(CallParticipant)
@@ -121,23 +115,17 @@ async def create_link(
     db: AsyncSession = Depends(get_db),
 ):
     ctype = CallType.voice if body.call_type == "voice" else CallType.video
-    link = CallLink(
-        org_id=user.org_id, creator_id=user.id, code=generate_call_code(), call_type=ctype
-    )
+    link = CallLink(org_id=user.org_id, creator_id=user.id, code=generate_call_code(), call_type=ctype)
     db.add(link)
     await db.commit()
     return {"code": link.code, "url": f"/call/{link.code}", "call_type": ctype.value}
 
 
 @router.get("/link/{code}")
-async def get_link(
-    code: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
-):
+async def get_link(code: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     _ = user  # any authenticated user may resolve a meet-style link
     link = (
-        await db.execute(
-            select(CallLink).where(CallLink.code == code, CallLink.is_active.is_(True))
-        )
+        await db.execute(select(CallLink).where(CallLink.code == code, CallLink.is_active.is_(True)))
     ).scalar_one_or_none()
     if link is None:
         raise HTTPException(status_code=404, detail="Call link not found")
@@ -200,9 +188,7 @@ async def schedule_call(
 
     # Keep only requested participants that exist, are active, and share the
     # caller's org; invalid/foreign ids are silently skipped (contract).
-    requested = list(
-        dict.fromkeys(u for u in (parse_uuid(p) for p in body.participant_ids) if u is not None)
-    )
+    requested = list(dict.fromkeys(u for u in (parse_uuid(p) for p in body.participant_ids) if u is not None))
     valid_ids: list[str] = []
     if requested:
         rows = (
@@ -246,9 +232,7 @@ async def schedule_call(
 
 
 @router.get("/scheduled")
-async def list_scheduled(
-    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)
-):
+async def list_scheduled(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     stmt = (
         select(ScheduledCall)
         .where(
@@ -285,9 +269,7 @@ async def call_token(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    call = (
-        await db.execute(select(Call).where(Call.id == call_id))
-    ).scalar_one_or_none()
+    call = (await db.execute(select(Call).where(Call.id == call_id))).scalar_one_or_none()
     member = await db.get(CallParticipant, (call_id, user.id)) if call else None
     if call is None or member is None:
         raise HTTPException(status_code=404, detail="Call not found")
@@ -309,9 +291,7 @@ async def _handle_webhook_event(db: AsyncSession, event) -> None:
     call_id = parse_uuid(room.removeprefix("call_"))
     if call_id is None:
         return
-    call = (
-        await db.execute(select(Call).where(Call.id == call_id))
-    ).scalar_one_or_none()
+    call = (await db.execute(select(Call).where(Call.id == call_id))).scalar_one_or_none()
     if call is None:
         return
 
@@ -323,9 +303,7 @@ async def _handle_webhook_event(db: AsyncSession, event) -> None:
         member = await db.get(CallParticipant, (call.id, member_id))
         if member is None:
             return
-        others = [
-            u for u in await calls_service._call_participant_ids(db, call.id) if u != member_id
-        ]
+        others = [u for u in await calls_service._call_participant_ids(db, call.id) if u != member_id]
         if name == "participant_joined":
             if member.joined_at is None:
                 member.joined_at = now_utc()

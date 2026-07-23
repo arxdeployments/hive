@@ -25,9 +25,7 @@ async def seed() -> None:
     async with SessionLocal() as db:
         existing = (
             await db.execute(
-                select(User).where(
-                    func.lower(User.email) == settings.seed_superadmin_email.lower()
-                )
+                select(User).where(func.lower(User.email) == settings.seed_superadmin_email.lower())
             )
         ).scalar_one_or_none()
         if existing:

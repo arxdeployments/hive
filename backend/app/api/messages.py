@@ -133,9 +133,7 @@ async def list_messages(
     participants = (
         (
             await db.execute(
-                select(ConversationParticipant).where(
-                    ConversationParticipant.conversation_id == conv_uuid
-                )
+                select(ConversationParticipant).where(ConversationParticipant.conversation_id == conv_uuid)
             )
         )
         .scalars()
@@ -301,9 +299,7 @@ async def message_info(msg_id: str, tenant: TenantContext = Depends(get_tenant))
     other_ids = [p.user_id for p in participants if p.user_id != msg.sender_id]
     names: dict[uuid.UUID, str] = {}
     if other_ids:
-        rows = (
-            await db.execute(select(User.id, User.display_name).where(User.id.in_(other_ids)))
-        ).all()
+        rows = (await db.execute(select(User.id, User.display_name).where(User.id.in_(other_ids)))).all()
         names = {user_id: display_name for user_id, display_name in rows}
 
     read_by: list[dict] = []

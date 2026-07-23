@@ -90,11 +90,7 @@ async def _load_call(db: AsyncSession, call_id: uuid.UUID) -> Call | None:
 
 async def _call_participant_ids(db: AsyncSession, call_id: uuid.UUID) -> list[uuid.UUID]:
     return (
-        (
-            await db.execute(
-                select(CallParticipant.user_id).where(CallParticipant.call_id == call_id)
-            )
-        )
+        (await db.execute(select(CallParticipant.user_id).where(CallParticipant.call_id == call_id)))
         .scalars()
         .all()
     )
@@ -150,9 +146,7 @@ async def _ring_timeout(call_id: uuid.UUID) -> None:
         caller_id = call.initiated_by
         callee_ids = [u for u in ids if u != caller_id]
         caller = await db.get(User, caller_id) if caller_id else None
-        await _finalize(
-            db, call, CallStatus.missed, system_note=f"{_call_emoji(call)} Missed call"
-        )
+        await _finalize(db, call, CallStatus.missed, system_note=f"{_call_emoji(call)} Missed call")
         if caller_id:
             await publish_to_users([caller_id], {"type": "call:missed", "call_id": str(call_id)})
         await publish_to_users(
@@ -211,9 +205,7 @@ async def initiate_direct_call(
             return
         if not await presence.is_online(callee.id):
             await _finalize(db, call, CallStatus.no_answer)
-            await publish_to_users(
-                [caller.id], {"type": "call:unavailable", "call_id": str(call_id)}
-            )
+            await publish_to_users([caller.id], {"type": "call:unavailable", "call_id": str(call_id)})
             return
 
         await _set_in_call([caller.id, callee.id], call_id)
@@ -290,11 +282,7 @@ async def initiate_group_call(user: User, conversation_id: uuid.UUID, call_type:
         await db.flush()
         call.room_name = room_name_for(call.id)
         for uid in member_ids:
-            db.add(
-                CallParticipant(
-                    call_id=call.id, user_id=uid, joined_at=now if uid == caller.id else None
-                )
-            )
+            db.add(CallParticipant(call_id=call.id, user_id=uid, joined_at=now if uid == caller.id else None))
         await db.commit()
         call_id = call.id
 
@@ -364,9 +352,7 @@ async def _decline(user: User, call_id: uuid.UUID) -> None:
         member = await db.get(CallParticipant, (call_id, user.id))
         if member is None or user.id == call.initiated_by:
             return
-        await _finalize(
-            db, call, CallStatus.declined, system_note=f"{_call_emoji(call)} Call declined"
-        )
+        await _finalize(db, call, CallStatus.declined, system_note=f"{_call_emoji(call)} Call declined")
         await publish_to_users([call.initiated_by], {"type": "call:declined", "call_id": str(call_id)})
 
 
@@ -575,9 +561,7 @@ async def handle_call_ws_message(user: User, data: dict) -> None:
     elif msg_type == "call:leave":
         await _leave(user, call_id)
     elif msg_type == "call:toggle_media":
-        await _toggle_media(
-            user, call_id, data.get("media_type", "audio"), data.get("enabled", True)
-        )
+        await _toggle_media(user, call_id, data.get("media_type", "audio"), data.get("enabled", True))
 
 
 async def handle_user_disconnect(user: User) -> None:
@@ -595,9 +579,7 @@ async def handle_user_disconnect(user: User) -> None:
             else:
                 ids = await _call_participant_ids(db, call_id)
                 caller = await db.get(User, call.initiated_by) if call.initiated_by else None
-                await _finalize(
-                    db, call, CallStatus.missed, system_note=f"{_call_emoji(call)} Missed call"
-                )
+                await _finalize(db, call, CallStatus.missed, system_note=f"{_call_emoji(call)} Missed call")
                 if call.initiated_by:
                     await publish_to_users(
                         [call.initiated_by], {"type": "call:missed", "call_id": str(call_id)}
@@ -639,15 +621,12 @@ def _parse_uuid(value) -> uuid.UUID | None:
 
 async def serialize_call(db: AsyncSession, call: Call, for_user: uuid.UUID) -> dict:
     parts = (
-        (
-            await db.execute(
-                select(CallParticipant, User)
-                .join(User, User.id == CallParticipant.user_id)
-                .where(CallParticipant.call_id == call.id)
-            )
+        await db.execute(
+            select(CallParticipant, User)
+            .join(User, User.id == CallParticipant.user_id)
+            .where(CallParticipant.call_id == call.id)
         )
-        .all()
-    )
+    ).all()
     participants = []
     initiator = None
     seen_by = []

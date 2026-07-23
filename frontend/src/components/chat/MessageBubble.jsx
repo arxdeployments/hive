@@ -1,7 +1,14 @@
 import React, { memo } from 'react';
-import { Check, CheckCheck, Clock, Ban } from 'lucide-react';
+import { Check, CheckCheck, Clock, Ban, Mic } from 'lucide-react';
 import { ImageBubble } from './ImageBubble';
 import { DocumentBubble } from './DocumentBubble';
+
+const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
+
+const resolveUrl = (url) => {
+  if (!url) return '';
+  return url.startsWith('http') ? url : `${backendUrl}${url}`;
+};
 
 const SENDER_COLORS = [
   '#F87171', '#FB923C', '#FBBF24', '#A3E635', '#34D399',
@@ -45,7 +52,18 @@ const aggregateReactions = (reactions) => {
   return Object.values(map);
 };
 
-const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUserId, onContextMenu, onReactionClick, onReplyClick }) => {
+const replyPreview = (replyMsg) => {
+  if (replyMsg.is_deleted) return 'This message was deleted';
+  switch (replyMsg.type) {
+    case 'image': return '📷 Photo';
+    case 'video': return '🎥 Video';
+    case 'audio': return '🎤 Audio';
+    case 'file': return '📎 File';
+    default: return (replyMsg.content || '').substring(0, 100);
+  }
+};
+
+const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUserId, onContextMenu, onReactionClick, onReplyClick, onEdit, onRetry }) => {
   // Deleted message
   if (message.is_deleted) {
     return (
@@ -67,13 +85,29 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
   }
 
   const isImage = message.type === 'image';
+  const isVideo = message.type === 'video';
+  const isAudio = message.type === 'audio';
   const isFile = message.type === 'file';
+  const richBubble = isImage || isVideo || isAudio || isFile;
+
   const reactions = aggregateReactions(message.reactions);
   const replyMsg = message.reply_to_message;
+
+  const videoCaption = message.caption ||
+    (isVideo && message.content && !message.content.startsWith('/api/') && !message.content.startsWith('/uploads') ? message.content : '');
+  const audioName = message.filename ||
+    (isAudio && message.content && !message.content.startsWith('/api/') ? message.content : '') ||
+    'Voice message';
+
+  const canEdit = isOwn && message.type === 'text' && !message.is_deleted;
 
   const handleContextMenu = (e) => {
     e.preventDefault();
     if (onContextMenu) onContextMenu(e, message);
+  };
+
+  const handleDoubleClick = () => {
+    if (canEdit && onEdit) onEdit(message);
   };
 
   return (
@@ -92,10 +126,11 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
 
       <div className="max-w-[80%] sm:max-w-[65%] lg:max-w-[550px]">
         <div
+          onDoubleClick={handleDoubleClick}
           className={`relative group ${
-            isImage
+            isImage || isVideo
               ? `px-1 py-1 ${isOwn ? 'bg-[#10B981] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
-              : isFile
+              : isFile || isAudio
                 ? `p-1 ${isOwn ? 'bg-[#10B981] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
                 : `px-3 py-2 ${isOwn ? 'bg-[#10B981] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
           }`}
@@ -109,7 +144,7 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
 
           {/* Sender name for groups */}
           {!isOwn && showSenderName && isGroup && (
-            <p className={`text-xs font-medium mb-0.5 ${isImage || isFile ? 'px-2 pt-1' : ''}`}
+            <p className={`text-xs font-medium mb-0.5 ${richBubble ? 'px-2 pt-1' : ''}`}
               style={{ color: getSenderColor(message.sender_id) }}>
               {message.sender_name}
             </p>
@@ -127,8 +162,7 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
                 {replyMsg.sender_name}
               </p>
               <p className={`text-[12px] line-clamp-2 ${isOwn ? 'text-white/70' : 'text-[#A3A3A3]'}`}>
-                {replyMsg.is_deleted ? 'This message was deleted' :
-                  replyMsg.type === 'image' ? '\ud83d\udcf7 Photo' : (replyMsg.content || '').substring(0, 100)}
+                {replyPreview(replyMsg)}
               </p>
             </div>
           )}
@@ -136,6 +170,35 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
           {/* Content by type */}
           {isImage ? (
             <ImageBubble message={message} isOwn={isOwn} />
+          ) : isVideo ? (
+            <div data-testid="video-bubble" className="max-w-[330px]">
+              <video
+                controls
+                playsInline
+                preload="metadata"
+                src={resolveUrl(message.media_url)}
+                poster={message.thumbnail_url ? resolveUrl(message.thumbnail_url) : undefined}
+                className="w-full rounded-[6px] max-h-[320px] bg-black"
+              />
+              {videoCaption && (
+                <p className={`text-sm mt-1 px-1 ${isOwn ? 'text-white' : 'text-[#F5F5F5]'}`}>{videoCaption}</p>
+              )}
+            </div>
+          ) : isAudio ? (
+            <div data-testid="audio-bubble" className="w-[260px] flex items-center gap-2.5 p-1.5">
+              <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 ${isOwn ? 'bg-white/15' : 'bg-[#10B981]/15'}`}>
+                <Mic size={18} className={isOwn ? 'text-white' : 'text-[#10B981]'} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className={`text-xs truncate ${isOwn ? 'text-white/90' : 'text-[#F5F5F5]'}`}>{audioName}</p>
+                <audio
+                  controls
+                  preload="metadata"
+                  src={resolveUrl(message.media_url)}
+                  className="w-full h-8 mt-1"
+                />
+              </div>
+            </div>
           ) : isFile ? (
             <DocumentBubble message={message} isOwn={isOwn} />
           ) : (
@@ -145,11 +208,33 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
           )}
 
           {/* Time + status */}
-          <div className={`flex items-center gap-1 mt-1 ${isImage || isFile ? 'px-2 pb-1' : ''} justify-end`}>
+          <div className={`flex items-center gap-1 mt-1 ${richBubble ? 'px-2 pb-1' : ''} justify-end`}>
             <span className={`text-[11px] ${isOwn ? 'text-white/70' : 'text-[#A3A3A3]'}`}>
               {formatTime(message.created_at)}
             </span>
-            {isOwn && <StatusIcon status={message.status || 'sent'} />}
+            {message.edited_at && (
+              <span
+                className={`text-[11px] ${isOwn ? 'text-white/70' : 'text-[#A3A3A3]'}`}
+                data-testid="edited-indicator"
+              >
+                · edited
+              </span>
+            )}
+            {isOwn && (
+              message.status === 'failed' ? (
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); onRetry && onRetry(message); }}
+                  title="Failed to send. Tap to retry."
+                  data-testid="message-retry"
+                  className="flex items-center justify-center w-4 h-4 rounded-full bg-[#EF4444] text-white text-[10px] font-bold leading-none hover:bg-[#DC2626] transition-colors"
+                >
+                  !
+                </button>
+              ) : (
+                <StatusIcon status={message.status || 'sent'} />
+              )
+            )}
           </div>
         </div>
 
@@ -187,5 +272,9 @@ export const MessageBubble = memo(MessageBubbleInner, (prev, next) => {
     prev.message.status === next.message.status &&
     prev.message.temp_id === next.message.temp_id &&
     prev.message.is_deleted === next.message.is_deleted &&
+    prev.message.edited_at === next.message.edited_at &&
+    prev.message.content === next.message.content &&
+    prev.message.media_url === next.message.media_url &&
+    prev.message.thumbnail_url === next.message.thumbnail_url &&
     JSON.stringify(prev.message.reactions) === JSON.stringify(next.message.reactions);
 });

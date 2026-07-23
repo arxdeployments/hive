@@ -174,9 +174,7 @@ async def _name_maps(
         )
         org_names = dict(rows.all())
     if dept_ids:
-        rows = await db.execute(
-            select(Department.id, Department.name).where(Department.id.in_(dept_ids))
-        )
+        rows = await db.execute(select(Department.id, Department.name).where(Department.id.in_(dept_ids)))
         dept_names = dict(rows.all())
     return org_names, dept_names
 
@@ -276,23 +274,13 @@ async def get_stats(
     db: AsyncSession = Depends(get_db),
     actor: User = Depends(require_superadmin),
 ):
-    total_orgs = (
-        await db.execute(select(func.count()).select_from(Organization))
-    ).scalar_one()
-    total_depts = (
-        await db.execute(select(func.count()).select_from(Department))
-    ).scalar_one()
+    total_orgs = (await db.execute(select(func.count()).select_from(Organization))).scalar_one()
+    total_depts = (await db.execute(select(func.count()).select_from(Department))).scalar_one()
     total_users = (
-        await db.execute(
-            select(func.count()).select_from(User).where(User.role != UserRole.superadmin)
-        )
+        await db.execute(select(func.count()).select_from(User).where(User.role != UserRole.superadmin))
     ).scalar_one()
     active_today = await _count_online_users()
-    logs = (
-        (await db.execute(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(10)))
-        .scalars()
-        .all()
-    )
+    logs = (await db.execute(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(10))).scalars().all()
     return {
         "total_orgs": total_orgs,
         "total_depts": total_depts,
@@ -325,9 +313,7 @@ async def list_organizations(
         "created_at": Organization.created_at,
         "slug": Organization.slug,
     }.get(sort, Organization.created_at)
-    total = (
-        await db.execute(select(func.count()).select_from(Organization).where(*filters))
-    ).scalar_one()
+    total = (await db.execute(select(func.count()).select_from(Organization).where(*filters))).scalar_one()
     stmt = (
         select(Organization)
         .where(*filters)
@@ -336,9 +322,7 @@ async def list_organizations(
         .limit(limit)
     )
     orgs = (await db.execute(stmt)).scalars().all()
-    dept_counts, user_counts = await _org_counts(
-        db, [o.id for o in orgs], active_users_only=False
-    )
+    dept_counts, user_counts = await _org_counts(db, [o.id for o in orgs], active_users_only=False)
     data = [
         {
             **_serialize_org(o),
@@ -358,22 +342,16 @@ async def create_organization(
 ):
     name = sanitize_text(body.name).strip()
     slug = slugify(name)
-    clash = (
-        await db.execute(select(Organization.id).where(Organization.slug == slug))
-    ).first()
+    clash = (await db.execute(select(Organization.id).where(Organization.slug == slug))).first()
     if clash:
         raise HTTPException(status_code=400, detail="Organization name already exists")
-    org = Organization(
-        name=name, slug=slug, logo_url=body.logo_url, is_active=True, created_at=now_utc()
-    )
+    org = Organization(name=name, slug=slug, logo_url=body.logo_url, is_active=True, created_at=now_utc())
     db.add(org)
     try:
         await db.flush()
     except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(
-            status_code=400, detail="Organization name already exists"
-        ) from exc
+        raise HTTPException(status_code=400, detail="Organization name already exists") from exc
     await log_audit(
         db,
         actor_id=actor.id,
@@ -395,17 +373,13 @@ async def list_all_organizations(
     orgs = (
         (
             await db.execute(
-                select(Organization)
-                .where(Organization.is_active.is_(True))
-                .order_by(Organization.name.asc())
+                select(Organization).where(Organization.is_active.is_(True)).order_by(Organization.name.asc())
             )
         )
         .scalars()
         .all()
     )
-    dept_counts, user_counts = await _org_counts(
-        db, [o.id for o in orgs], active_users_only=True
-    )
+    dept_counts, user_counts = await _org_counts(db, [o.id for o in orgs], active_users_only=True)
     return [
         {
             **_serialize_org(o),
@@ -443,9 +417,7 @@ async def update_organization(
         slug = slugify(name)
         clash = (
             await db.execute(
-                select(Organization.id).where(
-                    Organization.slug == slug, Organization.id != org.id
-                )
+                select(Organization.id).where(Organization.slug == slug, Organization.id != org.id)
             )
         ).first()
         if clash:
@@ -506,13 +478,7 @@ async def organization_users_by_department(
 ):
     oid = _uuid_or_400(org_id, "Invalid org ID")
     depts = (
-        (
-            await db.execute(
-                select(Department)
-                .where(Department.org_id == oid)
-                .order_by(Department.name.asc())
-            )
-        )
+        (await db.execute(select(Department).where(Department.org_id == oid).order_by(Department.name.asc())))
         .scalars()
         .all()
     )
@@ -567,9 +533,7 @@ async def list_departments(
         filters.append(Department.org_id == oid)
     if search:
         filters.append(Department.name.ilike(_like_pattern(search), escape="\\"))
-    total = (
-        await db.execute(select(func.count()).select_from(Department).where(*filters))
-    ).scalar_one()
+    total = (await db.execute(select(func.count()).select_from(Department).where(*filters))).scalar_one()
     depts = (
         (
             await db.execute(
@@ -587,14 +551,10 @@ async def list_departments(
     dept_ids = [d.id for d in depts]
     if dept_ids:
         rows = await db.execute(
-            select(User.dept_id, func.count())
-            .where(User.dept_id.in_(dept_ids))
-            .group_by(User.dept_id)
+            select(User.dept_id, func.count()).where(User.dept_id.in_(dept_ids)).group_by(User.dept_id)
         )
         member_counts = dict(rows.all())
-    data = [
-        {**_serialize_dept(d), "member_count": member_counts.get(d.id, 0)} for d in depts
-    ]
+    data = [{**_serialize_dept(d), "member_count": member_counts.get(d.id, 0)} for d in depts]
     return {"data": data, "total": total, "page": page, "limit": limit}
 
 
@@ -610,14 +570,10 @@ async def create_department(
         raise HTTPException(status_code=404, detail="Organization not found")
     name = sanitize_text(body.name).strip()
     duplicate = (
-        await db.execute(
-            select(Department.id).where(Department.org_id == oid, Department.name == name)
-        )
+        await db.execute(select(Department.id).where(Department.org_id == oid, Department.name == name))
     ).first()
     if duplicate:
-        raise HTTPException(
-            status_code=400, detail="Department already exists in this organization"
-        )
+        raise HTTPException(status_code=400, detail="Department already exists in this organization")
     dept = Department(
         org_id=oid,
         name=name,
@@ -629,9 +585,7 @@ async def create_department(
         await db.flush()
     except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(
-            status_code=400, detail="Department already exists in this organization"
-        ) from exc
+        raise HTTPException(status_code=400, detail="Department already exists in this organization") from exc
     await log_audit(
         db,
         actor_id=actor.id,
@@ -679,9 +633,7 @@ async def update_department(
             )
         ).first()
         if duplicate:
-            raise HTTPException(
-                status_code=400, detail="Department name already exists in this organization"
-            )
+            raise HTTPException(status_code=400, detail="Department name already exists in this organization")
         dept.name = name
         update_data["name"] = name
     if "description" in update_data:
@@ -711,9 +663,7 @@ async def delete_department(
     dept = await _get_dept_or_404(db, dept_id)
     active_users = (
         await db.execute(
-            select(func.count())
-            .select_from(User)
-            .where(User.dept_id == dept.id, User.is_active.is_(True))
+            select(func.count()).select_from(User).where(User.dept_id == dept.id, User.is_active.is_(True))
         )
     ).scalar_one()
     if active_users:
@@ -763,10 +713,7 @@ async def list_users(
         filters.append(User.dept_id == did)
     if search:
         pattern = _like_pattern(search)
-        filters.append(
-            User.display_name.ilike(pattern, escape="\\")
-            | User.email.ilike(pattern, escape="\\")
-        )
+        filters.append(User.display_name.ilike(pattern, escape="\\") | User.email.ilike(pattern, escape="\\"))
     if status == "active":
         filters.append(User.is_active.is_(True))
     elif status == "inactive":
@@ -778,9 +725,7 @@ async def list_users(
         "created_at": User.created_at,
         "last_seen": User.last_seen_at,
     }.get(sort, User.created_at)
-    total = (
-        await db.execute(select(func.count()).select_from(User).where(*filters))
-    ).scalar_one()
+    total = (await db.execute(select(func.count()).select_from(User).where(*filters))).scalar_one()
     users = (
         (
             await db.execute(
@@ -812,22 +757,16 @@ async def create_user(
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
     dept = (
-        await db.execute(
-            select(Department).where(Department.id == did, Department.org_id == oid)
-        )
+        await db.execute(select(Department).where(Department.id == did, Department.org_id == oid))
     ).scalar_one_or_none()
     if dept is None:
-        raise HTTPException(
-            status_code=404, detail="Department not found in this organization"
-        )
+        raise HTTPException(status_code=404, detail="Department not found in this organization")
     try:
         enforce_password_policy(body.password)
     except PasswordPolicyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # citext equality is case-insensitive; the unique index backstops races.
-    existing = (
-        await db.execute(select(User.id).where(User.email == str(body.email)))
-    ).first()
+    existing = (await db.execute(select(User.id).where(User.email == str(body.email)))).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already in use")
 
@@ -876,9 +815,7 @@ async def bulk_user_action(
         ids = list(
             (
                 await db.execute(
-                    select(User.id).where(
-                        User.id.in_(valid_ids), User.role != UserRole.superadmin
-                    )
+                    select(User.id).where(User.id.in_(valid_ids), User.role != UserRole.superadmin)
                 )
             )
             .scalars()
@@ -904,13 +841,7 @@ async def bulk_user_action(
         if dept is None:
             raise HTTPException(status_code=400, detail="Invalid dept_id")
         users = (
-            (
-                await db.execute(
-                    select(User).where(
-                        User.id.in_(valid_ids), User.role != UserRole.superadmin
-                    )
-                )
-            )
+            (await db.execute(select(User).where(User.id.in_(valid_ids), User.role != UserRole.superadmin)))
             .scalars()
             .all()
         )
@@ -966,16 +897,10 @@ async def update_user(
         did = _uuid_or_400(update_data["dept_id"], "Invalid dept_id")
         # Fix: the department must exist and belong to the user's org.
         dept = (
-            await db.execute(
-                select(Department).where(
-                    Department.id == did, Department.org_id == user.org_id
-                )
-            )
+            await db.execute(select(Department).where(Department.id == did, Department.org_id == user.org_id))
         ).scalar_one_or_none()
         if dept is None:
-            raise HTTPException(
-                status_code=404, detail="Department not found in this organization"
-            )
+            raise HTTPException(status_code=404, detail="Department not found in this organization")
         user.dept_id = did
     if "role" in update_data:
         user.role = _db_role(update_data["role"])

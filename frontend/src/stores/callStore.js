@@ -19,6 +19,11 @@ const useCallStore = create((set, get) => ({
   callHistory: [],
   missedCallCount: 0,
   activeGroupCalls: {},
+  // LiveKit-fed media state
+  localStream: null,
+  isScreenSharing: false,
+  activeSpeakerIds: [],
+  networkQuality: 'good',
 
   initiateCall: (callId, callType, isGroup = false, conversationId = null) => set({
     callState: 'outgoing_ringing', callId, callType, isGroupCall: isGroup,
@@ -61,6 +66,7 @@ const useCallStore = create((set, get) => ({
       incomingCaller: null, isMuted: false, isCameraOn: true,
       callStartTime: null, callDuration: 0, durationInterval: null,
       isMinimized: false, showCallUI: false,
+      localStream: null, isScreenSharing: false, activeSpeakerIds: [], networkQuality: 'good',
     });
   },
 

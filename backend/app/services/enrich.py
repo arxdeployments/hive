@@ -299,16 +299,19 @@ async def serialize_message(
         "sender_name": sender.display_name if sender else "System",
         "sender_avatar": sender.avatar_url if sender else None,
     }
-    doc.update(
-        _attachment_fields([] if msg.deleted_at else list(msg.attachments))
-    )
+    doc.update(_attachment_fields([] if msg.deleted_at else list(msg.attachments)))
 
     if include_reply and msg.reply_to_id:
-        reply = await db.get(
-            Message,
-            msg.reply_to_id,
-            options=[selectinload(Message.sender), selectinload(Message.attachments)],
-        )
+        # Explicit select (not db.get): an identity-map hit would skip the
+        # eager-load options and later lazy-loads would blow up in async.
+        reply = (
+            await db.execute(
+                select(Message)
+                .options(selectinload(Message.sender), selectinload(Message.attachments))
+                .where(Message.id == msg.reply_to_id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
         if reply:
             reply_media = _attachment_fields([] if reply.deleted_at else list(reply.attachments))
             doc["reply_to_message"] = {
@@ -333,7 +336,14 @@ MESSAGE_LOAD_OPTIONS = [
 
 
 async def load_message(db: AsyncSession, message_id: uuid.UUID) -> Message | None:
-    stmt = select(Message).options(*MESSAGE_LOAD_OPTIONS).where(Message.id == message_id)
+    # populate_existing refreshes an identity-map hit so freshly committed
+    # reactions/attachments are re-read instead of served from a stale collection.
+    stmt = (
+        select(Message)
+        .options(*MESSAGE_LOAD_OPTIONS)
+        .where(Message.id == message_id)
+        .execution_options(populate_existing=True)
+    )
     return (await db.execute(stmt)).scalar_one_or_none()
 
 

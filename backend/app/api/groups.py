@@ -93,9 +93,7 @@ async def _serialized(db, conv_id: uuid.UUID, for_user: uuid.UUID) -> dict:
 async def create_group(body: CreateGroupRequest, tenant: TenantContext = Depends(get_tenant)):
     db, user = tenant.db, tenant.user
     if user.org_id is None:
-        raise HTTPException(
-            status_code=403, detail="You must belong to an organization to create a group"
-        )
+        raise HTTPException(status_code=403, detail="You must belong to an organization to create a group")
     name = sanitize_text(body.name).strip()
     if not name:
         raise HTTPException(status_code=400, detail="Group name is required")
@@ -124,9 +122,7 @@ async def create_group(body: CreateGroupRequest, tenant: TenantContext = Depends
         if member is None or not member.is_active:
             raise HTTPException(status_code=404, detail="Member not found")
         if member.org_id != user.org_id:
-            raise HTTPException(
-                status_code=403, detail="Cannot add members from another organization"
-            )
+            raise HTTPException(status_code=403, detail="Cannot add members from another organization")
         members.append(member)
 
     now = now_utc()
@@ -164,9 +160,7 @@ async def create_group(body: CreateGroupRequest, tenant: TenantContext = Depends
 
 
 @router.put("/{conv_id}/group")
-async def update_group(
-    conv_id: str, body: UpdateGroupRequest, tenant: TenantContext = Depends(get_tenant)
-):
+async def update_group(conv_id: str, body: UpdateGroupRequest, tenant: TenantContext = Depends(get_tenant)):
     db, user = tenant.db, tenant.user
     group_id = _parse_conv_id(conv_id)
     conv, _me = await _require_group_admin(tenant, group_id, "update the group")
@@ -205,9 +199,7 @@ async def update_group(
 
 
 @router.post("/{conv_id}/members")
-async def add_members(
-    conv_id: str, body: AddMembersRequest, tenant: TenantContext = Depends(get_tenant)
-):
+async def add_members(conv_id: str, body: AddMembersRequest, tenant: TenantContext = Depends(get_tenant)):
     db, user = tenant.db, tenant.user
     group_id = _parse_conv_id(conv_id)
     conv, _me = await _require_group_admin(tenant, group_id, "add members")
@@ -238,9 +230,7 @@ async def add_members(
             if member is None or not member.is_active:
                 continue  # nonexistent/inactive users are skipped silently
             if member.org_id != conv.org_id:
-                raise HTTPException(
-                    status_code=403, detail="Cannot add members from another organization"
-                )
+                raise HTTPException(status_code=403, detail="Cannot add members from another organization")
             new_members.append(member)
 
     if len(existing) + len(new_members) > MAX_GROUP_MEMBERS:

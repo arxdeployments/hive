@@ -19,9 +19,7 @@ from app.services import enrich
 from app.utils import now_utc
 
 
-async def find_direct(
-    db: AsyncSession, user_a: uuid.UUID, user_b: uuid.UUID
-) -> Conversation | None:
+async def find_direct(db: AsyncSession, user_a: uuid.UUID, user_b: uuid.UUID) -> Conversation | None:
     cp1 = ConversationParticipant.__table__.alias("cp1")
     cp2 = ConversationParticipant.__table__.alias("cp2")
     stmt = (
@@ -56,12 +54,8 @@ async def get_or_create_direct(
     await db.flush()
     db.add_all(
         [
-            ConversationParticipant(
-                conversation_id=conv.id, user_id=me.id, role=ParticipantRole.member
-            ),
-            ConversationParticipant(
-                conversation_id=conv.id, user_id=other.id, role=ParticipantRole.member
-            ),
+            ConversationParticipant(conversation_id=conv.id, user_id=me.id, role=ParticipantRole.member),
+            ConversationParticipant(conversation_id=conv.id, user_id=other.id, role=ParticipantRole.member),
         ]
     )
     db.add(

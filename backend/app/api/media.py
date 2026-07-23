@@ -262,9 +262,7 @@ async def conversation_media(
     sender_ids = {m.sender_id for m in messages if m.sender_id}
     sender_names: dict = {}
     if sender_ids:
-        rows = (
-            await db.execute(select(User.id, User.display_name).where(User.id.in_(sender_ids)))
-        ).all()
+        rows = (await db.execute(select(User.id, User.display_name).where(User.id.in_(sender_ids)))).all()
         sender_names = {row.id: row.display_name for row in rows}
 
     data = []
