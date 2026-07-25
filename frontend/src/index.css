@@ -151,3 +151,26 @@ body {
   }
 }
 
+
+/* ---- Toasts (sonner) ----------------------------------------------------
+   The close button is always visible rather than sonner's hover-only default:
+   a dismiss affordance you have to discover by hovering isn't one, and toasts
+   here can cover the content behind them. */
+[data-sonner-toast] [data-close-button] {
+  opacity: 1;
+  background: #1F1F1F;
+  border: 1px solid #2D2D2D;
+  color: #A3A3A3;
+  transition: background 150ms var(--rx-ease, ease), color 150ms var(--rx-ease, ease);
+}
+
+[data-sonner-toast] [data-close-button]:hover,
+[data-sonner-toast] [data-close-button]:focus-visible {
+  background: #2D2D2D;
+  color: #F5F5F5;
+}
+
+[data-sonner-toast] [data-close-button]:focus-visible {
+  outline: 2px solid #10B981;
+  outline-offset: 2px;
+}

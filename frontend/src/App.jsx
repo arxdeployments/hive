@@ -139,15 +139,24 @@ function App() {
         <OutgoingCallScreen />
         <ActiveCallView />
         <MinimizedCallBanner />
+        {/* Toasts are confirmations, not reading material: they clear quickly and
+            can always be dismissed outright. Rapid toggles (mute/unmute) used to
+            stack and cover the content underneath, so cap how many show at once. */}
         <Toaster
           position="top-right"
-          duration={4000}
+          duration={2000}
+          closeButton
+          visibleToasts={2}
+          gap={8}
           toastOptions={{
             style: {
               background: '#141414',
               border: '1px solid #1F1F1F',
               color: '#F5F5F5',
               fontSize: '14px',
+            },
+            classNames: {
+              closeButton: 'rxhive-toast-close',
             },
           }}
           theme="dark"
