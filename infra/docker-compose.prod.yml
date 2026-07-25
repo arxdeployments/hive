@@ -109,10 +109,8 @@ services:
       # a container is one extra network hop away from 169.254.169.254).
       RXHIVE_S3_ACCESS_KEY: ""
       RXHIVE_S3_SECRET_KEY: ""
-      # !! BLOCKER: config.py's production validator rejects an empty
-      # !! RXHIVE_S3_SECRET_KEY as a placeholder, so the API will refuse to boot
-      # !! until that check learns to skip the S3 pair when both are empty
-      # !! (the instance-role path). See the deployment notes.
+      # config.py's production secret validator deliberately skips the S3 pair
+      # when both are empty — that is how the instance-role path boots.
 
       # --- LiveKit ---
       # Path-style URL the browser resolves against the site origin

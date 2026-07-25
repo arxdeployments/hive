@@ -20,12 +20,6 @@ handle /api/* {
 	reverse_proxy api:8000
 }
 
-# App websocket: messages, presence, typing, call signalling fan-out.
-# Caddy proxies the Upgrade transparently, no extra config needed.
-handle /ws* {
-	reverse_proxy api:8000
-}
-
 # LiveKit signal websocket only. Media does NOT pass through here — it is SRTP
 # direct to the instance on UDP 50000-50100 (TCP 7881 as fallback).
 # Attachments. /api/media/* authorises the request, then redirects here with a

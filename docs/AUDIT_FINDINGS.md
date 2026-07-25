@@ -46,22 +46,43 @@ Test isolation was also fixed: per-session Postgres schema + Redis logical DB, s
 suite is safe to run concurrently. Proven — two simultaneous runs, both 77/77,
 no leftover schemas. It is now a real CI gate rather than a serial-only one.
 
-## Accepted, not fixed
+## Still open
 
-Lower-severity items were left deliberately rather than churn code immediately
-before a deploy. They are recorded here so they are not rediscovered as
-surprises:
+Everything reported by the audit is now fixed. These are defects noticed *in
+passing* while fixing it — outside the audit's scope, none of them blocking, all
+recorded so they are not rediscovered as surprises:
 
-- Reaction shape differs between `serialize_message` (`{user_id, emoji, created_at}`)
-  and `enriched_reactions` (`{user_id, user_name, emoji}`). Cosmetic today; a
-  trap for the next person who assumes one shape.
-- `contacts.py` groups-in-common serialises conversations sequentially without
-  the batch helpers, so it is O(n) awaited queries. Fine at current scale.
-- Media/links scan uses `ILIKE '%http%'`, which cannot use an index; bounded by
-  `_LINK_SCAN_LIMIT = 500`.
-- `terraform.tfvars.example` is absent, so the operator must read `variables.tf`
-  to know what to set.
-- `alert_email` is declared but wired to nothing — no CloudWatch alarms exist.
+- **Media is POSTed twice when the socket is down.** `ChatPanel.handleSend`'s
+  `if (!wsConnected)` fallback posts, and `MessageComposer.sendMediaFile` posts
+  as well, so one file becomes two server messages. Pre-existing; only reachable
+  while the WebSocket is disconnected.
+- **The cross-org conversation header always renders `?`.** `ChatPanel.jsx`
+  builds "N members from X organizations" from `p.org_name`, which
+  `enrich.serialize_user_brief` does not send — the same class of defect as the
+  ContactInfoPanel rows that were removed.
+- **Group permissions do not live-update while the panel is open.**
+  `permissions_updated` now reaches the store, but `GroupInfoPanel` keeps the
+  toggles it fetched when the section was opened until it is reopened. Only
+  `send_messages` (which gates the composer) propagates immediately.
+- **One unexplained test count.** A single concurrent run reported `78 passed`
+  against 77 collected; never reproduced across six later runs, and executed
+  node-ids matched collection exactly. Probably a reporting artefact of the
+  concurrent-run harness, but it is unexplained rather than understood.
+
+## Accepted trade-offs
+
+Deliberate decisions, not omissions:
+
+- **Rate limiting fails closed on a Redis outage.** Realtime fan-out and
+  presence degrade, but `core/rate_limit.py` still raises — degrading it would
+  fail *open* and allow unlimited login attempts during an outage.
+- **VAPID keys are provisioned by hand.** Terraform cannot generate an EC P-256
+  keypair, and a wrong-format key is worse than none: an empty key is a clean
+  feature-off no-op, while an invalid one passes the check and then fails at
+  send time. A Terraform output prints the exact commands instead.
+- **`perm_send_history` / `invite_via_link` / `approve_new_members` columns
+  remain in the schema** but are no longer exposed. Dropping them needs a
+  migration; they are commented RESERVED / NOT ENFORCED at the model.
 
 ## Method
 
