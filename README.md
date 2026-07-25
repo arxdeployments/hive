@@ -62,13 +62,25 @@ npm run dev            # http://localhost:5173
 # Backend: pytest against a real Postgres + Redis (rxhive_test DB)
 cd backend && .venv/bin/pytest -q
 
-# Frontend: Playwright E2E against a running stack
+# Frontend: Playwright E2E — boots the web server, waits for a healthy API
 cd frontend && npm run test:e2e
+
+# Against an already-running stack (faster local loop):
+E2E_NO_SERVER=1 npm run test:e2e
 ```
 
 The backend suite includes an explicit tenant-isolation gate proving org A can
 never read org B (messages, reactions, forwards, search, admin portals, calls,
 attachments).
+
+The E2E suite asserts cross-user delivery lands **within 5 seconds** — a budget
+the 15s conversation poll cannot satisfy, so a broken WebSocket fails the test
+instead of silently degrading to polling. `tests/global-setup.js` fails loudly
+if the API isn't healthy, rather than letting a dead stack surface as opaque
+locator timeouts.
+
+All E2E traffic shares one source IP, so raise the login budget for those runs:
+`RXHIVE_RATE_LIMIT_LOGIN=200` (rate limits are settings-tunable per scope).
 
 ## Production notes
 
