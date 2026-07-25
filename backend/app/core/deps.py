@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import ACCESS_COOKIE, decode_access_token
-from app.db.models import Conversation, ConversationParticipant, User, UserRole
+from app.db.models import Conversation, ConversationParticipant, ConversationType, User, UserRole
 from app.db.session import get_db
 
 _credentials_error = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
@@ -114,6 +114,14 @@ class TenantContext:
         membership = await self.db.get(ConversationParticipant, (conversation_id, self.user.id))
         if membership is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        # Org check lives here rather than in each route: every participant row the
+        # API can create today already matches the conversation's org, so this is
+        # defence in depth — but the message read paths checked it and the pin /
+        # mute / delete / clear / export routes did not, and only enforcing it in
+        # the shared guard keeps a future route from drifting the same way.
+        # cross_org conversations belong to no single org and are exempt by design.
+        if conv.type != ConversationType.cross_org and conv.org_id != self.user.org_id:
+            raise HTTPException(status_code=403, detail="Access denied")
         return conv
 
     async def org_user(self, user_id: uuid.UUID) -> User:

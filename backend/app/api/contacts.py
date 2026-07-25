@@ -24,6 +24,11 @@ from app.utils import iso_z, parse_uuid
 
 router = APIRouter(prefix="/api/users", tags=["contacts"])
 
+# The contact panel renders this list in full — the wire contract has no cursor —
+# so the query must cap itself: a user who shares hundreds of groups with a
+# colleague would otherwise serialize every one of them on each profile open.
+_GROUPS_IN_COMMON_LIMIT = 50
+
 
 def _like_pattern(value: str) -> str:
     """Escape LIKE wildcards so user input is matched literally."""
@@ -106,7 +111,23 @@ async def groups_in_common(user_id: str, tenant: TenantContext = Depends(get_ten
             Conversation.type.in_((ConversationType.group, ConversationType.cross_org)),
         )
         .order_by(Conversation.last_message_at.desc().nulls_last())
+        .limit(_GROUPS_IN_COMMON_LIMIT)
     )
     convs = (await tenant.db.execute(stmt)).scalars().all()
-    data = [await enrich.serialize_conversation(tenant.db, c, tenant.user.id) for c in convs]
+
+    # Batched like the conversation LIST endpoint: serializing one at a time made
+    # this three queries PER group (unread, last message, presence) issued
+    # sequentially, so the panel's latency grew linearly with shared groups.
+    db = tenant.db
+    conv_ids = [c.id for c in convs]
+    unread = await enrich.unread_counts(db, conv_ids, tenant.user.id)
+    last_msgs = await enrich.last_messages(db, conv_ids, tenant.user.id)
+    statuses = await presence.get_statuses(list({p.user_id for c in convs for p in c.participants}))
+
+    data = [
+        await enrich.serialize_conversation(
+            db, c, tenant.user.id, statuses=statuses, unread=unread, last_msgs=last_msgs
+        )
+        for c in convs
+    ]
     return {"data": data}

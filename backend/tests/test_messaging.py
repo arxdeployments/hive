@@ -123,6 +123,13 @@ async def test_reaction_toggle_and_shape(client, two_orgs_with_users):
     reactions = resp.json()["reactions"]
     assert reactions == [{"user_id": str(users["alice"].id), "user_name": "Alice", "emoji": "👍"}]
 
+    # The loaded message must name the reactor too, or the client's reaction
+    # tooltip is blank until the viewer happens to react themselves.
+    resp = await client.get(f"/api/conversations/{conv}/messages")
+    loaded = [m for m in resp.json()["messages"] if m["_id"] == msg["_id"]][0]
+    assert loaded["reactions"][0]["user_name"] == "Alice"
+    assert loaded["reactions"][0]["user_id"] == str(users["alice"].id)
+
     resp = await client.post(f"/api/conversations/messages/{msg['_id']}/react", json={"emoji": "👍"})
     assert resp.json()["reactions"] == []
 

@@ -344,6 +344,11 @@ async def serialize_message(
         reactions.append(
             {
                 "user_id": str(r.user_id),
+                # user_name is what the client's reaction tooltip reads. Only the
+                # react endpoint used to send it, so tooltips were blank on load and
+                # filled in only for whoever had just reacted. The reactor is
+                # batch-loaded with the message (MESSAGE_LOAD_OPTIONS), not per row.
+                "user_name": r.user.display_name if r.user else "Unknown",
                 "emoji": r.emoji,
                 "created_at": iso_z(r.created_at),
             }
@@ -398,7 +403,9 @@ async def serialize_message(
 
 
 MESSAGE_LOAD_OPTIONS = [
-    selectinload(Message.reactions),
+    # The nested load is what keeps serialize_message's reactor names off an N+1:
+    # one IN query for the reactions of the page, one more for their users.
+    selectinload(Message.reactions).selectinload(MessageReaction.user),
     selectinload(Message.attachments),
     selectinload(Message.sender),
 ]

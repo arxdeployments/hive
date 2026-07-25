@@ -16,8 +16,14 @@ resource "aws_instance" "app" {
   ami           = data.aws_ssm_parameter.al2023.value
   instance_type = var.instance_type
 
-  subnet_id              = aws_subnet.public.id
-  vpc_security_group_ids = [aws_security_group.app.id]
+  # eth0 is the pre-built ENI below, not one EC2 creates at launch, so the
+  # Elastic IP is already on the box the moment it powers on (see the ENI
+  # comment). subnet_id / vpc_security_group_ids move to the ENI — EC2 does not
+  # accept them here as well.
+  network_interface {
+    network_interface_id = aws_network_interface.app.id
+    device_index         = 0
+  }
 
   # Defined in iam.tf. Grants SSM Session Manager (so no SSH key or open :22),
   # read access to the SSM parameters holding the app secrets, and S3 access to
@@ -83,6 +89,14 @@ resource "aws_instance" "app" {
   # with `terraform apply -replace=aws_instance.app`.
   user_data_replace_on_change = false
 
+  # Attaching the ENI is not enough on its own: Terraform is free to launch the
+  # instance while the address is still being associated. user_data starts the
+  # moment the box boots and immediately opens long-lived connections (dnf, git
+  # clone), and a public-IP change mid-flight kills them and leaves a
+  # half-provisioned host. Ordering the association first makes boot
+  # deterministic — the final address is present before any of that runs.
+  depends_on = [aws_eip_association.app]
+
   lifecycle {
     # Same reasoning: AWS ships a new AL2023 AMI roughly monthly, and the SSM
     # parameter tracks it. Without this, an unrelated `terraform apply` weeks
@@ -91,6 +105,36 @@ resource "aws_instance" "app" {
     # an explicit, planned operation.
     ignore_changes = [ami]
   }
+
+  tags = {
+    Name        = "rxhive-${var.environment}-app"
+    Project     = "rxhive"
+    Environment = var.environment
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Primary network interface
+#
+# Created up front, and used as the instance's eth0, purely so the Elastic IP
+# can be attached BEFORE anything boots. An EIP cannot be handed to RunInstances
+# directly; associating it to an already-running instance swaps the public
+# address out from under a box that is mid-bootstrap. Attaching it to a
+# detached ENI and then launching onto that ENI removes the window entirely.
+#
+# Note this also turns off the subnet's map_public_ip_on_launch for this host:
+# auto-assign only applies to an interface EC2 builds at launch, so the EIP is
+# now the one and only public address this instance ever has. That is the
+# point — LiveKit's rtc.use_external_ip discovery cannot latch a temporary
+# address that no longer exists.
+#
+# The ENI outlives the instance (delete_on_termination defaults to false for a
+# pre-existing interface), so a deliberate instance replacement keeps both the
+# private address and the EIP association.
+# ---------------------------------------------------------------------------
+resource "aws_network_interface" "app" {
+  subnet_id       = aws_subnet.public.id
+  security_groups = [aws_security_group.app.id]
 
   tags = {
     Name        = "rxhive-${var.environment}-app"
@@ -123,7 +167,10 @@ resource "aws_eip" "app" {
   }
 }
 
+# Associated to the interface rather than to the instance, so this can (and
+# must) happen while the instance does not exist yet. aws_instance.app takes an
+# explicit depends_on against this resource.
 resource "aws_eip_association" "app" {
-  instance_id   = aws_instance.app.id
-  allocation_id = aws_eip.app.id
+  network_interface_id = aws_network_interface.app.id
+  allocation_id        = aws_eip.app.id
 }

@@ -35,14 +35,6 @@ resource "aws_iam_role" "app" {
   }
 }
 
-# secrets.tf stores SecureStrings without an explicit key_id, so they are
-# encrypted under the AWS-managed alias/aws/ssm CMK. Reading them needs
-# kms:Decrypt on that key; looking the alias up keeps the account id out of the
-# policy instead of hardcoding an ARN.
-data "aws_kms_alias" "ssm" {
-  name = "alias/aws/ssm"
-}
-
 locals {
   # ARN of the parameter *path* itself (…:parameter/rxhive/<env>), which is what
   # ssm:GetParametersByPath authorizes against. Derived from a parameter we
@@ -96,12 +88,29 @@ data "aws_iam_policy_document" "app" {
     ]
   }
 
-  # Decrypt only — the instance can read the SecureStrings it was given, not
-  # write new ones or re-encrypt anything else with this key.
+  # secrets.tf stores SecureStrings without an explicit key_id, so they are
+  # encrypted under the AWS-managed alias/aws/ssm CMK and reading them needs
+  # kms:Decrypt on that key. The key ARN is deliberately NOT looked up: AWS
+  # creates alias/aws/ssm lazily, on first SecureString use, so a
+  # `data "aws_kms_alias"` on it is resolved at plan time against a key that
+  # does not exist yet and hard-fails the very first plan/apply in a fresh
+  # account — the greenfield case this stack is built for.
+  #
+  # The ViaService condition is the scoping instead of a resource ARN, and it
+  # is tight in the way that matters: the role can only exercise Decrypt when
+  # SSM in this region is making the call for it, never against an arbitrary
+  # key directly. Decrypt only — it cannot write new SecureStrings or
+  # re-encrypt anything.
   statement {
     sid       = "DecryptAppSecrets"
     actions   = ["kms:Decrypt"]
-    resources = [data.aws_kms_alias.ssm.target_key_arn]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["ssm.${var.region}.amazonaws.com"]
+    }
   }
 }
 

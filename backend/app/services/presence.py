@@ -8,7 +8,7 @@ connection's heartbeat keeps refreshing, so crashed workers can't leak
 
 import uuid
 
-from app.realtime.redis_bus import get_redis
+from app.realtime.redis_bus import degrade_on_outage, get_redis
 
 _TTL = 90  # seconds; heartbeats arrive at least every 60s
 
@@ -40,18 +40,28 @@ async def mark_offline(user_id: uuid.UUID, conn_id: str) -> bool:
 
 
 async def is_online(user_id) -> bool:
-    return await get_redis().exists(_key(user_id)) > 0
+    online = False
+    async with degrade_on_outage("presence.is_online"):
+        online = await get_redis().exists(_key(user_id)) > 0
+    return online
 
 
 async def get_statuses(user_ids: list) -> dict[str, str]:
-    """Batch presence lookup: {user_id_str: "online"|"offline"}."""
+    """Batch presence lookup: {user_id_str: "online"|"offline"}.
+
+    Degrades to all-offline when Redis is unreachable. This lookup decorates
+    responses whose real payload came from Postgres — including the login and
+    send paths — so an outage must cost a green dot, not the whole request.
+    """
     if not user_ids:
         return {}
-    redis = get_redis()
-    pipe = redis.pipeline()
-    for uid in user_ids:
-        pipe.exists(_key(uid))
-    results = await pipe.execute()
-    return {
-        str(uid): ("online" if exists else "offline") for uid, exists in zip(user_ids, results, strict=True)
-    }
+    statuses = {str(uid): "offline" for uid in user_ids}
+    async with degrade_on_outage("presence.get_statuses"):
+        redis = get_redis()
+        pipe = redis.pipeline()
+        for uid in user_ids:
+            pipe.exists(_key(uid))
+        results = await pipe.execute()
+        for uid, exists in zip(user_ids, results, strict=True):
+            statuses[str(uid)] = "online" if exists else "offline"
+    return statuses

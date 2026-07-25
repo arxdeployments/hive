@@ -16,6 +16,13 @@ logger = logging.getLogger("rxhive.access")
 _counters: dict[str, int] = defaultdict(int)
 _latency_ms_total: dict[str, float] = defaultdict(float)
 
+# Counters live for the process lifetime and are never evicted, so a per-request
+# key must come from a bounded set. Requests that matched no route (404s to
+# arbitrary URLs) have no route template, and keying them by raw path let anyone
+# who can reach the port mint unbounded keys — a memory leak, unauthenticated.
+# They all share this one label; the raw path still reaches the access log.
+UNMATCHED_ROUTE_LABEL = "<unmatched>"
+
 
 def incr(name: str, by: int = 1) -> None:
     _counters[name] += by
@@ -44,8 +51,8 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
         elapsed_ms = (time.perf_counter() - start) * 1000
 
         route = request.scope.get("route")
-        label = getattr(route, "path", request.url.path)
-        key = f"{request.method} {label}"
+        route_path = getattr(route, "path", None)
+        key = f"{request.method} {route_path or UNMATCHED_ROUTE_LABEL}"
         incr("http_requests_total")
         incr(f"status_{status // 100}xx")
         _counters[key] += 1
@@ -59,7 +66,7 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
             extra={
                 "request_id": request_id,
                 "method": request.method,
-                "path": label,
+                "path": route_path or request.url.path,
                 "status": status,
                 "ms": round(elapsed_ms, 1),
             },

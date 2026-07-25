@@ -6,6 +6,7 @@ import { toast } from 'sonner';
 import EmojiPicker from 'emoji-picker-react';
 import wsClient from '../../services/websocket';
 import client from '../../api/client';
+import useChatStore from '../../stores/chatStore';
 
 // Client-side size hints (server still enforces its own limits).
 const MAX_IMAGE_SIZE = 16 * 1024 * 1024;   // 16MB
@@ -179,22 +180,33 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   };
 
   // Upload a single file, then create the message carrying media_url (the fix).
-  const sendMediaFile = async (file, replyId) => {
+  // `caption` overrides the derived content (the image preview strip's caption).
+  const sendMediaFile = async (file, replyId, caption = '') => {
     const uploadResult = await uploadFile(file, setUploadProgress);
     const msgType = mapMessageType(uploadResult.file_type);
-    const content = msgType === 'file' ? (uploadResult.filename || '') : '';
+    const content = caption || (msgType === 'file' ? (uploadResult.filename || '') : '');
     const tempId = uuidv4();
 
     // Optimistic bubble with the real media url + thumbnail.
     onSend(content, tempId, msgType, uploadResult.file_url, uploadResult.thumbnail_url);
 
-    await client.post(`/api/conversations/${conversationId}/messages`, {
-      content,
-      type: msgType,
-      temp_id: tempId,
-      media_url: uploadResult.file_url,
-      reply_to: replyId,
-    });
+    try {
+      const { data } = await client.post(`/api/conversations/${conversationId}/messages`, {
+        content,
+        type: msgType,
+        temp_id: tempId,
+        media_url: uploadResult.file_url,
+        reply_to: replyId,
+      });
+      // Media is created over HTTP, so there is no WS message_ack to reconcile
+      // against the way a text send has. Discarding this response left the bubble
+      // holding its temp _id at status 'sending' forever — the tick never resolved.
+      useChatStore.getState().replaceOptimisticMessage(conversationId, tempId, data);
+    } catch (err) {
+      // Same reason: leave a retryable bubble rather than one stuck on 'sending'.
+      useChatStore.getState().replaceOptimisticMessage(conversationId, tempId, { status: 'failed' });
+      throw err;
+    }
   };
 
   // Send a batch of non-image files (video / audio / documents) directly.
@@ -252,20 +264,13 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     const replyId = replyTo?._id || null;
     try {
       for (let i = 0; i < previewImages.length; i++) {
-        const uploadResult = await uploadFile(previewImages[i].file, setUploadProgress);
-        const msgType = mapMessageType(uploadResult.file_type);
-        const caption = i === 0 ? previewCaption.trim() : '';
-        const tempId = uuidv4();
-
-        onSend(caption, tempId, msgType, uploadResult.file_url, uploadResult.thumbnail_url);
-
-        await client.post(`/api/conversations/${conversationId}/messages`, {
-          content: caption,
-          type: msgType,
-          temp_id: tempId,
-          media_url: uploadResult.file_url,
-          reply_to: i === 0 ? replyId : null,
-        });
+        // Shared with the direct-send path so the optimistic bubble is reconciled
+        // with the created message in exactly one place.
+        await sendMediaFile(
+          previewImages[i].file,
+          i === 0 ? replyId : null,
+          i === 0 ? previewCaption.trim() : ''
+        );
       }
       setPreviewImages([]);
       setPreviewCaption('');

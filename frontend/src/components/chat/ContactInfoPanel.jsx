@@ -8,8 +8,15 @@
  *
  * HARD RULE: this panel never renders a phone number. WhatsApp puts the phone
  * number under the contact's name; RX HIVE is an org directory keyed on work
- * email, so the email goes there instead, alongside organization and department.
+ * email, so the email goes there instead, alongside the department.
  * There is no phone field in the wire contract — do not add one.
+ *
+ * Organization and "about" are deliberately absent: nothing the panel can reach
+ * carries them for *another* user — participants come from
+ * enrich.serialize_user_brief and the roster from GET /api/users/contacts, and
+ * neither sends `org_name` or `about` (only /api/auth/me exposes your own about).
+ * Both rows rendered a permanent em dash. Do not re-add them without a wire
+ * field to fill them.
  *
  * `contact` is optional: when it is omitted the other participant of a direct
  * conversation is used, which is how ChatPanel opens the panel today.
@@ -17,7 +24,6 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  Building2,
   Check,
   Copy,
   Download,
@@ -69,7 +75,7 @@ const formatPresence = (person) => {
   return 'offline';
 };
 
-/** One read-only identity row (email / organization / department). */
+/** One read-only identity row (email / department). */
 const DetailRow = ({ icon: Icon, label, value, onCopy, copied, testId }) => (
   <div className="flex items-center gap-3 px-4 py-3" data-testid={testId}>
     {Icon && <Icon size={18} className="text-[#A3A3A3] shrink-0" />}
@@ -147,12 +153,10 @@ export const ContactInfoPanel = ({
       user_id: targetId,
       display_name: base.display_name || base.name || 'Unknown',
       avatar_url: base.avatar_url || livePresence?.avatar_url || null,
-      about: base.about || '',
       status: livePresence?.status || base.status || 'offline',
       last_seen: livePresence?.last_seen || base.last_seen || null,
       email: base.email || directory?.email || '',
       department: base.department_name || base.department || directory?.department_name || '',
-      organization: base.org_name || livePresence?.org_name || directory?.org_name || '',
     };
   }, [base, targetId, livePresence, directory]);
 
@@ -331,11 +335,6 @@ export const ContactInfoPanel = ({
         >
           {formatPresence(person)}
         </p>
-        {person.about && (
-          <p className="text-sm text-[#A3A3A3] mt-3 max-w-[360px] whitespace-pre-wrap break-words">
-            {person.about}
-          </p>
-        )}
       </div>
 
       {/* Quick actions */}
@@ -365,12 +364,6 @@ export const ContactInfoPanel = ({
             onCopy={handleCopyEmail}
             copied={copied}
             testId="contact-info-email"
-          />
-          <DetailRow
-            icon={Building2}
-            label="Organization"
-            value={person.organization}
-            testId="contact-info-organization"
           />
           <DetailRow
             icon={FolderTree}

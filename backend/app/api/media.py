@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import RedirectResponse
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, literal_column, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -51,6 +51,12 @@ _URL_TRAILING = ".,;:!?)]}>'\""
 # Links come out of message text, so the scan is bounded to the newest N
 # link-bearing messages rather than the whole (unbounded) history.
 _LINK_SCAN_LIMIT = 500
+# Inlined as a SQL literal, not a bind parameter, so it matches the predicate of
+# the ix_messages_links partial index verbatim (Postgres cannot prove a
+# parameterised ILIKE implies the index predicate when it caches a generic plan,
+# and silently falls back to scanning the conversation's whole history).
+# Safe to inline: a fixed constant, never user input.
+_LINK_PATTERN = literal_column("'%http%'")
 
 _INLINE_MIME_PREFIXES = ("image/", "video/", "audio/")
 
@@ -263,7 +269,12 @@ async def _conversation_links(db: AsyncSession, conv_id, user_id, page: int, lim
                     Message.type != MessageType.system,
                     Message.deleted_at.is_(None),
                     MessageDeletion.message_id.is_(None),  # exclude the caller's delete-for-me
-                    Message.content.ilike("%http%"),  # literal pattern, no user input
+                    # A leading-wildcard match can use no ordinary index, so the
+                    # limit below bounded the rows RETURNED while the scan still
+                    # read every message in the conversation. The partial index
+                    # ix_messages_links carries exactly this predicate, moving
+                    # that work to write time; keep the two in lockstep.
+                    Message.content.ilike(_LINK_PATTERN),
                 )
                 .order_by(Message.created_at.desc())
                 .limit(_LINK_SCAN_LIMIT)

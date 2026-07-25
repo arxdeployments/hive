@@ -22,6 +22,30 @@ do not establish, correctness.
 | MED | `/pinned` and `/starred` unbounded; no pin cap | Pinned is on the conversation-open hot path, so an uncapped pin list degrades the most frequent action in the app without limit |
 | MED | `GET /api/metrics` unauthenticated | Exposed per-route request counts and latencies to anyone |
 
+## Also fixed (second pass — everything remaining)
+
+| Sev | Finding | Fix |
+|---|---|---|
+| HIGH | `message_pin_update` / `permissions_updated` broadcast but unhandled by the WS client | Pins and permission changes never propagated live; handlers added |
+| HIGH | Runbook's super-admin password retrieval named the wrong SSM leaf and a nonexistent output | Operator could not log in; corrected against `secrets.tf` |
+| HIGH | Runbook §3.1 referenced a missing tfvars example and two variables that do not exist | Matched to the real `terraform.tfvars.example` |
+| MED | Own media messages stuck at `sending` forever — POST response discarded | Reconciled via `replaceOptimisticMessage`; failures now retryable |
+| MED | Redis outage 500'd already-committed sends | `degrade_on_outage` guard; presence falls back to offline. Rate limiting deliberately still fails **closed** |
+| MED | `iam.tf` read `alias/aws/ssm` at plan time | First `apply` failed in a greenfield account; replaced with a `kms:ViaService` condition |
+| MED | groups-in-common: 3 unbatched round-trips per group, unbounded | Batched + capped at 50 |
+| MED | Metrics label set grew without bound on 404s | Unmatched paths bucket to `<unmatched>` |
+| MED | Rotation procedure invoked a script that does not exist | Replaced with verified commands |
+| LOW | EIP associated after boot could strand the bootstrap | Pre-created ENI so the box boots with its final address |
+| LOW | VAPID silently unprovisioned | Left manual (a wrong-format key is worse than none) but now surfaced via a Terraform output + runbook section |
+| LOW | `ContactInfoPanel` org/bio rows had no data source | Removed rather than left permanently blank |
+| LOW | Reaction tooltips read `user_name`, absent from `serialize_message` | Batch-loaded into the message shape |
+| LOW | Links tab ran an unindexable scan on every open | Partial index; measured 2470 → 91 buffers |
+| INFO | Six routes omitted the org check | Moved into `require_membership` so it cannot drift |
+
+Test isolation was also fixed: per-session Postgres schema + Redis logical DB, so the
+suite is safe to run concurrently. Proven — two simultaneous runs, both 77/77,
+no leftover schemas. It is now a real CI gate rather than a serial-only one.
+
 ## Accepted, not fixed
 
 Lower-severity items were left deliberately rather than churn code immediately

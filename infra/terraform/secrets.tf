@@ -150,3 +150,30 @@ resource "aws_ssm_parameter" "superadmin_password" {
     ignore_changes = [value]
   }
 }
+
+###############################################################################
+# Web Push (VAPID) — NOT created here. This is a deliberate, documented gap.
+#
+# The app reads RXHIVE_VAPID_PUBLIC_KEY / RXHIVE_VAPID_PRIVATE_KEY, and
+# user_data.sh.tftpl already picks them up from
+# /rxhive/<environment>/vapid_public_key and .../vapid_private_key when they
+# exist. The instance role needs no change either: iam.tf grants the whole
+# /rxhive/<environment> path, not a per-parameter list.
+#
+# Terraform cannot generate the values. A VAPID keypair is an EC P-256 key
+# serialised as raw base64url (see backend/app/tools/vapid.py), not a random
+# string, so random_password would produce something structurally wrong. SSM
+# also rejects an empty parameter value, so there is no blank placeholder to
+# fall back to either.
+#
+# Both substitutes would be worse than absence, and that is why neither is
+# used: backend/app/services/push.py gates on `not settings.vapid_private_key`,
+# so an EMPTY key means "web push disabled" and every send cleanly no-ops. A
+# non-empty INVALID key passes that gate — every send then fails at runtime,
+# and /api/notifications/vapid-key hands browsers a garbage
+# applicationServerKey that breaks subscription itself.
+#
+# So the keypair stays a manual step, and the `web_push_setup` output in
+# outputs.tf prints it after every apply — the failure mode being fixed here is
+# that the omission was silent, not that it was manual.
+###############################################################################

@@ -49,6 +49,38 @@ output "connect_command" {
   }
 }
 
+# Web Push is the one thing Terraform cannot provision (see the block at the
+# end of secrets.tf). Printing the step on every apply is the actual fix: with
+# no keypair in SSM the stack still boots green and reports healthy, push just
+# never fires, and nothing anywhere says so.
+output "web_push_setup" {
+  description = "MANUAL STEP — Web Push stays silently disabled until a VAPID keypair is stored in SSM."
+  value       = <<-EOT
+    Web Push is NOT provisioned by Terraform (VAPID keys are EC P-256 keypairs,
+    which Terraform cannot generate). Until the two parameters below exist, the
+    app runs normally and push notifications simply never arrive.
+
+    1. Generate the keypair:
+         cd backend && python -m app.tools.vapid
+       It prints RXHIVE_VAPID_PUBLIC_KEY=<pub> and RXHIVE_VAPID_PRIVATE_KEY=<priv>.
+       Store the values only — not the RXHIVE_... = prefix.
+
+    2. Write them to SSM (leaf names must match exactly; the instance role
+       already covers this path):
+         aws ssm put-parameter --region ${var.region} --type SecureString \
+           --name /rxhive/${var.environment}/vapid_public_key  --value '<pub>'
+         aws ssm put-parameter --region ${var.region} --type SecureString \
+           --name /rxhive/${var.environment}/vapid_private_key --value '<priv>'
+
+    3. Re-render infra/.env and restart the stack on the box:
+         aws ssm start-session --region ${var.region} --target <instance_id>
+         sudo bash /var/lib/cloud/instance/user-data.txt
+
+    Verify: GET https://${var.domain_name}/api/notifications/vapid-key (as a
+    logged-in user) must return a non-empty public_key.
+  EOT
+}
+
 output "db_endpoint" {
   description = "RDS PostgreSQL endpoint (host:port). Reachable only from the app security group; the password lives in SSM, not here."
   value       = aws_db_instance.main.endpoint

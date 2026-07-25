@@ -258,6 +258,21 @@ class RxHiveWebSocket {
         break;
       }
 
+      // Group permissions travel on their own event (PUT /permissions), not on
+      // conversation_updated. `send_messages` is the wire inverse of the stored
+      // admin_only_messages, which is what gates the composer — without this a
+      // member keeps typing into a group they can no longer post to until they
+      // reload, and only finds out when the send 403s.
+      case 'permissions_updated': {
+        const { conversation_id: permConvId, permissions } = data;
+        if (permConvId && typeof permissions?.send_messages === 'boolean') {
+          store.updateConversation(permConvId, {
+            admin_only_messages: !permissions.send_messages
+          });
+        }
+        break;
+      }
+
       case 'member_added': {
         const { conversation_id, conversation: updatedConv } = data;
         if (updatedConv) {
@@ -318,6 +333,20 @@ class RxHiveWebSocket {
           const msgs = store.messages[rConvId] || [];
           store.setMessages(rConvId, msgs.map(m =>
             m._id === rMsgId ? { ...m, reactions } : m
+          ));
+        }
+        break;
+      }
+
+      // A pin is conversation-wide, and both the pinned banner and the bubble's
+      // pin icon read `is_pinned` off the message — so without this everyone
+      // except the actor keeps the stale state until the thread is re-fetched.
+      case 'message_pin_update': {
+        const { message_id: pMsgId, conversation_id: pConvId, is_pinned: pinned } = data;
+        if (pConvId && pMsgId) {
+          const msgs = store.messages[pConvId] || [];
+          store.setMessages(pConvId, msgs.map(m =>
+            m._id === pMsgId ? { ...m, is_pinned: pinned } : m
           ));
         }
         break;

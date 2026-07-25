@@ -1,11 +1,11 @@
 import asyncio
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+from alembic import context
 from app.core.config import get_settings
 from app.db.models import Base
 
@@ -30,7 +30,14 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        # None (the default) leaves the version table unqualified, so on a
+        # non-default search_path Alembic reads whichever alembic_version it
+        # finds first and can conclude an empty schema is already at head.
+        version_table_schema=config.attributes.get("version_table_schema"),
+    )
     with context.begin_transaction():
         context.run_migrations()
 
@@ -47,7 +54,15 @@ async def run_async_migrations() -> None:
 
 
 def run_migrations_online() -> None:
-    asyncio.run(run_async_migrations())
+    # A caller can hand us a live connection via config.attributes (the test
+    # harness does, so migrations land on that connection's search_path instead
+    # of a fresh engine's). Without this hook there is no way to migrate
+    # anywhere but the URL's default schema.
+    connection = config.attributes.get("connection")
+    if connection is not None:
+        do_run_migrations(connection)
+    else:
+        asyncio.run(run_async_migrations())
 
 
 if context.is_offline_mode():
