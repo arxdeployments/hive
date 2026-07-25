@@ -19,6 +19,7 @@ Deliberate fixes vs the Mongo build (docs/reference/api-conversations-messages.m
 import datetime as dt
 import uuid
 
+from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
@@ -29,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.deps import TenantContext, get_current_user, get_tenant
+from app.core.rate_limit import export_limiter
 from app.db.models import (
     Conversation,
     ConversationParticipant,
@@ -43,6 +45,11 @@ from app.services.conversations import get_or_create_direct
 from app.utils import iso_z, parse_uuid
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
+
+# Export holds the rows, the formatted lines and the joined body in memory at
+# once, so an uncapped transcript of a busy group is hundreds of MB per
+# concurrent request. Cap it and tell the reader when history was cut.
+EXPORT_MAX_MESSAGES = 20_000
 
 
 def _escape_like(value: str) -> str:
@@ -248,8 +255,12 @@ async def clear_conversation(conv_id: str, tenant: TenantContext = Depends(get_t
 
 
 @router.get("/{conv_id}/export")
-async def export_conversation(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
-    """Plain-text transcript, oldest-first, of everything the caller can see."""
+async def export_conversation(
+    conv_id: str,
+    tenant: TenantContext = Depends(get_tenant),
+    _rl: None = Depends(export_limiter),
+):
+    """Plain-text transcript, oldest-first, of the caller's most recent history."""
     conv_uuid = _conv_uuid(conv_id)
     await tenant.require_membership(conv_uuid)
 
@@ -267,15 +278,36 @@ async def export_conversation(conv_id: str, tenant: TenantContext = Depends(get_
             Message.conversation_id == conv_uuid,
             MessageDeletion.message_id.is_(None),  # exclude the caller's delete-for-me
         )
-        .order_by(Message.created_at.asc())
+        # Newest-first + LIMIT so the cap keeps the RECENT tail; reversed below
+        # to restore the oldest-first wire order. The extra row only detects
+        # truncation and is dropped. id breaks created_at ties into a total
+        # order, so the reverse is an exact inverse rather than arbitrary.
+        .order_by(Message.created_at.desc(), Message.id.desc())
+        .limit(EXPORT_MAX_MESSAGES + 1)
     )
-    rows = (await tenant.db.execute(stmt)).all()
+    rows = list((await tenant.db.execute(stmt)).all())
+    truncated = len(rows) > EXPORT_MAX_MESSAGES
+    rows = rows[:EXPORT_MAX_MESSAGES]
+    rows.reverse()
 
-    lines = []
-    for msg, display_name in rows:
-        content = "This message was deleted" if msg.deleted_at else (msg.content or "")
-        lines.append(f"[{iso_z(msg.created_at)}] {display_name or 'System'}: {content}")
-    body = "\n".join(lines) + ("\n" if lines else "")
+    def _render() -> str:
+        lines = []
+        if truncated:
+            # Oldest history is what got dropped, so the notice leads the file —
+            # a reader sees it before the first surviving message.
+            lines.append(
+                f"[Note] Truncated: only the most recent {EXPORT_MAX_MESSAGES} messages are "
+                "included; earlier history was omitted."
+            )
+        for msg, display_name in rows:
+            content = "This message was deleted" if msg.deleted_at else (msg.content or "")
+            lines.append(f"[{iso_z(msg.created_at)}] {display_name or 'System'}: {content}")
+        return "\n".join(lines) + ("\n" if lines else "")
+
+    # Formatting up to 20k rows is CPU-bound; inline it would block the event
+    # loop and stall every other request on the worker. Only already-loaded
+    # column attributes are touched, so no lazy IO happens off-loop.
+    body = await to_thread.run_sync(_render)
 
     # Filename is derived from the id, never from the (user-controlled)
     # conversation name — no header injection, no encoding surprises.

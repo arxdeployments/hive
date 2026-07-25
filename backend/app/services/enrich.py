@@ -210,17 +210,18 @@ async def serialize_conversation(
 
 # Wire permission name -> Conversation column. `send_messages` is deliberately
 # absent: it maps to the existing admin_only_messages column, INVERTED.
+# Only enforced permissions are exposed. perm_send_history / perm_invite_via_link /
+# perm_approve_new_members are stored but no read path honours them (a later member
+# still sees the full pre-join history via messages, search, starred, pinned, media
+# and export), so serving them would advertise privacy the server does not provide.
 PERMISSION_COLUMNS = {
     "edit_info": "perm_edit_info",
     "add_members": "perm_add_members",
-    "send_history": "perm_send_history",
-    "invite_via_link": "perm_invite_via_link",
-    "approve_new_members": "perm_approve_new_members",
 }
 
 
 def serialize_permissions(conv: Conversation) -> dict:
-    """The six-boolean permissions object the group settings UI reads/writes."""
+    """The three-boolean permissions object the group settings UI reads/writes."""
     doc = {name: bool(getattr(conv, column)) for name, column in PERMISSION_COLUMNS.items()}
     doc["send_messages"] = not conv.admin_only_messages
     return doc

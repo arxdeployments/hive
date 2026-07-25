@@ -58,3 +58,6 @@ login_limiter = RateLimiter("login", default_times=10)
 refresh_limiter = RateLimiter("refresh", default_times=30)
 password_limiter = RateLimiter("password", default_times=5)
 upload_limiter = RateLimiter("upload", default_times=30)
+# Export materializes a whole transcript in memory, so it needs its own (tight)
+# bucket rather than sharing one with cheap reads.
+export_limiter = RateLimiter("export", default_times=10)

@@ -73,6 +73,7 @@ multi-worker delivery test.
 
 - `GET /api/health` — liveness/readiness (checks Postgres + Redis); 200/503.
 - `GET /api/metrics` — request counters, average latencies, live socket count.
+  Super-admin authentication required (it maps your private API surface).
 - Structured JSON access logs (request id, method, route template, status, ms)
   on stdout — ship to your aggregator. No query strings or bodies are logged.
 - Every response carries an `X-Request-ID` for correlation.

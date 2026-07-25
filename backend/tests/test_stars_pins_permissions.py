@@ -8,6 +8,7 @@ import contextlib
 
 from httpx import ASGITransport, AsyncClient
 
+from app.db.models import UserRole
 from app.main import app
 from tests.conftest import CSRF, login, make_user
 
@@ -120,24 +121,22 @@ async def test_permissions_read_write_and_non_admin_403(client, two_orgs_with_us
 
     resp = await client.get(f"/api/conversations/{group}/permissions")
     assert resp.status_code == 200, resp.text
+    # Only enforced permissions are on the wire: send_history / invite_via_link /
+    # approve_new_members were removed because nothing honoured them.
     assert resp.json() == {
         "edit_info": True,
         "send_messages": True,
         "add_members": True,
-        "send_history": True,
-        "invite_via_link": True,
-        "approve_new_members": False,
     }
 
     resp = await client.put(
         f"/api/conversations/{group}/permissions",
-        json={"send_messages": False, "add_members": False, "approve_new_members": True},
+        json={"send_messages": False, "add_members": False},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["send_messages"] is False
     assert body["add_members"] is False
-    assert body["approve_new_members"] is True
     assert body["edit_info"] is True  # untouched keys keep their value
 
     # send_messages=False is admin_only_messages=True: a plain member is refused.
@@ -152,6 +151,43 @@ async def test_permissions_read_write_and_non_admin_403(client, two_orgs_with_us
 
     resp = await client.get(f"/api/conversations/{group}/permissions")
     assert resp.json()["send_messages"] is False  # bob's 403 changed nothing
+
+
+async def test_cross_org_group_admin_gets_404_from_permissions(client, two_orgs_with_users):
+    """A cross-org participant with ParticipantRole.admin is not a group admin.
+
+    These routes used to gate on membership alone, so this user could read and flip
+    a superadmin-managed group's permissions — silencing another organization's
+    participants, unaudited. Both verbs must 404 like every other /group route.
+    """
+    users = two_orgs_with_users
+    await make_user("root@x.com", role=UserRole.superadmin)
+    async with _client_for("root@x.com") as root:
+        resp = await root.post(
+            "/api/admin/cross-org-groups",
+            json={
+                "name": "Joint Programme",
+                "org_ids": [str(users["org_a"].id), str(users["org_b"].id)],
+                "members": [
+                    {"user_id": str(users["alice"].id), "role": "admin"},
+                    {"user_id": str(users["carol"].id), "role": "member"},
+                ],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        group = resp.json()["_id"]
+
+    await login(client, "alice@a.com")
+    assert (await client.get(f"/api/conversations/{group}/permissions")).status_code == 404
+    resp = await client.put(f"/api/conversations/{group}/permissions", json={"send_messages": False})
+    assert resp.status_code == 404
+
+    # Nothing was silenced: Carol's org can still post in the cross-org group.
+    async with _client_for("carol@b.com") as carol:
+        resp = await carol.post(
+            f"/api/conversations/{group}/messages", json={"content": "hi", "type": "text"}
+        )
+        assert resp.status_code == 200, resp.text
 
 
 async def test_groups_in_common(client, two_orgs_with_users):

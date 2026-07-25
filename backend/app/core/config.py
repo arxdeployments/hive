@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     rate_limit_refresh: int = 30
     rate_limit_password: int = 5
     rate_limit_upload: int = 30
+    rate_limit_export: int = 10
 
     s3_endpoint: str = "http://localhost:9000"
     # Endpoint the *browser* uses for presigned URLs. May be a bare path like "/s3"

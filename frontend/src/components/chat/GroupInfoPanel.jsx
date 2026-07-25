@@ -67,7 +67,16 @@ import {
 
 const ROLE_ORDER = { creator: 0, admin: 1, member: 2 };
 
-/** "Members can:" rows, in WhatsApp's order. */
+/**
+ * "Members can:" rows, in WhatsApp's order.
+ *
+ * Only permissions the backend actually enforces are listed. `send_history`,
+ * `invite_via_link` and `approve_new_members` were switches that saved happily
+ * and changed nothing — a member added later still read the entire pre-join
+ * history through the message list, search, starred, pinned, media and export.
+ * A privacy control that silently does nothing is worse than none at all, so
+ * they stay hidden until a read path enforces them.
+ */
 const MEMBER_PERMISSIONS = [
   {
     key: 'edit_info',
@@ -76,21 +85,6 @@ const MEMBER_PERMISSIONS = [
   },
   { key: 'send_messages', label: 'Send new messages' },
   { key: 'add_members', label: 'Add other members' },
-  {
-    key: 'send_history',
-    label: 'Send message history',
-    description: 'New members can see messages sent before they joined',
-  },
-  { key: 'invite_via_link', label: 'Invite via link or QR code' },
-];
-
-/** "Admins can:" rows. */
-const ADMIN_PERMISSIONS = [
-  {
-    key: 'approve_new_members',
-    label: 'Approve new members',
-    description: 'Requests to join must be approved by an admin',
-  },
 ];
 
 export const GroupInfoPanel = ({
@@ -647,24 +641,6 @@ export const GroupInfoPanel = ({
           <SectionHeading className="px-1 mb-2">Members can</SectionHeading>
           <div className="bg-[#141414] border border-[#1F1F1F] rounded-[10px] divide-y divide-[#1F1F1F]">
             {MEMBER_PERMISSIONS.map((row) => (
-              <ToggleRow
-                key={row.key}
-                label={row.label}
-                description={row.description}
-                checked={!!permissions[row.key]}
-                disabled={!isAdmin}
-                busy={permSaving === row.key}
-                onChange={(next) => handleTogglePermission(row.key, next)}
-                testId={`group-permission-${row.key}`}
-              />
-            ))}
-          </div>
-        </div>
-
-        <div>
-          <SectionHeading className="px-1 mb-2">Admins can</SectionHeading>
-          <div className="bg-[#141414] border border-[#1F1F1F] rounded-[10px] divide-y divide-[#1F1F1F]">
-            {ADMIN_PERMISSIONS.map((row) => (
               <ToggleRow
                 key={row.key}
                 label={row.label}

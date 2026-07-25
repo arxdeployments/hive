@@ -2,6 +2,7 @@
 never blocks the request that triggered it. No-op when VAPID is unconfigured.
 """
 
+import asyncio
 import ipaddress
 import json
 import logging
@@ -14,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.db.models import PushSubscription
+from app.db.session import SessionLocal
 
 
 def validate_push_endpoint(endpoint: str) -> bool:
@@ -54,6 +56,40 @@ except ImportError:  # optional dependency; feature simply disabled if absent
     _HAS_WEBPUSH = False
 
 
+SEND_TIMEOUT_SECONDS = 5
+_MAX_CONCURRENT_SENDS = 10
+
+# asyncio keeps only a weak reference to a running task, so a fire-and-forget
+# task with no other referent can be garbage-collected mid-flight. Hold a
+# strong reference until it completes.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def dispatch_push_to_users(user_ids, payload: dict) -> None:
+    """Fan out Web Push off the caller's path, fire-and-forget.
+
+    Awaited inline this put N remote HTTPS POSTs into the sender's latency and
+    pinned the request's DB session (pool size 10) for their whole duration.
+    """
+    settings = get_settings()
+    if not _HAS_WEBPUSH or not settings.vapid_private_key or not user_ids:
+        return
+    task = asyncio.create_task(_push_in_background(list(user_ids), payload))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _push_in_background(user_ids, payload: dict) -> None:
+    # Own session: the request that triggered this has already returned and
+    # closed its own. Nothing may escape — push is best-effort, and an
+    # exception here has no caller left to surface it to.
+    try:
+        async with SessionLocal() as db:
+            await push_to_users(db, user_ids, payload)
+    except Exception:
+        logger.exception("background web push failed")
+
+
 async def push_to_users(db: AsyncSession, user_ids, payload: dict) -> None:
     settings = get_settings()
     if not _HAS_WEBPUSH or not settings.vapid_private_key or not user_ids:
@@ -67,20 +103,33 @@ async def push_to_users(db: AsyncSession, user_ids, payload: dict) -> None:
         return
     data = json.dumps(payload)
     dead: list[str] = []
-    for sub in subs:
-        try:
-            await anyio.to_thread.run_sync(_send_one, sub, data, settings)
-        except WebPushException as exc:  # noqa: PERF203
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            if status in (404, 410):
-                dead.append(sub.endpoint)
-            else:
-                logger.warning("web push failed: %s", exc)
-        except Exception:
-            logger.exception("web push error")
+    # Concurrent, but bounded: a large group must not hand the whole worker
+    # thread pool to one push fan-out.
+    limiter = anyio.CapacityLimiter(_MAX_CONCURRENT_SENDS)
+    async with anyio.create_task_group() as tg:
+        for sub in subs:
+            tg.start_soon(_deliver, sub, data, settings, limiter, dead)
     if dead:
         await db.execute(delete(PushSubscription).where(PushSubscription.endpoint.in_(dead)))
         await db.commit()
+
+
+async def _deliver(
+    sub: PushSubscription, data: str, settings, limiter: anyio.CapacityLimiter, dead: list[str]
+) -> None:
+    """Deliver to one subscription. Must never raise: an exception out of a
+    task-group child cancels its siblings, so one bad endpoint would take down
+    the rest of the fan-out."""
+    try:
+        await anyio.to_thread.run_sync(_send_one, sub, data, settings, limiter=limiter)
+    except WebPushException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (404, 410):
+            dead.append(sub.endpoint)
+        else:
+            logger.warning("web push failed: %s", exc)
+    except Exception:
+        logger.exception("web push error")
 
 
 def _send_one(sub: PushSubscription, data: str, settings) -> None:
@@ -89,4 +138,7 @@ def _send_one(sub: PushSubscription, data: str, settings) -> None:
         data=data,
         vapid_private_key=settings.vapid_private_key,
         vapid_claims={"sub": settings.vapid_subject},
+        # pywebpush uses requests, which has no default timeout: a blackholed
+        # push endpoint would hang this worker thread forever.
+        timeout=SEND_TIMEOUT_SECONDS,
     )

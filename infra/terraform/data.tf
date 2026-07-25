@@ -66,9 +66,9 @@ resource "aws_db_instance" "main" {
   backup_retention_period = 7
   # UTC. Backup and maintenance windows must not overlap, and both are placed in
   # the small hours of the lowest-traffic day for a clinic-hours workload.
-  backup_window           = "07:00-08:00"
-  maintenance_window      = "sun:08:30-sun:09:30"
-  copy_tags_to_snapshot   = true
+  backup_window         = "07:00-08:00"
+  maintenance_window    = "sun:08:30-sun:09:30"
+  copy_tags_to_snapshot = true
 
   # Never silently discard the data on destroy: take a final snapshot, and in
   # prod refuse the destroy outright until someone flips this off deliberately.

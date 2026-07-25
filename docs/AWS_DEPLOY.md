@@ -393,7 +393,8 @@ sudo tail -100 /var/log/cloud-init-output.log                    # first-boot pr
 Every API response carries an `X-Request-ID`; access logs are structured JSON with the
 same id, so a user-reported error can be traced from a browser network tab to a log
 line. `GET /api/metrics` exposes request counters, average latencies and live socket
-count if you want a quick dashboard.
+count if you want a quick dashboard — it requires a super-admin session, so scrape it
+with super-admin credentials, not anonymously.
 
 ### Restart
 

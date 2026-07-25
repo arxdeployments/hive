@@ -18,10 +18,19 @@ export const ForwardModal = ({ message, messages, isOpen, onClose }) => {
   const [selected, setSelected] = useState([]);
   const [sending, setSending] = useState(false);
 
-  const targetIds = useMemo(() => {
-    const source = Array.isArray(messages) && messages.length ? messages : message ? [message] : [];
-    return Array.from(new Set(source.map((m) => m?._id || m?.message_id).filter(Boolean)));
-  }, [message, messages]);
+  // Every render below must read off `items`, never `message` directly: the
+  // media/links/docs Select flow passes only `messages`, so `message` is
+  // undefined there and a bare `message.type` throws into ChatErrorBoundary,
+  // blanking the whole chat pane.
+  const items = useMemo(
+    () => (Array.isArray(messages) && messages.length ? messages : message ? [message] : []),
+    [message, messages]
+  );
+
+  const targetIds = useMemo(
+    () => Array.from(new Set(items.map((m) => m?._id || m?.message_id).filter(Boolean))),
+    [items]
+  );
 
   useEffect(() => {
     if (!isOpen) { setSelected([]); setSearch(''); return; }
@@ -66,6 +75,14 @@ export const ForwardModal = ({ message, messages, isOpen, onClose }) => {
 
   if (!isOpen || targetIds.length === 0) return null;
 
+  // Media/links/docs items arrive as bare `{ _id }`, so type/content may be absent.
+  const preview = items[0];
+  const previewLabel = targetIds.length > 1
+    ? `${targetIds.length} messages`
+    : preview?.type === 'image' ? '📷 Photo'
+    : preview?.type === 'file' ? `📄 ${preview?.content || 'File'}`
+    : preview?.content || '1 message';
+
   const filteredConvs = conversations.filter(c =>
     !search || (c.name || '').toLowerCase().includes(search.toLowerCase()) ||
     c.participants?.some(p => p.display_name?.toLowerCase().includes(search.toLowerCase()))
@@ -92,9 +109,7 @@ export const ForwardModal = ({ message, messages, isOpen, onClose }) => {
           {/* Message preview */}
           <div className="px-5 py-3 border-b border-[#1F1F1F] bg-[#0F0F0F]">
             <p className="text-xs text-[#A3A3A3] mb-1">Forwarding:</p>
-            <p className="text-sm text-[#F5F5F5] truncate">
-              {message.type === 'image' ? '📷 Photo' : message.type === 'file' ? `📄 ${message.content}` : message.content}
-            </p>
+            <p className="text-sm text-[#F5F5F5] truncate">{previewLabel}</p>
           </div>
 
           {/* Search */}
@@ -114,7 +129,7 @@ export const ForwardModal = ({ message, messages, isOpen, onClose }) => {
                 {filteredConvs.map(c => {
                   const isSelected = selected.includes(`conv:${c._id}`);
                   const name = c.type === 'direct'
-                    ? c.participants?.find(p => p.user_id !== message.sender_id)?.display_name || 'Chat'
+                    ? c.participants?.find(p => p.user_id !== preview?.sender_id)?.display_name || 'Chat'
                     : c.name || 'Group';
                   return (
                     <button key={c._id} onClick={() => toggle('conv', c._id)}

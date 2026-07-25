@@ -53,12 +53,11 @@ class AddMembersRequest(BaseModel):
 class PermissionsRequest(BaseModel):
     """Every field optional — a PUT applies only the keys actually sent."""
 
+    # send_history / invite_via_link / approve_new_members are intentionally gone:
+    # nothing enforced them, so accepting them was a success response for a no-op.
     edit_info: bool | None = None
     send_messages: bool | None = None
     add_members: bool | None = None
-    send_history: bool | None = None
-    invite_via_link: bool | None = None
-    approve_new_members: bool | None = None
 
 
 class ChangeRoleRequest(BaseModel):
@@ -211,8 +210,16 @@ async def update_group(conv_id: str, body: UpdateGroupRequest, tenant: TenantCon
 
 @router.get("/{conv_id}/permissions")
 async def get_permissions(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
-    """Any participant may read the permission set (404 outside the conversation)."""
-    conv = await tenant.require_membership(_parse_conv_id(conv_id))
+    """Any participant of a live in-org group may read the permission set (404 otherwise)."""
+    group_id = _parse_conv_id(conv_id)
+    # require_membership alone let cross-org groups through: their members are
+    # participants, but those conversations are superadmin-managed and belong to no
+    # single org. _load_group pins this to a group inside the caller's own org.
+    conv = await _load_group(tenant, group_id)
+    if not conv.is_active:
+        raise HTTPException(status_code=404, detail="Group not found")
+    if await tenant.db.get(ConversationParticipant, (conv.id, tenant.user.id)) is None:
+        raise HTTPException(status_code=404, detail="Group not found")
     return enrich.serialize_permissions(conv)
 
 
@@ -221,11 +228,12 @@ async def update_permissions(
     conv_id: str, body: PermissionsRequest, tenant: TenantContext = Depends(get_tenant)
 ):
     """Creator/admin only (403 for plain members, 404 outside the conversation)."""
-    db, user = tenant.db, tenant.user
-    conv = await tenant.require_membership(_parse_conv_id(conv_id))
-    me = await db.get(ConversationParticipant, (conv.id, user.id))
-    if me is None or me.role not in _ADMIN_ROLES:
-        raise HTTPException(status_code=403, detail="Only group admins can change permissions")
+    db = tenant.db
+    # Gated like every other mutating route here: membership alone let a user who a
+    # superadmin made admin of a cross-org group silence participants in other orgs.
+    conv, _me = await _require_group_admin(tenant, _parse_conv_id(conv_id), "change permissions")
+    if not conv.is_active:
+        raise HTTPException(status_code=404, detail="Group not found")
 
     data = body.model_dump(exclude_unset=True, exclude_none=True)
     for name, column in enrich.PERMISSION_COLUMNS.items():

@@ -10,7 +10,7 @@ import re
 import uuid
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -35,6 +35,11 @@ _MEDIA_TYPES = {"image", "video", "audio", "file"}
 _UPLOAD_URL_RE = re.compile(r"/api/media/up/([0-9a-f-]{36})")
 
 DELETE_FOR_EVERYONE_WINDOW_SECONDS = 3600
+
+# Pins are conversation-wide and the whole set is fetched on conversation open,
+# so they must stay bounded — otherwise one member can pin every message and
+# make the hot path unbounded for everyone. Keep in sync with the /pinned limit.
+MAX_PINS_PER_CONVERSATION = 50
 
 
 def _push_preview(doc: dict) -> str:
@@ -197,14 +202,15 @@ async def send_message(
             },
         )
 
-    # Web Push to recipients who are offline (best-effort, never blocks the send).
+    # Web Push to recipients who are offline. Dispatched, never awaited: these
+    # are remote HTTPS POSTs to third-party push services, and a slow or dead
+    # endpoint must not delay — or fail — the sender's send.
     offline = [uid for uid in others if uid not in set(online)]
     if offline:
-        from app.services.push import push_to_users
+        from app.services.push import dispatch_push_to_users
 
         preview = _push_preview(doc)
-        await push_to_users(
-            db,
+        dispatch_push_to_users(
             offline,
             {
                 "title": sender.display_name,
@@ -397,6 +403,21 @@ async def toggle_pin(db: AsyncSession, *, message_id: uuid.UUID, actor: User) ->
         await db.delete(existing)
         pinned = False
     else:
+        pin_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(MessagePin)
+                .where(MessagePin.conversation_id == msg.conversation_id)
+            )
+        ).scalar_one()
+        if pin_count >= MAX_PINS_PER_CONVERSATION:
+            raise SendError(
+                status_code=400,
+                detail=(
+                    f"This conversation already has the maximum of {MAX_PINS_PER_CONVERSATION} "
+                    "pinned messages. Unpin one first."
+                ),
+            )
         db.add(
             MessagePin(
                 message_id=message_id,

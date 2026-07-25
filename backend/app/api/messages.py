@@ -29,6 +29,10 @@ from app.utils import iso_z, parse_uuid
 
 router = APIRouter(prefix="/api/conversations", tags=["messages"])
 
+# Stars are per-user and unbounded over a conversation's lifetime; the endpoint
+# has no pagination, so cap the page rather than serializing every star ever made.
+_STARRED_PAGE_LIMIT = 200
+
 _SEARCHABLE_TYPES = (
     MessageType.text,
     MessageType.image,
@@ -295,6 +299,7 @@ async def list_starred_messages(conv_id: str, tenant: TenantContext = Depends(ge
             MessageDeletion.message_id.is_(None),
         )
         .order_by(Message.created_at.desc())
+        .limit(_STARRED_PAGE_LIMIT)
     )
     rows = list((await db.execute(stmt)).scalars().all())
     participants = await _participants_of(db, conv_uuid)
@@ -324,7 +329,10 @@ async def list_pinned_messages(conv_id: str, tenant: TenantContext = Depends(get
             Message.conversation_id == conv_uuid,
             MessageDeletion.message_id.is_(None),
         )
+        # Bounded by the same cap the pin endpoint enforces, so a full pin set
+        # still serializes completely on this (conversation-open) hot path.
         .order_by(MessagePin.created_at.desc())
+        .limit(messaging.MAX_PINS_PER_CONVERSATION)
     )
     rows = list((await db.execute(stmt)).scalars().all())
     participants = await _participants_of(db, conv_uuid)

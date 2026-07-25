@@ -3,13 +3,15 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.core.config import get_settings
+from app.core.deps import require_superadmin
 from app.core.observability import AccessLogMiddleware, snapshot
+from app.db.models import User
 from app.db.session import engine
 from app.realtime import hub
 from app.realtime.redis_bus import close_redis, get_redis
@@ -172,9 +174,13 @@ async def health():
 
 
 @app.get("/api/metrics")
-async def metrics():
+async def metrics(_admin: User = Depends(require_superadmin)):
     """In-process request counters + average latencies for scraping/dashboards.
-    Cheap and dependency-free; swap for Prometheus if/when scale demands."""
+    Cheap and dependency-free; swap for Prometheus if/when scale demands.
+
+    Superadmin-only: per-route counts and latencies leak the private API surface
+    and traffic shape to anyone who can reach the port. /api/health stays public
+    because load balancers probe it unauthenticated."""
     data = snapshot()
     data["ws_local_sockets"] = hub.registry.local_socket_count()
     return data
