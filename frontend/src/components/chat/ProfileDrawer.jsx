@@ -47,11 +47,8 @@ export const ProfileDrawer = ({ isOpen, onClose }) => {
     try {
       const formData = new FormData();
       formData.append('file', file);
-      const token = localStorage.getItem('access_token');
-      const uploadRes = await fetch(`${backendUrl}/api/upload`, {
-        method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, body: formData
-      });
-      const uploadData = await uploadRes.json();
+      // Cookie-authenticated upload via the shared client (no Bearer token exists).
+      const { data: uploadData } = await client.post('/api/upload', formData);
       if (uploadData.file_url) {
         await client.put('/api/users/profile', { avatar_url: uploadData.file_url });
         setProfile(prev => ({ ...prev, avatar_url: uploadData.file_url }));

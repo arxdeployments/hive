@@ -1,12 +1,11 @@
 """Messaging core contracts: replies, editing, deletes, reactions, unread."""
 
+import contextlib
+
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
 from tests.conftest import CSRF, login
-
-
-import contextlib
 
 
 @contextlib.asynccontextmanager
@@ -52,7 +51,7 @@ async def test_reply_to_foreign_conversation_message_is_dropped(client, two_orgs
     users = two_orgs_with_users
     await login(client, "alice@a.com")
     conv1 = await _direct(client, users["bob"].id)
-    msg1 = await _send(client, conv1, "in conv1")
+    await _send(client, conv1, "in conv1")
 
     async with _client_for("bob@a.com") as bob:
         conv2_resp = await bob.post(

@@ -34,6 +34,9 @@ from app.utils import iso_z, now_utc
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
+# A fixed bcrypt hash used to burn constant time on unknown-email logins.
+_DUMMY_HASH = "$2b$12$C6UzMDM.H6dfI/f/IKcEeO0000000000000000000000000000000000"
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -62,7 +65,7 @@ def set_auth_cookies(response: Response, access: str, refresh: str) -> None:
     settings = get_settings()
     common = {
         "httponly": True,
-        "secure": settings.cookie_secure,
+        "secure": settings.cookies_secure,
         "samesite": "lax",
         "domain": settings.cookie_domain,
         "path": "/",
@@ -103,7 +106,12 @@ async def login(
 ):
     stmt = select(User).where(func.lower(User.email) == body.email.lower())
     user = (await db.execute(stmt)).scalar_one_or_none()
-    if user is None or not verify_password(body.password, user.password_hash):
+    if user is None:
+        # Equalize timing so a missing account can't be distinguished from a
+        # wrong password by response latency (user-enumeration defense).
+        verify_password(body.password, _DUMMY_HASH)
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not user.is_active:
         raise HTTPException(status_code=401, detail="Account is deactivated")

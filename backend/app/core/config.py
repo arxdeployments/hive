@@ -1,7 +1,19 @@
 from functools import lru_cache
 
-from pydantic import field_validator
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Secrets shipped in .env.example / code defaults. Booting production with any
+# of these is a hard error — they are public.
+_KNOWN_PLACEHOLDER_SECRETS = {
+    "dev-only-secret-change-in-production",
+    "change-me-openssl-rand-hex-32",
+    "devsecret-at-least-32-characters-long",
+    "rxhive-dev",
+    "change-me-strong-password",
+    "change-me-32-chars-minimum-secret",
+    "",
+}
 
 
 class Settings(BaseSettings):
@@ -17,10 +29,25 @@ class Settings(BaseSettings):
     access_token_minutes: int = 15
     refresh_token_days: int = 30
 
-    cookie_secure: bool = False
+    # None → derive from environment (Secure cookies in production). Set
+    # RXHIVE_COOKIE_SECURE explicitly to force a value (e.g. false for local
+    # HTTPS-less testing). Read via the `cookies_secure` property.
+    cookie_secure: bool | None = None
     cookie_domain: str | None = None
 
     cors_origins: str = ""  # comma-separated exact origins; empty = same-origin only
+
+    # True when running behind a trusted reverse proxy (the bundled Caddy):
+    # the real client IP is taken from the first X-Forwarded-For hop for
+    # rate limiting. Only enable when the proxy is the sole ingress.
+    trust_proxy: bool = False
+
+    # Per-IP requests allowed per 60s window. 0 disables that limiter.
+    # Raise for E2E runs where all traffic shares one source IP.
+    rate_limit_login: int = 10
+    rate_limit_refresh: int = 30
+    rate_limit_password: int = 5
+    rate_limit_upload: int = 30
 
     s3_endpoint: str = "http://localhost:9000"
     # Endpoint the *browser* uses for presigned URLs. May be a bare path like "/s3"
@@ -47,10 +74,26 @@ class Settings(BaseSettings):
     vapid_private_key: str = ""
     vapid_subject: str = "mailto:admin@rhythmrx.ai"
 
-    @field_validator("secret_key")
-    @classmethod
-    def _no_default_secret_in_prod(cls, v: str, info):
-        return v
+    @model_validator(mode="after")
+    def _reject_placeholder_secrets_in_prod(self):
+        """In production, refuse to boot with a public/placeholder or too-short
+        secret. This closes the 'default JWT key ships to prod' auth bypass."""
+        if self.environment != "production":
+            return self
+        checks = {
+            "RXHIVE_SECRET_KEY": self.secret_key,
+            "RXHIVE_LIVEKIT_API_SECRET": self.livekit_api_secret,
+            "RXHIVE_S3_SECRET_KEY": self.s3_secret_key,
+        }
+        for name, value in checks.items():
+            if value in _KNOWN_PLACEHOLDER_SECRETS:
+                raise ValueError(f"{name} is a known placeholder — set a real secret for production")
+            if len(value) < 32:
+                raise ValueError(f"{name} must be at least 32 characters in production")
+        if not self.seed_superadmin_password or self.seed_superadmin_password in _KNOWN_PLACEHOLDER_SECRETS:
+            # allowed to be empty only if a superadmin already exists; seed skips it
+            pass
+        return self
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -59,6 +102,13 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def cookies_secure(self) -> bool:
+        """Secure cookie flag: explicit override, else on in production."""
+        if self.cookie_secure is not None:
+            return self.cookie_secure
+        return self.is_production
 
 
 @lru_cache

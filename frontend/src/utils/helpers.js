@@ -77,22 +77,35 @@ export const formatRelativeTime = (dateStr) => {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 };
 
-// Detect and linkify URLs in text
+// HTML-escape untrusted text before it goes into markup.
+const escapeHtml = (s) =>
+  String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+// Detect and linkify URLs in text. Output is HTML — every interpolated value
+// (both the link and surrounding text) is escaped so message content can never
+// inject markup, even if it reached here unsanitized. Only http(s) links are
+// produced, so javascript:/data: URLs can't become clickable.
 export const linkifyText = (text) => {
   if (!text) return text;
   const urlRegex = /(https?:\/\/[^\s<]+[^\s<.,:;"')\]!])/gi;
   const parts = text.split(urlRegex);
-  if (parts.length === 1) return text; // No URLs found
+  if (parts.length === 1) return escapeHtml(text);
 
-  return parts.map((part, i) => {
-    if (urlRegex.test(part)) {
-      urlRegex.lastIndex = 0; // Reset regex state
-      return (
-        `<a href="${part}" target="_blank" rel="noopener noreferrer" class="text-[#10B981] hover:underline">${part}</a>`
-      );
-    }
-    return part;
-  }).join('');
+  return parts
+    .map((part) => {
+      if (urlRegex.test(part)) {
+        urlRegex.lastIndex = 0;
+        const safe = escapeHtml(part);
+        return `<a href="${safe}" target="_blank" rel="noopener noreferrer" class="text-[#10B981] hover:underline">${safe}</a>`;
+      }
+      return escapeHtml(part);
+    })
+    .join('');
 };
 
 // Check if text contains URLs

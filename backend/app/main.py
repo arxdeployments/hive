@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.core.config import get_settings
+from app.core.observability import AccessLogMiddleware, snapshot
 from app.db.session import engine
 from app.realtime import hub
 from app.realtime.redis_bus import close_redis, get_redis
@@ -24,9 +25,8 @@ CSRF_EXEMPT_PATHS = {"/api/auth/login", "/api/auth/refresh", "/api/livekit/webho
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings = get_settings()
-    if settings.is_production and settings.secret_key == "dev-only-secret-change-in-production":
-        raise RuntimeError("RXHIVE_SECRET_KEY must be set in production")
+    # Production secret validation happens in Settings (config.py) and raises at
+    # instantiation, so an unsafe production config never reaches here.
     with contextlib.suppress(Exception):
         from app.services.storage import ensure_bucket
 
@@ -38,9 +38,17 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
 
 
-app = FastAPI(title="RX HIVE API", version="1.0.0", lifespan=lifespan)
-
 settings = get_settings()
+# Interactive API docs are dev-only — no schema/enumeration surface in prod.
+app = FastAPI(
+    title="RX HIVE API",
+    version="1.0.0",
+    lifespan=lifespan,
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
+)
+
 if settings.cors_origin_list:
     app.add_middleware(
         CORSMiddleware,
@@ -51,6 +59,8 @@ if settings.cors_origin_list:
     )
 # No wildcard fallback: with no configured origins, cross-origin browsers are
 # simply refused (same-origin deployments behind Caddy need no CORS at all).
+
+app.add_middleware(AccessLogMiddleware)
 
 
 @app.middleware("http")
@@ -70,7 +80,7 @@ async def security_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    if settings.cookie_secure:
+    if settings.cookies_secure:
         response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
     return response
 
@@ -130,3 +140,12 @@ async def health():
         "redis": redis_status,
     }
     return JSONResponse(status_code=200 if healthy else 503, content=body)
+
+
+@app.get("/api/metrics")
+async def metrics():
+    """In-process request counters + average latencies for scraping/dashboards.
+    Cheap and dependency-free; swap for Prometheus if/when scale demands."""
+    data = snapshot()
+    data["ws_local_sockets"] = hub.registry.local_socket_count()
+    return data

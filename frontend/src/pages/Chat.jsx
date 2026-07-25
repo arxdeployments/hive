@@ -14,16 +14,19 @@ export default function Chat() {
   const [showMessages, setShowMessages] = useState(false);
   const [notifAsked, setNotifAsked] = useState(false);
 
-  // Connect WebSocket on mount
+  // Connect the realtime socket once we have a session. Auth rides in the
+  // httpOnly cookie sent with the WS handshake — there is no token in JS, so
+  // gating this on localStorage would silently never connect.
+  // Keyed on the user id, not the object: checkAuth() mints a new object on
+  // every profile refresh, which would otherwise cycle the socket needlessly.
+  const userId = user?.id;
   useEffect(() => {
-    const token = localStorage.getItem('access_token');
-    if (token && user) {
-      wsClient.connect(token);
-    }
+    if (!userId) return undefined;
+    wsClient.connect();
     return () => {
       wsClient.disconnect();
     };
-  }, [user]);
+  }, [userId]);
 
   // FIX: iOS virtual keyboard viewport lock
   useEffect(() => {

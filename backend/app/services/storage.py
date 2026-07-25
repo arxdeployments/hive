@@ -17,6 +17,10 @@ from PIL import Image
 
 from app.core.config import get_settings
 
+# Decompression-bomb guard: cap decoded pixels well below a memory-exhaustion
+# threshold. A crafted small file can otherwise claim huge dimensions.
+Image.MAX_IMAGE_PIXELS = 40_000_000  # ~40 MP
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".m4v"}
 AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".aac", ".opus"}
@@ -135,6 +139,9 @@ async def make_thumbnail(data: bytes) -> bytes | None:
     def _thumb() -> bytes | None:
         try:
             img = Image.open(io.BytesIO(data))
+            # Reject decompression bombs by declared dimensions before decoding.
+            if img.size[0] * img.size[1] > Image.MAX_IMAGE_PIXELS:
+                return None
             img.thumbnail((200, 200))
             if img.mode in ("RGBA", "P", "LA"):
                 background = Image.new("RGB", img.size, (26, 26, 26))

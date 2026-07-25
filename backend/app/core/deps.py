@@ -47,13 +47,27 @@ async def get_current_user(request: Request, db: AsyncSession = Depends(get_db))
     return await _load_user(_token_from_request(request), db)
 
 
-async def get_current_user_ws(websocket: WebSocket, db: AsyncSession) -> User | None:
-    """Cookie-authenticated WebSocket handshake (token query param as fallback)."""
-    token = websocket.cookies.get(ACCESS_COOKIE) or websocket.query_params.get("token")
-    try:
-        return await _load_user(token, db)
-    except HTTPException:
+async def get_current_user_ws(websocket: WebSocket, db: AsyncSession) -> tuple[User, int] | None:
+    """Cookie-authenticated WebSocket handshake. Returns (user, token_exp) so the
+    connection can enforce the access-token lifetime and force a re-auth on
+    expiry. The query-param token fallback exists only outside production."""
+    from app.core.config import get_settings
+
+    token = websocket.cookies.get(ACCESS_COOKIE)
+    if token is None and not get_settings().is_production:
+        token = websocket.query_params.get("token")
+    if not token:
         return None
+    payload = decode_access_token(token)
+    if not payload:
+        return None
+    try:
+        user = await db.get(User, uuid.UUID(payload["sub"]))
+    except (ValueError, KeyError):
+        return None
+    if not user or not user.is_active:
+        return None
+    return user, int(payload.get("exp", 0))
 
 
 async def require_superadmin(user: User = Depends(get_current_user)) -> User:

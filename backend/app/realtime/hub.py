@@ -251,13 +251,15 @@ def _parse_uuid(value) -> uuid.UUID | None:
 @router.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     async with SessionLocal() as db:
-        user = await get_current_user_ws(websocket, db)
-    if user is None:
+        auth = await get_current_user_ws(websocket, db)
+    if auth is None:
         await websocket.accept()
         await websocket.close(code=4001, reason="Invalid token")
         return
+    user, token_exp = auth
 
     await websocket.accept()
+    last_active_check = now_utc()
     conn_id = uuid.uuid4().hex
     await registry.add(user.id, conn_id, websocket)
     came_online = await presence.mark_online(user.id, conn_id)
@@ -303,6 +305,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 continue
 
             if data["type"] == "ping":
+                # Enforce the access-token lifetime on the long-lived socket:
+                # once it expires, force a re-auth (the client refreshes its
+                # cookie and reconnects). Also re-check is_active periodically so
+                # a deactivated user is dropped, not left connected indefinitely.
+                if token_exp and now.timestamp() > token_exp:
+                    await websocket.close(code=4001, reason="Token expired")
+                    break
+                if (now - last_active_check).total_seconds() > 60:
+                    last_active_check = now
+                    async with SessionLocal() as db:
+                        fresh = await db.get(User, user.id)
+                    if fresh is None or not fresh.is_active:
+                        await websocket.close(code=4001, reason="Account inactive")
+                        break
                 await presence.refresh(user.id)
                 await websocket.send_text(json.dumps({"type": "pong", "timestamp": iso_z(now_utc())}))
                 continue

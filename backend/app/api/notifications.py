@@ -73,9 +73,15 @@ async def subscribe(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    from app.services.push import validate_push_endpoint
+
     endpoint = (body.endpoint or "").strip()
     if not endpoint:
         raise HTTPException(status_code=400, detail="Endpoint required")
+    # SSRF guard: the server will POST to this URL, so it must be a public HTTPS
+    # push service — never an internal/loopback address.
+    if not validate_push_endpoint(endpoint):
+        raise HTTPException(status_code=400, detail="Invalid push endpoint")
     existing = (
         await db.execute(select(PushSubscription).where(PushSubscription.endpoint == endpoint))
     ).scalar_one_or_none()

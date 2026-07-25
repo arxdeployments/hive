@@ -381,6 +381,19 @@ async def _end(user: User, call_id: uuid.UUID, reason: str = "normal") -> None:
         if call.status == CallStatus.ringing and call.initiated_by == user.id:
             await _cancel(user, call_id)
             return
+    # In a group call, an ordinary participant hanging up is a LEAVE — it must
+    # not tear down the room for everyone. Only the initiator (or the last one
+    # out, handled in _leave) ends the whole call.
+    if call.is_group and call.initiated_by != user.id:
+        await _leave(user, call_id)
+        return
+    async with SessionLocal() as db:
+        call = await _load_call(db, call_id)
+        if call is None or call.status not in (CallStatus.ringing, CallStatus.connected):
+            return
+        member = await db.get(CallParticipant, (call_id, user.id))
+        if member is None:
+            return
         member.left_at = now_utc()
         ids = await _call_participant_ids(db, call_id)
         final = CallStatus.answered if call.answered_at else CallStatus.cancelled
