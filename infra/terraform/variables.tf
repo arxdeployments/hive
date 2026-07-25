@@ -97,7 +97,7 @@ variable "branch" {
 # --- Ops ---------------------------------------------------------------------
 
 variable "alert_email" {
-  description = "Optional email for CloudWatch alarm notifications. Null disables alerting."
+  description = "RESERVED — not yet wired. No CloudWatch alarms exist in this stack, so setting this has no effect. Left declared so adding alarms later does not change the variable interface."
   type        = string
   default     = null
 }

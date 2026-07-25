@@ -1,0 +1,31 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+#
+#   cd infra/terraform && cp terraform.tfvars.example terraform.tfvars
+#   tofu init && tofu apply     (or terraform init && terraform apply)
+
+# --- Required ---------------------------------------------------------------
+
+# Where to deploy. Pick the region closest to your users: WebRTC media hairpins
+# through this box, so region choice sets the floor on call latency.
+region = "ap-south-1"
+
+# The hostname users will visit. Caddy requests a Let's Encrypt certificate for
+# exactly this name, so its DNS A record must already point at the Elastic IP
+# (see the `dns_record_instructions` output) before the first boot finishes.
+domain_name = "chat.example.com"
+
+# Git remote the instance clones the app from at boot. It must be reachable
+# unauthenticated from EC2 — a public repo, or add a deploy key to user_data.
+repo_url = "https://github.com/your-org/rxhive.git"
+
+# --- Optional ---------------------------------------------------------------
+
+# environment      = "prod"        # gates RDS deletion protection
+# branch           = "main"
+# instance_type    = "t3.large"    # 2 vCPU / 8GB; the whole stack minus RDS
+# db_instance_class    = "db.t4g.small"
+# db_allocated_storage = 20
+
+# Break-glass SSH. Left null, port 22 is closed entirely and you connect with
+# SSM Session Manager instead (the instance role already allows it).
+# ssh_allowed_cidr = "203.0.113.4/32"
