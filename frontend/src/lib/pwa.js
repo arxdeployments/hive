@@ -46,7 +46,8 @@ export async function disablePushNotifications() {
   const reg = await navigator.serviceWorker.ready;
   const sub = await reg.pushManager.getSubscription();
   if (sub) {
-    await client.post('/api/notifications/unsubscribe', { endpoint: sub.endpoint });
+    // DELETE carries a body here, so it must go in axios' `data` option.
+    await client.delete('/api/notifications/subscribe', { data: { endpoint: sub.endpoint } });
     await sub.unsubscribe();
   }
 }

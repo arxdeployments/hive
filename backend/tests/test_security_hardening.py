@@ -104,3 +104,33 @@ async def test_change_password_revokes_other_sessions(client):
             (await db.execute(select(RefreshToken).where(RefreshToken.user_id == user.id))).scalars().all()
         )
         assert tokens and all(t.revoked_at is not None for t in tokens)
+
+
+async def test_push_subscribe_unsubscribe_round_trip(client, two_orgs_with_users):
+    """The frontend's subscribe/unsubscribe pair must match the routes the API
+    actually exposes — a mismatch here silently 404s in the browser."""
+    from sqlalchemy import select
+
+    from app.db.models import PushSubscription
+    from app.db.session import SessionLocal
+
+    await login(client, "alice@a.com")
+    endpoint = "https://fcm.googleapis.com/fcm/send/round-trip-test"
+
+    resp = await client.post(
+        "/api/notifications/subscribe",
+        json={"endpoint": endpoint, "keys": {"p256dh": "x", "auth": "y"}},
+    )
+    assert resp.status_code == 200, resp.text
+
+    async with SessionLocal() as db:
+        rows = (await db.execute(select(PushSubscription))).scalars().all()
+        assert [r.endpoint for r in rows] == [endpoint]
+
+    resp = await client.request(
+        "DELETE", "/api/notifications/subscribe", json={"endpoint": endpoint}
+    )
+    assert resp.status_code == 200, resp.text
+
+    async with SessionLocal() as db:
+        assert (await db.execute(select(PushSubscription))).scalars().all() == []
