@@ -338,8 +338,12 @@ async def _accept(user: User, call_id: uuid.UUID) -> None:
         task = _ring_timers.pop(str(call_id), None)
         if task:
             task.cancel()
+        # Both sides get this: the caller needs to know who answered, and the
+        # accepter needs the server's confirmation that the call really moved to
+        # connected before joining the SFU room. Sending it only to the caller
+        # left the callee never joining — a connected-looking but silent call.
         await publish_to_users(
-            [call.initiated_by],
+            [call.initiated_by, user.id],
             {"type": "call:accepted", "call_id": str(call_id), "accepter_id": str(user.id)},
         )
 

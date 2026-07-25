@@ -366,6 +366,17 @@ class RxHiveWebSocket {
             avatar_url: participant.avatar_url
           });
         }
+        // This event is addressed to the joiner, and it is the server's
+        // confirmation that the join was accepted — so it's where a group
+        // participant connects media. (call:group_started only reaches the
+        // initiator, so relying on that alone left joiners silent.)
+        callStore.getState().setCallState('connected');
+        callStore.getState().callConnected();
+        livekitClient.joinCall(data.call_id).catch((e) => {
+          console.error('[LiveKit] join failed:', e);
+          toast.error('Could not join the call');
+          callStore.getState().resetCall();
+        });
         break;
       }
       case 'call:full': {

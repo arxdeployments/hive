@@ -86,8 +86,13 @@ const NetworkDot = ({ quality }) => {
 };
 
 /* WhatsApp-style control button (rounded pill) */
-const CallControl = ({ icon: Icon, active, onClick, label, disabled }) => (
-  <button onClick={onClick} disabled={disabled} className="flex flex-col items-center gap-1.5">
+const CallControl = ({ icon: Icon, active, onClick, label, disabled, testId }) => (
+  <button
+    onClick={onClick}
+    disabled={disabled}
+    data-testid={testId}
+    className="flex flex-col items-center gap-1.5"
+  >
     <div
       className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all duration-200 active:scale-90 ${
         active ? 'bg-white' : 'bg-white/10 backdrop-blur-sm'
@@ -198,7 +203,7 @@ export const ActiveCallView = () => {
       >
         <RemoteAudioSink participants={remoteParticipants} />
 
-        <div className="flex-1 relative">
+        <div className="flex-1 min-h-0 relative overflow-hidden">
           {/* Remote full-bleed */}
           {showRemoteVideo ? (
             <StreamVideo
@@ -255,13 +260,13 @@ export const ActiveCallView = () => {
         {/* Controls */}
         <div className="bg-black/80 backdrop-blur-xl px-6 py-6 safe-bottom">
           <div className="flex items-center justify-center gap-4 sm:gap-5 mb-5">
-            <CallControl icon={isMuted ? MicOff : Mic} active={isMuted} onClick={handleToggleMute} label={isMuted ? 'Unmute' : 'Mute'} />
-            <CallControl icon={isCameraOn ? Video : VideoOff} active={!isCameraOn} onClick={handleToggleCamera} label="Camera" />
-            <CallControl icon={isScreenSharing ? MonitorOff : Monitor} active={isScreenSharing} onClick={handleToggleScreenShare} label="Share" />
+            <CallControl icon={isMuted ? MicOff : Mic} active={isMuted} onClick={handleToggleMute} label={isMuted ? 'Unmute' : 'Mute'} testId="call-mute-btn" />
+            <CallControl icon={isCameraOn ? Video : VideoOff} active={!isCameraOn} onClick={handleToggleCamera} label="Camera" testId="call-camera-btn" />
+            <CallControl icon={isScreenSharing ? MonitorOff : Monitor} active={isScreenSharing} onClick={handleToggleScreenShare} label="Share" testId="call-screenshare-btn" />
             <CallControl icon={Volume2} active={speakerOn} onClick={() => setSpeakerOn((v) => !v)} label="Speaker" />
           </div>
           <div className="flex justify-center">
-            <button onClick={handleEnd} aria-label="End call" className="w-16 h-16 rounded-full bg-[#EF4444] flex items-center justify-center active:scale-90 transition-transform">
+            <button onClick={handleEnd} data-testid="call-end-btn" aria-label="End call" className="w-16 h-16 rounded-full bg-[#EF4444] flex items-center justify-center active:scale-90 transition-transform">
               <PhoneOff size={28} className="text-white" />
             </button>
           </div>
@@ -305,13 +310,13 @@ export const ActiveCallView = () => {
 
         <div className="bg-[#0A0A0A]/80 backdrop-blur-xl px-6 py-5 safe-bottom flex-shrink-0">
           <div className="flex items-center justify-center gap-4 sm:gap-5 mb-5">
-            <CallControl icon={isMuted ? MicOff : Mic} active={isMuted} onClick={handleToggleMute} label={isMuted ? 'Unmute' : 'Mute'} />
-            {isVideo && <CallControl icon={isCameraOn ? Video : VideoOff} active={!isCameraOn} onClick={handleToggleCamera} label="Camera" />}
-            <CallControl icon={isScreenSharing ? MonitorOff : Monitor} active={isScreenSharing} onClick={handleToggleScreenShare} label="Share" />
+            <CallControl icon={isMuted ? MicOff : Mic} active={isMuted} onClick={handleToggleMute} label={isMuted ? 'Unmute' : 'Mute'} testId="call-mute-btn" />
+            {isVideo && <CallControl icon={isCameraOn ? Video : VideoOff} active={!isCameraOn} onClick={handleToggleCamera} label="Camera" testId="call-camera-btn" />}
+            <CallControl icon={isScreenSharing ? MonitorOff : Monitor} active={isScreenSharing} onClick={handleToggleScreenShare} label="Share" testId="call-screenshare-btn" />
             <CallControl icon={Volume2} active={speakerOn} onClick={() => setSpeakerOn((v) => !v)} label="Speaker" />
           </div>
           <div className="flex justify-center">
-            <button onClick={handleEnd} aria-label="End call" className="w-16 h-16 rounded-full bg-[#EF4444] flex items-center justify-center active:scale-90 transition-transform">
+            <button onClick={handleEnd} data-testid="call-end-btn" aria-label="End call" className="w-16 h-16 rounded-full bg-[#EF4444] flex items-center justify-center active:scale-90 transition-transform">
               <PhoneOff size={28} className="text-white" />
             </button>
           </div>
@@ -341,7 +346,7 @@ export const ActiveCallView = () => {
       </div>
 
       {/* Center — avatar + name + status */}
-      <div className="flex-1 flex flex-col items-center justify-center px-6">
+      <div className="flex-1 min-h-0 overflow-hidden flex flex-col items-center justify-center px-6">
         <motion.div
           animate={isConnecting ? { scale: [1, 1.04, 1] } : {}}
           transition={{ repeat: Infinity, duration: 2, ease: 'easeInOut' }}
@@ -389,13 +394,13 @@ export const ActiveCallView = () => {
         <div className="px-6 pb-8 safe-bottom">
           <div className="flex items-center justify-evenly mb-8 max-w-sm mx-auto">
             <CallControl icon={MoreHorizontal} onClick={() => setShowMore(true)} label="More" />
-            <CallControl icon={isScreenSharing ? MonitorOff : Monitor} active={isScreenSharing} onClick={handleToggleScreenShare} label="Share" />
+            <CallControl icon={isScreenSharing ? MonitorOff : Monitor} active={isScreenSharing} onClick={handleToggleScreenShare} label="Share" testId="call-screenshare-btn" />
             <CallControl icon={Volume2} active={speakerOn} onClick={() => setSpeakerOn((v) => !v)} label="Speaker" />
-            <CallControl icon={isMuted ? MicOff : Mic} active={isMuted} onClick={handleToggleMute} label={isMuted ? 'Unmute' : 'Mute'} />
+            <CallControl icon={isMuted ? MicOff : Mic} active={isMuted} onClick={handleToggleMute} label={isMuted ? 'Unmute' : 'Mute'} testId="call-mute-btn" />
           </div>
 
           <div className="flex justify-center">
-            <button onClick={handleEnd} aria-label="End call" className="w-[72px] h-[72px] rounded-full bg-[#EF4444] flex items-center justify-center shadow-lg shadow-red-500/20 active:scale-90 transition-transform">
+            <button onClick={handleEnd} data-testid="call-end-btn" aria-label="End call" className="w-[72px] h-[72px] rounded-full bg-[#EF4444] flex items-center justify-center shadow-lg shadow-red-500/20 active:scale-90 transition-transform">
               <PhoneOff size={32} className="text-white" />
             </button>
           </div>

@@ -33,6 +33,16 @@ export default defineConfig({
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
     actionTimeout: 15000,
+    permissions: ['camera', 'microphone'],
+    launchOptions: {
+      args: [
+        // Synthetic camera/mic so calls can be exercised without hardware,
+        // and auto-granted permission prompts so nothing blocks on a dialog.
+        '--use-fake-ui-for-media-stream',
+        '--use-fake-device-for-media-stream',
+        '--autoplay-policy=no-user-gesture-required',
+      ],
+    },
   },
   projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
   metadata: { apiUrl: API_URL },

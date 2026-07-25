@@ -57,3 +57,55 @@ came from selecting controls by visible text:
 Both produced "no API call, nothing created" — the same signature as a real
 contract bug. Always confirm which element was actually clicked before
 reporting. Select by `data-testid`, never by visible text.
+
+---
+
+# Calling UI browser verification
+
+Driven with Playwright against a real LiveKit SFU, using Chromium's fake media
+devices (`--use-fake-device-for-media-stream`) so calls run without hardware and
+can run in CI.
+
+## Two real defects found
+
+**1. The callee never joined the SFU room.** `call:accepted` was published only
+to `call.initiated_by`, and that handler was the frontend's only 1:1 trigger for
+`livekitClient.joinCall()`. The callee's UI showed "connected" while it had
+neither published nor subscribed to any track — every 1:1 call was silent and
+black on one side. The group path had the same hole: `call:group_started`
+reaches only the initiator, so joiners never connected either.
+
+Fix: the server now sends `call:accepted` to both parties, so each side joins on
+the server's confirmation that the call actually reached `connected`; and
+`call:group_participants` (addressed to the joiner) triggers the group join.
+
+Proof, from the SFU log: both participants in one room, each publishing VP8
+simulcast 1280x720, and two `/api/calls/{id}/token` requests instead of one.
+
+**2. Call controls rendered off-screen.** In a 1280x720 viewport the End Call
+button measured `y=842..906` — 186px below the fold, visible to CSS but
+unclickable. A user could not hang up. Cause: the video area is a flex child, and
+`min-height: auto` stopped it shrinking, pushing the control bar out of the
+`fixed inset-0` container. Fix: `min-h-0` + `overflow-hidden` on the flex-1
+regions. Verified: the control moved to `y=632..696`, inside the viewport.
+
+The test now asserts the control's bounding box lies within the viewport, so a
+layout regression fails rather than merely looking odd.
+
+## Test-design corrections made along the way
+
+- Call history was a separate test that silently depended on the call test's side
+  effect; when the call test failed, history read zero and reported a phantom
+  backend bug. Merged into one self-contained test.
+- Asserting "zero console errors" was too strict: a fresh context always probes
+  `GET /api/auth/me` before it has a session (twice, since StrictMode
+  double-invokes effects), so the 401 is expected. Errors are now captured only
+  after login, and socket-teardown noise is filtered.
+- Three layouts render `call-end-btn`; the selector must target the visible one.
+
+## Still not covered
+
+Screen share is wired and manually reachable, but not asserted here — automating
+`getDisplayMedia` needs `--auto-select-desktop-capture-source`, which is
+unreliable headless. Group calls (3+) are likewise unverified in a browser; the
+join path is now correct by construction but has no test.
