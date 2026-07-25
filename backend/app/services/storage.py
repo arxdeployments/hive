@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 import anyio
 from minio import Minio
+from minio.credentials import IamAwsProvider
 from PIL import Image
 
 from app.core.config import get_settings
@@ -106,12 +107,22 @@ def _endpoint_parts(url: str) -> tuple[str, bool]:
 
 @lru_cache
 def _client() -> Minio:
+    """S3 client. With no static keys configured, fall back to the AWS instance
+    role (EC2/ECS metadata) — that is the deployed path, so no long-lived
+    credentials ever sit on the box. MinIO locally still uses explicit keys."""
     settings = get_settings()
     host, secure = _endpoint_parts(settings.s3_endpoint)
+    if settings.s3_access_key and settings.s3_secret_key:
+        return Minio(
+            host,
+            access_key=settings.s3_access_key,
+            secret_key=settings.s3_secret_key,
+            secure=secure,
+            region=settings.s3_region,
+        )
     return Minio(
         host,
-        access_key=settings.s3_access_key,
-        secret_key=settings.s3_secret_key,
+        credentials=IamAwsProvider(region=settings.s3_region),
         secure=secure,
         region=settings.s3_region,
     )
@@ -178,11 +189,35 @@ async def presign_get(key: str, *, filename: str | None = None, inline: bool = T
         )
 
     url = await anyio.to_thread.run_sync(_presign)
-    public = settings.s3_public_endpoint.rstrip("/")
-    internal = settings.s3_endpoint.rstrip("/")
-    if public and public != internal:
-        url = url.replace(internal, public, 1)
-    return url
+    return rewrite_to_public(url, settings.s3_public_endpoint)
+
+
+def rewrite_to_public(url: str, public_endpoint: str) -> str:
+    """Point a presigned URL at the endpoint the browser can actually reach.
+
+    Rewrites by PARSING the URL rather than string-replacing the configured
+    endpoint: against real AWS, minio signs virtual-host style
+    (https://<bucket>.s3.<region>.amazonaws.com/<key>), which never contains the
+    configured "https://s3.<region>.amazonaws.com" prefix — a prefix replace
+    silently no-ops and leaks a cross-origin URL to the browser.
+
+    A path-style public endpoint ("/s3") keeps media same-origin, which matters:
+    CSP is enforced against redirect targets, so a cross-origin redirect out of
+    /api/media is blocked by `img-src 'self'`. The signature stays valid because
+    only the host is swapped — the proxy must forward the original Host.
+    """
+    public = (public_endpoint or "").rstrip("/")
+    if not public:
+        return url
+    parts = urlsplit(url)
+    query = f"?{parts.query}" if parts.query else ""
+    if public.startswith(("http://", "https://")):
+        pub = urlsplit(public)
+        if (pub.scheme, pub.netloc) == (parts.scheme, parts.netloc):
+            return url
+        return f"{pub.scheme}://{pub.netloc}{pub.path.rstrip('/')}{parts.path}{query}"
+    # Same-origin path prefix (e.g. "/s3"), resolved by the browser.
+    return f"{public}{parts.path}{query}"
 
 
 def new_storage_key(org_id, ext: str) -> str:

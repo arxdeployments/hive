@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+#
+# RX HIVE bootstrap — Amazon Linux 2023, single EC2 host.
+#
+# Rendered by Terraform's templatefile(). A single-dollar brace expansion is
+# interpolated by TERRAFORM; any literal shell expansion must therefore be
+# written with a doubled dollar, e.g. $${HOME}. Expected template vars:
+#   repo_url  branch  ssm_prefix  db_endpoint  db_name  db_user
+#   site_address  region  s3_bucket
+#
+# Idempotent by design: re-running it re-pulls the branch, rewrites infra/.env
+# from SSM and reconciles the compose stack. To re-run by hand on the box:
+#   sudo bash /var/lib/cloud/instance/user-data.txt
+#
+set -euo pipefail
+
+APP_DIR=/opt/rxhive
+ENV_FILE="$${APP_DIR}/infra/.env"
+COMPOSE_FILE=infra/docker-compose.prod.yml
+# --env-file is passed explicitly rather than relying on compose's default
+# lookup: which directory that default searches has changed between compose
+# releases, and a silently-empty .env would trip every required-variable guard
+# in the compose file at once.
+COMPOSE=(docker compose --env-file infra/.env -f "$${COMPOSE_FILE}")
+COMPOSE_PLUGIN_VERSION=v2.29.7
+LOG=/var/log/rxhive-bootstrap.log
+
+# Everything (including failures) goes to the log AND to the cloud-init console.
+touch "$${LOG}"
+chmod 600 "$${LOG}"
+exec > >(tee -a "$${LOG}") 2>&1
+
+log() { echo "[rxhive] $(date -Is) $${*}"; }
+fail() { echo "[rxhive] $(date -Is) FATAL: $${*}" >&2; exit 1; }
+
+log "=== bootstrap start (branch=${branch}, region=${region}) ==="
+
+# ---------------------------------------------------------------------------
+# 1. Packages: docker, git, docker compose v2 plugin
+# ---------------------------------------------------------------------------
+log "installing packages"
+dnf install -y docker git tar
+
+# AL2023 ships the docker CLI without the compose v2 plugin, and there is no
+# dnf package for it — fetch the static plugin binary into the CLI plugin dir.
+PLUGIN_DIR=/usr/local/lib/docker/cli-plugins
+install -d -m 0755 "$${PLUGIN_DIR}"
+if ! docker compose version >/dev/null 2>&1; then
+  log "installing docker compose $${COMPOSE_PLUGIN_VERSION}"
+  curl -fsSL \
+    "https://github.com/docker/compose/releases/download/$${COMPOSE_PLUGIN_VERSION}/docker-compose-linux-$(uname -m)" \
+    -o "$${PLUGIN_DIR}/docker-compose"
+  chmod 0755 "$${PLUGIN_DIR}/docker-compose"
+fi
+docker compose version || fail "docker compose plugin did not install"
+
+systemctl enable --now docker
+# Convenience only: lets an operator run docker without sudo after re-login.
+usermod -aG docker ec2-user || true
+
+# AL2023 preinstalls AWS CLI v2; only fall back if a stripped AMI is used.
+if ! command -v aws >/dev/null 2>&1; then
+  dnf install -y awscli-2 || dnf install -y awscli || true
+fi
+command -v aws >/dev/null 2>&1 || fail "aws cli not available — cannot read SSM"
+
+# ---------------------------------------------------------------------------
+# 2. Source checkout
+# ---------------------------------------------------------------------------
+if [ -d "$${APP_DIR}/.git" ]; then
+  log "updating existing checkout in $${APP_DIR}"
+  git config --global --add safe.directory "$${APP_DIR}" || true
+  git -C "$${APP_DIR}" remote set-url origin "${repo_url}"
+  git -C "$${APP_DIR}" fetch --depth 1 origin "${branch}"
+  git -C "$${APP_DIR}" checkout -B "${branch}" "origin/${branch}"
+  git -C "$${APP_DIR}" reset --hard "origin/${branch}"
+else
+  log "cloning ${repo_url} (${branch}) into $${APP_DIR}"
+  git clone --depth 1 --branch "${branch}" "${repo_url}" "$${APP_DIR}"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Secrets from SSM Parameter Store -> infra/.env
+# ---------------------------------------------------------------------------
+# Values are only ever captured into shell variables, never echoed, so the log
+# stays safe to read.
+ssm_required() {
+  aws ssm get-parameter \
+    --name "${ssm_prefix}/$${1}" \
+    --with-decryption \
+    --region "${region}" \
+    --query 'Parameter.Value' \
+    --output text 2>/dev/null \
+    || fail "missing required SSM parameter ${ssm_prefix}/$${1}"
+}
+
+ssm_optional() {
+  aws ssm get-parameter \
+    --name "${ssm_prefix}/$${1}" \
+    --with-decryption \
+    --region "${region}" \
+    --query 'Parameter.Value' \
+    --output text 2>/dev/null \
+    || echo ""
+}
+
+# Parameter leaf names must match the aws_ssm_parameter resources in
+# secrets.tf; the four below are the ones the API cannot boot without.
+log "reading secrets from SSM under ${ssm_prefix}"
+DB_PASSWORD="$(ssm_required db_password)"
+SECRET_KEY="$(ssm_required secret_key)"
+LIVEKIT_API_SECRET="$(ssm_required livekit_api_secret)"
+SEED_ADMIN_PASSWORD="$(ssm_required superadmin_password)"
+
+# Optional: absent parameters resolve to empty and fall back to the defaults
+# below (or to the app's own defaults, in the VAPID case — web push simply
+# stays off until a keypair is stored).
+LIVEKIT_API_KEY="$(ssm_optional livekit_api_key)"
+SEED_ADMIN_EMAIL="$(ssm_optional superadmin_email)"
+VAPID_PUBLIC_KEY="$(ssm_optional vapid_public_key)"
+VAPID_PRIVATE_KEY="$(ssm_optional vapid_private_key)"
+
+# `--output text` prints the literal string "None" for a null value. Written as
+# an if/fi rather than `[ ... ] && x=` because under `set -e` a trailing false
+# test at the top level would abort the whole bootstrap.
+for VAR in LIVEKIT_API_KEY SEED_ADMIN_EMAIL VAPID_PUBLIC_KEY VAPID_PRIVATE_KEY; do
+  if [ "$${!VAR}" = "None" ]; then
+    printf -v "$${VAR}" '%s' ""
+  fi
+done
+LIVEKIT_API_KEY="$${LIVEKIT_API_KEY:-rxhive-api}"
+SEED_ADMIN_EMAIL="$${SEED_ADMIN_EMAIL:-admin@rhythmrx.ai}"
+
+# RDS gives the endpoint as host:port in some attributes and bare host in
+# others; normalise so we never end up with a doubled port in the DSN.
+DB_HOST="${db_endpoint}"
+DB_HOST="$${DB_HOST%%:*}"
+
+# The DSN is built here rather than in compose so the URL-encoding lives in one
+# place: an unencoded '@' or '/' in a generated password silently corrupts the
+# DSN and the API fails with a confusing host-not-found. Encoding via env (not
+# argv) keeps the password out of the process list.
+DB_USER_ENC="$(RXV="${db_user}" python3 -c 'import os,urllib.parse;print(urllib.parse.quote(os.environ["RXV"],safe=""))')"
+DB_PASSWORD_ENC="$(RXV="$${DB_PASSWORD}" python3 -c 'import os,urllib.parse;print(urllib.parse.quote(os.environ["RXV"],safe=""))')"
+DATABASE_URL="postgresql+asyncpg://$${DB_USER_ENC}:$${DB_PASSWORD_ENC}@$${DB_HOST}:5432/${db_name}"
+
+log "writing $${ENV_FILE}"
+install -d -m 0755 "$${APP_DIR}/infra"
+umask 077
+cat > "$${ENV_FILE}" <<ENVEOF
+# Generated by user_data.sh.tftpl from SSM Parameter Store. DO NOT EDIT and DO
+# NOT COMMIT — every re-run of the bootstrap overwrites this file.
+
+# --- Caddy / site ---
+SITE_ADDRESS=${site_address}
+
+# --- AWS ---
+AWS_REGION=${region}
+RXHIVE_S3_BUCKET=${s3_bucket}
+# No S3 access/secret key: the instance IAM role supplies short-lived
+# credentials via the metadata service.
+
+# --- Database (managed RDS) ---
+RXHIVE_DATABASE_URL=$${DATABASE_URL}
+# Same values unassembled, for psql and one-off admin tasks on the box.
+POSTGRES_HOST=$${DB_HOST}
+POSTGRES_PORT=5432
+POSTGRES_DB=${db_name}
+POSTGRES_USER=${db_user}
+POSTGRES_PASSWORD=$${DB_PASSWORD}
+
+# --- API ---
+RXHIVE_ENVIRONMENT=production
+RXHIVE_SECRET_KEY=$${SECRET_KEY}
+RXHIVE_COOKIE_SECURE=true
+RXHIVE_TRUST_PROXY=true
+RXHIVE_CORS_ORIGINS=
+API_WORKERS=2
+RXHIVE_SEED_SUPERADMIN_EMAIL=$${SEED_ADMIN_EMAIL}
+RXHIVE_SEED_SUPERADMIN_PASSWORD=$${SEED_ADMIN_PASSWORD}
+RXHIVE_VAPID_PUBLIC_KEY=$${VAPID_PUBLIC_KEY}
+RXHIVE_VAPID_PRIVATE_KEY=$${VAPID_PRIVATE_KEY}
+
+# --- LiveKit ---
+LIVEKIT_API_KEY=$${LIVEKIT_API_KEY}
+LIVEKIT_API_SECRET=$${LIVEKIT_API_SECRET}
+# Path-style: the browser resolves this against the site origin, so it becomes
+# wss://${site_address}/livekit through Caddy.
+RXHIVE_LIVEKIT_PUBLIC_URL=/livekit
+ENVEOF
+chmod 600 "$${ENV_FILE}"
+umask 022
+
+# ---------------------------------------------------------------------------
+# 4. Bring the stack up
+# ---------------------------------------------------------------------------
+cd "$${APP_DIR}"
+log "building and starting the stack (first run takes several minutes)"
+"$${COMPOSE[@]}" up -d --build --remove-orphans
+
+# ---------------------------------------------------------------------------
+# 5. systemd unit so the stack returns after a reboot
+# ---------------------------------------------------------------------------
+log "installing rxhive.service"
+cat > /etc/systemd/system/rxhive.service <<'UNITEOF'
+[Unit]
+Description=RX HIVE application stack (docker compose)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/rxhive
+# No --build here: images are built by the bootstrap and on deploys. A reboot
+# should start what is already there, not rebuild (and possibly fail) on boot.
+ExecStart=/usr/bin/docker compose --env-file infra/.env -f infra/docker-compose.prod.yml up -d --remove-orphans
+ExecStop=/usr/bin/docker compose --env-file infra/.env -f infra/docker-compose.prod.yml down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+
+systemctl daemon-reload
+# --now is a no-op reconcile: the containers are already running from step 4.
+systemctl enable --now rxhive.service
+
+# ---------------------------------------------------------------------------
+# 6. Report health (never fatal — a slow first migration must not fail the boot)
+# ---------------------------------------------------------------------------
+log "waiting for the api container to report healthy"
+API_CID="$("$${COMPOSE[@]}" ps -q api || true)"
+STATE=unknown
+for _ in $(seq 1 60); do
+  STATE="$(docker inspect -f '{{.State.Health.Status}}' "$${API_CID}" 2>/dev/null || echo unknown)"
+  if [ "$${STATE}" = "healthy" ]; then break; fi
+  sleep 5
+done
+log "api health: $${STATE}"
+"$${COMPOSE[@]}" ps || true
+
+log "=== bootstrap complete ==="

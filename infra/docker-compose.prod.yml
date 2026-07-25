@@ -1,0 +1,195 @@
+name: rxhive
+
+# Production stack for the single EC2 host (Amazon Linux 2023, Elastic IP).
+#
+#   docker compose -f infra/docker-compose.prod.yml up -d --build
+#
+# Rendered onto the box by terraform/user_data.sh.tftpl, which writes
+# infra/.env from SSM Parameter Store. Every secret below arrives through that
+# file — nothing secret may ever be literal in here, this file is in git.
+#
+# Differences from infra/docker-compose.yml (the self-contained dev stack):
+#   postgres -> managed RDS PostgreSQL 16   (RXHIVE_DATABASE_URL)
+#   minio    -> S3 bucket                   (credentials from the instance role)
+# Both containers and both of their volumes are gone; the only stateful things
+# left on this box are Caddy's certificates.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Presence, pub/sub fan-out and rate-limit counters only. All of it is
+    # rebuildable from Postgres or simply re-established by reconnecting
+    # clients, so persistence is off and there is no volume: losing this
+    # container loses nothing durable. (LiveKit shares it for SFU state.)
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  livekit:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./livekit.prod.yaml:/etc/livekit.yaml:ro
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-rxhive-api}: ${LIVEKIT_API_SECRET:?set in infra/.env}"
+    expose:
+      # Signal websocket. NOT published on the host: Caddy reaches it over the
+      # compose network and terminates TLS for it at /livekit.
+      - "7880"
+    ports:
+      # WebRTC media does not go through Caddy — it is SRTP straight between the
+      # browser and this process, so these have to be published on the host and
+      # opened in the security group or calls connect but stay silent.
+      - "7881:7881/tcp"                 # ICE/TCP fallback for UDP-blocked networks
+      - "50000-50100:50000-50100/udp"   # media; one port per published track
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      # LiveKit answers `/` with a plain 200 on the signal port.
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:7880/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  api:
+    build:
+      context: ../backend
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      # Production mode enforces real secrets (config.py refuses to boot on a
+      # placeholder or a <32 char key), Secure cookies and no /docs.
+      RXHIVE_ENVIRONMENT: production
+
+      # Managed RDS. The bootstrap composes this from the Terraform-supplied
+      # endpoint/database/user plus the SSM password, URL-encoding the password
+      # in one place — a raw `@` or `/` in it would otherwise corrupt the DSN.
+      RXHIVE_DATABASE_URL: ${RXHIVE_DATABASE_URL:?written to infra/.env by the bootstrap}
+      RXHIVE_REDIS_URL: redis://redis:6379/0
+
+      RXHIVE_SECRET_KEY: ${RXHIVE_SECRET_KEY:?32+ char secret, from SSM}
+      RXHIVE_COOKIE_SECURE: "true"
+      # Caddy is the only ingress, so the first X-Forwarded-For hop is
+      # trustworthy — this is what makes the rate limiter and audit logs see the
+      # real client IP instead of the Docker bridge address.
+      RXHIVE_TRUST_PROXY: "true"
+      # One origin for everything (same-origin httpOnly cookies + the
+      # X-Requested-With CSRF header), so CORS stays off. Do not populate this.
+      RXHIVE_CORS_ORIGINS: ""
+
+      # --- S3 (replaces MinIO) ---
+      # Regional endpoint so SigV4 signs for the bucket's actual region; a
+      # mismatch here surfaces as SignatureDoesNotMatch on every attachment.
+      RXHIVE_S3_ENDPOINT: https://s3.${AWS_REGION:?set in infra/.env}.amazonaws.com
+      # Media is served SAME-ORIGIN via Caddy's /s3 route, not straight from
+      # S3. Two reasons, both verified rather than assumed:
+      #   1. CSP is enforced against redirect targets, so a cross-origin
+      #      redirect out of /api/media is blocked by `img-src 'self'` and
+      #      every attachment silently fails to render.
+      #   2. minio signs virtual-host URLs (<bucket>.s3.<region>.amazonaws.com),
+      #      so the browser would see a third origin anyway.
+      # Attachments stay private either way: /api/media/* checks membership
+      # first and only then redirects to a short-lived presigned URL.
+      RXHIVE_S3_PUBLIC_ENDPOINT: /s3
+      RXHIVE_S3_BUCKET: ${RXHIVE_S3_BUCKET:?set in infra/.env}
+      RXHIVE_S3_REGION: ${AWS_REGION}
+      # No static AWS credentials on this box. Both keys are pinned to the empty
+      # string (rather than simply left out) because that is the exact condition
+      # app/services/storage.py tests: with either one truthy it builds a
+      # static-key client, and the code defaults would hand it the dev
+      # "rxhive"/"rxhive-dev" pair, which 403s against real S3. Empty selects
+      # minio's IamAwsProvider, which pulls short-lived credentials from the EC2
+      # instance metadata service (so the instance needs an IMDS hop limit of 2 —
+      # a container is one extra network hop away from 169.254.169.254).
+      RXHIVE_S3_ACCESS_KEY: ""
+      RXHIVE_S3_SECRET_KEY: ""
+      # !! BLOCKER: config.py's production validator rejects an empty
+      # !! RXHIVE_S3_SECRET_KEY as a placeholder, so the API will refuse to boot
+      # !! until that check learns to skip the S3 pair when both are empty
+      # !! (the instance-role path). See the deployment notes.
+
+      # --- LiveKit ---
+      # Path-style URL the browser resolves against the site origin
+      # (wss://<domain>/livekit via Caddy).
+      RXHIVE_LIVEKIT_URL: ${RXHIVE_LIVEKIT_PUBLIC_URL:-/livekit}
+      # The API cannot resolve that path, so /api/health probes the SFU directly
+      # over the compose network.
+      RXHIVE_LIVEKIT_HEALTH_URL: http://livekit:7880
+      RXHIVE_LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-rxhive-api}
+      RXHIVE_LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set in infra/.env}
+
+      RXHIVE_VAPID_PUBLIC_KEY: ${RXHIVE_VAPID_PUBLIC_KEY:-}
+      RXHIVE_VAPID_PRIVATE_KEY: ${RXHIVE_VAPID_PRIVATE_KEY:-}
+      RXHIVE_SEED_SUPERADMIN_EMAIL: ${RXHIVE_SEED_SUPERADMIN_EMAIL:-admin@rhythmrx.ai}
+      RXHIVE_SEED_SUPERADMIN_PASSWORD: ${RXHIVE_SEED_SUPERADMIN_PASSWORD:-}
+    depends_on:
+      # Only Redis is local now; RDS availability is checked by the migration
+      # step itself, which is where a bad DSN should fail loudly.
+      redis: { condition: service_healthy }
+    # Migrations + idempotent superadmin seed run on every boot before uvicorn.
+    # --forwarded-allow-ips=* trusts X-Forwarded-For from the only ingress
+    # (Caddy on the Docker network); paired with RXHIVE_TRUST_PROXY above.
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m app.seed &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000
+                     --workers ${API_WORKERS:-2}
+                     --proxy-headers --forwarded-allow-ips='*'"
+    healthcheck:
+      # python:3.12-slim has neither curl nor wget, so probe with the stdlib.
+      # /api/health reports database/redis/livekit and 503s when db or redis is
+      # down. start_period covers alembic + seed on a cold boot.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  web:
+    build:
+      context: ../frontend
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      # Both are required for Let's Encrypt: :80 for the HTTP-01 challenge and
+      # the HTTPS redirect, :443 for the real traffic.
+      - "80:80"
+      - "443:443"
+    environment:
+      # Must be the real hostname (e.g. chat.example.com) with an A record
+      # pointing at the Elastic IP, or Caddy cannot obtain a certificate.
+      SITE_ADDRESS: ${SITE_ADDRESS:?set to the public hostname in infra/.env}
+      # Virtual-host style bucket endpoint that Caddy's /s3 route proxies to.
+      # Must match the host minio signs, or S3 returns SignatureDoesNotMatch.
+      S3_BUCKET_HOST: ${RXHIVE_S3_BUCKET}.s3.${AWS_REGION}.amazonaws.com
+    volumes:
+      - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      # Issued certificates and the ACME account key. Losing this volume means
+      # re-issuing certs, which Let's Encrypt rate-limits — keep it.
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on: [api, web, livekit]
+    healthcheck:
+      # Caddy's admin API on loopback: liveness without needing a valid cert.
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  caddydata:
+  caddyconfig:

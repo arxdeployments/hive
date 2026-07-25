@@ -59,7 +59,15 @@ class Settings(BaseSettings):
     s3_region: str = "us-east-1"
     presign_expiry_seconds: int = 300
 
+    # URL handed to browsers for the SFU websocket. May be a bare path like
+    # "/livekit" (the bundled Caddy route) — a browser resolves that against the
+    # site origin, but the API server cannot, so /api/health probes
+    # `livekit_health_url` when the public URL is path-style.
     livekit_url: str = "ws://localhost:7880"
+    # Server-side address of the SFU, used only by the /api/health probe.
+    # Empty → derive from livekit_url. Set this when livekit_url is path-style
+    # (docker compose sets it to the service address: http://livekit:7880).
+    livekit_health_url: str = ""
     livekit_api_key: str = "devkey"
     livekit_api_secret: str = "devsecret-at-least-32-characters-long"
 
@@ -83,8 +91,13 @@ class Settings(BaseSettings):
         checks = {
             "RXHIVE_SECRET_KEY": self.secret_key,
             "RXHIVE_LIVEKIT_API_SECRET": self.livekit_api_secret,
-            "RXHIVE_S3_SECRET_KEY": self.s3_secret_key,
         }
+        # S3 keys are only checked when static credentials are actually in use.
+        # Leaving BOTH empty is the deployed AWS path: storage.py then pulls
+        # short-lived credentials from the instance role, so there is no secret
+        # to validate — and demanding one here would refuse to boot on EC2.
+        if self.s3_access_key or self.s3_secret_key:
+            checks["RXHIVE_S3_SECRET_KEY"] = self.s3_secret_key
         for name, value in checks.items():
             if value in _KNOWN_PLACEHOLDER_SECRETS:
                 raise ValueError(f"{name} is a known placeholder — set a real secret for production")
@@ -102,6 +115,27 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def livekit_probe_url(self) -> str | None:
+        """HTTP(S) address the API can GET to see whether the SFU is alive.
+
+        LiveKit serves a plain 200 on `/` over the same port as the signalling
+        websocket, so the ws→http translation of the client URL is a valid
+        liveness probe. Returns None when nothing probeable is configured
+        (unset, or a path-style URL only a browser can resolve).
+        """
+        raw = (self.livekit_health_url or self.livekit_url or "").strip()
+        if not raw:
+            return None
+        if raw.startswith("ws://"):
+            raw = "http://" + raw[len("ws://") :]
+        elif raw.startswith("wss://"):
+            raw = "https://" + raw[len("wss://") :]
+        if not raw.startswith(("http://", "https://")):
+            # e.g. "/livekit" — resolvable by the browser, not by this process.
+            return None
+        return raw
 
     @property
     def cookies_secure(self) -> bool:

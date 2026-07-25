@@ -1,0 +1,31 @@
+# LiveKit server config (self-hosted SFU) for the single-EC2 production stack.
+# API keys are injected via the LIVEKIT_KEYS env var in docker-compose.prod.yml
+# and must never be written here — this file is in git.
+port: 7880
+rtc:
+  # These are published on the host and must also be open in the security group.
+  # One UDP port is consumed per published track, so the width of this range
+  # bounds concurrent media streams. Widening it means changing three places in
+  # lockstep: here, the ports list in docker-compose.prod.yml, and the security
+  # group rule in Terraform.
+  port_range_start: 50000
+  port_range_end: 50100
+  # TCP fallback for clients on networks that block UDP (hospital and corporate
+  # guest wifi, mostly). Slower, but the difference between a bad call and none.
+  tcp_port: 7881
+  # This single line is what makes calls work on EC2. The SFU only ever sees the
+  # container's private address (172.x on the Docker bridge, behind the
+  # instance's 10.x VPC address). Without use_external_ip it advertises that
+  # private address in its ICE candidates: signalling succeeds, both peers join
+  # the room, and then no media ever flows because the browser is trying to
+  # reach an RFC1918 host it cannot route to. With it set, LiveKit discovers the
+  # public address (instance metadata / STUN) and advertises the Elastic IP
+  # instead, which is what the browser can actually reach.
+  use_external_ip: true
+redis:
+  # Shared with the API on the compose network — the service name resolves from
+  # inside this container, whereas a loopback address would point at LiveKit's
+  # own network namespace and silently fail.
+  address: redis:6379
+logging:
+  level: info

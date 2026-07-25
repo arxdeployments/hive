@@ -1,0 +1,53 @@
+# Production reverse proxy: ONE origin in front of the SPA, the API and the
+# LiveKit signal websocket, with automatic TLS from Let's Encrypt.
+#
+# SITE_ADDRESS must be the real hostname (chat.example.com) whose A record
+# points at the Elastic IP. Caddy needs :80 reachable for the HTTP-01 challenge
+# and :443 for traffic. ":80" here would disable TLS — dev only, and it would
+# also break auth, since RXHIVE_COOKIE_SECURE=true means the browser refuses to
+# send the session cookies over plain HTTP.
+#
+# Keeps the dev Caddyfile's /s3 route, repointed from MinIO to S3: production has no
+# MinIO container, and the browser fetches presigned URLs directly from S3.
+# Attachments are still never public — /api/media/* verifies membership and only
+# then redirects to a short-lived presigned URL.
+{$SITE_ADDRESS}
+
+encode gzip zstd
+
+# API (REST + presign redirects)
+handle /api/* {
+	reverse_proxy api:8000
+}
+
+# App websocket: messages, presence, typing, call signalling fan-out.
+# Caddy proxies the Upgrade transparently, no extra config needed.
+handle /ws* {
+	reverse_proxy api:8000
+}
+
+# LiveKit signal websocket only. Media does NOT pass through here — it is SRTP
+# direct to the instance on UDP 50000-50100 (TCP 7881 as fallback).
+# Attachments. /api/media/* authorises the request, then redirects here with a
+# short-lived presigned URL. Proxying (rather than redirecting the browser
+# straight to S3) keeps media same-origin, which is required because CSP is
+# enforced against redirect targets — a cross-origin redirect is blocked by
+# `img-src 'self'` and every attachment fails to render.
+#
+# header_up Host is load-bearing: SigV4 signs the Host header, and minio signs
+# virtual-host style, so the upstream must see <bucket>.s3.<region>.amazonaws.com
+# or S3 answers SignatureDoesNotMatch.
+handle_path /s3/* {
+	reverse_proxy https://{$S3_BUCKET_HOST} {
+		header_up Host {$S3_BUCKET_HOST}
+	}
+}
+
+handle_path /livekit/* {
+	reverse_proxy livekit:7880
+}
+
+# Frontend SPA (nginx serving the built bundle)
+handle {
+	reverse_proxy web:80
+}
