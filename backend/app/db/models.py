@@ -153,7 +153,14 @@ class Conversation(Base):
     avatar_url: Mapped[str | None]
     purpose_tag: Mapped[str | None] = mapped_column(String(100))  # cross_org groups
     allowed_org_ids: Mapped[dict] = mapped_column(JSONB, default=list)  # [str] for cross_org
+    # The wire "send_messages" permission is this column INVERTED — one source of
+    # truth for who may post, shared with the send path in services/messaging.
     admin_only_messages: Mapped[bool] = mapped_column(default=False)
+    perm_edit_info: Mapped[bool] = mapped_column(default=True)
+    perm_add_members: Mapped[bool] = mapped_column(default=True)
+    perm_send_history: Mapped[bool] = mapped_column(default=True)
+    perm_invite_via_link: Mapped[bool] = mapped_column(default=True)
+    perm_approve_new_members: Mapped[bool] = mapped_column(default=False)
     is_active: Mapped[bool] = mapped_column(default=True)
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     last_message_at: Mapped[dt.datetime | None]
@@ -251,6 +258,39 @@ class MessageReaction(Base):
 
     message: Mapped[Message] = relationship(back_populates="reactions")
     user: Mapped[User] = relationship()
+
+
+class MessageStar(Base):
+    """Starred messages — per-user and private (never visible to other members)."""
+
+    __tablename__ = "message_stars"
+
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    created_at: Mapped[dt.datetime] = _now()
+
+    __table_args__ = (Index("ix_message_stars_user", "user_id"),)
+
+
+class MessagePin(Base):
+    """Pinned messages — conversation-wide, so one row per message (PK message_id).
+
+    conversation_id is denormalized so the pinned list for a conversation is one
+    indexed lookup instead of a join back through messages.
+    """
+
+    __tablename__ = "message_pins"
+
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"))
+    pinned_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    created_at: Mapped[dt.datetime] = _now()
+
+    __table_args__ = (Index("ix_message_pins_conversation", "conversation_id"),)
 
 
 class MessageDeletion(Base):

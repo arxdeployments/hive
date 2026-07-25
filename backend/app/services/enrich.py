@@ -22,7 +22,9 @@ from app.db.models import (
     Message,
     MessageAttachment,
     MessageDeletion,
+    MessagePin,
     MessageReaction,
+    MessageStar,
     MessageType,
     User,
 )
@@ -193,12 +195,34 @@ async def serialize_conversation(
         "last_message": last_msgs.get(conv.id),
         "unread_count": unread.get(conv.id, 0),
         "is_pinned": bool(me and me.is_pinned),
+        # Mute was stored and toggleable but never sent back, so every client read
+        # it as False after a reload — and since PUT /mute is a blind flip, the
+        # menu offered "Mute" on an already-muted chat and unmuted it instead.
+        "is_muted": bool(me and me.is_muted),
     }
     if is_group:
         doc["description"] = conv.description
         doc["admin_only_messages"] = conv.admin_only_messages
     if conv.type.value == "cross_org":
         doc["purpose_tag"] = conv.purpose_tag
+    return doc
+
+
+# Wire permission name -> Conversation column. `send_messages` is deliberately
+# absent: it maps to the existing admin_only_messages column, INVERTED.
+PERMISSION_COLUMNS = {
+    "edit_info": "perm_edit_info",
+    "add_members": "perm_add_members",
+    "send_history": "perm_send_history",
+    "invite_via_link": "perm_invite_via_link",
+    "approve_new_members": "perm_approve_new_members",
+}
+
+
+def serialize_permissions(conv: Conversation) -> dict:
+    """The six-boolean permissions object the group settings UI reads/writes."""
+    doc = {name: bool(getattr(conv, column)) for name, column in PERMISSION_COLUMNS.items()}
+    doc["send_messages"] = not conv.admin_only_messages
     return doc
 
 
@@ -247,6 +271,28 @@ def receipts_for_message(
     return read_by, delivered_to
 
 
+async def starred_message_ids(
+    db: AsyncSession, message_ids: list[uuid.UUID], user_id: uuid.UUID
+) -> set[uuid.UUID]:
+    """Which of these messages the given user has starred (one batched query)."""
+    if not message_ids:
+        return set()
+    rows = await db.execute(
+        select(MessageStar.message_id).where(
+            MessageStar.message_id.in_(message_ids), MessageStar.user_id == user_id
+        )
+    )
+    return set(rows.scalars().all())
+
+
+async def pinned_message_ids(db: AsyncSession, message_ids: list[uuid.UUID]) -> set[uuid.UUID]:
+    """Which of these messages are pinned (conversation-wide, one batched query)."""
+    if not message_ids:
+        return set()
+    rows = await db.execute(select(MessagePin.message_id).where(MessagePin.message_id.in_(message_ids)))
+    return set(rows.scalars().all())
+
+
 async def serialize_message(
     db: AsyncSession,
     msg: Message,
@@ -254,7 +300,16 @@ async def serialize_message(
     conv_participants: list[ConversationParticipant] | None = None,
     sender: User | None = None,
     include_reply: bool = True,
+    for_user: uuid.UUID | None = None,
+    starred_ids: set[uuid.UUID] | None = None,
+    pinned_ids: set[uuid.UUID] | None = None,
 ) -> dict:
+    """Serialize one message.
+
+    `is_starred` is the REQUESTING user's star, so it needs `for_user`; with no
+    user context it is False. List endpoints pass pre-computed `starred_ids` /
+    `pinned_ids` sets so a page costs two queries instead of two per message.
+    """
     if sender is None and msg.sender_id:
         sender = await db.get(User, msg.sender_id)
     if conv_participants is None:
@@ -271,6 +326,17 @@ async def serialize_message(
         )
 
     read_by, delivered_to = receipts_for_message(msg.created_at, msg.sender_id, conv_participants)
+
+    if starred_ids is not None:
+        is_starred = msg.id in starred_ids
+    elif for_user is not None:
+        is_starred = await db.get(MessageStar, (msg.id, for_user)) is not None
+    else:
+        is_starred = False
+    if pinned_ids is not None:
+        is_pinned = msg.id in pinned_ids
+    else:
+        is_pinned = await db.get(MessagePin, msg.id) is not None
 
     reactions = []
     for r in msg.reactions:
@@ -294,6 +360,8 @@ async def serialize_message(
         "delivered_to": delivered_to,
         "is_deleted": msg.deleted_at is not None,
         "is_forwarded": msg.is_forwarded,
+        "is_starred": is_starred,
+        "is_pinned": is_pinned,
         "created_at": iso_z(msg.created_at),
         "edited_at": iso_z(msg.edited_at),
         "sender_name": sender.display_name if sender else "System",

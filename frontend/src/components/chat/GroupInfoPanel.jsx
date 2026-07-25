@@ -1,103 +1,316 @@
-import React, { useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { X, Crown, Shield, UserPlus, LogOut, Pencil, MoreVertical, MessageSquare, UserMinus, ShieldCheck, ShieldOff } from 'lucide-react';
-import client from '../../api/client';
+/**
+ * Group Info — WhatsApp-parity two-column drawer.
+ *
+ *   <GroupInfoPanel conversation={conv} isOpen={bool} onClose={fn} initialSection="info" />
+ *
+ * Left rail: Info · Media, links and docs · Starred · Group permissions ·
+ * Encryption · Members. Every nav item carries data-testid="group-info-nav-<section>".
+ *
+ * `currentUserId` is optional — it is read from AuthContext when omitted, so the
+ * documented four-prop contract is enough on its own. `onJumpToMessage`,
+ * `onSearchMessages` and `onGroupCreated` are optional integration hooks; the
+ * panel degrades gracefully (no dead UI) when they are not supplied.
+ */
+
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
+import {
+  Check,
+  Copy,
+  Crown,
+  Download,
+  Eraser,
+  Info,
+  Image as ImageIcon,
+  Lock,
+  LogOut,
+  MessageSquare,
+  MoreVertical,
+  Pencil,
+  Phone,
+  Search,
+  Shield,
+  ShieldCheck,
+  ShieldOff,
+  SlidersHorizontal,
+  Star,
+  Timer,
+  UserMinus,
+  UserPlus,
+  Users,
+  Video,
+  X,
+} from 'lucide-react';
 import { toast } from 'sonner';
-import { NewChatModal } from './NewChatModal';
+import client from '../../api/client';
 import useChatStore from '../../stores/chatStore';
+import useCallStore from '../../stores/callStore';
+import wsClient from '../../services/websocket';
+import { useAuth } from '../../contexts/AuthContext';
+import { NewChatModal } from './NewChatModal';
+import { CreateGroupModal } from './CreateGroupModal';
+import { InfoPanelShell } from './info/InfoPanelShell';
+import { MediaLinksDocsSection } from './info/MediaLinksDocsSection';
+import { StarredSection } from './info/StarredSection';
+import { EncryptionSection } from './info/EncryptionSection';
+import {
+  ActionRow,
+  Avatar,
+  ConfirmDialog,
+  EmptyState,
+  LoadingState,
+  QuickAction,
+  SectionHeading,
+  ToggleRow,
+  formatLongDate,
+} from './info/InfoPanelPrimitives';
 
-export const GroupInfoPanel = ({ conversation, currentUserId, isOpen, onClose }) => {
+const ROLE_ORDER = { creator: 0, admin: 1, member: 2 };
+
+/** "Members can:" rows, in WhatsApp's order. */
+const MEMBER_PERMISSIONS = [
+  {
+    key: 'edit_info',
+    label: 'Edit group settings',
+    description: 'Change the group name, icon and description',
+  },
+  { key: 'send_messages', label: 'Send new messages' },
+  { key: 'add_members', label: 'Add other members' },
+  {
+    key: 'send_history',
+    label: 'Send message history',
+    description: 'New members can see messages sent before they joined',
+  },
+  { key: 'invite_via_link', label: 'Invite via link or QR code' },
+];
+
+/** "Admins can:" rows. */
+const ADMIN_PERMISSIONS = [
+  {
+    key: 'approve_new_members',
+    label: 'Approve new members',
+    description: 'Requests to join must be approved by an admin',
+  },
+];
+
+export const GroupInfoPanel = ({
+  conversation,
+  isOpen,
+  onClose,
+  initialSection = 'info',
+  currentUserId,
+  onJumpToMessage,
+  onSearchMessages,
+  onGroupCreated,
+}) => {
+  const { user } = useAuth();
+  const myUserId = currentUserId || user?.id;
+  const setActiveConversation = useChatStore((s) => s.setActiveConversation);
+  const updateConversation = useChatStore((s) => s.updateConversation);
+  const setMessages = useChatStore((s) => s.setMessages);
+
+  const [section, setSection] = useState(initialSection);
+
   const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState('');
   const [editingDesc, setEditingDesc] = useState(false);
-  const [newName, setNewName] = useState('');
-  const [newDesc, setNewDesc] = useState('');
-  const [showAddMembers, setShowAddMembers] = useState(false);
+  const [descDraft, setDescDraft] = useState('');
+  const [savingInfo, setSavingInfo] = useState(false);
+
+  const [muted, setMuted] = useState(false);
+  const [mutePending, setMutePending] = useState(false);
+
+  const [permissions, setPermissions] = useState(null);
+  const [permLoading, setPermLoading] = useState(false);
+  const [permError, setPermError] = useState(false);
+  const [permSaving, setPermSaving] = useState(null);
+
+  const [memberSearch, setMemberSearch] = useState('');
   const [memberMenu, setMemberMenu] = useState(null);
-  const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
-  const { setActiveConversation } = useChatStore();
+  const [showAddMembers, setShowAddMembers] = useState(false);
+  const [showSimilarGroup, setShowSimilarGroup] = useState(false);
 
-  if (!isOpen || !conversation) return null;
+  const [confirm, setConfirm] = useState(null); // 'leave' | 'clear'
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
-  const isCrossOrg = conversation.cross_org === true;
-  const participants = conversation.participants || [];
-  const myRole = participants.find(p => p.user_id === currentUserId)?.role;
+  const convId = conversation?._id;
+  const participants = useMemo(() => conversation?.participants || [], [conversation]);
+  const myRole = participants.find((p) => p.user_id === myUserId)?.role;
   const isCreator = myRole === 'creator';
   const isAdmin = myRole === 'admin' || isCreator;
-  const adminOnly = conversation.admin_only_messages;
+  const isCrossOrg = conversation?.cross_org === true;
+  const memberCount = participants.length;
 
-  // Sort: creator first, then admins, then members
-  const sortedMembers = [...participants].sort((a, b) => {
-    const order = { creator: 0, admin: 1, member: 2 };
-    return (order[a.role] || 2) - (order[b.role] || 2);
-  });
+  // Re-arm the requested section every time the drawer opens: the integrator
+  // passes initialSection per invocation ("open straight to Members"), and a
+  // panel that remembered the last section would ignore it on re-open.
+  useEffect(() => {
+    if (isOpen) {
+      setSection(initialSection || 'info');
+      setMemberMenu(null);
+      setMemberSearch('');
+      setEditingName(false);
+      setEditingDesc(false);
+    }
+  }, [isOpen, initialSection, convId]);
 
-  const handleEditName = async () => {
-    if (!newName.trim()) return;
+  // Mute is per-participant. Prefer whatever the conversation doc exposes, then
+  // my participant row, then Off — the toggle response is the source of truth.
+  useEffect(() => {
+    const mine = participants.find((p) => p.user_id === myUserId);
+    setMuted(Boolean(conversation?.is_muted ?? mine?.is_muted ?? false));
+  }, [conversation?.is_muted, participants, myUserId]);
+
+  const loadPermissions = useCallback(async () => {
+    if (!convId) return;
+    setPermLoading(true);
+    setPermError(false);
     try {
-      await client.put(`/api/conversations/${conversation._id}/group`, { name: newName.trim() });
+      const { data } = await client.get(`/api/conversations/${convId}/permissions`);
+      setPermissions(data);
+    } catch {
+      setPermissions(null);
+      setPermError(true);
+    } finally {
+      setPermLoading(false);
+    }
+  }, [convId]);
+
+  useEffect(() => {
+    if (isOpen && section === 'permissions') loadPermissions();
+  }, [isOpen, section, loadPermissions]);
+
+  const handleSaveName = async () => {
+    const name = nameDraft.trim();
+    if (!name || name === conversation.name) {
+      setEditingName(false);
+      return;
+    }
+    setSavingInfo(true);
+    try {
+      const { data } = await client.put(`/api/conversations/${convId}/group`, { name });
+      updateConversation(convId, { name: data?.name ?? name });
       toast.success('Group name updated');
       setEditingName(false);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to update');
+      toast.error(err.response?.data?.detail || 'Failed to update group name');
+    } finally {
+      setSavingInfo(false);
     }
   };
 
-  const handleEditDesc = async () => {
+  const handleSaveDesc = async () => {
+    const description = descDraft.trim();
+    setSavingInfo(true);
     try {
-      await client.put(`/api/conversations/${conversation._id}/group`, { description: newDesc.trim() || null });
+      await client.put(`/api/conversations/${convId}/group`, { description: description || null });
+      updateConversation(convId, { description: description || null });
       toast.success('Description updated');
       setEditingDesc(false);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to update');
+      toast.error(err.response?.data?.detail || 'Failed to update description');
+    } finally {
+      setSavingInfo(false);
     }
   };
 
-  const handleToggleAdminOnly = async () => {
+  const handleToggleMute = async (next) => {
+    setMutePending(true);
+    setMuted(next); // optimistic
     try {
-      await client.put(`/api/conversations/${conversation._id}/group`, { admin_only_messages: !adminOnly });
-      toast.success(adminOnly ? 'All members can now send messages' : 'Only admins can send messages');
+      const { data } = await client.put(`/api/conversations/${convId}/mute`);
+      const value = Boolean(data?.is_muted);
+      setMuted(value);
+      updateConversation(convId, { is_muted: value });
+      toast.success(value ? 'Notifications muted' : 'Notifications unmuted');
     } catch (err) {
-      toast.error('Failed to update');
+      setMuted(!next); // roll back
+      toast.error(err.response?.data?.detail || 'Failed to change mute');
+    } finally {
+      setMutePending(false);
     }
   };
 
-  const handleRemoveMember = async (memberId) => {
+  const handleTogglePermission = async (key, next) => {
+    const previous = permissions;
+    setPermissions((prev) => ({ ...prev, [key]: next })); // optimistic
+    setPermSaving(key);
     try {
-      await client.delete(`/api/conversations/${conversation._id}/members/${memberId}`);
-      toast.success('Member removed');
-      setMemberMenu(null);
+      const { data } = await client.put(`/api/conversations/${convId}/permissions`, { [key]: next });
+      setPermissions(data);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to remove');
+      setPermissions(previous); // roll back
+      toast.error(err.response?.data?.detail || 'Failed to update permission');
+    } finally {
+      setPermSaving(null);
     }
   };
 
-  const handleChangeRole = async (memberId, newRole) => {
+  const handleCall = (callType) => {
+    if (useCallStore.getState().callState !== 'idle') {
+      toast.error('You are already in a call');
+      return;
+    }
+    wsClient.send({ type: 'call:group_initiate', conversation_id: convId, call_type: callType });
+    useCallStore.getState().initiateCall(null, callType, true, convId);
+    onClose?.();
+  };
+
+  const handleExport = async () => {
+    setExporting(true);
     try {
-      await client.put(`/api/conversations/${conversation._id}/members/${memberId}/role`, { role: newRole });
-      toast.success(newRole === 'admin' ? 'Made admin' : 'Removed as admin');
-      setMemberMenu(null);
+      const response = await client.get(`/api/conversations/${convId}/export`, { responseType: 'blob' });
+      const blob = new Blob([response.data], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      // Filename from the id, never the (user-controlled) group name.
+      link.download = `rxhive-chat-${convId}.txt`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      toast.success('Chat exported');
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to change role');
+      toast.error(err.response?.data?.detail || 'Export failed');
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleClearChat = async () => {
+    setConfirmBusy(true);
+    try {
+      await client.post(`/api/conversations/${convId}/clear`);
+      setMessages(convId, []);
+      toast.success('Chat cleared');
+      setConfirm(null);
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to clear chat');
+    } finally {
+      setConfirmBusy(false);
     }
   };
 
   const handleLeave = async () => {
+    setConfirmBusy(true);
     try {
-      await client.post(`/api/conversations/${conversation._id}/leave`);
+      await client.post(`/api/conversations/${convId}/leave`);
       toast.success('Left group');
-      setShowLeaveConfirm(false);
-      onClose();
+      setConfirm(null);
+      onClose?.();
       setActiveConversation(null);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to leave');
+      toast.error(err.response?.data?.detail || 'Failed to leave group');
+    } finally {
+      setConfirmBusy(false);
     }
   };
 
-  const handleAddMembers = async (contactId) => {
+  const handleAddMember = async (contactId) => {
     try {
-      await client.post(`/api/conversations/${conversation._id}/members`, {
-        user_ids: [contactId]
-      });
+      await client.post(`/api/conversations/${convId}/members`, { user_ids: [contactId] });
       toast.success('Member added');
       setShowAddMembers(false);
     } catch (err) {
@@ -105,258 +318,586 @@ export const GroupInfoPanel = ({ conversation, currentUserId, isOpen, onClose })
     }
   };
 
-  return (
-    <AnimatePresence>
-      {isOpen && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          className="fixed inset-0 z-50"
-          onClick={onClose}
-        >
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-[4px]" />
-          <motion.div
-            initial={{ x: '100%' }}
-            animate={{ x: 0 }}
-            exit={{ x: '100%' }}
-            transition={{ duration: 0.3, ease: [0.2, 0.8, 0.2, 1] }}
-            onClick={(e) => e.stopPropagation()}
-            className="absolute right-0 top-0 h-full w-full sm:w-[380px] bg-[#0F0F0F] border-l border-[#1F1F1F] shadow-2xl overflow-y-auto"
-            data-testid="group-info-panel"
-          >
-            {/* Close button */}
-            <div className="flex items-center justify-between px-4 py-3 border-b border-[#1F1F1F]">
-              <h3 className="text-base font-semibold text-[#F5F5F5]">Group Info</h3>
-              <button onClick={onClose} className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors">
-                <X size={18} />
+  const handleRemoveMember = async (memberId) => {
+    setMemberMenu(null);
+    try {
+      await client.delete(`/api/conversations/${convId}/members/${memberId}`);
+      toast.success('Member removed');
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to remove member');
+    }
+  };
+
+  const handleChangeRole = async (memberId, role) => {
+    setMemberMenu(null);
+    try {
+      await client.put(`/api/conversations/${convId}/members/${memberId}/role`, { role });
+      toast.success(role === 'admin' ? 'Made admin' : 'Removed as admin');
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to change role');
+    }
+  };
+
+  const handleMessageMember = async (memberId) => {
+    setMemberMenu(null);
+    try {
+      const { data } = await client.post('/api/conversations/direct', { participant_id: memberId });
+      onClose?.();
+      setActiveConversation(data._id);
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to open chat');
+    }
+  };
+
+  const sortedMembers = useMemo(() => {
+    const query = memberSearch.trim().toLowerCase();
+    return [...participants]
+      .filter((p) => !query || (p.display_name || '').toLowerCase().includes(query))
+      .sort((a, b) => {
+        const byRole = (ROLE_ORDER[a.role] ?? 2) - (ROLE_ORDER[b.role] ?? 2);
+        if (byRole !== 0) return byRole;
+        return (a.display_name || '').localeCompare(b.display_name || '');
+      });
+  }, [participants, memberSearch]);
+
+  /** Everyone except me, shaped the way CreateGroupModal's contact list expects. */
+  const similarGroupMembers = useMemo(
+    () =>
+      participants
+        .filter((p) => p.user_id !== myUserId)
+        .map((p) => ({
+          id: p.user_id,
+          display_name: p.display_name,
+          avatar_url: p.avatar_url,
+          department_name: p.department_name || '',
+        })),
+    [participants, myUserId]
+  );
+
+  const creatorName =
+    participants.find((p) => p.user_id === conversation?.created_by)?.display_name ||
+    participants.find((p) => p.role === 'creator')?.display_name ||
+    'Unknown';
+
+  const sections = [
+    { id: 'info', label: 'Info', icon: Info },
+    { id: 'media', label: 'Media, links and docs', icon: ImageIcon },
+    { id: 'starred', label: 'Starred', icon: Star },
+    { id: 'permissions', label: 'Group permissions', icon: SlidersHorizontal },
+    { id: 'encryption', label: 'Encryption', icon: Lock },
+    { id: 'members', label: 'Members', icon: Users, badge: memberCount },
+  ];
+
+  if (!conversation) return null;
+
+  const renderInfo = () => (
+    <div className="p-5 space-y-6">
+      {/* Identity */}
+      <div className="flex flex-col items-center text-center">
+        <Avatar name={conversation.name || 'Group'} src={conversation.avatar_url} size={112} />
+
+        {editingName ? (
+          <div className="mt-4 w-full max-w-[320px] flex items-center gap-2">
+            <input
+              type="text"
+              value={nameDraft}
+              maxLength={100}
+              autoFocus
+              onChange={(e) => setNameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleSaveName();
+                if (e.key === 'Escape') setEditingName(false);
+              }}
+              data-testid="group-info-name-input"
+              className="flex-1 h-10 px-3 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] text-center focus:border-[#10B981] focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={handleSaveName}
+              disabled={savingInfo}
+              aria-label="Save group name"
+              data-testid="group-info-name-save"
+              className="p-2 text-[#10B981] hover:bg-[#10B981]/10 rounded-[6px] transition-colors disabled:opacity-50"
+            >
+              <Check size={16} />
+            </button>
+            <button
+              type="button"
+              onClick={() => setEditingName(false)}
+              aria-label="Cancel"
+              className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] rounded-[6px] transition-colors"
+            >
+              <X size={16} />
+            </button>
+          </div>
+        ) : (
+          <div className="mt-4 flex items-center gap-2">
+            <h2 className="text-xl font-semibold text-[#F5F5F5]">{conversation.name || 'Group'}</h2>
+            {isAdmin && (
+              <button
+                type="button"
+                onClick={() => {
+                  setNameDraft(conversation.name || '');
+                  setEditingName(true);
+                }}
+                aria-label="Edit group name"
+                data-testid="group-info-edit-name"
+                className="p-1.5 text-[#A3A3A3] hover:text-[#10B981] rounded-[6px] transition-colors"
+              >
+                <Pencil size={14} />
+              </button>
+            )}
+          </div>
+        )}
+
+        <p className="text-sm text-[#A3A3A3] mt-1">
+          Group · {memberCount} {memberCount === 1 ? 'member' : 'members'}
+        </p>
+        {isCrossOrg && (
+          <span className="mt-2 text-[11px] px-3 py-1 rounded-full bg-[#10B981]/20 text-[#10B981]">
+            Cross-Organization Group
+          </span>
+        )}
+      </div>
+
+      {/* Quick actions */}
+      <div className="flex gap-2">
+        <QuickAction icon={Phone} label="Audio" onClick={() => handleCall('voice')} testId="group-info-action-audio" />
+        <QuickAction icon={Video} label="Video" onClick={() => handleCall('video')} testId="group-info-action-video" />
+        <QuickAction
+          icon={UserPlus}
+          label="Add"
+          disabled={!isAdmin}
+          onClick={() => setShowAddMembers(true)}
+          testId="group-info-action-add"
+        />
+        <QuickAction
+          icon={Search}
+          label="Search"
+          onClick={() => {
+            onClose?.();
+            onSearchMessages?.();
+          }}
+          testId="group-info-action-search"
+        />
+      </div>
+
+      {/* Description */}
+      <div className="bg-[#141414] border border-[#1F1F1F] rounded-[10px] p-4">
+        <div className="flex items-center justify-between mb-2">
+          <SectionHeading>Description</SectionHeading>
+          {isAdmin && !editingDesc && (
+            <button
+              type="button"
+              onClick={() => {
+                setDescDraft(conversation.description || '');
+                setEditingDesc(true);
+              }}
+              data-testid="group-info-edit-description"
+              className="text-xs text-[#10B981] hover:text-[#059669] transition-colors"
+            >
+              Edit
+            </button>
+          )}
+        </div>
+        {editingDesc ? (
+          <div className="space-y-2">
+            <textarea
+              value={descDraft}
+              maxLength={500}
+              rows={3}
+              autoFocus
+              onChange={(e) => setDescDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') setEditingDesc(false);
+              }}
+              placeholder="Add a group description"
+              data-testid="group-info-description-input"
+              className="w-full px-3 py-2 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#A3A3A3]/60 focus:border-[#10B981] focus:outline-none resize-none"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setEditingDesc(false)}
+                className="px-3 py-1.5 text-xs text-[#A3A3A3] hover:text-[#F5F5F5] rounded-[6px] transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleSaveDesc}
+                disabled={savingInfo}
+                data-testid="group-info-description-save"
+                className="px-3 py-1.5 text-xs font-medium bg-[#10B981] text-[#0A0A0A] rounded-[6px] hover:bg-[#059669] disabled:opacity-50 transition-colors"
+              >
+                Save
               </button>
             </div>
+          </div>
+        ) : (
+          <p className="text-sm text-[#F5F5F5] whitespace-pre-wrap break-words">
+            {conversation.description || <span className="text-[#A3A3A3]">No description yet</span>}
+          </p>
+        )}
+      </div>
 
-            <div className="p-5 space-y-6">
-              {/* Avatar + Name */}
-              <div className="text-center">
-                <div className="w-24 h-24 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-3xl font-bold mx-auto mb-3">
-                  {conversation.name?.substring(0, 2).toUpperCase() || 'G'}
+      {/* Chat settings */}
+      <div className="bg-[#141414] border border-[#1F1F1F] rounded-[10px] divide-y divide-[#1F1F1F]">
+        <ToggleRow
+          label="Mute notifications"
+          description={muted ? 'You will not be notified about new messages' : 'Notifications are on'}
+          checked={muted}
+          busy={mutePending}
+          onChange={handleToggleMute}
+          testId="group-info-mute-toggle"
+        />
+        <div className="flex items-center justify-between gap-4 px-4 py-3" data-testid="group-info-disappearing">
+          <span className="flex items-center gap-3 min-w-0">
+            <Timer size={18} className="text-[#A3A3A3] shrink-0" />
+            <span className="min-w-0">
+              <span className="block text-sm text-[#F5F5F5]">Disappearing messages</span>
+              <span className="block text-xs text-[#A3A3A3] mt-0.5">Not available on RX HIVE yet</span>
+            </span>
+          </span>
+          <span className="text-sm text-[#A3A3A3] shrink-0">Off</span>
+        </div>
+      </div>
+
+      {/* Chat actions */}
+      <div className="bg-[#141414] border border-[#1F1F1F] rounded-[10px] divide-y divide-[#1F1F1F]">
+        <ActionRow
+          icon={Copy}
+          label="Create a similar group"
+          description="Start a new group with the same members"
+          onClick={() => setShowSimilarGroup(true)}
+          testId="group-info-create-similar"
+        />
+        <ActionRow
+          icon={Download}
+          label="Export chat"
+          description="Download this conversation as a text file"
+          onClick={handleExport}
+          disabled={exporting}
+          trailing={exporting ? 'Exporting…' : undefined}
+          testId="group-info-export"
+        />
+        <ActionRow
+          icon={Eraser}
+          label="Clear chat"
+          description="Remove all messages from your copy of this chat"
+          onClick={() => setConfirm('clear')}
+          testId="group-info-clear"
+        />
+        {isCrossOrg ? (
+          <div className="px-4 py-3">
+            <p className="text-xs text-[#A3A3A3]">
+              This cross-organization group is managed by an administrator — you cannot leave it yourself.
+            </p>
+          </div>
+        ) : (
+          <ActionRow
+            icon={LogOut}
+            label={isCreator && memberCount === 1 ? 'Delete group' : 'Exit group'}
+            danger
+            onClick={() => setConfirm('leave')}
+            testId="group-leave-button"
+          />
+        )}
+      </div>
+
+      <p className="text-xs text-[#A3A3A3] text-center" data-testid="group-info-created">
+        Created by {creatorName} · Created {formatLongDate(conversation.created_at) || 'unknown'}
+      </p>
+    </div>
+  );
+
+  const renderPermissions = () => {
+    if (permLoading) return <LoadingState label="Loading permissions…" />;
+    if (permError || !permissions) {
+      return (
+        <div className="flex flex-col items-center py-16 gap-3">
+          <p className="text-sm text-[#A3A3A3]">Couldn&apos;t load group permissions.</p>
+          <button
+            type="button"
+            onClick={loadPermissions}
+            className="px-3 py-1.5 text-xs text-[#10B981] border border-[#10B981]/40 rounded-[6px] hover:bg-[#10B981]/10 transition-colors"
+          >
+            Try again
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div className="p-5 space-y-5">
+        {!isAdmin && (
+          <div
+            className="flex gap-3 p-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[10px]"
+            data-testid="group-permissions-readonly-notice"
+          >
+            <Shield size={18} className="text-[#A3A3A3] shrink-0 mt-0.5" />
+            <p className="text-sm text-[#A3A3A3]">
+              Only the group creator and admins can change these settings. You can see what is currently
+              allowed, but the switches are read-only for you.
+            </p>
+          </div>
+        )}
+
+        <div>
+          <SectionHeading className="px-1 mb-2">Members can</SectionHeading>
+          <div className="bg-[#141414] border border-[#1F1F1F] rounded-[10px] divide-y divide-[#1F1F1F]">
+            {MEMBER_PERMISSIONS.map((row) => (
+              <ToggleRow
+                key={row.key}
+                label={row.label}
+                description={row.description}
+                checked={!!permissions[row.key]}
+                disabled={!isAdmin}
+                busy={permSaving === row.key}
+                onChange={(next) => handleTogglePermission(row.key, next)}
+                testId={`group-permission-${row.key}`}
+              />
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <SectionHeading className="px-1 mb-2">Admins can</SectionHeading>
+          <div className="bg-[#141414] border border-[#1F1F1F] rounded-[10px] divide-y divide-[#1F1F1F]">
+            {ADMIN_PERMISSIONS.map((row) => (
+              <ToggleRow
+                key={row.key}
+                label={row.label}
+                description={row.description}
+                checked={!!permissions[row.key]}
+                disabled={!isAdmin}
+                busy={permSaving === row.key}
+                onChange={(next) => handleTogglePermission(row.key, next)}
+                testId={`group-permission-${row.key}`}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderMembers = () => (
+    <div className="p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <div className="relative flex-1">
+          <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#A3A3A3]" />
+          <input
+            type="text"
+            value={memberSearch}
+            onChange={(e) => setMemberSearch(e.target.value)}
+            placeholder="Search members"
+            data-testid="group-members-search"
+            className="w-full h-9 pl-9 pr-3 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#A3A3A3]/60 focus:border-[#10B981] focus:outline-none transition-colors"
+          />
+        </div>
+        {isAdmin && (
+          <button
+            type="button"
+            onClick={() => setShowAddMembers(true)}
+            data-testid="group-add-members"
+            className="flex items-center gap-1.5 h-9 px-3 text-xs text-[#10B981] border border-[#10B981]/40 rounded-[6px] hover:bg-[#10B981]/10 transition-colors shrink-0"
+          >
+            <UserPlus size={14} /> Add
+          </button>
+        )}
+      </div>
+
+      <p className="text-xs text-[#A3A3A3] px-1">
+        {sortedMembers.length} of {memberCount} {memberCount === 1 ? 'member' : 'members'}
+      </p>
+
+      {sortedMembers.length === 0 ? (
+        <EmptyState icon={Users} title="No members match that search" />
+      ) : (
+        <div className="space-y-1">
+          {sortedMembers.map((member) => {
+            const isMe = member.user_id === myUserId;
+            const canManage = isAdmin && !isMe && member.role !== 'creator';
+            const canPromote = isCreator && !isMe && member.role !== 'creator';
+            return (
+              <div
+                key={member.user_id}
+                className="group flex items-center gap-3 p-2.5 rounded-[8px] hover:bg-[#141414] transition-colors relative"
+                data-testid="group-member-row"
+              >
+                <Avatar name={member.display_name} src={member.avatar_url} size={38} />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-sm text-[#F5F5F5] truncate">{member.display_name}</span>
+                    {isMe && <span className="text-xs text-[#A3A3A3] shrink-0">(You)</span>}
+                  </div>
+                  <span
+                    className={`text-xs ${
+                      member.status === 'online' ? 'text-[#10B981]' : 'text-[#A3A3A3]'
+                    }`}
+                  >
+                    {member.status === 'online' ? 'online' : 'offline'}
+                  </span>
                 </div>
 
-                {editingName ? (
-                  <div className="flex items-center gap-2 justify-center">
-                    <input
-                      type="text"
-                      value={newName}
-                      onChange={(e) => setNewName(e.target.value)}
-                      onKeyDown={(e) => { if (e.key === 'Enter') handleEditName(); if (e.key === 'Escape') setEditingName(false); }}
-                      autoFocus
-                      className="h-9 px-3 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] text-center focus:border-[#10B981] focus:outline-none"
-                    />
-                  </div>
-                ) : (
-                  <div className="flex items-center justify-center gap-2">
-                    <h2 className="text-xl font-semibold text-[#F5F5F5]">{conversation.name}</h2>
-                    {isAdmin && (
-                      <button onClick={() => { setNewName(conversation.name || ''); setEditingName(true); }}
-                        className="p-1 text-[#A3A3A3] hover:text-[#10B981] transition-colors">
-                        <Pencil size={14} />
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                {editingDesc ? (
-                  <div className="mt-2 flex flex-col items-center gap-2">
-                    <textarea
-                      value={newDesc}
-                      onChange={(e) => setNewDesc(e.target.value)}
-                      onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleEditDesc(); } if (e.key === 'Escape') setEditingDesc(false); }}
-                      autoFocus
-                      rows={2}
-                      className="w-full px-3 py-2 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#A3A3A3] text-center focus:border-[#10B981] focus:outline-none resize-none"
-                    />
-                  </div>
-                ) : (
-                  <div className="mt-1 flex items-center justify-center gap-1">
-                    <p className="text-sm text-[#A3A3A3]">{conversation.description || 'No description'}</p>
-                    {isAdmin && (
-                      <button onClick={() => { setNewDesc(conversation.description || ''); setEditingDesc(true); }}
-                        className="p-1 text-[#A3A3A3] hover:text-[#10B981] transition-colors">
-                        <Pencil size={12} />
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                <p className="text-xs text-[#A3A3A3] mt-2">{participants.length} members</p>
-                {isCrossOrg && (
-                  <span className="inline-block mt-2 text-[11px] px-3 py-1 rounded-full bg-[#10B981]/20 text-[#10B981]">
-                    Cross-Organization Group
+                {member.role === 'creator' && (
+                  <span className="flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-[#FBBF24]/15 text-[#FBBF24] shrink-0">
+                    <Crown size={11} /> Creator
                   </span>
                 )}
-              </div>
+                {member.role === 'admin' && (
+                  <span className="flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-[#10B981]/15 text-[#10B981] shrink-0">
+                    <Shield size={11} /> Admin
+                  </span>
+                )}
 
-              {/* Admin only toggle */}
-              {isAdmin && (
-                <button
-                  onClick={handleToggleAdminOnly}
-                  className="w-full flex items-center justify-between p-3 bg-[#141414] border border-[#1F1F1F] rounded-[8px] hover:border-[#10B981]/20 transition-colors"
-                >
-                  <span className="text-sm text-[#F5F5F5]">Only admins can send</span>
-                  <div className={`w-10 h-5 rounded-full transition-colors ${adminOnly ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
-                    <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform`}
-                      style={{ left: adminOnly ? '22px' : '2px' }} />
-                  </div>
-                </button>
-              )}
-
-              {/* Members */}
-              <div>
-                <div className="flex items-center justify-between mb-3">
-                  <h4 className="text-sm font-medium text-[#A3A3A3]">Members</h4>
-                  {isAdmin && (
+                {!isMe && (
+                  <div className="relative shrink-0">
                     <button
-                      onClick={() => setShowAddMembers(true)}
-                      data-testid="group-add-members"
-                      className="flex items-center gap-1 text-xs text-[#10B981] hover:text-[#059669] transition-colors"
+                      type="button"
+                      onClick={() => setMemberMenu(memberMenu === member.user_id ? null : member.user_id)}
+                      aria-label={`Actions for ${member.display_name}`}
+                      data-testid="group-member-menu"
+                      className="p-1.5 text-[#A3A3A3] hover:text-[#F5F5F5] rounded-[6px] opacity-0 group-hover:opacity-100 focus:opacity-100 transition-all"
                     >
-                      <UserPlus size={14} /> Add
+                      <MoreVertical size={15} />
                     </button>
-                  )}
-                </div>
-
-                <div className="space-y-1">
-                  {sortedMembers.map(member => (
-                    <div
-                      key={member.user_id}
-                      className="flex items-center gap-3 p-2 rounded-[6px] hover:bg-[#141414] transition-colors relative group"
-                    >
-                      <div className="w-9 h-9 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-sm font-medium flex-shrink-0">
-                        {member.display_name?.charAt(0)?.toUpperCase() || '?'}
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-sm text-[#F5F5F5] truncate">{member.display_name}</span>
-                          {member.user_id === currentUserId && <span className="text-xs text-[#A3A3A3]">(You)</span>}
-                          {member.role === 'creator' && <Crown size={12} className="text-[#FBBF24] flex-shrink-0" />}
-                          {member.role === 'admin' && <Shield size={12} className="text-[#10B981] flex-shrink-0" />}
-                        </div>
-                      </div>
-
-                      {member.user_id !== currentUserId && (
-                        <div className="relative">
-                          <button
-                            onClick={() => setMemberMenu(memberMenu === member.user_id ? null : member.user_id)}
-                            className="p-1.5 text-[#A3A3A3] hover:text-[#F5F5F5] opacity-0 group-hover:opacity-100 transition-all rounded"
+                    <AnimatePresence>
+                      {memberMenu === member.user_id && (
+                        <>
+                          <div className="fixed inset-0 z-40" onClick={() => setMemberMenu(null)} />
+                          <motion.div
+                            initial={{ opacity: 0, scale: 0.95 }}
+                            animate={{ opacity: 1, scale: 1 }}
+                            exit={{ opacity: 0, scale: 0.95 }}
+                            transition={{ duration: 0.12 }}
+                            className="absolute right-0 top-full mt-1 w-48 bg-[#141414] border border-[#1F1F1F] rounded-[8px] shadow-[0_12px_40px_rgba(0,0,0,0.6)] z-50 py-1"
                           >
-                            <MoreVertical size={14} />
-                          </button>
-                          <AnimatePresence>
-                            {memberMenu === member.user_id && (
-                              <>
-                                <div className="fixed inset-0 z-40" onClick={() => setMemberMenu(null)} />
-                                <motion.div
-                                  initial={{ opacity: 0, scale: 0.95 }}
-                                  animate={{ opacity: 1, scale: 1 }}
-                                  exit={{ opacity: 0, scale: 0.95 }}
-                                  className="absolute right-0 top-full mt-1 w-44 bg-[#141414] border border-[#1F1F1F] rounded-[8px] shadow-lg z-50 py-1"
-                                >
-                                  {isCreator && member.role !== 'creator' && (
-                                    <button
-                                      onClick={() => handleChangeRole(member.user_id, member.role === 'admin' ? 'member' : 'admin')}
-                                      className="w-full flex items-center gap-2 px-3 py-2 text-xs text-[#F5F5F5] hover:bg-[#1A1A1A] transition-colors"
-                                    >
-                                      {member.role === 'admin' ? <ShieldOff size={12} /> : <ShieldCheck size={12} />}
-                                      {member.role === 'admin' ? 'Remove Admin' : 'Make Admin'}
-                                    </button>
-                                  )}
-                                  {isAdmin && member.role !== 'creator' && (
-                                    <button
-                                      onClick={() => handleRemoveMember(member.user_id)}
-                                      className="w-full flex items-center gap-2 px-3 py-2 text-xs text-[#EF4444] hover:bg-[#EF4444]/10 transition-colors"
-                                    >
-                                      <UserMinus size={12} /> Remove
-                                    </button>
-                                  )}
-                                  <button
-                                    onClick={() => { setMemberMenu(null); }}
-                                    className="w-full flex items-center gap-2 px-3 py-2 text-xs text-[#F5F5F5] hover:bg-[#1A1A1A] transition-colors"
-                                  >
-                                    <MessageSquare size={12} /> Message
-                                  </button>
-                                </motion.div>
-                              </>
+                            <button
+                              type="button"
+                              onClick={() => handleMessageMember(member.user_id)}
+                              data-testid="group-member-message"
+                              className="w-full flex items-center gap-2 px-3 py-2 text-xs text-[#F5F5F5] hover:bg-[#1A1A1A] transition-colors"
+                            >
+                              <MessageSquare size={13} /> Message
+                            </button>
+                            {canPromote && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleChangeRole(member.user_id, member.role === 'admin' ? 'member' : 'admin')
+                                }
+                                data-testid="group-member-role"
+                                className="w-full flex items-center gap-2 px-3 py-2 text-xs text-[#F5F5F5] hover:bg-[#1A1A1A] transition-colors"
+                              >
+                                {member.role === 'admin' ? <ShieldOff size={13} /> : <ShieldCheck size={13} />}
+                                {member.role === 'admin' ? 'Dismiss as admin' : 'Make group admin'}
+                              </button>
                             )}
-                          </AnimatePresence>
-                        </div>
+                            {canManage && (
+                              <button
+                                type="button"
+                                onClick={() => handleRemoveMember(member.user_id)}
+                                data-testid="group-member-remove"
+                                className="w-full flex items-center gap-2 px-3 py-2 text-xs text-[#EF4444] hover:bg-[#EF4444]/10 transition-colors"
+                              >
+                                <UserMinus size={13} /> Remove from group
+                              </button>
+                            )}
+                          </motion.div>
+                        </>
                       )}
-                    </div>
-                  ))}
-                </div>
+                    </AnimatePresence>
+                  </div>
+                )}
               </div>
-
-              {/* Shared Media placeholder */}
-              <div>
-                <h4 className="text-sm font-medium text-[#A3A3A3] mb-3">Shared Media</h4>
-                <p className="text-xs text-[#525252] text-center py-4">No shared media yet</p>
-              </div>
-
-              {/* Leave / Delete */}
-              {isCrossOrg ? (
-                <div className="pt-2 border-t border-[#1F1F1F] text-center">
-                  <p className="text-xs text-[#525252] py-2">Managed by administrator</p>
-                </div>
-              ) : (
-                <div className="pt-2 border-t border-[#1F1F1F]">
-                  <button
-                    onClick={() => setShowLeaveConfirm(true)}
-                    data-testid="group-leave-button"
-                    className="w-full flex items-center gap-2 px-3 py-2.5 text-sm text-[#EF4444] hover:bg-[#EF4444]/10 rounded-[6px] transition-colors"
-                  >
-                    <LogOut size={16} />
-                    {isCreator && participants.length === 1 ? 'Delete Group' : 'Exit Group'}
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Leave Confirmation */}
-            <AnimatePresence>
-              {showLeaveConfirm && (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  className="fixed inset-0 z-[60] flex items-center justify-center p-4"
-                  onClick={() => setShowLeaveConfirm(false)}
-                >
-                  <div className="absolute inset-0 bg-black/60" />
-                  <motion.div
-                    initial={{ scale: 0.95 }}
-                    animate={{ scale: 1 }}
-                    exit={{ scale: 0.95 }}
-                    onClick={(e) => e.stopPropagation()}
-                    className="relative bg-[#141414] border border-[#1F1F1F] rounded-[8px] p-6 max-w-sm"
-                  >
-                    <p className="text-sm text-[#F5F5F5] mb-4">
-                      Are you sure you want to leave "{conversation.name}"?
-                    </p>
-                    <div className="flex justify-end gap-3">
-                      <button onClick={() => setShowLeaveConfirm(false)} className="px-4 py-2 text-sm text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors">Cancel</button>
-                      <button onClick={handleLeave} className="px-4 py-2 text-sm font-medium bg-[#EF4444] text-white rounded-[6px] hover:opacity-90 transition-all">Leave</button>
-                    </div>
-                  </motion.div>
-                </motion.div>
-              )}
-            </AnimatePresence>
-
-            {/* Add Members Modal */}
-            <NewChatModal
-              isOpen={showAddMembers}
-              onClose={() => setShowAddMembers(false)}
-              onSelectContact={handleAddMembers}
-            />
-          </motion.div>
-        </motion.div>
+            );
+          })}
+        </div>
       )}
-    </AnimatePresence>
+    </div>
+  );
+
+  return (
+    <>
+      <InfoPanelShell
+        isOpen={isOpen}
+        onClose={onClose}
+        title="Group info"
+        sections={sections}
+        activeSection={section}
+        onSectionChange={setSection}
+        navTestIdPrefix="group-info-nav-"
+        panelTestId="group-info-panel"
+      >
+        {section === 'info' && renderInfo()}
+        {section === 'media' && (
+          <MediaLinksDocsSection
+            conversationId={convId}
+            onJumpToMessage={(msgId) => {
+              onClose?.();
+              onJumpToMessage?.(msgId);
+            }}
+            testIdPrefix="group-info-media"
+          />
+        )}
+        {section === 'starred' && (
+          <StarredSection
+            conversationId={convId}
+            onJumpToMessage={(msgId) => {
+              onClose?.();
+              onJumpToMessage?.(msgId);
+            }}
+            testIdPrefix="group-info-starred"
+          />
+        )}
+        {section === 'permissions' && renderPermissions()}
+        {section === 'encryption' && <EncryptionSection testIdPrefix="group-info-encryption" />}
+        {section === 'members' && renderMembers()}
+      </InfoPanelShell>
+
+      <ConfirmDialog
+        open={confirm === 'clear'}
+        title="Clear this chat?"
+        body="Every message will be removed from your copy of this chat. Other members keep theirs."
+        confirmLabel="Clear chat"
+        busy={confirmBusy}
+        onConfirm={handleClearChat}
+        onCancel={() => setConfirm(null)}
+        testId="group-info-clear-confirm"
+      />
+
+      <ConfirmDialog
+        open={confirm === 'leave'}
+        title={`Exit "${conversation.name || 'this group'}"?`}
+        body="You will stop receiving messages from this group. Only group admins can add you back."
+        confirmLabel="Exit group"
+        busy={confirmBusy}
+        onConfirm={handleLeave}
+        onCancel={() => setConfirm(null)}
+        testId="group-info-leave-confirm"
+      />
+
+      <NewChatModal
+        isOpen={showAddMembers}
+        onClose={() => setShowAddMembers(false)}
+        onSelectContact={handleAddMember}
+      />
+
+      <CreateGroupModal
+        isOpen={showSimilarGroup}
+        onClose={() => setShowSimilarGroup(false)}
+        prefillMembers={similarGroupMembers}
+        prefillName={conversation.name ? `${conversation.name} (2)` : ''}
+        prefillDescription={conversation.description || ''}
+        onGroupCreated={(group) => {
+          setShowSimilarGroup(false);
+          onClose?.();
+          onGroupCreated?.(group);
+          if (group?._id) setActiveConversation(group._id);
+        }}
+      />
+    </>
   );
 };

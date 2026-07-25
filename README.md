@@ -36,6 +36,15 @@ create organizations, departments, and users from the admin portal.
 
 ## Running each side independently
 
+**LiveKit SFU** — required for voice and video calls. Nothing else needs it, so
+it is easy to forget; without it every call fails at the moment of connecting.
+Its key/secret **must** match the API's `RXHIVE_LIVEKIT_API_KEY` / `_SECRET`:
+
+```bash
+LIVEKIT_KEYS="devkey: devsecret-at-least-32-characters-long" \
+  livekit-server --dev            # ws://localhost:7880
+```
+
 **Backend** (needs Postgres + Redis; MinIO for attachments; LiveKit for calls):
 
 ```bash
@@ -46,6 +55,18 @@ cp .env.example .env
 .venv/bin/python -m app.seed
 .venv/bin/uvicorn app.main:app --reload
 ```
+
+Confirm the whole stack, calls included, in one request:
+
+```bash
+curl -s localhost:8000/api/health
+# {"status":"healthy", "database":"connected", "redis":"connected",
+#  "livekit":"connected", "calls_available":true, ...}
+```
+
+`livekit` is reported separately from `status` on purpose: messaging works
+without the SFU, so a stopped LiveKit leaves the API `healthy` with
+`"livekit":"unreachable"` and `"calls_available":false`.
 
 **Frontend** (proxies `/api` → `localhost:8000` in dev):
 
@@ -81,6 +102,35 @@ locator timeouts.
 
 All E2E traffic shares one source IP, so raise the login budget for those runs:
 `RXHIVE_RATE_LIMIT_LOGIN=200` (rate limits are settings-tunable per scope).
+
+## Troubleshooting: "the call won't connect"
+
+**Symptom** — the call rings, the other side answers, then it drops or stays
+silent/black. Messaging is unaffected.
+
+**Check, in this order:**
+
+1. `curl -s localhost:8000/api/health` → is `"livekit":"connected"`?
+   - `unreachable` — livekit-server isn't running (or isn't listening where the
+     API expects). Start it with the command above.
+   - `not_configured` — `RXHIVE_LIVEKIT_URL` is unset, or it's a browser-only
+     path like `/livekit`; set `RXHIVE_LIVEKIT_HEALTH_URL` to the server-side
+     address (docker compose already does).
+2. Read the toast in the browser — each cause has its own message:
+   | Toast | Cause |
+   |---|---|
+   | Call server unreachable — check that LiveKit is running | SFU down/unreachable from the browser |
+   | Microphone blocked. Allow microphone access… | the browser denied mic permission |
+   | Your microphone is in use by another app | another app holds the device |
+   | Camera blocked — continuing with audio only | camera failed; the call is live, audio-only |
+   | That call is no longer active | the call ended before this side joined |
+3. Open the browser console: every join failure logs
+   `[call:<context>] join failed (<reason>)` with the underlying LiveKit or
+   `getUserMedia` error.
+4. Still failing? The SFU key/secret must match the API's exactly
+   (`LIVEKIT_KEYS="<key>: <secret>"` vs `RXHIVE_LIVEKIT_API_KEY`/`_SECRET`) —
+   a mismatch surfaces as the SFU rejecting the token, not as a network error.
+   In production also confirm the UDP media range is open (see below).
 
 ## Production notes
 

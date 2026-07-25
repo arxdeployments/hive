@@ -1,16 +1,27 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Search, X, Forward } from 'lucide-react';
 import { toast } from 'sonner';
 import client from '../../api/client';
 import useChatStore from '../../stores/chatStore';
 
-export const ForwardModal = ({ message, isOpen, onClose }) => {
+/**
+ * `message` forwards one message (the message context menu's path). `messages`
+ * forwards a batch — the info panels' media/links/docs Select mode hands one in.
+ * Either shape accepts `_id` or `message_id`, since the media list is keyed on
+ * `message_id` rather than the full message doc.
+ */
+export const ForwardModal = ({ message, messages, isOpen, onClose }) => {
   const { conversations } = useChatStore();
   const [contacts, setContacts] = useState([]);
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState([]);
   const [sending, setSending] = useState(false);
+
+  const targetIds = useMemo(() => {
+    const source = Array.isArray(messages) && messages.length ? messages : message ? [message] : [];
+    return Array.from(new Set(source.map((m) => m?._id || m?.message_id).filter(Boolean)));
+  }, [message, messages]);
 
   useEffect(() => {
     if (!isOpen) { setSelected([]); setSearch(''); return; }
@@ -23,24 +34,37 @@ export const ForwardModal = ({ message, isOpen, onClose }) => {
   };
 
   const handleForward = async () => {
-    if (selected.length === 0 || !message) return;
+    if (selected.length === 0 || targetIds.length === 0) return;
     setSending(true);
     const convIds = selected.filter(k => k.startsWith('conv:')).map(k => k.split(':')[1]);
     const contactIds = selected.filter(k => k.startsWith('contact:')).map(k => k.split(':')[1]);
-    try {
-      await client.post('/api/conversations/messages/forward', {
-        message_id: message._id,
-        conversation_ids: convIds,
-        contact_ids: contactIds
-      });
-      toast.success(`Forwarded to ${selected.length} recipient(s)`);
+    // The API forwards one message per call, so a batch is a sequential fan-out.
+    // Failures are aggregated: one unforwardable item must not silently drop the rest.
+    let sent = 0;
+    let lastError = null;
+    for (const messageId of targetIds) {
+      try {
+        await client.post('/api/conversations/messages/forward', {
+          message_id: messageId,
+          conversation_ids: convIds,
+          contact_ids: contactIds
+        });
+        sent += 1;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    setSending(false);
+    if (sent > 0) {
+      toast.success(`Forwarded ${sent} ${sent === 1 ? 'message' : 'messages'} to ${selected.length} recipient(s)`);
+      if (sent < targetIds.length) toast.error('Some messages could not be forwarded');
       onClose();
-    } catch (err) {
-      toast.error(err.response?.data?.detail || 'Forward failed');
-    } finally { setSending(false); }
+      return;
+    }
+    toast.error(lastError?.response?.data?.detail || 'Forward failed');
   };
 
-  if (!isOpen || !message) return null;
+  if (!isOpen || targetIds.length === 0) return null;
 
   const filteredConvs = conversations.filter(c =>
     !search || (c.name || '').toLowerCase().includes(search.toLowerCase()) ||

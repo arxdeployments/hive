@@ -127,9 +127,7 @@ async def test_push_subscribe_unsubscribe_round_trip(client, two_orgs_with_users
         rows = (await db.execute(select(PushSubscription))).scalars().all()
         assert [r.endpoint for r in rows] == [endpoint]
 
-    resp = await client.request(
-        "DELETE", "/api/notifications/subscribe", json={"endpoint": endpoint}
-    )
+    resp = await client.request("DELETE", "/api/notifications/subscribe", json={"endpoint": endpoint})
     assert resp.status_code == 200, resp.text
 
     async with SessionLocal() as db:

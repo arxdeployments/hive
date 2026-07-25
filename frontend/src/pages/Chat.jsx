@@ -8,7 +8,16 @@ import { useAuth } from '../contexts/AuthContext';
 import wsClient from '../services/websocket';
 
 export default function Chat() {
-  const { activeConversationId, setActiveConversation, conversations } = useChatStore();
+  // Narrow selectors. This component renders the whole chat surface, so
+  // subscribing to the entire store re-mounted-through-rendered both panes on
+  // every message, receipt, presence ping and keystroke-driven typing event.
+  // The unread total is selected as a number, not the conversations array, so
+  // the title effect only reruns when the number actually changes.
+  const activeConversationId = useChatStore(s => s.activeConversationId);
+  const setActiveConversation = useChatStore(s => s.setActiveConversation);
+  const totalUnread = useChatStore(
+    s => s.conversations.reduce((sum, c) => sum + (c.unread_count || 0), 0)
+  );
   const { user } = useAuth();
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
   const [showMessages, setShowMessages] = useState(false);
@@ -92,9 +101,8 @@ export default function Chat() {
 
   // Update document title with unread count
   useEffect(() => {
-    const totalUnread = conversations.reduce((sum, c) => sum + (c.unread_count || 0), 0);
     document.title = totalUnread > 0 ? `RxHive (${totalUnread})` : 'RxHive';
-  }, [conversations]);
+  }, [totalUnread]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -130,15 +138,17 @@ export default function Chat() {
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  const handleSelectConversation = (convId) => {
+  // Stable: these reach every conversation row through the sidebar, so a fresh
+  // identity per render defeats the rows' memoisation.
+  const handleSelectConversation = useCallback((convId) => {
     setActiveConversation(convId);
     if (isMobile) setShowMessages(true);
-  };
+  }, [setActiveConversation, isMobile]);
 
-  const handleBack = () => {
+  const handleBack = useCallback(() => {
     setShowMessages(false);
     setActiveConversation(null);
-  };
+  }, [setActiveConversation]);
 
   const showNotifBanner = !notifAsked && typeof Notification !== 'undefined' && Notification.permission === 'default' && !localStorage.getItem('rxhive_notif_asked');
 

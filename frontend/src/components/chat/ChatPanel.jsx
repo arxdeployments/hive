@@ -1,6 +1,8 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { motion } from 'framer-motion';
-import { ArrowLeft, Search, Video, Phone, MoreVertical, ChevronDown, X, Check } from 'lucide-react';
+import {
+  ArrowLeft, Search, ChevronDown, X, Check, Pin, Star, StarOff, Forward, Trash2,
+} from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { Virtuoso } from 'react-virtuoso';
 import { MessageBubble } from './MessageBubble';
@@ -10,18 +12,25 @@ import { TypingIndicator } from './TypingIndicator';
 import { EmptyChat } from './EmptyChat';
 import { GroupInfoPanel } from './GroupInfoPanel';
 import { MessageContextMenu } from './MessageContextMenu';
+import { ChatHeaderMenu } from './ChatHeaderMenu';
+import { CallButtonDropdown } from './CallButtonDropdown';
 import { ReplyPreview } from './ReplyPreview';
 import { ReactionPicker } from './ReactionPicker';
 import { ForwardModal } from './ForwardModal';
 import { MessageInfoModal } from './MessageInfoModal';
 import { ConversationSearch } from './ConversationSearch';
 import { ContactInfoPanel } from './ContactInfoPanel';
-import useChatStore from '../../stores/chatStore';
+import { CreateGroupModal } from './CreateGroupModal';
+import { ConfirmDialog } from './info/InfoPanelPrimitives';
+import useChatStore, { EMPTY_MESSAGES, EMPTY_TYPING } from '../../stores/chatStore';
 import useCallStore from '../../stores/callStore';
 import { useAuth } from '../../contexts/AuthContext';
 import client from '../../api/client';
 import wsClient from '../../services/websocket';
+import { withDerivedStatuses } from '../../utils/messageStatus';
 import { toast } from 'sonner';
+
+const EMPTY_PINNED = [];
 
 const formatStatus = (participant) => {
   if (!participant) return '';
@@ -47,108 +56,236 @@ const isDifferentDay = (d1, d2) => {
     a.getDate() !== b.getDate();
 };
 
+/** One-line summary of a message, for the pinned banner and confirm dialogs. */
+const messagePreview = (msg) => {
+  if (!msg) return '';
+  if (msg.is_deleted) return 'This message was deleted';
+  switch (msg.type) {
+    case 'image': return '📷 Photo';
+    case 'video': return '🎥 Video';
+    case 'audio': return '🎤 Audio';
+    case 'file': return `📎 ${msg.filename || msg.content || 'File'}`;
+    default: return (msg.content || '').slice(0, 140);
+  }
+};
+
+/**
+ * "Reply privately" quotes the original message as text rather than as a real
+ * reply: the API only links `reply_to` within the same conversation (see
+ * messaging.send_message), so a cross-chat reply id is silently dropped and the
+ * quote would vanish the moment the message came back from the server.
+ */
+const privateQuoteFor = (msg) => {
+  const who = msg?.sender_name || 'Them';
+  const body = msg?.type === 'text' ? (msg.content || '') : messagePreview(msg);
+  const snippet = body.length > 180 ? `${body.slice(0, 180)}…` : body;
+  return `> ${who}: ${snippet}\n\n`;
+};
+
 export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   const { user } = useAuth();
-  const {
-    conversations, messages, setMessages, prependMessages,
-    addOptimisticMessage, typingUsers,
-    clearUnread, bumpConversation, wsConnected
-  } = useChatStore();
+
+  // Narrow selectors, not `useChatStore()`. Subscribing to the whole store made
+  // this panel (and the virtualized list under it) re-render on *every* store
+  // write anywhere in the app — another conversation's message, a presence
+  // broadcast, someone typing in a thread you don't have open.
+  const conversation = useChatStore(s => s.conversations.find(c => c._id === conversationId));
+  const convMessages = useChatStore(s => s.messages[conversationId] || EMPTY_MESSAGES);
+  const convTyping = useChatStore(s => s.typingUsers?.[conversationId] || EMPTY_TYPING);
+  const wsConnected = useChatStore(s => s.wsConnected);
+  // Actions are created once with the store, so selecting them never re-renders.
+  const setMessages = useChatStore(s => s.setMessages);
+  const prependMessages = useChatStore(s => s.prependMessages);
+  const addOptimisticMessage = useChatStore(s => s.addOptimisticMessage);
+  const clearUnread = useChatStore(s => s.clearUnread);
+  const bumpConversation = useChatStore(s => s.bumpConversation);
+  const updateConversation = useChatStore(s => s.updateConversation);
+  // Subscribed, not read through getState() at render time: the old header read
+  // the store during render, so the call buttons never restyled when a call
+  // started and could be clicked into a second, doomed call.
+  const callState = useCallStore(s => s.callState);
 
   const [loading, setLoading] = useState(false);
-  const [hasMore, setHasMore] = useState(false);
+  // Keyed by conversation: a single `hasMore` flag leaked the previous thread's
+  // pagination state onto the next one now that re-opens serve from cache.
+  const [hasMoreByConv, setHasMoreByConv] = useState({});
   const [loadingMore, setLoadingMore] = useState(false);
   const [showScrollDown, setShowScrollDown] = useState(false);
-  const [showGroupInfo, setShowGroupInfo] = useState(false);
   const [contextMenu, setContextMenu] = useState(null);
   const [replyTo, setReplyTo] = useState(null);
+  const [draft, setDraft] = useState(null);
   const [editingMessage, setEditingMessage] = useState(null);
   const [editText, setEditText] = useState('');
   const [reactionPicker, setReactionPicker] = useState(null);
-  const [forwardMsg, setForwardMsg] = useState(null);
+  const [forwardBatch, setForwardBatch] = useState(null);
   const [msgInfo, setMsgInfo] = useState(null);
   const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [showConvSearch, setShowConvSearch] = useState(false);
-  const [showContactInfo, setShowContactInfo] = useState(false);
-  const virtuosoRef = useRef(null);
-  const [atBottom, setAtBottom] = useState(true);
-  const prevMsgCountRef = useRef(0);
+  // Info drawers. `section` is re-armed on every open so "Group info" lands on
+  // Info while "Select people" lands straight on Members.
+  const [groupInfo, setGroupInfo] = useState({ open: false, section: 'info' });
+  const [contactInfo, setContactInfo] = useState({ open: false, section: 'info' });
+  const [leaveConfirm, setLeaveConfirm] = useState(false);
+  const [leaveBusy, setLeaveBusy] = useState(false);
+  const [showNewGroupCall, setShowNewGroupCall] = useState(false);
+  // Multi-select
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [batchDelete, setBatchDelete] = useState(false);
+  const [batchBusy, setBatchBusy] = useState(false);
+  // Pinned banner
+  const [pinnedFromApi, setPinnedFromApi] = useState(EMPTY_PINNED);
+  const [pinCursor, setPinCursor] = useState(0);
 
-  const conversation = conversations.find(c => c._id === conversationId);
-  const convMessages = messages[conversationId] || [];
+  const virtuosoRef = useRef(null);
+
+  const myUserId = user?.id;
+  const myName = user?.name;
+  const hasMore = hasMoreByConv[conversationId] ?? false;
+  const callBusy = callState !== 'idle';
 
   const otherParticipant = conversation?.participants?.find(
     p => p.user_id !== user?.id
   );
-  const displayName = conversation?.type === 'direct'
+  const isDirect = conversation?.type === 'direct';
+  const isGroup = conversation?.type === 'group';
+  const isGroupLike = conversation?.type === 'group' || conversation?.type === 'cross_org';
+  const headerType = isDirect ? 'direct' : 'group';
+
+  const displayName = isDirect
     ? otherParticipant?.display_name || 'Unknown'
     : conversation?.name || 'Group';
 
-  const statusText = conversation?.type === 'direct'
+  const statusText = isDirect
     ? formatStatus(otherParticipant)
     : `${conversation?.participants?.length || 0} members`;
 
-  // Fetch messages (initial load only - WS handles real-time updates)
-  const fetchMessages = useCallback(async () => {
+  /**
+   * Conversations whose full first window this panel has actually fetched.
+   *
+   * "There are messages in the store" is NOT the same thing: the socket's
+   * new_message handler appends to *every* conversation, so a thread you have
+   * never opened can hold a single message. Serving that from cache would show
+   * a one-message thread. Only a window we fetched ourselves may be reused.
+   */
+  const loadedWindowsRef = useRef(new Set());
+  useEffect(() => {
+    // A fresh socket session invalidates nothing that is already loaded, but a
+    // disconnect does: force the next open of each thread to re-fetch.
+    if (!wsConnected) loadedWindowsRef.current = new Set();
+  }, [wsConnected]);
+
+  /**
+   * Load the message window for this conversation.
+   *
+   * Cache-first: while the socket is up it applies every new_message, edit,
+   * delete and reaction to *every* cached thread, not just the open one — so a
+   * window we already loaded is already current. Re-fetching it on each open
+   * cost a round trip, a full-screen spinner, and a rebuild of every message
+   * object (new identities => every bubble re-renders). Re-opening now paints
+   * from the store on the same frame as the click.
+   *
+   * `force` is the escape hatch for the one case the cache can be stale: a
+   * socket reconnect, where messages may have been missed while it was down.
+   */
+  const fetchMessages = useCallback(async ({ force = false } = {}) => {
     if (!conversationId) return;
+    const cached = useChatStore.getState().messages[conversationId];
+    const hasWindow = loadedWindowsRef.current.has(conversationId)
+      && Array.isArray(cached) && cached.length > 0;
+    if (hasWindow && !force) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
       const { data } = await client.get(`/api/conversations/${conversationId}/messages`, {
         params: { limit: 50 }
       });
-      setMessages(conversationId, data.messages);
-      setHasMore(data.has_more);
+      // Loaded messages have no `status` — derive the ticks from the read_by /
+      // delivered_to receipts the API sends, or every own message reads as unread.
+      setMessages(conversationId, withDerivedStatuses(data.messages, myUserId));
+      setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
+      loadedWindowsRef.current.add(conversationId);
     } catch (err) {
       console.error('Failed to fetch messages', err);
     } finally {
       setLoading(false);
     }
-  }, [conversationId, setMessages]);
+  }, [conversationId, setMessages, myUserId]);
 
   useEffect(() => {
     fetchMessages();
-    // Mark as read + send read receipt via WS
+    // Mark read server-side; the API broadcasts messages_read to the other side,
+    // so no separate WS read-receipt frame is needed here.
     if (conversationId) {
       client.put(`/api/conversations/${conversationId}/read`).catch(() => {});
       clearUnread(conversationId);
     }
   }, [fetchMessages, conversationId, clearUnread]);
 
-  // Reset transient composer state when switching conversations
+  // Re-sync the open thread after a socket reconnect — that is the only window
+  // in which the cache can have missed messages.
+  const wasConnectedRef = useRef(wsConnected);
+  useEffect(() => {
+    if (wsConnected && !wasConnectedRef.current) fetchMessages({ force: true });
+    wasConnectedRef.current = wsConnected;
+  }, [wsConnected, fetchMessages]);
+
+  /**
+   * Pinned messages for the banner. Fetched once per conversation because a pin
+   * can live far outside the loaded window; live pins/unpins are folded in from
+   * the store below, so the banner reacts instantly without a second round trip.
+   */
+  useEffect(() => {
+    if (!conversationId) {
+      setPinnedFromApi(EMPTY_PINNED);
+      return undefined;
+    }
+    let cancelled = false;
+    client.get(`/api/conversations/${conversationId}/pinned`)
+      .then(({ data }) => {
+        if (!cancelled) setPinnedFromApi(Array.isArray(data?.data) ? data.data : EMPTY_PINNED);
+      })
+      .catch(() => {
+        if (!cancelled) setPinnedFromApi(EMPTY_PINNED);
+      });
+    return () => { cancelled = true; };
+  }, [conversationId]);
+
+  // `pendingDraftRef` survives the conversation switch that "Reply privately"
+  // triggers — the reset effect below would otherwise wipe it on arrival.
+  const pendingDraftRef = useRef(null);
+
+  // Reset transient per-conversation state when switching conversations.
   useEffect(() => {
     setEditingMessage(null);
     setEditText('');
     setReplyTo(null);
+    setContextMenu(null);
+    setReactionPicker(null);
+    setShowConvSearch(false);
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+    setPinCursor(0);
+    setDraft(pendingDraftRef.current);
+    pendingDraftRef.current = null;
   }, [conversationId]);
 
-  // Send read receipt when new messages arrive in active conversation
-  useEffect(() => {
-    if (!conversationId || !convMessages.length) return;
-
-    const lastMsg = convMessages[convMessages.length - 1];
-    if (lastMsg && lastMsg.sender_id !== user?.id && lastMsg._id && !lastMsg.temp_id) {
-      // Only send read receipt via WS if we have a real message ID
-      if (wsConnected) {
-        wsClient.sendReadReceipt(conversationId, lastMsg._id);
-      }
-      clearUnread(conversationId);
-    }
-  }, [convMessages.length, conversationId, user?.id, wsConnected, clearUnread]);
-
-  // Auto-scroll when new messages arrive and we're at the bottom
-  useEffect(() => {
-    if (convMessages.length > prevMsgCountRef.current && atBottom) {
-      setTimeout(() => {
-        virtuosoRef.current?.scrollToIndex({ index: 'LAST', behavior: 'smooth' });
-      }, 50);
-    }
-    prevMsgCountRef.current = convMessages.length;
-  }, [convMessages.length, atBottom]);
+  // Read receipts for messages arriving in the open conversation are sent by the
+  // socket's own new_message handler, and the open itself is acked by PUT /read
+  // above. The effect that used to live here duplicated both — two receipt
+  // frames per inbound message, each triggering its own messages_read fan-out.
+  //
+  // Auto-scroll is Virtuoso's `followOutput` (below). The manual scrollToIndex
+  // that used to run here fought it with a second smooth animation.
 
   // Load older messages
   const loadMore = useCallback(async () => {
     if (!hasMore || loadingMore || !conversationId) return;
-    const msgs = messages[conversationId] || [];
+    // Read the window straight from the store: depending on the whole `messages`
+    // map here rebuilt this callback on every message anywhere in the app.
+    const msgs = useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES;
     if (msgs.length === 0) return;
 
     setLoadingMore(true);
@@ -158,32 +295,38 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         params: { before: oldestMsg._id, limit: 50 }
       });
       if (data.messages.length > 0) {
-        prependMessages(conversationId, data.messages);
+        prependMessages(conversationId, withDerivedStatuses(data.messages, myUserId));
       }
-      setHasMore(data.has_more);
+      setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
     } catch (err) {
       console.error('Failed to load more messages', err);
     } finally {
       setLoadingMore(false);
     }
-  }, [hasMore, loadingMore, conversationId, messages, prependMessages]);
+  }, [hasMore, loadingMore, conversationId, prependMessages, myUserId]);
+
+  // `replyTo` is read through a ref so handleSend keeps a stable identity across
+  // reply-preview changes — it is passed to the memoised composer, which would
+  // otherwise re-render (and re-render the list with it) on every keystroke.
+  const replyToRef = useRef(replyTo);
+  replyToRef.current = replyTo;
 
   // Send message - optimistic UI, WS delivery handled by MessageComposer.
   // replyOverride: pass explicitly (incl. null) to bypass the live replyTo state (used by retry).
-  const handleSend = async (content, tempId, msgType = 'text', mediaUrl = null, thumbnailUrl = null, replyOverride) => {
+  const handleSend = useCallback(async (content, tempId, msgType = 'text', mediaUrl = null, thumbnailUrl = null, replyOverride) => {
     if (!conversationId) return;
     if (msgType === 'text' && (!content || !content.trim())) return;
 
     // Capture the reply context up-front: replyTo state may be cleared before async work resolves.
-    const activeReply = replyOverride !== undefined ? replyOverride : replyTo;
+    const activeReply = replyOverride !== undefined ? replyOverride : replyToRef.current;
     const replyToId = activeReply?._id || null;
 
     const optimisticMsg = {
       _id: tempId,
       temp_id: tempId,
       conversation_id: conversationId,
-      sender_id: user.id,
-      sender_name: user.name,
+      sender_id: myUserId,
+      sender_name: myName,
       type: msgType,
       content: content,
       media_url: mediaUrl,
@@ -207,8 +350,8 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     // Update conversation list immediately
     bumpConversation(conversationId, {
       content: content,
-      sender_id: user.id,
-      sender_name: user.name,
+      sender_id: myUserId,
+      sender_name: myName,
       created_at: new Date().toISOString(),
       type: 'text'
     });
@@ -237,16 +380,16 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
 
     // Clear reply state after sending (only when driven by the composer, not a retry override)
     if (replyOverride === undefined) setReplyTo(null);
-  };
+  }, [conversationId, myUserId, myName, wsConnected, addOptimisticMessage, bumpConversation]);
 
   // Retry a failed send: drop the failed bubble and re-send down the same path as handleSend.
-  const handleRetry = (failedMsg) => {
+  const handleRetry = useCallback((failedMsg) => {
     if (!failedMsg || !conversationId) return;
 
     const store = useChatStore.getState();
     const removeKey = failedMsg.temp_id || failedMsg._id;
     store.setMessages(conversationId,
-      (store.messages[conversationId] || []).filter(m => (m.temp_id || m._id) !== removeKey)
+      (store.messages[conversationId] || EMPTY_MESSAGES).filter(m => (m.temp_id || m._id) !== removeKey)
     );
 
     const newTempId = uuidv4();
@@ -274,65 +417,337 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         });
       }
     }
-  };
+  }, [conversationId, wsConnected, handleSend]);
 
-  // Context menu handler
-  const handleContextMenu = (e, msg) => {
+  // ── Multi-select ──────────────────────────────────────────────────────────
+  const enterSelection = useCallback((seedMessage) => {
+    setContextMenu(null);
+    setReactionPicker(null);
+    setSelectionMode(true);
+    setSelectedIds(seedMessage?._id ? new Set([seedMessage._id]) : new Set());
+  }, []);
+
+  const exitSelection = useCallback(() => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
+
+  const toggleSelected = useCallback((messageId) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(messageId)) next.delete(messageId);
+      else next.add(messageId);
+      return next;
+    });
+  }, []);
+
+  // Escape leaves selection mode. Bound only while it is active so it never
+  // competes with the menus' own Escape handling.
+  useEffect(() => {
+    if (!selectionMode) return undefined;
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        exitSelection();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [selectionMode, exitSelection]);
+
+  const selectedMessages = useMemo(
+    () => (selectedIds.size === 0 ? EMPTY_MESSAGES : convMessages.filter(m => selectedIds.has(m._id))),
+    [convMessages, selectedIds]
+  );
+
+  /** Patch one message in place, preserving every other row's identity. */
+  const patchMessage = useCallback((messageId, patch) => {
+    const store = useChatStore.getState();
+    const list = store.messages[conversationId];
+    if (!list) return;
+    let changed = false;
+    const next = list.map((m) => {
+      if (m._id !== messageId) return m;
+      changed = true;
+      return { ...m, ...patch };
+    });
+    if (changed) store.setMessages(conversationId, next);
+  }, [conversationId]);
+
+  const allSelectedStarred = selectedMessages.length > 0 && selectedMessages.every(m => m.is_starred);
+
+  const handleBatchStar = useCallback(async () => {
+    // The endpoint is a toggle, so only touch the messages whose state actually
+    // needs to change — otherwise "Star" would unstar whatever was already starred.
+    const targets = selectedMessages.filter(m => !!m.is_starred === allSelectedStarred);
+    if (targets.length === 0) { exitSelection(); return; }
+    const wanted = !allSelectedStarred;
+    targets.forEach(m => patchMessage(m._id, { is_starred: wanted }));
+    exitSelection();
+    const results = await Promise.allSettled(
+      targets.map(m => client.post(`/api/conversations/messages/${m._id}/star`))
+    );
+    const failed = results.filter(r => r.status === 'rejected').length;
+    if (failed > 0) {
+      results.forEach((r, i) => {
+        if (r.status === 'rejected') patchMessage(targets[i]._id, { is_starred: !wanted });
+      });
+      toast.error(`Failed to ${wanted ? 'star' : 'unstar'} ${failed} message(s)`);
+      return;
+    }
+    toast.success(wanted
+      ? `${targets.length} message${targets.length === 1 ? '' : 's'} starred`
+      : `${targets.length} message${targets.length === 1 ? '' : 's'} unstarred`);
+  }, [selectedMessages, allSelectedStarred, patchMessage, exitSelection]);
+
+  const handleBatchDelete = useCallback(async () => {
+    const targets = selectedMessages;
+    if (targets.length === 0) { setBatchDelete(false); return; }
+    setBatchBusy(true);
+    const results = await Promise.allSettled(
+      targets.map(m => client.delete(`/api/conversations/messages/${m._id}?for_everyone=false`))
+    );
+    const deleted = new Set(
+      targets.filter((_, i) => results[i].status === 'fulfilled').map(m => m._id)
+    );
+    if (deleted.size > 0) {
+      const store = useChatStore.getState();
+      store.setMessages(conversationId,
+        (store.messages[conversationId] || EMPTY_MESSAGES).filter(m => !deleted.has(m._id))
+      );
+    }
+    setBatchBusy(false);
+    setBatchDelete(false);
+    exitSelection();
+    if (deleted.size < targets.length) toast.error('Some messages could not be deleted');
+    else toast.success(`${deleted.size} message${deleted.size === 1 ? '' : 's'} deleted`);
+  }, [selectedMessages, conversationId, exitSelection]);
+
+  // ── Message context menu ──────────────────────────────────────────────────
+  const handleContextMenu = useCallback((e, msg) => {
     e.preventDefault();
-    setContextMenu({ message: msg, position: { x: Math.min(e.clientX, window.innerWidth - 200), y: Math.min(e.clientY, window.innerHeight - 300) } });
-  };
+    // Raw viewport coords: MessageContextMenu measures itself and flips rather
+    // than clipping, so pre-clamping here only moved the anchor off the bubble.
+    setContextMenu({ message: msg, position: { x: e.clientX, y: e.clientY } });
+  }, []);
 
-  // Context menu actions
-  const handleContextAction = async (action, msg) => {
+  /**
+   * Open (or create) the DM with `userId`, optionally seeding the composer with
+   * a quote of `quoteMsg` — the "Reply privately" / "Message <sender>" path.
+   */
+  const openDirectWith = useCallback(async (userId, quoteMsg) => {
+    if (!userId || userId === myUserId) return;
+    try {
+      const { data } = await client.post('/api/conversations/direct', { participant_id: userId });
+      const store = useChatStore.getState();
+      // The socket also broadcasts conversation_created, but the panel must be
+      // able to render the thread on this frame — not whenever that lands.
+      if (!store.conversations.some(c => c._id === data._id)) {
+        store.setConversations([data, ...store.conversations]);
+      }
+      const seed = quoteMsg
+        ? { token: `${quoteMsg._id}-${Date.now()}`, text: privateQuoteFor(quoteMsg) }
+        : null;
+      if (data._id === conversationId) {
+        // Already open: the conversation-switch effect that normally applies the
+        // pending draft will never fire, so seed the composer directly.
+        if (seed) setDraft(seed);
+        return;
+      }
+      pendingDraftRef.current = seed;
+      store.setActiveConversation(data._id);
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to open chat');
+    }
+  }, [myUserId, conversationId]);
+
+  /**
+   * Every row of MessageContextMenu lands here. Star, pin, copy and report are
+   * carried out inside the menu itself (see its header contract) — repeating
+   * their requests here would undo them, since star/pin are toggles.
+   */
+  const handleMessageAction = useCallback(async (action, msg) => {
+    const anchor = contextMenu?.position;
     setContextMenu(null);
     switch (action) {
       case 'reply':
+        setEditingMessage(null);
         setReplyTo(msg);
         break;
       case 'edit':
         // Only own, non-deleted, text/media messages are editable
-        if (msg.sender_id === user?.id && !msg.is_deleted && ['text', 'image', 'file'].includes(msg.type)) {
+        if (msg.sender_id === myUserId && !msg.is_deleted && ['text', 'image', 'file'].includes(msg.type)) {
           setReplyTo(null);
           setEditingMessage(msg);
           setEditText(msg.content || '');
         }
         break;
       case 'react':
-        setReactionPicker({ message: msg, position: { x: 300, y: 300 } });
+        setReactionPicker({
+          message: msg,
+          position: {
+            x: Math.min(Math.max(8, anchor?.x ?? 300), Math.max(8, window.innerWidth - 300)),
+            y: Math.min(Math.max(70, anchor?.y ?? 300), window.innerHeight - 20),
+          },
+        });
         break;
       case 'forward':
-        setForwardMsg(msg);
+        setForwardBatch([msg]);
         break;
       case 'info':
         try {
           const { data } = await client.get(`/api/conversations/messages/${msg._id}/info`);
           setMsgInfo(data);
-        } catch (err) { toast.error('Failed to load message info'); }
+        } catch {
+          toast.error('Failed to load message info');
+        }
         break;
-      case 'delete_me':
+      case 'delete-me':
         setDeleteConfirm({ message: msg, forEveryone: false });
         break;
-      case 'delete_all':
+      case 'delete-all':
         setDeleteConfirm({ message: msg, forEveryone: true });
         break;
-      default: break;
+      case 'select':
+        enterSelection(msg);
+        break;
+      case 'reply-privately':
+        openDirectWith(msg.sender_id, msg);
+        break;
+      case 'message-user':
+        openDirectWith(msg.sender_id, null);
+        break;
+      // star / pin / copy / report are executed inside MessageContextMenu.
+      case 'star':
+      case 'pin':
+      case 'copy':
+      case 'report':
+      default:
+        break;
     }
-  };
+  }, [contextMenu, myUserId, enterSelection, openDirectWith]);
+
+  // ── Calls ─────────────────────────────────────────────────────────────────
+  const startCall = useCallback((callType) => {
+    if (!conversationId) return;
+    if (useCallStore.getState().callState !== 'idle') {
+      toast.error('You are already in a call');
+      return;
+    }
+    if (isDirect && otherParticipant) {
+      wsClient.send({
+        type: 'call:initiate',
+        callee_id: otherParticipant.user_id,
+        call_type: callType,
+        conversation_id: conversationId,
+      });
+      useCallStore.getState().initiateCall(null, callType, false, conversationId);
+    } else if (isGroupLike) {
+      wsClient.send({ type: 'call:group_initiate', conversation_id: conversationId, call_type: callType });
+      useCallStore.getState().initiateCall(null, callType, true, conversationId);
+    }
+  }, [conversationId, isDirect, isGroupLike, otherParticipant]);
+
+  /** CallButtonDropdown: send-call-link and schedule-call are done inside it. */
+  const handleCallAction = useCallback((action) => {
+    switch (action) {
+      case 'voice':
+        startCall('voice');
+        break;
+      case 'video':
+        startCall('video');
+        break;
+      case 'select-people':
+        // "Select people" is the group's member list — the only place a call's
+        // participants can be inspected today.
+        setGroupInfo({ open: true, section: 'members' });
+        break;
+      default:
+        break;
+    }
+  }, [startCall]);
+
+  const closeChat = useCallback(() => {
+    exitSelection();
+    if (onBack) onBack();
+    else useChatStore.getState().setActiveConversation(null);
+  }, [onBack, exitSelection]);
+
+  /** ChatHeaderMenu: mute, new-window, send-call-link and schedule-call are done inside it. */
+  const handleHeaderAction = useCallback((action, payload) => {
+    switch (action) {
+      case 'info':
+        if (isDirect) setContactInfo({ open: true, section: 'info' });
+        else setGroupInfo({ open: true, section: 'info' });
+        break;
+      case 'search':
+        setShowConvSearch(true);
+        break;
+      case 'select':
+        enterSelection(null);
+        break;
+      case 'mute':
+        // The request already happened inside the menu; mirror the confirmed
+        // value into the store so the info drawers and the sidebar agree.
+        if (typeof payload?.is_muted === 'boolean') {
+          updateConversation(conversationId, { is_muted: payload.is_muted });
+        }
+        break;
+      case 'exit':
+        if (conversation?.cross_org) {
+          toast.error('Cross-organization groups are managed by an administrator');
+          return;
+        }
+        setLeaveConfirm(true);
+        break;
+      case 'new-group-call':
+        // A group call needs a group. Build one seeded with this contact, then
+        // ring it the moment it exists.
+        setShowNewGroupCall(true);
+        break;
+      case 'close':
+        closeChat();
+        break;
+      // new-window / send-call-link / schedule-call are executed inside the menu.
+      default:
+        break;
+    }
+  }, [isDirect, conversationId, conversation?.cross_org, enterSelection, updateConversation, closeChat]);
+
+  const handleLeaveGroup = useCallback(async () => {
+    if (!conversationId) return;
+    setLeaveBusy(true);
+    try {
+      await client.post(`/api/conversations/${conversationId}/leave`);
+      toast.success('Left group');
+      setLeaveConfirm(false);
+      closeChat();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to leave group');
+    } finally {
+      setLeaveBusy(false);
+    }
+  }, [conversationId, closeChat]);
 
   // Reaction click on badge
-  const handleReactionClick = async (messageId, emoji) => {
+  const handleReactionClick = useCallback(async (messageId, emoji) => {
     try {
       await client.post(`/api/conversations/messages/${messageId}/react`, { emoji });
-    } catch (err) { toast.error('Failed to react'); }
-  };
+    } catch {
+      toast.error('Failed to react');
+    }
+  }, []);
 
   // React from picker
-  const handleReactFromPicker = async (emoji) => {
-    if (!reactionPicker?.message) return;
+  const handleReactFromPicker = useCallback(async (emoji) => {
+    const target = reactionPicker?.message;
+    if (!target) return;
     try {
-      await client.post(`/api/conversations/messages/${reactionPicker.message._id}/react`, { emoji });
-    } catch (err) { toast.error('Failed to react'); }
-  };
+      await client.post(`/api/conversations/messages/${target._id}/react`, { emoji });
+    } catch {
+      toast.error('Failed to react');
+    }
+  }, [reactionPicker]);
 
   // Delete handler
   const handleDelete = async () => {
@@ -343,7 +758,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         // Remove from local view
         const store = useChatStore.getState();
         store.setMessages(conversationId,
-          (store.messages[conversationId] || []).filter(m => m._id !== deleteConfirm.message._id)
+          (store.messages[conversationId] || EMPTY_MESSAGES).filter(m => m._id !== deleteConfirm.message._id)
         );
       }
       toast.success(deleteConfirm.forEveryone ? 'Message deleted for everyone' : 'Message deleted');
@@ -369,13 +784,8 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       return;
     }
     // Optimistic content update
-    const store = useChatStore.getState();
     const editedAt = new Date().toISOString();
-    store.setMessages(conversationId,
-      (store.messages[conversationId] || []).map(m =>
-        m._id === msgId ? { ...m, content: trimmed, edited_at: editedAt } : m
-      )
-    );
+    patchMessage(msgId, { content: trimmed, edited_at: editedAt });
     try {
       await client.put(`/api/conversations/messages/${msgId}`, { content: trimmed });
     } catch (err) {
@@ -384,150 +794,291 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     cancelEdit();
   };
 
-  // Reply click -> scroll to original message
-  const handleReplyBlockClick = (originalMsgId) => {
-    const idx = items.findIndex(item => item.type === 'message' && item.message._id === originalMsgId);
+  // Build message items with date separators.
+  // Memoised: this array is Virtuoso's `data`, so rebuilding it on every render
+  // re-rendered every visible row for renders that changed nothing.
+  const items = useMemo(() => {
+    const built = [];
+    for (let i = 0; i < convMessages.length; i++) {
+      const msg = convMessages[i];
+      const prevMsg = i > 0 ? convMessages[i - 1] : null;
+
+      if (!prevMsg || isDifferentDay(prevMsg.created_at, msg.created_at)) {
+        built.push({ type: 'date', date: msg.created_at, key: `date-${msg.created_at}-${i}` });
+      }
+      built.push({
+        type: 'message',
+        message: msg,
+        key: msg._id || msg.temp_id,
+        isOwn: msg.sender_id === myUserId,
+        showSenderName: !prevMsg || prevMsg.sender_id !== msg.sender_id || isDifferentDay(prevMsg.created_at, msg.created_at),
+      });
+    }
+    return built;
+  }, [convMessages, myUserId]);
+
+  // Read through a ref so the scroll-to-reply handler stays stable for the
+  // memoised bubbles instead of changing identity with every new message.
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+
+  // Reply / search / pinned-banner click -> scroll to the original message.
+  const handleJumpToMessage = useCallback((originalMsgId) => {
+    const idx = itemsRef.current.findIndex(item => item.type === 'message' && item.message._id === originalMsgId);
     if (idx >= 0 && virtuosoRef.current) {
       virtuosoRef.current.scrollToIndex({ index: idx, behavior: 'smooth' });
+      return true;
     }
-  };
+    // Silently doing nothing here read as "the app is broken"; say why instead.
+    toast.message('That message is not loaded yet — scroll up to load older messages');
+    return false;
+  }, []);
+
+  /**
+   * Banner list: everything currently pinned. Live store state wins (an optimistic
+   * pin/unpin from the message menu shows up immediately), and pins that sit
+   * outside the loaded window are topped up from the one-shot /pinned fetch.
+   */
+  const pinnedMessages = useMemo(() => {
+    const loaded = new Set(convMessages.map(m => m._id));
+    const out = convMessages.filter(m => m.is_pinned && !m.is_deleted);
+    for (const p of pinnedFromApi) {
+      if (!loaded.has(p._id) && !p.is_deleted) out.push(p);
+    }
+    out.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+    return out;
+  }, [convMessages, pinnedFromApi]);
+
+  const activePin = pinnedMessages.length > 0
+    ? pinnedMessages[Math.min(pinCursor, pinnedMessages.length - 1)]
+    : null;
+
+  const handlePinnedBannerClick = useCallback(() => {
+    const list = pinnedMessages;
+    if (list.length === 0) return;
+    const idx = Math.min(pinCursor, list.length - 1);
+    handleJumpToMessage(list[idx]._id);
+    // WhatsApp cycles through the pins on repeated taps.
+    if (list.length > 1) setPinCursor((idx + 1) % list.length);
+  }, [pinnedMessages, pinCursor, handleJumpToMessage]);
+
+  const itemContent = useCallback((index, item) => {
+    if (item.type === 'date') {
+      return <DateSeparator date={item.date} />;
+    }
+    const bubble = (
+      <MessageBubble
+        message={item.message}
+        isOwn={item.isOwn}
+        showSenderName={item.showSenderName}
+        isGroup={isGroup}
+        currentUserId={myUserId}
+        onContextMenu={handleContextMenu}
+        onReactionClick={handleReactionClick}
+        onReplyClick={handleJumpToMessage}
+        onRetry={handleRetry}
+      />
+    );
+
+    // Deleted and system rows are notices, not messages — nothing to act on.
+    const selectable = !item.message.is_deleted && item.message.type !== 'system';
+    if (!selectionMode || !selectable) return bubble;
+
+    const checked = selectedIds.has(item.message._id);
+    const toggle = () => toggleSelected(item.message._id);
+    return (
+      <div
+        role="checkbox"
+        aria-checked={checked}
+        // The bubble is `inert` below, so it is out of the a11y tree — the row
+        // has to carry the content itself or a screen reader hears only "checkbox".
+        aria-label={`${item.message.sender_name || 'Unknown'}: ${messagePreview(item.message)}`}
+        tabIndex={0}
+        onClick={toggle}
+        onContextMenu={(e) => { e.preventDefault(); toggle(); }}
+        onKeyDown={(e) => {
+          if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggle(); }
+        }}
+        data-testid="message-select-row"
+        className={`flex items-center gap-2 pl-3 cursor-pointer transition-colors outline-none focus-visible:ring-1 focus-visible:ring-[#10B981] ${
+          checked ? 'bg-[#10B981]/10' : 'hover:bg-[#141414]'
+        }`}
+      >
+        <span
+          aria-hidden="true"
+          className={`w-5 h-5 rounded-full border-2 flex items-center justify-center flex-shrink-0 transition-colors ${
+            checked ? 'bg-[#10B981] border-[#10B981]' : 'border-[#2D2D2D]'
+          }`}
+        >
+          {checked && <Check size={12} className="text-[#0A0A0A]" strokeWidth={3} />}
+        </span>
+        {/* Truly inert while selecting, not merely pointer-events-none: the row
+            owns the click, and a keyboard user tabbing onto a reaction badge
+            inside a selected bubble could otherwise still fire it. `inert` also
+            keeps the hover chevron from opening a menu over the checkbox. */}
+        <div inert={true} className="flex-1 min-w-0 [&_[data-testid=message-menu-trigger]]:hidden">
+          {bubble}
+        </div>
+      </div>
+    );
+  }, [isGroup, myUserId, handleContextMenu, handleReactionClick, handleJumpToMessage, handleRetry,
+    selectionMode, selectedIds, toggleSelected]);
 
   if (!conversationId) {
     return <EmptyChat />;
   }
 
-  // Build message items with date separators
-  const items = [];
-  for (let i = 0; i < convMessages.length; i++) {
-    const msg = convMessages[i];
-    const prevMsg = i > 0 ? convMessages[i - 1] : null;
-
-    if (!prevMsg || isDifferentDay(prevMsg.created_at, msg.created_at)) {
-      items.push({ type: 'date', date: msg.created_at, key: `date-${msg.created_at}-${i}` });
-    }
-    items.push({
-      type: 'message',
-      message: msg,
-      key: msg._id || msg.temp_id,
-      isOwn: msg.sender_id === user?.id,
-      showSenderName: !prevMsg || prevMsg.sender_id !== msg.sender_id || isDifferentDay(prevMsg.created_at, msg.created_at),
-    });
-  }
-
-  const convTyping = typingUsers?.[conversationId] || {};
+  const typingCount = Object.keys(convTyping).length;
+  const selectedCount = selectedIds.size;
+  const composerBlocked = conversation?.admin_only_messages && isGroup &&
+    !['creator', 'admin'].includes(conversation?.participants?.find(p => p.user_id === myUserId)?.role);
 
   return (
     <div className="flex-1 flex flex-col bg-[#0A0A0A] h-full min-h-0 overflow-hidden">
-      {/* Chat Header */}
-      <div className="h-16 bg-[#0F0F0F] border-b border-[#1F1F1F] flex items-center justify-between px-4 flex-shrink-0">
-        <div className="flex items-center gap-3 cursor-pointer" onClick={() => {
-          if (conversation?.type === 'group') setShowGroupInfo(true);
-          else if (conversation?.type === 'direct') setShowContactInfo(true);
-        }}>
-          {isMobile && (
+      {/* Chat Header — same 64px box in both modes, so entering selection never
+          shifts the message list. */}
+      <div className="h-16 bg-[#0F0F0F] border-b border-[#1F1F1F] flex items-center justify-between px-4 flex-shrink-0 gap-2">
+        {selectionMode ? (
+          <>
+            <div className="flex items-center gap-3 min-w-0">
+              <button
+                type="button"
+                onClick={exitSelection}
+                aria-label="Cancel selection"
+                title="Cancel selection"
+                data-testid="selection-cancel-btn"
+                className="p-2 -ml-2 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors"
+              >
+                <X size={20} />
+              </button>
+              <h3 className="text-base font-medium text-[#F5F5F5]" data-testid="selection-count">
+                {selectedCount} selected
+              </h3>
+            </div>
             <button
-              onClick={onBack}
-              data-testid="chat-back-button"
-              className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] transition-colors -ml-2"
+              type="button"
+              onClick={() => setSelectedIds(new Set())}
+              disabled={selectedCount === 0}
+              data-testid="selection-clear-btn"
+              className="px-3 py-1.5 text-xs text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
             >
-              <ArrowLeft size={20} />
+              Clear
             </button>
-          )}
-          <div className="relative">
-            <div className="w-10 h-10 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-sm font-medium">
-              {displayName?.charAt(0)?.toUpperCase() || '?'}
-            </div>
-            {otherParticipant?.status === 'online' && (
-              <span className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-[#10B981] rounded-full border-2 border-[#0F0F0F]" />
-            )}
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <h3 className="text-base font-medium text-[#F5F5F5]">{displayName}</h3>
-              {conversation?.cross_org && (
-                <span className="text-[11px] px-2 py-0.5 rounded-full bg-[#10B981]/20 text-[#10B981]">Cross-Org</span>
+          </>
+        ) : (
+          <>
+            <div className="flex items-center gap-3 min-w-0">
+              {isMobile && (
+                <button
+                  onClick={onBack}
+                  aria-label="Back to chats"
+                  data-testid="chat-back-button"
+                  className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] transition-colors -ml-2"
+                >
+                  <ArrowLeft size={20} />
+                </button>
               )}
-            </div>
-            <p className={`text-xs ${otherParticipant?.status === 'online' ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}>
-              {Object.keys(convTyping).length > 0 ? (
-                <span className="text-[#10B981] flex items-center gap-1">
-                  typing
-                  <span className="inline-flex gap-0.5">
-                    <span className="w-1 h-1 bg-[#10B981] rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                    <span className="w-1 h-1 bg-[#10B981] rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                    <span className="w-1 h-1 bg-[#10B981] rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+              <button
+                type="button"
+                onClick={() => {
+                  if (isDirect) setContactInfo({ open: true, section: 'info' });
+                  else if (conversation) setGroupInfo({ open: true, section: 'info' });
+                }}
+                aria-label={isDirect ? 'Contact info' : 'Group info'}
+                data-testid="chat-header-identity"
+                className="flex items-center gap-3 min-w-0 text-left rounded-[6px] px-1 -mx-1 py-1 hover:bg-[#1A1A1A] focus:outline-none focus-visible:ring-1 focus-visible:ring-[#10B981] transition-colors"
+              >
+                <span className="relative flex-shrink-0">
+                  <span className="w-10 h-10 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-sm font-medium">
+                    {displayName?.charAt(0)?.toUpperCase() || '?'}
+                  </span>
+                  {otherParticipant?.status === 'online' && (
+                    <span className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-[#10B981] rounded-full border-2 border-[#0F0F0F]" />
+                  )}
+                </span>
+                <span className="min-w-0">
+                  <span className="flex items-center gap-2">
+                    <h3 className="text-base font-medium text-[#F5F5F5] truncate">{displayName}</h3>
+                    {conversation?.cross_org && (
+                      <span className="text-[11px] px-2 py-0.5 rounded-full bg-[#10B981]/20 text-[#10B981] flex-shrink-0">Cross-Org</span>
+                    )}
+                  </span>
+                  <span className={`block text-xs truncate ${otherParticipant?.status === 'online' ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}>
+                    {typingCount > 0 ? (
+                      <span className="text-[#10B981] flex items-center gap-1">
+                        typing
+                        <span className="inline-flex gap-0.5">
+                          <span className="w-1 h-1 bg-[#10B981] rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                          <span className="w-1 h-1 bg-[#10B981] rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                          <span className="w-1 h-1 bg-[#10B981] rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                        </span>
+                      </span>
+                    ) : conversation?.cross_org
+                      ? `${conversation?.participants?.length || 0} members from ${new Set(conversation?.participants?.map(p => p.org_name).filter(Boolean)).size || '?'} organizations`
+                      : statusText}
                   </span>
                 </span>
-              ) : conversation?.cross_org
-                ? `${conversation?.participants?.length || 0} members from ${new Set(conversation?.participants?.map(p => p.org_name).filter(Boolean)).size || '?'} organizations`
-                : statusText}
-            </p>
-          </div>
-        </div>
-        <div className="flex items-center gap-1">
-          <button onClick={() => setShowConvSearch(!showConvSearch)} className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors" data-testid="chat-search-btn">
-            <Search size={18} />
-          </button>
-          <button
-            onClick={() => {
-              const wsC = wsClient;
-              const callSt = useCallStore;
-              if (callSt.getState().callState !== 'idle') return;
-              if (conversation?.type === 'direct' && otherParticipant) {
-                wsC.send({ type: 'call:initiate', callee_id: otherParticipant.user_id, call_type: 'voice', conversation_id: conversationId });
-                callSt.getState().initiateCall(null, 'voice', false, conversationId);
-              } else if (conversation?.type === 'group' || conversation?.type === 'cross_org') {
-                wsC.send({ type: 'call:group_initiate', conversation_id: conversationId, call_type: 'voice' });
-                callSt.getState().initiateCall(null, 'voice', true, conversationId);
-              }
-            }}
-            data-testid="header-voice-call-btn"
-            className={`p-2 rounded-[6px] transition-colors ${
-              useCallStore.getState?.().callState !== 'idle' ? 'text-[#A3A3A3]/30 cursor-not-allowed' : 'text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A]'
-            }`}
-            title="Voice call"
-          >
-            <Phone size={18} />
-          </button>
-          <button
-            onClick={() => {
-              const wsC = wsClient;
-              const callSt = useCallStore;
-              if (callSt.getState().callState !== 'idle') return;
-              if (conversation?.type === 'direct' && otherParticipant) {
-                wsC.send({ type: 'call:initiate', callee_id: otherParticipant.user_id, call_type: 'video', conversation_id: conversationId });
-                callSt.getState().initiateCall(null, 'video', false, conversationId);
-              } else if (conversation?.type === 'group' || conversation?.type === 'cross_org') {
-                wsC.send({ type: 'call:group_initiate', conversation_id: conversationId, call_type: 'video' });
-                callSt.getState().initiateCall(null, 'video', true, conversationId);
-              }
-            }}
-            data-testid="header-video-call-btn"
-            className={`p-2 rounded-[6px] transition-colors ${
-              useCallStore.getState?.().callState !== 'idle' ? 'text-[#A3A3A3]/30 cursor-not-allowed' : 'text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A]'
-            }`}
-            title="Video call"
-          >
-            <Video size={18} />
-          </button>
-          <button className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors">
-            <MoreVertical size={18} />
-          </button>
-        </div>
+              </button>
+            </div>
+
+            <div className="flex items-center gap-1 flex-shrink-0">
+              <button
+                onClick={() => setShowConvSearch(s => !s)}
+                aria-label="Search messages"
+                title="Search"
+                data-testid="chat-search-btn"
+                className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors"
+              >
+                <Search size={18} />
+              </button>
+              <CallButtonDropdown
+                type={headerType}
+                conversation={conversation}
+                disabled={callBusy}
+                onAction={handleCallAction}
+              />
+              <ChatHeaderMenu
+                type={headerType}
+                conversation={conversation}
+                onAction={handleHeaderAction}
+              />
+            </div>
+          </>
+        )}
       </div>
 
       {/* In-conversation search */}
       <ConversationSearch
         conversationId={conversationId}
-        isOpen={showConvSearch}
+        isOpen={showConvSearch && !selectionMode}
         onClose={() => setShowConvSearch(false)}
-        onScrollToMessage={(msgId) => {
-          const idx = items.findIndex(item => item.type === 'message' && item.message._id === msgId);
-          if (idx >= 0 && virtuosoRef.current) {
-            virtuosoRef.current.scrollToIndex({ index: idx, behavior: 'smooth' });
-          }
-        }}
+        // Same "scroll to this message id" behaviour as a reply-block click, and
+        // stable — an inline arrow here re-armed ConversationSearch's debounce on
+        // every ChatPanel render, so the search never fired while messages flowed.
+        onScrollToMessage={handleJumpToMessage}
       />
+
+      {/* Pinned messages banner */}
+      {activePin && !selectionMode && (
+        <button
+          type="button"
+          onClick={handlePinnedBannerClick}
+          data-testid="pinned-messages-banner"
+          className="flex items-center gap-3 px-4 py-2 bg-[#141414] border-b border-[#1F1F1F] text-left hover:bg-[#1A1A1A] focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[#10B981] transition-colors flex-shrink-0"
+        >
+          <Pin size={14} className="text-[#10B981] flex-shrink-0" />
+          <span className="min-w-0 flex-1">
+            <span className="block text-[11px] text-[#10B981]">
+              {pinnedMessages.length > 1
+                ? `Pinned message ${Math.min(pinCursor, pinnedMessages.length - 1) + 1} of ${pinnedMessages.length}`
+                : 'Pinned message'}
+            </span>
+            <span className="block text-[13px] text-[#A3A3A3] truncate">
+              {activePin.sender_name ? `${activePin.sender_name}: ` : ''}{messagePreview(activePin)}
+            </span>
+          </span>
+        </button>
+      )}
 
       {/* Message Area */}
       <div className="flex-1 relative overflow-hidden min-h-0 scrollable-area">
@@ -540,41 +1091,29 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
           </div>
         ) : (
           <Virtuoso
+            // Remount per conversation. `initialTopMostItemIndex` only applies at
+            // mount, and switching threads used to remount the list implicitly
+            // via the loading spinner. Now that a cached thread renders without
+            // one, without this key the list keeps the previous thread's scroll
+            // state and has to walk its way down to the newest message.
+            key={conversationId}
             ref={virtuosoRef}
             style={{ height: '100%' }}
             data={items}
             initialTopMostItemIndex={items.length - 1}
             followOutput="smooth"
             atBottomStateChange={(bottom) => {
-              setAtBottom(bottom);
               setShowScrollDown(!bottom && items.length > 10);
             }}
             startReached={() => {
               if (hasMore) loadMore();
             }}
-            itemContent={(index, item) => {
-              if (item.type === 'date') {
-                return <DateSeparator date={item.date} />;
-              }
-              return (
-                <MessageBubble
-                  message={item.message}
-                  isOwn={item.isOwn}
-                  showSenderName={item.showSenderName}
-                  isGroup={conversation?.type === 'group'}
-                  currentUserId={user?.id}
-                  onContextMenu={handleContextMenu}
-                  onReactionClick={handleReactionClick}
-                  onReplyClick={handleReplyBlockClick}
-                  onRetry={handleRetry}
-                />
-              );
-            }}
+            itemContent={itemContent}
           />
         )}
 
         {/* Typing indicator - positioned at bottom of message area */}
-        {Object.keys(convTyping).length > 0 && (
+        {typingCount > 0 && (
           <div className="absolute bottom-0 left-0 right-0 bg-[#0A0A0A]/90 backdrop-blur-sm z-[5]">
             <TypingIndicator users={convTyping} />
           </div>
@@ -587,6 +1126,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.8 }}
             onClick={() => virtuosoRef.current?.scrollToIndex({ index: 'LAST', behavior: 'smooth' })}
+            aria-label="Scroll to latest message"
             className="absolute bottom-4 right-4 w-10 h-10 rounded-full bg-[#10B981] text-white flex items-center justify-center shadow-lg hover:bg-[#059669] transition-colors z-10"
           >
             <ChevronDown size={20} />
@@ -594,8 +1134,47 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         )}
       </div>
 
-      {/* Edit banner + inline editor, else reply preview + composer */}
-      {editingMessage ? (
+      {/* Bottom bar: selection actions, edit bar, or composer */}
+      {selectionMode ? (
+        <div
+          data-testid="selection-action-bar"
+          className="bg-[#0F0F0F] border-t border-[#1F1F1F] px-4 py-3 safe-bottom flex items-center justify-between gap-3"
+        >
+          <span className="text-sm text-[#A3A3A3]">
+            {selectedCount === 0 ? 'Select messages' : `${selectedCount} selected`}
+          </span>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => setForwardBatch(selectedMessages)}
+              disabled={selectedCount === 0}
+              data-testid="selection-forward-btn"
+              className="flex items-center gap-2 px-3 py-2 text-sm text-[#F5F5F5] rounded-[6px] hover:bg-[#1A1A1A] transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+            >
+              <Forward size={16} /> Forward
+            </button>
+            <button
+              type="button"
+              onClick={handleBatchStar}
+              disabled={selectedCount === 0}
+              data-testid="selection-star-btn"
+              className="flex items-center gap-2 px-3 py-2 text-sm text-[#F5F5F5] rounded-[6px] hover:bg-[#1A1A1A] transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+            >
+              {allSelectedStarred ? <StarOff size={16} /> : <Star size={16} />}
+              {allSelectedStarred ? 'Unstar' : 'Star'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setBatchDelete(true)}
+              disabled={selectedCount === 0}
+              data-testid="selection-delete-btn"
+              className="flex items-center gap-2 px-3 py-2 text-sm text-[#EF4444] rounded-[6px] hover:bg-[#EF4444]/10 transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+            >
+              <Trash2 size={16} /> Delete
+            </button>
+          </div>
+        </div>
+      ) : editingMessage ? (
         <div className="bg-[#141414] border-t border-[#1F1F1F]" data-testid="edit-message-bar">
           {/* Edit banner (mirrors ReplyPreview) */}
           <div className="px-4 py-2 flex items-center gap-3">
@@ -652,13 +1231,17 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
           )}
 
           {/* Composer or admin-only banner */}
-          {conversation?.admin_only_messages && conversation?.type === 'group' &&
-            !['creator', 'admin'].includes(conversation?.participants?.find(p => p.user_id === user?.id)?.role) ? (
+          {composerBlocked ? (
             <div className="bg-[#0F0F0F] border-t border-[#1F1F1F] px-4 py-3 text-center">
               <p className="text-sm text-[#A3A3A3]">Only admins can send messages in this group</p>
             </div>
           ) : (
-            <MessageComposer conversationId={conversationId} onSend={handleSend} replyTo={replyTo} />
+            <MessageComposer
+              conversationId={conversationId}
+              onSend={handleSend}
+              replyTo={replyTo}
+              draft={draft}
+            />
           )}
         </>
       )}
@@ -667,9 +1250,10 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       {contextMenu && (
         <MessageContextMenu
           message={contextMenu.message}
-          isOwn={contextMenu.message.sender_id === user?.id}
+          isOwn={contextMenu.message.sender_id === myUserId}
+          isGroup={isGroupLike}
           position={contextMenu.position}
-          onAction={handleContextAction}
+          onAction={handleMessageAction}
           onClose={() => setContextMenu(null)}
         />
       )}
@@ -683,11 +1267,15 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         />
       )}
 
-      {/* Forward Modal */}
+      {/* Forward Modal — one message from the menu, or a whole selection. */}
       <ForwardModal
-        message={forwardMsg}
-        isOpen={!!forwardMsg}
-        onClose={() => setForwardMsg(null)}
+        message={forwardBatch?.[0] || null}
+        messages={forwardBatch || undefined}
+        isOpen={!!forwardBatch?.length}
+        onClose={() => {
+          setForwardBatch(null);
+          exitSelection();
+        }}
       />
 
       {/* Message Info Modal */}
@@ -697,7 +1285,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         onClose={() => setMsgInfo(null)}
       />
 
-      {/* Delete Confirmation */}
+      {/* Delete Confirmation (single message) */}
       {deleteConfirm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={() => setDeleteConfirm(null)}>
           <div className="absolute inset-0 bg-black/60 backdrop-blur-[4px]" />
@@ -711,6 +1299,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
               <button onClick={() => setDeleteConfirm(null)}
                 className="px-4 py-2 text-sm text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors">Cancel</button>
               <button onClick={handleDelete}
+                data-testid="delete-message-confirm"
                 className={`px-4 py-2 text-sm font-medium rounded-[6px] transition-all ${
                   deleteConfirm.forEveryone ? 'bg-[#EF4444] text-white hover:opacity-90' : 'bg-[#1A1A1A] text-[#F5F5F5] border border-[#2D2D2D] hover:bg-[#2D2D2D]'
                 }`}>
@@ -721,20 +1310,84 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         </div>
       )}
 
-      {/* Group Info Panel */}
-      <GroupInfoPanel
-        conversation={conversation}
-        currentUserId={user?.id}
-        isOpen={showGroupInfo}
-        onClose={() => setShowGroupInfo(false)}
+      {/* Batch delete confirmation (selection mode) */}
+      <ConfirmDialog
+        open={batchDelete}
+        title={`Delete ${selectedCount} message${selectedCount === 1 ? '' : 's'}?`}
+        body="They will be removed from your copy of this chat. Everyone else keeps theirs."
+        confirmLabel="Delete for me"
+        busy={batchBusy}
+        onConfirm={handleBatchDelete}
+        onCancel={() => setBatchDelete(false)}
+        testId="selection-delete-confirm"
       />
 
+      {/* Exit group confirmation (header menu) */}
+      <ConfirmDialog
+        open={leaveConfirm}
+        title={`Exit "${conversation?.name || 'this group'}"?`}
+        body="You will stop receiving messages from this group. Only group admins can add you back."
+        confirmLabel="Exit group"
+        busy={leaveBusy}
+        onConfirm={handleLeaveGroup}
+        onCancel={() => setLeaveConfirm(false)}
+        testId="chat-leave-group-confirm"
+      />
+
+      {/* Group Info Panel */}
+      {!isDirect && conversation && (
+        <GroupInfoPanel
+          conversation={conversation}
+          currentUserId={myUserId}
+          isOpen={groupInfo.open}
+          onClose={() => setGroupInfo(prev => ({ ...prev, open: false }))}
+          initialSection={groupInfo.section}
+          // Same "scroll to this message id" handler the reply blocks and the
+          // in-conversation search already use.
+          onJumpToMessage={handleJumpToMessage}
+          onSearchMessages={() => setShowConvSearch(true)}
+        />
+      )}
+
       {/* Contact Info Panel */}
-      <ContactInfoPanel
-        conversation={conversation}
-        currentUserId={user?.id}
-        isOpen={showContactInfo}
-        onClose={() => setShowContactInfo(false)}
+      {isDirect && (
+        <ContactInfoPanel
+          contact={otherParticipant}
+          conversation={conversation}
+          currentUserId={myUserId}
+          isOpen={contactInfo.open}
+          onClose={() => setContactInfo(prev => ({ ...prev, open: false }))}
+          initialSection={contactInfo.section}
+          onJumpToMessage={handleJumpToMessage}
+          onSearchMessages={() => setShowConvSearch(true)}
+        />
+      )}
+
+      {/* "New group call" from a DM: build the group, then ring it. */}
+      <CreateGroupModal
+        isOpen={showNewGroupCall}
+        onClose={() => setShowNewGroupCall(false)}
+        prefillMembers={otherParticipant ? [{
+          id: otherParticipant.user_id,
+          display_name: otherParticipant.display_name,
+          avatar_url: otherParticipant.avatar_url,
+          department_name: otherParticipant.department_name || '',
+        }] : undefined}
+        onGroupCreated={(group) => {
+          setShowNewGroupCall(false);
+          if (!group?._id) return;
+          const store = useChatStore.getState();
+          if (!store.conversations.some(c => c._id === group._id)) {
+            store.setConversations([group, ...store.conversations]);
+          }
+          store.setActiveConversation(group._id);
+          if (useCallStore.getState().callState !== 'idle') {
+            toast.error('You are already in a call');
+            return;
+          }
+          wsClient.send({ type: 'call:group_initiate', conversation_id: group._id, call_type: 'video' });
+          useCallStore.getState().initiateCall(null, 'video', true, group._id);
+        }}
       />
     </div>
   );

@@ -24,7 +24,16 @@ const FILTER_TABS = [
 export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
-  const { conversations, setConversations, activeConversationId, typingUsers, clearUnread } = useChatStore();
+  // Narrow selectors: `useChatStore()` subscribed the whole sidebar (and every
+  // row in it) to every store write, including message traffic in threads that
+  // aren't even shown here. `typingUsers` is deliberately not read at this level
+  // — each ConversationItem subscribes to its own slice, so one person typing
+  // re-renders one row instead of the entire list.
+  const conversations = useChatStore(s => s.conversations);
+  const activeConversationId = useChatStore(s => s.activeConversationId);
+  const wsConnected = useChatStore(s => s.wsConnected);
+  const setConversations = useChatStore(s => s.setConversations);
+  const clearUnread = useChatStore(s => s.clearUnread);
 
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('all');
@@ -54,10 +63,33 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
     return () => clearTimeout(timer);
   }, [fetchConversations]);
 
-  // Light refresh every 15s as fallback (WS handles most updates now)
+  /**
+   * No polling while the socket is up.
+   *
+   * The 15s interval predates a working WebSocket. Now that the socket delivers
+   * new_message, conversation_created/updated, member_*, presence and
+   * profile_updated, the poll added nothing but cost: four requests a minute at
+   * idle, and — because it replaced the whole list with freshly deserialized
+   * objects — a full re-render of every row each time, which also clobbered the
+   * locally-bumped order and any just-cleared unread badge.
+   *
+   * What is left is a genuine safety net for the only case the socket cannot
+   * cover: it being down. The socket's own reconnect handler re-syncs the list
+   * (_syncAfterReconnect), and returning to a backgrounded tab re-syncs too,
+   * since a socket can die while hidden without the close event landing.
+   */
   useEffect(() => {
+    if (wsConnected) return undefined;
     const interval = setInterval(fetchConversations, 15000);
     return () => clearInterval(interval);
+  }, [wsConnected, fetchConversations]);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') fetchConversations();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
   }, [fetchConversations]);
 
   const handleSelectContact = async (contactId) => {
@@ -80,14 +112,12 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
     navigate('/login');
   };
 
-  const handleConversationClick = (conv) => {
+  const handleConversationClick = useCallback((conv) => {
     onSelectConversation(conv._id);
-    // Mark as read via API
-    if (conv.unread_count > 0) {
-      client.put(`/api/conversations/${conv._id}/read`).catch(() => {});
-      clearUnread(conv._id);
-    }
-  };
+    // Clear the badge immediately; ChatPanel issues the PUT /read for every open
+    // path (this one included), so doing it here too just doubled the request.
+    if (conv.unread_count > 0) clearUnread(conv._id);
+  }, [onSelectConversation, clearUnread]);
 
   return (
     <div className="h-full flex flex-col bg-[#0F0F0F] border-r border-[#1F1F1F] overflow-hidden" data-testid="chat-sidebar">
@@ -266,24 +296,25 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
             </button>
           </div>
         ) : (
-          <AnimatePresence>
-            {conversations.map((conv, idx) => (
-              <motion.div
-                key={conv._id}
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                transition={{ delay: idx * 0.03 }}
-              >
-                <ConversationItem
-                  conversation={conv}
-                  currentUserId={user?.id}
-                  isActive={activeConversationId === conv._id}
-                  onClick={() => handleConversationClick(conv)}
-                  typingUsers={typingUsers}
-                />
-              </motion.div>
-            ))}
-          </AnimatePresence>
+          // No AnimatePresence: none of these children declare an `exit`, so it
+          // tracked presence for every row and bought nothing. The stagger is
+          // capped too — at 0.03s per index a 40-thread list took over a second
+          // to finish appearing.
+          conversations.map((conv, idx) => (
+            <motion.div
+              key={conv._id}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ delay: Math.min(idx, 8) * 0.02 }}
+            >
+              <ConversationItem
+                conversation={conv}
+                currentUserId={user?.id}
+                isActive={activeConversationId === conv._id}
+                onClick={handleConversationClick}
+              />
+            </motion.div>
+          ))
         )}
       </div>
       </>

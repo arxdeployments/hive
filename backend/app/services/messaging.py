@@ -19,7 +19,9 @@ from app.db.models import (
     Message,
     MessageAttachment,
     MessageDeletion,
+    MessagePin,
     MessageReaction,
+    MessageStar,
     MessageType,
     ParticipantRole,
     Upload,
@@ -166,7 +168,15 @@ async def send_message(
 
     loaded = await enrich.load_message(db, msg.id)
     doc = await enrich.serialize_message(
-        db, loaded, conv_participants=participants, sender=sender, include_reply=True
+        db,
+        loaded,
+        conv_participants=participants,
+        sender=sender,
+        include_reply=True,
+        # Brand-new message: it cannot be starred or pinned yet, so hand the
+        # serializer empty sets instead of paying two lookups on the send path.
+        starred_ids=set(),
+        pinned_ids=set(),
     )
 
     others = [p.user_id for p in participants if p.user_id != sender.id]
@@ -227,7 +237,7 @@ async def send_system_message(
         conv.last_message_at = now
     await db.commit()
     loaded = await enrich.load_message(db, msg.id)
-    doc = await enrich.serialize_message(db, loaded, include_reply=False)
+    doc = await enrich.serialize_message(db, loaded, include_reply=False, starred_ids=set(), pinned_ids=set())
     if broadcast and conv is not None:
         participants = (
             (
@@ -349,6 +359,77 @@ async def toggle_reaction(db: AsyncSession, *, message_id: uuid.UUID, actor: Use
     return reactions
 
 
+async def _member_message(db: AsyncSession, message_id: uuid.UUID, actor: User) -> Message:
+    """Load a message iff the actor participates in its conversation.
+
+    404 either way — a non-member must not be able to tell a foreign message
+    from a nonexistent one (same posture as toggle_reaction/delete_message).
+    """
+    msg = await db.get(Message, message_id)
+    if msg is None:
+        raise SendError(status_code=404, detail="Message not found")
+    me = await db.get(ConversationParticipant, (msg.conversation_id, actor.id))
+    if me is None:
+        raise SendError(status_code=404, detail="Message not found")
+    return msg
+
+
+async def toggle_star(db: AsyncSession, *, message_id: uuid.UUID, actor: User) -> bool:
+    """Star/unstar for the actor only. Private: never broadcast, never visible
+    to other participants."""
+    await _member_message(db, message_id, actor)
+    existing = await db.get(MessageStar, (message_id, actor.id))
+    if existing is not None:
+        await db.delete(existing)
+        starred = False
+    else:
+        db.add(MessageStar(message_id=message_id, user_id=actor.id))
+        starred = True
+    await db.commit()
+    return starred
+
+
+async def toggle_pin(db: AsyncSession, *, message_id: uuid.UUID, actor: User) -> bool:
+    """Pin/unpin for the whole conversation, then tell every participant."""
+    msg = await _member_message(db, message_id, actor)
+    existing = await db.get(MessagePin, message_id)
+    if existing is not None:
+        await db.delete(existing)
+        pinned = False
+    else:
+        db.add(
+            MessagePin(
+                message_id=message_id,
+                conversation_id=msg.conversation_id,
+                pinned_by=actor.id,
+            )
+        )
+        pinned = True
+    await db.commit()
+
+    participants = (
+        (
+            await db.execute(
+                select(ConversationParticipant.user_id).where(
+                    ConversationParticipant.conversation_id == msg.conversation_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    await publish_to_users(
+        participants,
+        {
+            "type": "message_pin_update",
+            "message_id": str(message_id),
+            "conversation_id": str(msg.conversation_id),
+            "is_pinned": pinned,
+        },
+    )
+    return pinned
+
+
 async def delete_message(db: AsyncSession, *, message_id: uuid.UUID, actor: User, for_everyone: bool) -> None:
     msg = await db.get(Message, message_id)
     if msg is None:
@@ -415,7 +496,7 @@ async def edit_message(db: AsyncSession, *, message_id: uuid.UUID, actor: User, 
     await db.commit()
 
     msg = await enrich.load_message(db, message_id)
-    doc = await enrich.serialize_message(db, msg)
+    doc = await enrich.serialize_message(db, msg, for_user=actor.id)
     participants = (
         (
             await db.execute(
@@ -488,7 +569,13 @@ async def forward_message(
         await db.commit()
         loaded = await enrich.load_message(db, copy.id)
         doc = await enrich.serialize_message(
-            db, loaded, conv_participants=participants, sender=actor, include_reply=False
+            db,
+            loaded,
+            conv_participants=participants,
+            sender=actor,
+            include_reply=False,
+            starred_ids=set(),  # the forwarded copy is new — no stars, no pin
+            pinned_ids=set(),
         )
         others = [p.user_id for p in participants if p.user_id != actor.id]
         await publish_to_users(others, {"type": "new_message", "message": {**doc, "status": "delivered"}})

@@ -78,6 +78,9 @@ services:
       RXHIVE_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-rxhive}
       RXHIVE_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       RXHIVE_LIVEKIT_URL: ${RXHIVE_LIVEKIT_PUBLIC_URL:-/livekit}
+      # The public URL above is a Caddy route only a browser can resolve; the
+      # API needs a real address to probe the SFU for /api/health.
+      RXHIVE_LIVEKIT_HEALTH_URL: http://livekit:7880
       RXHIVE_LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-rxhive-api}
       RXHIVE_LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
       RXHIVE_VAPID_PUBLIC_KEY: ${RXHIVE_VAPID_PUBLIC_KEY:-}

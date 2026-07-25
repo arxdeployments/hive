@@ -1,7 +1,9 @@
-import React, { memo } from 'react';
-import { Check, CheckCheck, Clock, Ban, Mic } from 'lucide-react';
+import React, { memo, useCallback, useEffect, useRef } from 'react';
+import { Check, CheckCheck, Clock, Ban, Mic, ChevronDown, Star, Pin } from 'lucide-react';
 import { ImageBubble } from './ImageBubble';
 import { DocumentBubble } from './DocumentBubble';
+
+const LONG_PRESS_MS = 500;
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 
@@ -30,13 +32,19 @@ const formatTime = (dateStr) => {
   return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
 };
 
+// WhatsApp tick semantics. These only ever render on your own (green) bubble,
+// so "grey" is white/70 against that background; blue (#53BDEB) means read.
 const StatusIcon = ({ status }) => {
   switch (status) {
-    case 'sending': return <Clock size={12} className="text-white/50" />;
-    case 'sent': return <Check size={12} className="text-white/70" />;
-    case 'delivered': return <CheckCheck size={12} className="text-white/70" />;
-    case 'read': return <CheckCheck size={12} className="text-[#53BDEB]" />;
-    default: return <Check size={12} className="text-white/70" />;
+    case 'sending':
+      return <Clock size={12} className="text-white/50" data-testid="message-status" data-status="sending" aria-label="Sending" />;
+    case 'delivered':
+      return <CheckCheck size={12} className="text-white/70" data-testid="message-status" data-status="delivered" aria-label="Delivered" />;
+    case 'read':
+      return <CheckCheck size={12} className="text-[#53BDEB]" data-testid="message-status" data-status="read" aria-label="Read" />;
+    case 'sent':
+    default:
+      return <Check size={12} className="text-white/70" data-testid="message-status" data-status="sent" aria-label="Sent" />;
   }
 };
 
@@ -63,7 +71,102 @@ const replyPreview = (replyMsg) => {
   }
 };
 
+/**
+ * The hover-revealed chevron, WhatsApp-style: parked in the bubble's top-right
+ * corner, invisible until the bubble is hovered or something inside it takes
+ * focus. Touch devices have no hover at all, so a coarse-pointer media query
+ * pins it visible there — otherwise the menu would be unreachable on mobile.
+ *
+ * It opens the *same* menu as right-click / long-press by calling the parent's
+ * onContextMenu(e, message), so there is only ever one menu implementation.
+ */
+const MenuTrigger = ({ isOwn, onOpen, overMedia }) => (
+  <button
+    type="button"
+    onClick={onOpen}
+    // Suppress the browser menu here; the click handler already opened ours.
+    onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); }}
+    aria-label="Message options"
+    aria-haspopup="menu"
+    data-testid="message-menu-trigger"
+    className={`absolute top-0.5 right-0.5 z-[2] w-6 h-6 flex items-center justify-center rounded-full
+      opacity-0 transition-opacity duration-100
+      group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100
+      [@media(pointer:coarse)]:opacity-100
+      ${overMedia
+        ? 'bg-black/40 text-white hover:bg-black/60'
+        : isOwn
+          ? 'text-white/80 hover:text-white hover:bg-black/15'
+          : 'text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-white/10'}`}
+  >
+    <ChevronDown size={16} />
+  </button>
+);
+
 const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUserId, onContextMenu, onReactionClick, onReplyClick, onEdit, onRetry }) => {
+  // Long-press is the touch equivalent of right-click. Android fires `contextmenu`
+  // after a long press as well, so the timer sets a flag that swallows the
+  // duplicate rather than opening the menu twice.
+  const longPressTimer = useRef(null);
+  const openedByLongPress = useRef(false);
+
+  // Virtuoso unmounts rows as they scroll out; a pending timer would otherwise
+  // open a menu for a bubble that is no longer on screen.
+  useEffect(() => () => {
+    if (longPressTimer.current) clearTimeout(longPressTimer.current);
+  }, []);
+
+  const openMenu = useCallback((e) => {
+    if (onContextMenu) onContextMenu(e, message);
+  }, [onContextMenu, message]);
+
+  const handleTriggerClick = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Keyboard activation reports (0, 0); anchor to the button itself instead so
+    // the menu doesn't fly to the top-left corner of the screen.
+    if (e.clientX === 0 && e.clientY === 0) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      openMenu({
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        clientX: rect.right,
+        clientY: rect.bottom + 4,
+        target: e.currentTarget,
+        currentTarget: e.currentTarget,
+      });
+      return;
+    }
+    openMenu(e);
+  }, [openMenu]);
+
+  const clearLongPress = useCallback(() => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  }, []);
+
+  const handleTouchStart = useCallback((e) => {
+    const touch = e.touches?.[0];
+    if (!touch) return;
+    const { clientX, clientY } = touch;
+    clearLongPress();
+    longPressTimer.current = setTimeout(() => {
+      longPressTimer.current = null;
+      openedByLongPress.current = true;
+      setTimeout(() => { openedByLongPress.current = false; }, 800);
+      openMenu({
+        preventDefault: () => {},
+        stopPropagation: () => {},
+        clientX,
+        clientY,
+        target: e.target,
+        currentTarget: e.currentTarget,
+      });
+    }, LONG_PRESS_MS);
+  }, [clearLongPress, openMenu]);
+
   // Deleted message
   if (message.is_deleted) {
     return (
@@ -103,7 +206,9 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
 
   const handleContextMenu = (e) => {
     e.preventDefault();
-    if (onContextMenu) onContextMenu(e, message);
+    // The long-press timer already opened it on this gesture.
+    if (openedByLongPress.current) return;
+    openMenu(e);
   };
 
   const handleDoubleClick = () => {
@@ -112,7 +217,11 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
 
   return (
     <div className={`flex ${isOwn ? 'justify-end' : 'justify-start'} mb-1 px-3 sm:px-8 md:px-16`}
-      onContextMenu={handleContextMenu}>
+      onContextMenu={handleContextMenu}
+      onTouchStart={handleTouchStart}
+      onTouchMove={clearLongPress}
+      onTouchEnd={clearLongPress}
+      onTouchCancel={clearLongPress}>
       {/* Avatar for group received messages */}
       {!isOwn && isGroup && showSenderName && (
         <div className="w-7 h-7 rounded-full bg-[#10B981]/10 flex items-center justify-center text-xs font-medium mr-2 mt-auto mb-1 flex-shrink-0"
@@ -132,9 +241,14 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
               ? `px-1 py-1 ${isOwn ? 'bg-[#10B981] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
               : isFile || isAudio
                 ? `p-1 ${isOwn ? 'bg-[#10B981] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
-                : `px-3 py-2 ${isOwn ? 'bg-[#10B981] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
+                // pr-8 permanently reserves the chevron's corner, so revealing it on
+                // hover never reflows the bubble or lets it sit on top of the text.
+                : `pl-3 pr-8 py-2 ${isOwn ? 'bg-[#10B981] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
           }`}
         >
+          {/* Hover / focus / touch menu trigger */}
+          <MenuTrigger isOwn={isOwn} onOpen={handleTriggerClick} overMedia={richBubble} />
+
           {/* Forwarded label */}
           {message.is_forwarded && (
             <p className={`text-[11px] italic mb-0.5 ${isOwn ? 'text-white/60' : 'text-[#A3A3A3]'}`}>
@@ -190,7 +304,8 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
                 <Mic size={18} className={isOwn ? 'text-white' : 'text-[#10B981]'} />
               </div>
               <div className="flex-1 min-w-0">
-                <p className={`text-xs truncate ${isOwn ? 'text-white/90' : 'text-[#F5F5F5]'}`}>{audioName}</p>
+                {/* pr-6 keeps the filename clear of the chevron's corner */}
+                <p className={`text-xs truncate pr-6 ${isOwn ? 'text-white/90' : 'text-[#F5F5F5]'}`}>{audioName}</p>
                 <audio
                   controls
                   preload="metadata"
@@ -207,8 +322,26 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
             </p>
           )}
 
-          {/* Time + status */}
-          <div className={`flex items-center gap-1 mt-1 ${richBubble ? 'px-2 pb-1' : ''} justify-end`}>
+          {/* Time + status. The negative right margin gives back the space the
+              chevron reserved above, so the timestamp still sits flush right. */}
+          <div className={`flex items-center gap-1 mt-1 ${richBubble ? 'px-2 pb-1' : '-mr-5'} justify-end`}>
+            {message.is_pinned && (
+              <Pin
+                size={11}
+                className={isOwn ? 'text-white/70' : 'text-[#A3A3A3]'}
+                data-testid="message-pinned-indicator"
+                aria-label="Pinned"
+              />
+            )}
+            {message.is_starred && (
+              <Star
+                size={11}
+                fill="currentColor"
+                className={isOwn ? 'text-white/70' : 'text-[#A3A3A3]'}
+                data-testid="message-starred-indicator"
+                aria-label="Starred"
+              />
+            )}
             <span className={`text-[11px] ${isOwn ? 'text-white/70' : 'text-[#A3A3A3]'}`}>
               {formatTime(message.created_at)}
             </span>
@@ -267,14 +400,26 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
   );
 };
 
-export const MessageBubble = memo(MessageBubbleInner, (prev, next) => {
-  return prev.message._id === next.message._id &&
-    prev.message.status === next.message.status &&
-    prev.message.temp_id === next.message.temp_id &&
-    prev.message.is_deleted === next.message.is_deleted &&
-    prev.message.edited_at === next.message.edited_at &&
-    prev.message.content === next.message.content &&
-    prev.message.media_url === next.message.media_url &&
-    prev.message.thumbnail_url === next.message.thumbnail_url &&
-    JSON.stringify(prev.message.reactions) === JSON.stringify(next.message.reactions);
-});
+/**
+ * The store never mutates a message in place — every reducer either returns the
+ * same object or a fresh one — so reference equality *is* "nothing changed", and
+ * it is both cheaper and stricter than field-by-field comparison.
+ *
+ * The previous comparator ran JSON.stringify(reactions) per visible row per
+ * render, and compared only message fields: it ignored `isGroup`,
+ * `showSenderName`, `isOwn` and `currentUserId`, so a bubble rendered before its
+ * conversation had loaded kept its non-group layout forever, sender-name
+ * grouping went stale after older pages were prepended, and reaction highlights
+ * missed the current user. It also missed `reply_to_message` entirely.
+ *
+ * The handler props are omitted deliberately: ChatPanel gives them stable
+ * identities (useCallback + refs), so comparing them would only ever produce
+ * false misses.
+ */
+export const MessageBubble = memo(MessageBubbleInner, (prev, next) => (
+  prev.message === next.message &&
+  prev.isOwn === next.isOwn &&
+  prev.showSenderName === next.showSenderName &&
+  prev.isGroup === next.isGroup &&
+  prev.currentUserId === next.currentUserId
+));

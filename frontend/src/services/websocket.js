@@ -3,6 +3,25 @@ import useChatStore from '../stores/chatStore';
 import useCallStore from '../stores/callStore';
 import livekitClient from './livekitClient';
 import { refreshSession } from '../api/client';
+import { withDerivedStatus, applyReadReceipt } from '../utils/messageStatus';
+import { handleCallJoinError, notifyCameraUnavailable } from '../utils/callErrors';
+
+/**
+ * Join the SFU and surface what happened. Every join site shares this so a
+ * stopped LiveKit server, a blocked microphone, and a dead call each produce
+ * their own message instead of one indistinguishable "could not connect".
+ */
+function joinLiveKit(callId, context, onFatal) {
+  return livekitClient
+    .joinCall(callId)
+    .then((result) => {
+      if (result?.cameraUnavailable) notifyCameraUnavailable(result.reason);
+    })
+    .catch((err) => {
+      handleCallJoinError(err, context);
+      onFatal(err);
+    });
+}
 
 // Auth rides in httpOnly cookies — the WS handshake carries them automatically
 // (same-origin in production behind Caddy, and via the Vite proxy in dev).
@@ -138,8 +157,11 @@ class RxHiveWebSocket {
       }
 
       case 'new_message': {
-        const msg = data.message;
-        if (!msg) break;
+        const incoming = data.message;
+        if (!incoming) break;
+        // Same rule as the load path: ticks come from the receipt arrays, not
+        // from whatever `status` the broadcast happened to carry.
+        const msg = withDerivedStatus(incoming, this._currentUserId());
         const convId = msg.conversation_id;
 
         store.addMessage(convId, msg);
@@ -170,21 +192,23 @@ class RxHiveWebSocket {
       }
 
       case 'messages_read': {
-        const { conversation_id, reader_id, last_read_message_id } = data;
+        const { conversation_id, reader_id, last_read_message_id, read_at } = data;
+        if (!conversation_id || !reader_id) break;
         const currentMsgs = store.messages[conversation_id] || [];
+        if (currentMsgs.length === 0) break;
         // last_read_message_id may be null (mark-all-read): treat as "everything".
+        // An id we cannot find is an anchor in an older, not-yet-loaded page —
+        // do NOT widen that to "everything" or newer unread messages go blue.
         const lastReadIdx = last_read_message_id
           ? currentMsgs.findIndex(m => m._id === last_read_message_id)
           : currentMsgs.length - 1;
-        if (lastReadIdx >= 0) {
-          const updatedMsgs = currentMsgs.map((m, idx) => {
-            if (idx <= lastReadIdx && m.sender_id !== reader_id && m.status !== 'read') {
-              return { ...m, status: 'read' };
-            }
-            return m;
-          });
-          store.setMessages(conversation_id, updatedMsgs);
-        }
+        if (lastReadIdx < 0) break;
+        const myId = this._currentUserId();
+        // applyReadReceipt merges the reader into read_by/delivered_to as well,
+        // so the ticks survive any later re-derive of the same objects.
+        store.setMessages(conversation_id, currentMsgs.map((m, idx) =>
+          idx <= lastReadIdx ? applyReadReceipt(m, reader_id, myId, read_at) : m
+        ));
         break;
       }
 
@@ -199,31 +223,19 @@ class RxHiveWebSocket {
         break;
       }
 
+      // Presence and profile churn constantly. Both used to walk every
+      // conversation and issue one store write each — N notifications and N
+      // full-list rebuilds per broadcast, which re-rendered the entire sidebar
+      // even for conversations the user isn't a participant of. One write now.
       case 'presence': {
         const { user_id, status, last_seen } = data;
-        const convs = store.conversations;
-        convs.forEach(conv => {
-          const updated = conv.participants?.map(p =>
-            p.user_id === user_id ? { ...p, status, last_seen } : p
-          );
-          if (updated) {
-            store.updateConversation(conv._id, { participants: updated });
-          }
-        });
+        store.updateParticipantEverywhere(user_id, { status, last_seen });
         break;
       }
 
       case 'profile_updated': {
         const { user_id, display_name, avatar_url } = data;
-        const convs = store.conversations;
-        convs.forEach(conv => {
-          const updated = conv.participants?.map(p =>
-            p.user_id === user_id ? { ...p, display_name, avatar_url } : p
-          );
-          if (updated) {
-            store.updateConversation(conv._id, { participants: updated });
-          }
-        });
+        store.updateParticipantEverywhere(user_id, { display_name, avatar_url });
         break;
       }
 
@@ -351,11 +363,7 @@ class RxHiveWebSocket {
       case 'call:group_started': {
         callStore.getState().setCallState('connected');
         callStore.getState().callConnected();
-        livekitClient.joinCall(data.call_id).catch((e) => {
-          console.error('[LiveKit] join failed:', e);
-          toast.error('Could not join the call');
-          callStore.getState().resetCall();
-        });
+        joinLiveKit(data.call_id, 'group_started', () => callStore.getState().resetCall());
         break;
       }
       case 'call:group_participants': {
@@ -372,11 +380,7 @@ class RxHiveWebSocket {
         // initiator, so relying on that alone left joiners silent.)
         callStore.getState().setCallState('connected');
         callStore.getState().callConnected();
-        livekitClient.joinCall(data.call_id).catch((e) => {
-          console.error('[LiveKit] join failed:', e);
-          toast.error('Could not join the call');
-          callStore.getState().resetCall();
-        });
+        joinLiveKit(data.call_id, 'group_join', () => callStore.getState().resetCall());
         break;
       }
       case 'call:full': {
@@ -391,12 +395,13 @@ class RxHiveWebSocket {
       case 'call:accepted': {
         const cs = callStore.getState();
         cs.acceptCall();
-        // Caller connects to the SFU room once the callee accepts.
-        livekitClient.joinCall(cs.callId || data.call_id).catch((e) => {
-          console.error('[LiveKit] join failed:', e);
-          toast.error('Could not connect the call');
+        // Both sides connect to the SFU room here: the caller because the
+        // callee just answered, the callee because this is the server's
+        // confirmation that the call really moved to connected.
+        const joinId = cs.callId || data.call_id;
+        joinLiveKit(joinId, 'accepted', () => {
           callStore.getState().endCall();
-          this.send({ type: 'call:end', call_id: cs.callId || data.call_id });
+          this.send({ type: 'call:end', call_id: joinId });
         });
         break;
       }
@@ -483,6 +488,16 @@ class RxHiveWebSocket {
 
       default:
         break;
+    }
+  }
+
+  // The socket lives outside React, so the session id comes from the
+  // localStorage mirror AuthContext keeps in step with /api/auth/me.
+  _currentUserId() {
+    try {
+      return JSON.parse(localStorage.getItem('user') || '{}')?.id || null;
+    } catch {
+      return null;
     }
   }
 

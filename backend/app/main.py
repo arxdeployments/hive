@@ -2,6 +2,7 @@ import contextlib
 import logging
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -117,6 +118,30 @@ app.include_router(notifications.router)
 app.include_router(hub.router)
 
 
+LIVEKIT_PROBE_TIMEOUT = 2.0
+
+
+async def livekit_status() -> str:
+    """Liveness of the calling SFU: connected | unreachable | not_configured.
+
+    Deliberately separate from the healthy/unhealthy verdict — messaging works
+    fine without LiveKit, only calls break. Without this field a stopped
+    livekit-server shows up as nothing but a generic "could not connect the
+    call" toast in the browser, which is what made call outages so hard to spot.
+    """
+    target = settings.livekit_probe_url
+    if not target:
+        return "not_configured"
+    try:
+        async with httpx.AsyncClient(timeout=LIVEKIT_PROBE_TIMEOUT) as http:
+            resp = await http.get(target)
+    except Exception as exc:
+        logger.warning("LiveKit probe failed for %s: %s", target, exc)
+        return "unreachable"
+    # LiveKit answers `/` with 200 OK; any non-5xx means the process is serving.
+    return "connected" if resp.status_code < 500 else "unreachable"
+
+
 @app.get("/api/health")
 async def health():
     db_status = "connected"
@@ -131,6 +156,7 @@ async def health():
         await get_redis().ping()
     except Exception:
         redis_status, healthy = "disconnected", False
+    livekit = await livekit_status()
     body = {
         "status": "healthy" if healthy else "unhealthy",
         "version": "1.0.0",
@@ -138,6 +164,9 @@ async def health():
         "timestamp": iso_z(now_utc()),
         "database": db_status,
         "redis": redis_status,
+        # Calls need the SFU; messaging does not. Reported, never fatal.
+        "livekit": livekit,
+        "calls_available": livekit == "connected",
     }
     return JSONResponse(status_code=200 if healthy else 503, content=body)
 

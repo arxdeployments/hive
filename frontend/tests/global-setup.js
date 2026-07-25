@@ -14,8 +14,18 @@ export default async function globalSetup() {
       const body = await resp.json();
       if (resp.ok && body.status === 'healthy') {
         console.log(
-          `[e2e] API healthy at ${API} (db=${body.database}, redis=${body.redis})`
+          `[e2e] API healthy at ${API} ` +
+            `(db=${body.database}, redis=${body.redis}, livekit=${body.livekit ?? 'not reported'})`
         );
+        // Not fatal — only the calling specs need the SFU, and they skip
+        // themselves. But say it once here so a whole skipped call suite is
+        // never mistaken for a passing one.
+        if (body.livekit && body.livekit !== 'connected') {
+          console.warn(
+            `[e2e] LiveKit is ${body.livekit} — calling tests will skip. Start it with:\n` +
+              `  LIVEKIT_KEYS="devkey: devsecret-at-least-32-characters-long" livekit-server --dev`
+          );
+        }
         return;
       }
       lastError = `status=${resp.status} body=${JSON.stringify(body)}`;

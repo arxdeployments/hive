@@ -17,8 +17,10 @@ Deliberate fixes vs the Mongo build (docs/reference/api-conversations-messages.m
 """
 
 import datetime as dt
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from sqlalchemy import and_, literal, or_, select
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -38,7 +40,7 @@ from app.db.models import (
 from app.db.session import get_db
 from app.services import enrich, messaging, presence
 from app.services.conversations import get_or_create_direct
-from app.utils import parse_uuid
+from app.utils import iso_z, parse_uuid
 
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
@@ -57,6 +59,13 @@ def _parse_cursor(cursor: str | None) -> dt.datetime | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.UTC)
+    return parsed
+
+
+def _conv_uuid(conv_id: str) -> uuid.UUID:
+    parsed = parse_uuid(conv_id)
+    if parsed is None:
+        raise HTTPException(status_code=400, detail="Invalid conversation ID")
     return parsed
 
 
@@ -177,9 +186,7 @@ async def create_direct_conversation(
 
 @router.put("/{conv_id}/pin")
 async def toggle_pin(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
-    conv_uuid = parse_uuid(conv_id)
-    if conv_uuid is None:
-        raise HTTPException(status_code=400, detail="Invalid conversation ID")
+    conv_uuid = _conv_uuid(conv_id)
     conv = await tenant.require_membership(conv_uuid)
     if not conv.is_active:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -190,19 +197,30 @@ async def toggle_pin(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
     return {"is_pinned": me.is_pinned}
 
 
-@router.delete("/{conv_id}")
-async def delete_conversation(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
-    conv_uuid = parse_uuid(conv_id)
-    if conv_uuid is None:
-        raise HTTPException(status_code=400, detail="Invalid conversation ID")
-    await tenant.require_membership(conv_uuid)
+@router.put("/{conv_id}/mute")
+async def toggle_mute(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
+    """Toggle MY mute flag. Per-participant, so it can't perturb anyone else."""
+    conv_uuid = _conv_uuid(conv_id)
+    conv = await tenant.require_membership(conv_uuid)
+    if not conv.is_active:
+        raise HTTPException(status_code=404, detail="Conversation not found")
 
-    db = tenant.db
+    me = await tenant.db.get(ConversationParticipant, (conv_uuid, tenant.user.id))
+    me.is_muted = not me.is_muted
+    await tenant.db.commit()
+    return {"is_muted": me.is_muted}
+
+
+async def _hide_all_messages_for_caller(db: AsyncSession, conv_uuid: uuid.UUID, user_id: uuid.UUID) -> None:
+    """Delete-for-me every message in the conversation, in one INSERT ... SELECT.
+
+    Only ever writes the caller's own rows — other users' history is untouched.
+    """
     already_deleted = select(MessageDeletion.message_id).where(
-        MessageDeletion.user_id == tenant.user.id,
+        MessageDeletion.user_id == user_id,
         MessageDeletion.message_id == Message.id,
     )
-    to_hide = select(Message.id, literal(tenant.user.id, type_=PG_UUID(as_uuid=True))).where(
+    to_hide = select(Message.id, literal(user_id, type_=PG_UUID(as_uuid=True))).where(
         Message.conversation_id == conv_uuid, ~already_deleted.exists()
     )
     insert_stmt = (
@@ -210,7 +228,61 @@ async def delete_conversation(conv_id: str, tenant: TenantContext = Depends(get_
     )
     await db.execute(insert_stmt)
     await db.commit()
+
+
+@router.delete("/{conv_id}")
+async def delete_conversation(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
+    conv_uuid = _conv_uuid(conv_id)
+    await tenant.require_membership(conv_uuid)
+    await _hide_all_messages_for_caller(tenant.db, conv_uuid, tenant.user.id)
     return {"message": "Conversation deleted"}
+
+
+@router.post("/{conv_id}/clear")
+async def clear_conversation(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
+    """Clear the chat for ME only — delete-for-me rows, never a destructive wipe."""
+    conv_uuid = _conv_uuid(conv_id)
+    await tenant.require_membership(conv_uuid)
+    await _hide_all_messages_for_caller(tenant.db, conv_uuid, tenant.user.id)
+    return {"message": "Chat cleared"}
+
+
+@router.get("/{conv_id}/export")
+async def export_conversation(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
+    """Plain-text transcript, oldest-first, of everything the caller can see."""
+    conv_uuid = _conv_uuid(conv_id)
+    await tenant.require_membership(conv_uuid)
+
+    stmt = (
+        select(Message, User.display_name)
+        .outerjoin(User, User.id == Message.sender_id)
+        .outerjoin(
+            MessageDeletion,
+            and_(
+                MessageDeletion.message_id == Message.id,
+                MessageDeletion.user_id == tenant.user.id,
+            ),
+        )
+        .where(
+            Message.conversation_id == conv_uuid,
+            MessageDeletion.message_id.is_(None),  # exclude the caller's delete-for-me
+        )
+        .order_by(Message.created_at.asc())
+    )
+    rows = (await tenant.db.execute(stmt)).all()
+
+    lines = []
+    for msg, display_name in rows:
+        content = "This message was deleted" if msg.deleted_at else (msg.content or "")
+        lines.append(f"[{iso_z(msg.created_at)}] {display_name or 'System'}: {content}")
+    body = "\n".join(lines) + ("\n" if lines else "")
+
+    # Filename is derived from the id, never from the (user-controlled)
+    # conversation name — no header injection, no encoding surprises.
+    return PlainTextResponse(
+        body,
+        headers={"Content-Disposition": f'attachment; filename="rxhive-chat-{conv_uuid}.txt"'},
+    )
 
 
 @router.put("/{conv_id}/read")
@@ -219,9 +291,7 @@ async def mark_conversation_read(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    conv_uuid = parse_uuid(conv_id)
-    if conv_uuid is None:
-        raise HTTPException(status_code=400, detail="Invalid conversation ID")
+    conv_uuid = _conv_uuid(conv_id)
     # Membership enforced inside mark_read (404 "Conversation not found").
     await messaging.mark_read(db, conversation_id=conv_uuid, reader=user)
     return {"message": "Marked as read"}

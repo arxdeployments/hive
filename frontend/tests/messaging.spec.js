@@ -64,8 +64,9 @@ test('two users exchange a message in real time', async ({ browser }) => {
   await expect(aPage.getByText(outbound).first()).toBeVisible();
 
   // Delivered live over the WebSocket into Bob's open conversation.
-  // The 5s budget is deliberate: the sidebar poll runs every 15s, so a pass
-  // here can only come from the socket. Without it, a dead socket looks green.
+  // The 5s budget is deliberate. It used to be justified by the sidebar's 15s
+  // poll being slower than the budget; that poll now only runs while the socket
+  // is *down*, so nothing but the socket can turn this green at all.
   await expect(bPage.getByText(outbound).first()).toBeVisible({ timeout: 5000 });
   expect(Date.now() - sentAt).toBeLessThan(5000);
 

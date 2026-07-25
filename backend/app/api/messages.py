@@ -19,6 +19,8 @@ from app.db.models import (
     ConversationParticipant,
     Message,
     MessageDeletion,
+    MessagePin,
+    MessageStar,
     MessageType,
     User,
 )
@@ -59,6 +61,49 @@ def _require_org_access(conv: Conversation, tenant: TenantContext) -> None:
     # Mirrors the send path: non-cross-org conversations must match the caller's org.
     if conv.type.value != "cross_org" and conv.org_id != tenant.user.org_id:
         raise HTTPException(status_code=403, detail="Access denied")
+
+
+async def _participants_of(db, conv_uuid: uuid.UUID) -> list[ConversationParticipant]:
+    return (
+        (
+            await db.execute(
+                select(ConversationParticipant).where(ConversationParticipant.conversation_id == conv_uuid)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def _serialize_page(
+    db,
+    messages: list[Message],
+    *,
+    user_id: uuid.UUID,
+    participants: list[ConversationParticipant],
+    include_reply: bool = True,
+) -> list[dict]:
+    """Serialize a page of messages with star/pin state batch-loaded once."""
+    ids = [m.id for m in messages]
+    starred_ids = await enrich.starred_message_ids(db, ids, user_id)
+    pinned_ids = await enrich.pinned_message_ids(db, ids)
+    # Senders arrive batch-loaded via MESSAGE_LOAD_OPTIONS (one IN query, no N+1).
+    senders: dict[uuid.UUID, User] = {
+        m.sender_id: m.sender for m in messages if m.sender_id is not None and m.sender is not None
+    }
+    return [
+        await enrich.serialize_message(
+            db,
+            m,
+            conv_participants=participants,
+            sender=senders.get(m.sender_id) if m.sender_id else None,
+            include_reply=include_reply,
+            for_user=user_id,
+            starred_ids=starred_ids,
+            pinned_ids=pinned_ids,
+        )
+        for m in messages
+    ]
 
 
 class SendMessageRequest(BaseModel):
@@ -130,29 +175,8 @@ async def list_messages(
     page = list(rows[:limit])
     page.reverse()  # wire order is oldest-first
 
-    participants = (
-        (
-            await db.execute(
-                select(ConversationParticipant).where(ConversationParticipant.conversation_id == conv_uuid)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    # Senders arrive batch-loaded via MESSAGE_LOAD_OPTIONS (one IN query, no N+1).
-    senders: dict[uuid.UUID, User] = {
-        m.sender_id: m.sender for m in page if m.sender_id is not None and m.sender is not None
-    }
-    messages = [
-        await enrich.serialize_message(
-            db,
-            m,
-            conv_participants=participants,
-            sender=senders.get(m.sender_id) if m.sender_id else None,
-            include_reply=True,
-        )
-        for m in page
-    ]
+    participants = await _participants_of(db, conv_uuid)
+    messages = await _serialize_page(db, page, user_id=tenant.user.id, participants=participants)
     return {"messages": messages, "has_more": has_more}
 
 
@@ -231,6 +255,81 @@ async def react_to_message(
         tenant.db, message_id=_msg_uuid(msg_id), actor=tenant.user, emoji=body.emoji
     )
     return {"reactions": reactions}
+
+
+@router.post("/messages/{msg_id}/star")
+async def star_message(msg_id: str, tenant: TenantContext = Depends(get_tenant)):
+    """Toggle the caller's private star. Membership-checked (404 otherwise)."""
+    starred = await messaging.toggle_star(tenant.db, message_id=_msg_uuid(msg_id), actor=tenant.user)
+    return {"starred": starred}
+
+
+@router.post("/messages/{msg_id}/pin")
+async def pin_message(msg_id: str, tenant: TenantContext = Depends(get_tenant)):
+    """Toggle the conversation-wide pin. Membership-checked (404 otherwise)."""
+    pinned = await messaging.toggle_pin(tenant.db, message_id=_msg_uuid(msg_id), actor=tenant.user)
+    return {"pinned": pinned}
+
+
+@router.get("/{conv_id}/starred")
+async def list_starred_messages(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
+    conv_uuid = _conv_uuid(conv_id)
+    conv = await tenant.require_membership(conv_uuid)
+    _require_org_access(conv, tenant)
+    db = tenant.db
+
+    stmt = (
+        select(Message)
+        .options(*enrich.MESSAGE_LOAD_OPTIONS)
+        .join(MessageStar, MessageStar.message_id == Message.id)
+        .outerjoin(
+            MessageDeletion,
+            and_(
+                MessageDeletion.message_id == Message.id,
+                MessageDeletion.user_id == tenant.user.id,
+            ),
+        )
+        .where(
+            Message.conversation_id == conv_uuid,
+            MessageStar.user_id == tenant.user.id,
+            MessageDeletion.message_id.is_(None),
+        )
+        .order_by(Message.created_at.desc())
+    )
+    rows = list((await db.execute(stmt)).scalars().all())
+    participants = await _participants_of(db, conv_uuid)
+    data = await _serialize_page(db, rows, user_id=tenant.user.id, participants=participants)
+    return {"data": data}
+
+
+@router.get("/{conv_id}/pinned")
+async def list_pinned_messages(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
+    conv_uuid = _conv_uuid(conv_id)
+    conv = await tenant.require_membership(conv_uuid)
+    _require_org_access(conv, tenant)
+    db = tenant.db
+
+    stmt = (
+        select(Message)
+        .options(*enrich.MESSAGE_LOAD_OPTIONS)
+        .join(MessagePin, MessagePin.message_id == Message.id)
+        .outerjoin(
+            MessageDeletion,
+            and_(
+                MessageDeletion.message_id == Message.id,
+                MessageDeletion.user_id == tenant.user.id,
+            ),
+        )
+        .where(
+            Message.conversation_id == conv_uuid,
+            MessageDeletion.message_id.is_(None),
+        )
+        .order_by(MessagePin.created_at.desc())
+    )
+    rows = list((await db.execute(stmt)).scalars().all())
+    participants = await _participants_of(db, conv_uuid)
+    data = await _serialize_page(db, rows, user_id=tenant.user.id, participants=participants)
+    return {"data": data}
 
 
 @router.post("/messages/forward")

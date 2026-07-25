@@ -25,9 +25,7 @@ def snapshot() -> dict:
     return {
         "counters": dict(_counters),
         "latency_ms_avg": {
-            k: round(_latency_ms_total[k] / _counters[k], 2)
-            for k in _latency_ms_total
-            if _counters.get(k)
+            k: round(_latency_ms_total[k] / _counters[k], 2) for k in _latency_ms_total if _counters.get(k)
         },
     }
 
@@ -41,9 +39,7 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
             status = response.status_code
         except Exception:
             incr("http_requests_error")
-            logger.exception(
-                "request failed", extra={"request_id": request_id, "path": request.url.path}
-            )
+            logger.exception("request failed", extra={"request_id": request_id, "path": request.url.path})
             raise
         elapsed_ms = (time.perf_counter() - start) * 1000
 

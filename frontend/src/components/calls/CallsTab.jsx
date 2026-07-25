@@ -19,20 +19,29 @@ const defaultScheduleTime = () => {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 };
 
-const ScheduleCallModal = ({ isOpen, onClose, onScheduled }) => {
-  const [title, setTitle] = useState('');
+// Exported so the chat header menus can schedule a call for the open
+// conversation instead of duplicating this form. `participantIds` /
+// `defaultTitle` default to the standalone Calls-tab behaviour.
+export const ScheduleCallModal = ({
+  isOpen,
+  onClose,
+  onScheduled,
+  participantIds = [],
+  defaultTitle = '',
+}) => {
+  const [title, setTitle] = useState(defaultTitle);
   const [startTime, setStartTime] = useState(defaultScheduleTime());
   const [callType, setCallType] = useState('video');
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (isOpen) {
-      setTitle('');
+      setTitle(defaultTitle);
       setStartTime(defaultScheduleTime());
       setCallType('video');
       setSaving(false);
     }
-  }, [isOpen]);
+  }, [isOpen, defaultTitle]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -48,7 +57,7 @@ const ScheduleCallModal = ({ isOpen, onClose, onScheduled }) => {
         title: title.trim(),
         start_time: when.toISOString(),
         call_type: callType,
-        participant_ids: [],
+        participant_ids: participantIds,
       });
       toast.success('Call scheduled');
       onScheduled?.();

@@ -7,13 +7,20 @@ search input is escaped + parameterized (was raw $regex — injection/ReDoS),
 and departments are batch-joined instead of one lookup per user.
 """
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import or_, select
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import and_, or_, select
+from sqlalchemy.orm import selectinload
 
 from app.core.deps import TenantContext, get_tenant
-from app.db.models import Department, User
-from app.services import presence
-from app.utils import iso_z
+from app.db.models import (
+    Conversation,
+    ConversationParticipant,
+    ConversationType,
+    Department,
+    User,
+)
+from app.services import enrich, presence
+from app.utils import iso_z, parse_uuid
 
 router = APIRouter(prefix="/api/users", tags=["contacts"])
 
@@ -71,3 +78,35 @@ async def list_contacts(
         }
         for u, dept_name in rows
     ]
+
+
+@router.get("/{user_id}/groups-in-common")
+async def groups_in_common(user_id: str, tenant: TenantContext = Depends(get_tenant)):
+    """Group conversations BOTH the caller and the target user belong to.
+
+    The target is resolved through the tenant guard, so a foreign-org user id
+    is a 404 — the caller can't probe another org's roster or memberships.
+    """
+    target_id = parse_uuid(user_id)
+    if target_id is None:
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+    target = await tenant.org_user(target_id)
+    if target.id == tenant.user.id:
+        return {"data": []}
+
+    mine = ConversationParticipant.__table__.alias("mine")
+    theirs = ConversationParticipant.__table__.alias("theirs")
+    stmt = (
+        select(Conversation)
+        .join(mine, and_(mine.c.conversation_id == Conversation.id, mine.c.user_id == tenant.user.id))
+        .join(theirs, and_(theirs.c.conversation_id == Conversation.id, theirs.c.user_id == target.id))
+        .options(selectinload(Conversation.participants).selectinload(ConversationParticipant.user))
+        .where(
+            Conversation.is_active.is_(True),
+            Conversation.type.in_((ConversationType.group, ConversationType.cross_org)),
+        )
+        .order_by(Conversation.last_message_at.desc().nulls_last())
+    )
+    convs = (await tenant.db.execute(stmt)).scalars().all()
+    data = [await enrich.serialize_conversation(tenant.db, c, tenant.user.id) for c in convs]
+    return {"data": data}

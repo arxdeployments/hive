@@ -7,6 +7,56 @@ import {
 import client from '../api/client';
 import useCallStore from '../stores/callStore';
 
+/**
+ * Why a join failed, so the UI can say something actionable instead of
+ * "Could not connect the call". The two causes that account for nearly every
+ * real report of "calls don't work" are a stopped SFU (`sfu_unreachable`) and a
+ * blocked microphone (`permission_denied`) — telling them apart is the whole
+ * point of this class.
+ */
+export class CallJoinError extends Error {
+  constructor(reason, message, cause) {
+    super(message);
+    this.name = 'CallJoinError';
+    this.reason = reason;
+    this.cause = cause;
+  }
+}
+
+// getUserMedia / LiveKit device failures → our reason vocabulary.
+const MEDIA_ERROR_REASONS = {
+  NotAllowedError: 'permission_denied',
+  PermissionDeniedError: 'permission_denied',
+  SecurityError: 'permission_denied',
+  NotFoundError: 'device_missing',
+  DevicesNotFoundError: 'device_missing',
+  OverconstrainedError: 'device_missing',
+  NotReadableError: 'device_busy',
+  TrackStartError: 'device_busy',
+};
+
+const mediaErrorReason = (err) => MEDIA_ERROR_REASONS[err?.name] || 'media_failed';
+
+/**
+ * LiveKit's ConnectionError carries a `reasonName`; anything we can't place is
+ * treated as the SFU being unreachable, because that is what it looks like from
+ * the user's seat and it points at the right thing to check first.
+ */
+const connectErrorReason = (err) => {
+  if (err?.name !== 'ConnectionError') return 'sfu_unreachable';
+  switch (err.reasonName) {
+    case 'NotAllowed':
+      return 'sfu_rejected';
+    case 'ServerUnreachable':
+    case 'WebSocket':
+    case 'ServiceNotFound':
+    case 'Timeout':
+      return 'sfu_unreachable';
+    default:
+      return 'sfu_error';
+  }
+};
+
 // Media layer for calls: the backend mints a scoped room token, this service
 // connects to the LiveKit SFU and mirrors room state into callStore so the
 // call UI just renders store state. Replaces webrtcManager + meshCallManager.
@@ -17,14 +67,38 @@ class LiveKitClient {
     this._screenSharePublication = null;
   }
 
+  /**
+   * Join the SFU room for `callId` and publish local media.
+   *
+   * A voice call must never touch the camera: `wantVideo` is false for
+   * callType 'voice', so getUserMedia is asked for audio only and no camera
+   * permission prompt appears.
+   *
+   * Throws {@link CallJoinError} when the call cannot carry media at all
+   * (SFU down, token refused, microphone blocked). A camera that fails while
+   * the microphone works is *not* fatal — the call degrades to audio and
+   * reports `cameraUnavailable` so the UI can say so.
+   *
+   * @returns {Promise<{cameraUnavailable: boolean, reason?: string}>}
+   */
   async joinCall(callId, { audio = true, video } = {}) {
-    if (this.room && this.callId === callId) return;
+    if (this.room && this.callId === callId) return { cameraUnavailable: false };
     await this.leave();
 
     const callStore = useCallStore.getState();
     const wantVideo = video ?? callStore.callType === 'video';
 
-    const { data } = await client.post(`/api/calls/${callId}/token`);
+    let data;
+    try {
+      ({ data } = await client.post(`/api/calls/${callId}/token`));
+    } catch (err) {
+      const status = err?.response?.status;
+      throw new CallJoinError(
+        status === 404 || status === 400 ? 'call_unavailable' : 'token_failed',
+        `token request failed (${status ?? 'network error'})`,
+        err
+      );
+    }
     const url = import.meta.env.VITE_LIVEKIT_URL || data.url;
 
     const room = new Room({
@@ -36,23 +110,70 @@ class LiveKitClient {
 
     this._wireRoomEvents(room);
 
-    await room.connect(this._absoluteUrl(url), data.token);
-
     try {
-      const tracks = await createLocalTracks({ audio, video: wantVideo });
-      for (const track of tracks) {
-        await room.localParticipant.publishTrack(track);
-      }
+      await room.connect(this._absoluteUrl(url), data.token);
     } catch (err) {
-      console.error('[LiveKit] media acquisition failed:', err);
+      await this.leave();
+      throw new CallJoinError(
+        connectErrorReason(err),
+        `could not reach the SFU at ${this._absoluteUrl(url)}`,
+        err
+      );
     }
+
+    const { cameraUnavailable, reason } = await this._publishLocalMedia(room, {
+      audio,
+      wantVideo,
+    });
 
     useCallStore.setState({
       isMuted: !audio,
-      isCameraOn: wantVideo,
+      isCameraOn: wantVideo && !cameraUnavailable,
       localStream: this._localStream(),
     });
     callStore.callConnected();
+    return { cameraUnavailable, reason };
+  }
+
+  /**
+   * Acquire and publish the local tracks. Failing to open the camera on a video
+   * call falls back to audio; failing to open the microphone is fatal, because
+   * a call nobody can hear you on is not a call — and silently swallowing that
+   * (as this used to) is exactly what makes a blocked mic look like "the call
+   * won't connect".
+   */
+  async _publishLocalMedia(room, { audio, wantVideo }) {
+    const publish = async (tracks) => {
+      for (const track of tracks) {
+        await room.localParticipant.publishTrack(track);
+      }
+    };
+
+    try {
+      await publish(await createLocalTracks({ audio, video: wantVideo }));
+      return { cameraUnavailable: false };
+    } catch (err) {
+      const reason = mediaErrorReason(err);
+      if (!wantVideo || !audio) {
+        console.error('[LiveKit] microphone unavailable:', err);
+        await this.leave();
+        throw new CallJoinError(reason, `could not acquire local media (${err?.name})`, err);
+      }
+      // Video call, media failed — retry without the camera before giving up.
+      console.warn('[LiveKit] camera+mic failed, retrying audio-only:', err);
+      try {
+        await publish(await createLocalTracks({ audio, video: false }));
+        return { cameraUnavailable: true, reason };
+      } catch (audioErr) {
+        console.error('[LiveKit] microphone unavailable:', audioErr);
+        await this.leave();
+        throw new CallJoinError(
+          mediaErrorReason(audioErr),
+          `could not acquire local media (${audioErr?.name})`,
+          audioErr
+        );
+      }
+    }
   }
 
   _absoluteUrl(url) {

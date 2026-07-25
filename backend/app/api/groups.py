@@ -50,6 +50,17 @@ class AddMembersRequest(BaseModel):
     user_ids: list[str]
 
 
+class PermissionsRequest(BaseModel):
+    """Every field optional — a PUT applies only the keys actually sent."""
+
+    edit_info: bool | None = None
+    send_messages: bool | None = None
+    add_members: bool | None = None
+    send_history: bool | None = None
+    invite_via_link: bool | None = None
+    approve_new_members: bool | None = None
+
+
 class ChangeRoleRequest(BaseModel):
     role: str
 
@@ -196,6 +207,47 @@ async def update_group(conv_id: str, body: UpdateGroupRequest, tenant: TenantCon
             {"type": "conversation_updated", "conversation_id": str(conv.id), "updates": updates},
         )
     return await _serialized(db, conv.id, user.id)
+
+
+@router.get("/{conv_id}/permissions")
+async def get_permissions(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
+    """Any participant may read the permission set (404 outside the conversation)."""
+    conv = await tenant.require_membership(_parse_conv_id(conv_id))
+    return enrich.serialize_permissions(conv)
+
+
+@router.put("/{conv_id}/permissions")
+async def update_permissions(
+    conv_id: str, body: PermissionsRequest, tenant: TenantContext = Depends(get_tenant)
+):
+    """Creator/admin only (403 for plain members, 404 outside the conversation)."""
+    db, user = tenant.db, tenant.user
+    conv = await tenant.require_membership(_parse_conv_id(conv_id))
+    me = await db.get(ConversationParticipant, (conv.id, user.id))
+    if me is None or me.role not in _ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="Only group admins can change permissions")
+
+    data = body.model_dump(exclude_unset=True, exclude_none=True)
+    for name, column in enrich.PERMISSION_COLUMNS.items():
+        if name in data:
+            setattr(conv, column, bool(data[name]))
+    if "send_messages" in data:
+        # send_messages is admin_only_messages inverted — one stored source of truth.
+        conv.admin_only_messages = not bool(data["send_messages"])
+    await db.commit()
+
+    permissions = enrich.serialize_permissions(conv)
+    if data:
+        await conv_service.broadcast_conversation_event(
+            db,
+            conv.id,
+            {
+                "type": "permissions_updated",
+                "conversation_id": str(conv.id),
+                "permissions": permissions,
+            },
+        )
+    return permissions
 
 
 @router.post("/{conv_id}/members")

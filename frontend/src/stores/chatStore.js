@@ -1,6 +1,21 @@
 import { create } from 'zustand';
 
-const useChatStore = create((set, get) => ({
+// Shared empty values so selectors for a missing conversation return a stable
+// reference — otherwise `s.messages[id] || []` mints a new array every render
+// and every subscriber re-renders on every unrelated store write.
+export const EMPTY_MESSAGES = [];
+export const EMPTY_TYPING = {};
+
+/**
+ * Identity is the render contract in this store: components (and MessageBubble's
+ * memo) compare message/conversation objects by reference, so every reducer must
+ * return the *same* object when nothing about it changed. Blind `.map()` writes
+ * hand out fresh identities for untouched rows and defeat every memo downstream.
+ */
+const sameConversationList = (prev, next) =>
+  prev.length === next.length && prev.every((c, i) => c === next[i]);
+
+const useChatStore = create((set) => ({
   conversations: [],
   activeConversationId: null,
   messages: {},
@@ -9,14 +24,16 @@ const useChatStore = create((set, get) => ({
   wsConnected: false,
   wsConnecting: false,
 
-  setConversations: (conversations) => set({ conversations }),
+  setConversations: (conversations) => set((state) => (
+    sameConversationList(state.conversations, conversations) ? state : { conversations }
+  )),
 
-  setActiveConversation: (id) => {
-    set({ activeConversationId: id });
-  },
+  setActiveConversation: (id) => set((state) => (
+    state.activeConversationId === id ? state : { activeConversationId: id }
+  )),
 
   addMessage: (convId, message) => set((state) => {
-    const existing = state.messages[convId] || [];
+    const existing = state.messages[convId] || EMPTY_MESSAGES;
     // Avoid duplicates
     if (existing.find(m => m._id === message._id)) return state;
     return {
@@ -28,7 +45,7 @@ const useChatStore = create((set, get) => ({
   }),
 
   addOptimisticMessage: (convId, message) => set((state) => {
-    const existing = state.messages[convId] || [];
+    const existing = state.messages[convId] || EMPTY_MESSAGES;
     return {
       messages: {
         ...state.messages,
@@ -38,24 +55,35 @@ const useChatStore = create((set, get) => ({
   }),
 
   replaceOptimisticMessage: (convId, tempId, realMessage) => set((state) => {
-    const existing = state.messages[convId] || [];
+    const existing = state.messages[convId];
+    if (!existing) return state;
+    let changed = false;
+    const next = existing.map(m => {
+      if (m.temp_id !== tempId) return m;
+      changed = true;
+      return { ...m, ...realMessage, status: realMessage.status || 'sent' };
+    });
+    return changed ? { messages: { ...state.messages, [convId]: next } } : state;
+  }),
+
+  // Callers often hand back an array whose rows are all the previous objects
+  // (e.g. a `.map()` that matched nothing). Keep the old array in that case so
+  // the message list doesn't re-render for a write that changed nothing.
+  setMessages: (convId, messages) => set((state) => {
+    const prev = state.messages[convId];
+    if (prev && prev.length === messages.length && prev.every((m, i) => m === messages[i])) {
+      return state;
+    }
     return {
       messages: {
         ...state.messages,
-        [convId]: existing.map(m => m.temp_id === tempId ? { ...m, ...realMessage, status: realMessage.status || 'sent' } : m)
+        [convId]: messages
       }
     };
   }),
 
-  setMessages: (convId, messages) => set((state) => ({
-    messages: {
-      ...state.messages,
-      [convId]: messages
-    }
-  })),
-
   prependMessages: (convId, olderMessages) => set((state) => {
-    const existing = state.messages[convId] || [];
+    const existing = state.messages[convId] || EMPTY_MESSAGES;
     return {
       messages: {
         ...state.messages,
@@ -64,26 +92,53 @@ const useChatStore = create((set, get) => ({
     };
   }),
 
-  updateConversation: (convId, updates) => set((state) => ({
-    conversations: state.conversations.map(c =>
-      c._id === convId ? { ...c, ...updates } : c
-    )
-  })),
+  updateConversation: (convId, updates) => set((state) => {
+    let changed = false;
+    const conversations = state.conversations.map(c => {
+      if (c._id !== convId) return c;
+      changed = true;
+      return { ...c, ...updates };
+    });
+    return changed ? { conversations } : state;
+  }),
+
+  /**
+   * Patch one user's participant record across every conversation in one write.
+   * Presence and profile broadcasts arrive constantly; doing this per-conversation
+   * cost one store notification and one full-list rebuild *each*, which re-rendered
+   * the whole sidebar even for conversations the user isn't in.
+   */
+  updateParticipantEverywhere: (userId, patch) => set((state) => {
+    let changed = false;
+    const conversations = state.conversations.map(c => {
+      if (!c.participants?.some(p => p.user_id === userId)) return c;
+      changed = true;
+      return {
+        ...c,
+        participants: c.participants.map(p => (p.user_id === userId ? { ...p, ...patch } : p)),
+      };
+    });
+    return changed ? { conversations } : state;
+  }),
 
   setContacts: (contacts) => set({ contacts }),
 
   updateMessageStatus: (convId, messageId, status) => set((state) => {
-    const existing = state.messages[convId] || [];
-    return {
-      messages: {
-        ...state.messages,
-        [convId]: existing.map(m => m._id === messageId ? { ...m, status } : m)
-      }
-    };
+    const existing = state.messages[convId];
+    if (!existing) return state;
+    let changed = false;
+    const next = existing.map(m => {
+      if (m._id !== messageId || m.status === status) return m;
+      changed = true;
+      return { ...m, status };
+    });
+    return changed ? { messages: { ...state.messages, [convId]: next } } : state;
   }),
 
   setTyping: (convId, userId, userName, isTyping) => set((state) => {
-    const convTyping = { ...(state.typingUsers[convId] || {}) };
+    const current = state.typingUsers[convId] || EMPTY_TYPING;
+    if (isTyping ? current[userId] === userName : !(userId in current)) return state;
+    const convTyping = { ...current };
     if (isTyping) {
       convTyping[userId] = userName;
     } else {
@@ -94,8 +149,14 @@ const useChatStore = create((set, get) => ({
     };
   }),
 
-  setWsConnected: (connected) => set({ wsConnected: connected, wsConnecting: false }),
-  setWsConnecting: (connecting) => set({ wsConnecting: connecting }),
+  setWsConnected: (connected) => set((state) => (
+    state.wsConnected === connected && !state.wsConnecting
+      ? state
+      : { wsConnected: connected, wsConnecting: false }
+  )),
+  setWsConnecting: (connecting) => set((state) => (
+    state.wsConnecting === connecting ? state : { wsConnecting: connecting }
+  )),
 
   // Move conversation to top of list when new message arrives
   bumpConversation: (convId, lastMessage) => set((state) => {
@@ -112,20 +173,29 @@ const useChatStore = create((set, get) => ({
       const bt = b.last_message?.created_at || b.created_at || '';
       return bt.localeCompare(at);
     });
-    return { conversations: [...pinned, ...unpinned] };
+    const conversations = [...pinned, ...unpinned];
+    return sameConversationList(state.conversations, conversations) ? state : { conversations };
   }),
 
-  incrementUnread: (convId) => set((state) => ({
-    conversations: state.conversations.map(c =>
-      c._id === convId ? { ...c, unread_count: (c.unread_count || 0) + 1 } : c
-    )
-  })),
+  incrementUnread: (convId) => set((state) => {
+    let changed = false;
+    const conversations = state.conversations.map(c => {
+      if (c._id !== convId) return c;
+      changed = true;
+      return { ...c, unread_count: (c.unread_count || 0) + 1 };
+    });
+    return changed ? { conversations } : state;
+  }),
 
-  clearUnread: (convId) => set((state) => ({
-    conversations: state.conversations.map(c =>
-      c._id === convId ? { ...c, unread_count: 0 } : c
-    )
-  })),
+  clearUnread: (convId) => set((state) => {
+    let changed = false;
+    const conversations = state.conversations.map(c => {
+      if (c._id !== convId || !c.unread_count) return c;
+      changed = true;
+      return { ...c, unread_count: 0 };
+    });
+    return changed ? { conversations } : state;
+  }),
 }));
 
 export default useChatStore;

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, memo } from 'react';
 import { Send, Smile, Paperclip, Mic, Image, FileText, Film, X, Loader2, Upload } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -44,7 +44,12 @@ const maxSizeForCategory = (category) => {
   return MAX_DOC_SIZE;
 };
 
-export const MessageComposer = ({ conversationId, onSend, disabled, replyTo }) => {
+/**
+ * `draft` is an optional `{ token, text }` seed from the parent — "Reply
+ * privately" uses it to drop a quote into a freshly opened DM. `token` (not
+ * `text`) is the trigger, so seeding the same quote twice still works.
+ */
+const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft }) => {
   const [text, setText] = useState('');
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [showEmoji, setShowEmoji] = useState(false);
@@ -68,6 +73,24 @@ export const MessageComposer = ({ conversationId, onSend, disabled, replyTo }) =
   }, []);
 
   useEffect(() => { adjustHeight(); }, [text, adjustHeight]);
+
+  // Seed the box from the parent's draft, caret parked at the end so the user
+  // types their reply after the quote rather than in front of it.
+  const draftToken = draft?.token;
+  useEffect(() => {
+    if (!draftToken) return;
+    const seed = draft?.text || '';
+    setText(seed);
+    const el = textareaRef.current;
+    if (!el) return;
+    el.focus();
+    try {
+      el.setSelectionRange(seed.length, seed.length);
+    } catch {
+      // Older engines reject setSelectionRange before layout; the focus is enough.
+    }
+    // `draft.text` is intentionally not a dependency: the token is the trigger.
+  }, [draftToken]);
 
   useEffect(() => {
     return () => {
@@ -524,3 +547,11 @@ export const MessageComposer = ({ conversationId, onSend, disabled, replyTo }) =
     </div>
   );
 };
+
+/**
+ * Memoised: the composer owns a textarea, an emoji picker and file inputs, and
+ * none of it depends on the message stream. Before this it re-rendered on every
+ * ChatPanel render — roughly 14 times for a single inbound message — purely
+ * because it was a child.
+ */
+export const MessageComposer = memo(MessageComposerInner);

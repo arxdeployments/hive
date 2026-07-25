@@ -4,7 +4,20 @@ import { Search, X, ArrowLeft, Camera, Users, Loader2 } from 'lucide-react';
 import client from '../../api/client';
 import { toast } from 'sonner';
 
-export const CreateGroupModal = ({ isOpen, onClose, onGroupCreated }) => {
+/**
+ * `prefillMembers` / `prefillName` / `prefillDescription` back GroupInfoPanel's
+ * "Create a similar group": the modal opens on step 1 with the source group's
+ * members already selected so they can be adjusted before the group is created.
+ * Members must be roster-shaped — { id, display_name, avatar_url, department_name }.
+ */
+export const CreateGroupModal = ({
+  isOpen,
+  onClose,
+  onGroupCreated,
+  prefillMembers,
+  prefillName,
+  prefillDescription,
+}) => {
   const [step, setStep] = useState(1);
   const [contacts, setContacts] = useState([]);
   const [search, setSearch] = useState('');
@@ -42,6 +55,19 @@ export const CreateGroupModal = ({ isOpen, onClose, onGroupCreated }) => {
       setGroupDesc('');
       setSearch('');
     }
+  }, [isOpen]);
+
+  // Seed from the prefill on open only. Re-seeding on every render would fight
+  // the user's own edits to the selection they were handed.
+  useEffect(() => {
+    if (!isOpen) return;
+    const seedMembers = Array.isArray(prefillMembers) ? prefillMembers.filter(m => m?.id) : [];
+    if (seedMembers.length === 0 && !prefillName && !prefillDescription) return;
+    setSelectedContacts(seedMembers);
+    setSelectedIds(seedMembers.map(m => m.id));
+    setGroupName(prefillName || '');
+    setGroupDesc(prefillDescription || '');
+    setStep(1);
   }, [isOpen]);
 
   const toggleContact = (contact) => {

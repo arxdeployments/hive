@@ -1,122 +1,548 @@
-import React, { useState, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { X, Mail, Building2, FolderTree, Phone, Video } from 'lucide-react';
+/**
+ * Contact Info — WhatsApp-parity two-column drawer.
+ *
+ *   <ContactInfoPanel contact={user} conversation={conv} isOpen={bool} onClose={fn} initialSection="info" />
+ *
+ * Left rail: Info · Media, links and docs · Starred · Encryption · Groups in common.
+ * Every nav item carries data-testid="contact-info-nav-<section>".
+ *
+ * HARD RULE: this panel never renders a phone number. WhatsApp puts the phone
+ * number under the contact's name; RX HIVE is an org directory keyed on work
+ * email, so the email goes there instead, alongside organization and department.
+ * There is no phone field in the wire contract — do not add one.
+ *
+ * `contact` is optional: when it is omitted the other participant of a direct
+ * conversation is used, which is how ChatPanel opens the panel today.
+ */
+
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Building2,
+  Check,
+  Copy,
+  Download,
+  Eraser,
+  FolderTree,
+  Info,
+  Image as ImageIcon,
+  Lock,
+  Mail,
+  Phone,
+  Search,
+  Star,
+  Timer,
+  Users,
+  Video,
+} from 'lucide-react';
+import { toast } from 'sonner';
 import client from '../../api/client';
-import wsClient from '../../services/websocket';
+import useChatStore from '../../stores/chatStore';
 import useCallStore from '../../stores/callStore';
+import wsClient from '../../services/websocket';
+import { useAuth } from '../../contexts/AuthContext';
+import { InfoPanelShell } from './info/InfoPanelShell';
+import { MediaLinksDocsSection } from './info/MediaLinksDocsSection';
+import { StarredSection } from './info/StarredSection';
+import { EncryptionSection } from './info/EncryptionSection';
+import {
+  ActionRow,
+  Avatar,
+  ConfirmDialog,
+  EmptyState,
+  LoadingState,
+  QuickAction,
+  SectionHeading,
+  ToggleRow,
+} from './info/InfoPanelPrimitives';
 
-const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
+const formatPresence = (person) => {
+  if (!person) return '';
+  if (person.status === 'online') return 'online';
+  if (person.last_seen) {
+    const d = new Date(person.last_seen);
+    if (Number.isNaN(d.getTime())) return 'offline';
+    const now = new Date();
+    const time = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+    if (d.toDateString() === now.toDateString()) return `last seen today at ${time}`;
+    return `last seen ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} at ${time}`;
+  }
+  return 'offline';
+};
 
-export const ContactInfoPanel = ({ conversation, currentUserId, isOpen, onClose }) => {
-  const [media, setMedia] = useState([]);
+/** One read-only identity row (email / organization / department). */
+const DetailRow = ({ icon: Icon, label, value, onCopy, copied, testId }) => (
+  <div className="flex items-center gap-3 px-4 py-3" data-testid={testId}>
+    {Icon && <Icon size={18} className="text-[#A3A3A3] shrink-0" />}
+    <div className="flex-1 min-w-0">
+      <p className="text-[11px] uppercase tracking-[0.08em] text-[#A3A3A3]">{label}</p>
+      <p className="text-sm text-[#F5F5F5] truncate mt-0.5">{value || '—'}</p>
+    </div>
+    {onCopy && value && (
+      <button
+        type="button"
+        onClick={onCopy}
+        aria-label={`Copy ${label.toLowerCase()}`}
+        data-testid={testId ? `${testId}-copy` : undefined}
+        className="shrink-0 p-2 text-[#A3A3A3] hover:text-[#10B981] hover:bg-[#1A1A1A] rounded-[6px] transition-colors"
+      >
+        {copied ? <Check size={15} className="text-[#10B981]" /> : <Copy size={15} />}
+      </button>
+    )}
+  </div>
+);
 
-  const otherParticipant = conversation?.participants?.find(p => p.user_id !== currentUserId);
+export const ContactInfoPanel = ({
+  contact,
+  conversation,
+  isOpen,
+  onClose,
+  initialSection = 'info',
+  currentUserId,
+  onJumpToMessage,
+  onSearchMessages,
+  onSelectConversation,
+}) => {
+  const { user } = useAuth();
+  const myUserId = currentUserId || user?.id;
+  const setActiveConversation = useChatStore((s) => s.setActiveConversation);
+  const updateConversation = useChatStore((s) => s.updateConversation);
+  const setMessages = useChatStore((s) => s.setMessages);
+
+  const [section, setSection] = useState(initialSection);
+  const [directory, setDirectory] = useState(null); // roster row: email + department
+  const [groups, setGroups] = useState([]);
+  const [groupsLoading, setGroupsLoading] = useState(false);
+  const [groupsError, setGroupsError] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [mutePending, setMutePending] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [confirm, setConfirm] = useState(null); // 'clear'
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const [exporting, setExporting] = useState(false);
+
+  const convId = conversation?._id;
+  const participants = useMemo(() => conversation?.participants || [], [conversation]);
+
+  // The contact prop wins; otherwise fall back to the other side of a direct chat.
+  const base = useMemo(() => {
+    if (contact) return contact;
+    if (conversation?.type === 'direct') {
+      return participants.find((p) => p.user_id !== myUserId) || null;
+    }
+    return null;
+  }, [contact, conversation?.type, participants, myUserId]);
+
+  const targetId = base?.user_id || base?.id || null;
+
+  // Presence lives on the conversation participant even when `contact` came from
+  // a stale roster row, so prefer the participant for status/last_seen.
+  const livePresence = useMemo(
+    () => participants.find((p) => p.user_id === targetId) || null,
+    [participants, targetId]
+  );
+
+  const person = useMemo(() => {
+    if (!base) return null;
+    return {
+      user_id: targetId,
+      display_name: base.display_name || base.name || 'Unknown',
+      avatar_url: base.avatar_url || livePresence?.avatar_url || null,
+      about: base.about || '',
+      status: livePresence?.status || base.status || 'offline',
+      last_seen: livePresence?.last_seen || base.last_seen || null,
+      email: base.email || directory?.email || '',
+      department: base.department_name || base.department || directory?.department_name || '',
+      organization: base.org_name || livePresence?.org_name || directory?.org_name || '',
+    };
+  }, [base, targetId, livePresence, directory]);
 
   useEffect(() => {
-    if (isOpen && conversation) {
-      client.get(`/api/conversations/${conversation._id}/media`, { params: { type: 'image', limit: 9 } })
-        .then(r => setMedia(r.data?.data || []))
-        .catch(() => {});
+    if (isOpen) {
+      setSection(initialSection || 'info');
+      setCopied(false);
     }
-  }, [isOpen, conversation]);
+  }, [isOpen, initialSection, targetId]);
 
-  if (!isOpen || !conversation || conversation.type !== 'direct') return null;
+  useEffect(() => {
+    const mine = participants.find((p) => p.user_id === myUserId);
+    setMuted(Boolean(conversation?.is_muted ?? mine?.is_muted ?? false));
+  }, [conversation?.is_muted, participants, myUserId]);
 
-  const formatStatus = (p) => {
-    if (!p) return '';
-    if (p.status === 'online') return 'online';
-    if (p.last_seen) {
-      const d = new Date(p.last_seen);
-      return `last seen ${d.toLocaleDateString()} at ${d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
+  /**
+   * Email and department are not on the conversation participant wire shape, so
+   * when the caller did not hand us a directory-shaped `contact` we resolve the
+   * row from the org roster (already cached in the chat store when available).
+   */
+  useEffect(() => {
+    if (!isOpen || !targetId) return;
+    if (base?.email && (base?.department_name || base?.department)) {
+      setDirectory(null);
+      return;
     }
-    return 'offline';
+    const cached = useChatStore.getState().contacts?.find((c) => c.id === targetId);
+    if (cached) {
+      setDirectory(cached);
+      return;
+    }
+    let cancelled = false;
+    client
+      .get('/api/users/contacts')
+      .then(({ data }) => {
+        if (cancelled) return;
+        const rows = Array.isArray(data) ? data : [];
+        if (rows.length) useChatStore.getState().setContacts(rows);
+        setDirectory(rows.find((c) => c.id === targetId) || null);
+      })
+      .catch(() => {
+        if (!cancelled) setDirectory(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, targetId, base?.email, base?.department_name, base?.department]);
+
+  const loadGroups = useCallback(async () => {
+    if (!targetId) return;
+    setGroupsLoading(true);
+    setGroupsError(false);
+    try {
+      const { data } = await client.get(`/api/users/${targetId}/groups-in-common`);
+      setGroups(data?.data || []);
+    } catch {
+      setGroups([]);
+      setGroupsError(true);
+    } finally {
+      setGroupsLoading(false);
+    }
+  }, [targetId]);
+
+  useEffect(() => {
+    if (isOpen && section === 'groups') loadGroups();
+  }, [isOpen, section, loadGroups]);
+
+  const handleCall = (callType) => {
+    if (!targetId) return;
+    if (useCallStore.getState().callState !== 'idle') {
+      toast.error('You are already in a call');
+      return;
+    }
+    wsClient.send({
+      type: 'call:initiate',
+      callee_id: targetId,
+      call_type: callType,
+      conversation_id: convId,
+    });
+    useCallStore.getState().initiateCall(null, callType, false, convId);
+    onClose?.();
+  };
+
+  const handleCopyEmail = async () => {
+    if (!person?.email) return;
+    try {
+      await navigator.clipboard.writeText(person.email);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      toast.error('Could not copy the email address');
+    }
+  };
+
+  const handleToggleMute = async (next) => {
+    if (!convId) return;
+    setMutePending(true);
+    setMuted(next); // optimistic
+    try {
+      const { data } = await client.put(`/api/conversations/${convId}/mute`);
+      const value = Boolean(data?.is_muted);
+      setMuted(value);
+      updateConversation(convId, { is_muted: value });
+      toast.success(value ? 'Notifications muted' : 'Notifications unmuted');
+    } catch (err) {
+      setMuted(!next); // roll back
+      toast.error(err.response?.data?.detail || 'Failed to change mute');
+    } finally {
+      setMutePending(false);
+    }
+  };
+
+  const handleExport = async () => {
+    if (!convId) return;
+    setExporting(true);
+    try {
+      const response = await client.get(`/api/conversations/${convId}/export`, { responseType: 'blob' });
+      const blob = new Blob([response.data], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `rxhive-chat-${convId}.txt`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      toast.success('Chat exported');
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Export failed');
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const handleClearChat = async () => {
+    setConfirmBusy(true);
+    try {
+      await client.post(`/api/conversations/${convId}/clear`);
+      setMessages(convId, []);
+      toast.success('Chat cleared');
+      setConfirm(null);
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to clear chat');
+    } finally {
+      setConfirmBusy(false);
+    }
+  };
+
+  const openGroup = (groupId) => {
+    onClose?.();
+    if (onSelectConversation) onSelectConversation(groupId);
+    else setActiveConversation(groupId);
+  };
+
+  const sections = [
+    { id: 'info', label: 'Info', icon: Info },
+    { id: 'media', label: 'Media, links and docs', icon: ImageIcon },
+    { id: 'starred', label: 'Starred', icon: Star },
+    { id: 'encryption', label: 'Encryption', icon: Lock },
+    { id: 'groups', label: 'Groups in common', icon: Users },
+  ];
+
+  if (!person) return null;
+
+  const renderInfo = () => (
+    <div className="p-5 space-y-6">
+      {/* Identity — email under the name, never a phone number. */}
+      <div className="flex flex-col items-center text-center">
+        <Avatar name={person.display_name} src={person.avatar_url} size={112} />
+        <h2 className="text-xl font-semibold text-[#F5F5F5] mt-4">{person.display_name}</h2>
+        <p className="text-sm text-[#A3A3A3] mt-1 break-all" data-testid="contact-info-email-inline">
+          {person.email || 'Email not available'}
+        </p>
+        <p
+          className={`text-xs mt-1 ${person.status === 'online' ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}
+        >
+          {formatPresence(person)}
+        </p>
+        {person.about && (
+          <p className="text-sm text-[#A3A3A3] mt-3 max-w-[360px] whitespace-pre-wrap break-words">
+            {person.about}
+          </p>
+        )}
+      </div>
+
+      {/* Quick actions */}
+      <div className="flex gap-2">
+        <QuickAction icon={Phone} label="Audio" onClick={() => handleCall('voice')} testId="contact-info-action-audio" />
+        <QuickAction icon={Video} label="Video" onClick={() => handleCall('video')} testId="contact-info-action-video" />
+        <QuickAction
+          icon={Search}
+          label="Search"
+          disabled={!convId}
+          onClick={() => {
+            onClose?.();
+            onSearchMessages?.();
+          }}
+          testId="contact-info-action-search"
+        />
+      </div>
+
+      {/* Directory details */}
+      <div>
+        <SectionHeading className="px-1 mb-2">Directory</SectionHeading>
+        <div className="bg-[#141414] border border-[#1F1F1F] rounded-[10px] divide-y divide-[#1F1F1F]">
+          <DetailRow
+            icon={Mail}
+            label="Email"
+            value={person.email}
+            onCopy={handleCopyEmail}
+            copied={copied}
+            testId="contact-info-email"
+          />
+          <DetailRow
+            icon={Building2}
+            label="Organization"
+            value={person.organization}
+            testId="contact-info-organization"
+          />
+          <DetailRow
+            icon={FolderTree}
+            label="Department"
+            value={person.department}
+            testId="contact-info-department"
+          />
+        </div>
+      </div>
+
+      {/* Chat settings */}
+      {convId && (
+        <div className="bg-[#141414] border border-[#1F1F1F] rounded-[10px] divide-y divide-[#1F1F1F]">
+          <ToggleRow
+            label="Mute notifications"
+            description={muted ? 'You will not be notified about new messages' : 'Notifications are on'}
+            checked={muted}
+            busy={mutePending}
+            onChange={handleToggleMute}
+            testId="contact-info-mute-toggle"
+          />
+          <div className="flex items-center justify-between gap-4 px-4 py-3" data-testid="contact-info-disappearing">
+            <span className="flex items-center gap-3 min-w-0">
+              <Timer size={18} className="text-[#A3A3A3] shrink-0" />
+              <span className="min-w-0">
+                <span className="block text-sm text-[#F5F5F5]">Disappearing messages</span>
+                <span className="block text-xs text-[#A3A3A3] mt-0.5">Not available on RX HIVE yet</span>
+              </span>
+            </span>
+            <span className="text-sm text-[#A3A3A3] shrink-0">Off</span>
+          </div>
+        </div>
+      )}
+
+      {/* Chat actions */}
+      {convId && (
+        <div className="bg-[#141414] border border-[#1F1F1F] rounded-[10px] divide-y divide-[#1F1F1F]">
+          <ActionRow
+            icon={Download}
+            label="Export chat"
+            description="Download this conversation as a text file"
+            onClick={handleExport}
+            disabled={exporting}
+            trailing={exporting ? 'Exporting…' : undefined}
+            testId="contact-info-export"
+          />
+          <ActionRow
+            icon={Eraser}
+            label="Clear chat"
+            description="Remove all messages from your copy of this chat"
+            onClick={() => setConfirm('clear')}
+            testId="contact-info-clear"
+          />
+        </div>
+      )}
+    </div>
+  );
+
+  const renderGroups = () => {
+    if (groupsLoading) return <LoadingState label="Loading groups…" />;
+    if (groupsError) {
+      return (
+        <div className="flex flex-col items-center py-16 gap-3">
+          <p className="text-sm text-[#A3A3A3]">Couldn&apos;t load groups in common.</p>
+          <button
+            type="button"
+            onClick={loadGroups}
+            className="px-3 py-1.5 text-xs text-[#10B981] border border-[#10B981]/40 rounded-[6px] hover:bg-[#10B981]/10 transition-colors"
+          >
+            Try again
+          </button>
+        </div>
+      );
+    }
+    if (groups.length === 0) {
+      return (
+        <EmptyState
+          icon={Users}
+          title="No groups in common"
+          hint={`You and ${person.display_name} are not in any of the same groups yet.`}
+        />
+      );
+    }
+    return (
+      <div className="p-4 space-y-1" data-testid="contact-info-groups-list">
+        <p className="text-xs text-[#A3A3A3] px-1 pb-1">
+          {groups.length} {groups.length === 1 ? 'group' : 'groups'} in common
+        </p>
+        {groups.map((group) => (
+          <button
+            key={group._id}
+            type="button"
+            onClick={() => openGroup(group._id)}
+            data-testid="contact-info-group-item"
+            className="w-full flex items-center gap-3 p-2.5 rounded-[8px] hover:bg-[#141414] transition-colors text-left"
+          >
+            <Avatar name={group.name || 'Group'} src={group.avatar_url} size={38} />
+            <span className="flex-1 min-w-0">
+              <span className="block text-sm text-[#F5F5F5] truncate">{group.name || 'Group'}</span>
+              <span className="block text-xs text-[#A3A3A3] truncate">
+                {(group.participants || [])
+                  .map((p) => (p.user_id === myUserId ? 'You' : p.display_name))
+                  .filter(Boolean)
+                  .slice(0, 4)
+                  .join(', ')}
+                {(group.participants || []).length > 4 && ` +${group.participants.length - 4}`}
+              </span>
+            </span>
+            {group.cross_org && (
+              <span className="text-[11px] px-2 py-0.5 rounded-full bg-[#10B981]/15 text-[#10B981] shrink-0">
+                Cross-Org
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+    );
   };
 
   return (
-    <AnimatePresence>
-      {isOpen && (
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-          className="fixed inset-0 z-50" onClick={onClose}>
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-[4px]" />
-          <motion.div
-            initial={{ x: '100%' }} animate={{ x: 0 }} exit={{ x: '100%' }}
-            transition={{ duration: 0.3, ease: [0.2, 0.8, 0.2, 1] }}
-            onClick={(e) => e.stopPropagation()}
-            className="absolute right-0 top-0 h-full w-full sm:w-[360px] bg-[#0F0F0F] border-l border-[#1F1F1F] shadow-2xl overflow-y-auto"
-            data-testid="contact-info-panel"
-          >
-            <div className="flex items-center justify-between px-4 py-3 border-b border-[#1F1F1F]">
-              <h3 className="text-base font-semibold text-[#F5F5F5]">Contact Info</h3>
-              <button onClick={onClose} className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] rounded-[6px] transition-colors">
-                <X size={18} />
-              </button>
-            </div>
+    <>
+      <InfoPanelShell
+        isOpen={isOpen}
+        onClose={onClose}
+        title="Contact info"
+        sections={sections}
+        activeSection={section}
+        onSectionChange={setSection}
+        navTestIdPrefix="contact-info-nav-"
+        panelTestId="contact-info-panel"
+      >
+        {section === 'info' && renderInfo()}
+        {section === 'media' &&
+          (convId ? (
+            <MediaLinksDocsSection
+              conversationId={convId}
+              onJumpToMessage={(msgId) => {
+                onClose?.();
+                onJumpToMessage?.(msgId);
+              }}
+              testIdPrefix="contact-info-media"
+            />
+          ) : (
+            <EmptyState icon={ImageIcon} title="No chat yet" hint="Start a chat to share media, links and docs." />
+          ))}
+        {section === 'starred' &&
+          (convId ? (
+            <StarredSection
+              conversationId={convId}
+              onJumpToMessage={(msgId) => {
+                onClose?.();
+                onJumpToMessage?.(msgId);
+              }}
+              testIdPrefix="contact-info-starred"
+            />
+          ) : (
+            <EmptyState icon={Star} title="No starred messages" hint="Start a chat to star messages." />
+          ))}
+        {section === 'encryption' && <EncryptionSection testIdPrefix="contact-info-encryption" />}
+        {section === 'groups' && renderGroups()}
+      </InfoPanelShell>
 
-            <div className="p-6 space-y-6">
-              {/* Avatar + Name */}
-              <div className="text-center">
-                <div className="w-24 h-24 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-3xl font-bold mx-auto mb-3">
-                  {otherParticipant?.avatar_url ? (
-                    <img src={otherParticipant.avatar_url.startsWith('http') ? otherParticipant.avatar_url : `${backendUrl}${otherParticipant.avatar_url}`}
-                      alt="" className="w-full h-full rounded-full object-cover" />
-                  ) : (otherParticipant?.display_name?.charAt(0)?.toUpperCase() || '?')}
-                </div>
-                <h2 className="text-xl font-semibold text-[#F5F5F5]">{otherParticipant?.display_name || 'Unknown'}</h2>
-                <p className={`text-sm mt-1 ${otherParticipant?.status === 'online' ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}>
-                  {formatStatus(otherParticipant)}
-                </p>
-              </div>
-
-              {/* Call buttons */}
-              <div className="flex gap-3 justify-center">
-                <button
-                  onClick={() => {
-                    if (otherParticipant?.user_id) {
-                      wsClient.send({ type: 'call:initiate', callee_id: otherParticipant.user_id, call_type: 'voice' });
-                      useCallStore.getState().initiateCall(null, 'voice');
-                      onClose();
-                    }
-                  }}
-                  className="flex items-center gap-2 px-4 py-2 bg-[#141414] border border-[#1F1F1F] rounded-[8px] text-sm text-[#F5F5F5] hover:border-[#10B981]/30 transition-colors"
-                  aria-label={`Voice call ${otherParticipant?.display_name}`}
-                >
-                  <Phone size={16} className="text-[#10B981]" /> Voice Call
-                </button>
-                <button
-                  onClick={() => {
-                    if (otherParticipant?.user_id) {
-                      wsClient.send({ type: 'call:initiate', callee_id: otherParticipant.user_id, call_type: 'video' });
-                      useCallStore.getState().initiateCall(null, 'video');
-                      onClose();
-                    }
-                  }}
-                  className="flex items-center gap-2 px-4 py-2 bg-[#141414] border border-[#1F1F1F] rounded-[8px] text-sm text-[#F5F5F5] hover:border-[#10B981]/30 transition-colors"
-                  aria-label={`Video call ${otherParticipant?.display_name}`}
-                >
-                  <Video size={16} className="text-[#10B981]" /> Video Call
-                </button>
-              </div>
-
-              {/* Shared Media */}
-              {media.length > 0 && (
-                <div>
-                  <h4 className="text-sm font-medium text-[#A3A3A3] mb-3">Shared Media</h4>
-                  <div className="grid grid-cols-3 gap-1 rounded-[8px] overflow-hidden">
-                    {media.slice(0, 9).map((m, i) => (
-                      <div key={i} className="aspect-square bg-[#1A1A1A]">
-                        {m.media_url && (
-                          <img src={m.media_url.startsWith('http') ? m.media_url : `${backendUrl}${m.media_url}`}
-                            alt="" className="w-full h-full object-cover" />
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </motion.div>
-        </motion.div>
-      )}
-    </AnimatePresence>
+      <ConfirmDialog
+        open={confirm === 'clear'}
+        title="Clear this chat?"
+        body={`Every message will be removed from your copy of this chat. ${person.display_name} keeps theirs.`}
+        confirmLabel="Clear chat"
+        busy={confirmBusy}
+        onConfirm={handleClearChat}
+        onCancel={() => setConfirm(null)}
+        testId="contact-info-clear-confirm"
+      />
+    </>
   );
 };

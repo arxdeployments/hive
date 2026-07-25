@@ -1,5 +1,6 @@
 import React, { memo } from 'react';
 import { Pin, Globe } from 'lucide-react';
+import useChatStore, { EMPTY_TYPING } from '../../stores/chatStore';
 
 const formatTimestamp = (dateStr) => {
   if (!dateStr) return '';
@@ -22,7 +23,11 @@ const formatTimestamp = (dateStr) => {
   return d.toLocaleDateString('en-US', { month: 'numeric', day: 'numeric', year: '2-digit' });
 };
 
-const ConversationItemInner = ({ conversation, currentUserId, isActive, onClick, typingUsers }) => {
+const ConversationItemInner = ({ conversation, currentUserId, isActive, onClick }) => {
+  // Subscribe to just this row's typing slice. The sidebar used to pass the whole
+  // typingUsers map down, so one person typing anywhere gave every row a new prop
+  // object and re-rendered the entire list.
+  const convTyping = useChatStore(s => s.typingUsers?.[conversation._id] || EMPTY_TYPING);
   // For direct chats, show the other participant's info
   const otherParticipant = conversation.participants?.find(
     p => p.user_id !== currentUserId
@@ -55,13 +60,12 @@ const ConversationItemInner = ({ conversation, currentUserId, isActive, onClick,
   }
 
   // Typing indicator
-  const convTyping = typingUsers?.[conversation._id] || {};
   const typingNames = Object.values(convTyping).filter(n => n);
   const isTyping = typingNames.length > 0;
 
   return (
     <button
-      onClick={onClick}
+      onClick={() => onClick(conversation)}
       data-testid="conversation-item"
       className={`w-full flex items-center gap-3 px-4 py-3 transition-colors duration-150 text-left ${
         isActive

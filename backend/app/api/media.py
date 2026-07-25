@@ -7,6 +7,8 @@ redirecting to a short-lived presigned URL.
 """
 
 import os
+import re
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import RedirectResponse
@@ -43,6 +45,13 @@ _TOO_LARGE_MESSAGES = {
 
 _MEDIA_LIST_TYPES = {"image", "video", "audio", "file"}
 
+_LINK_TYPE = "link"
+_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_URL_TRAILING = ".,;:!?)]}>'\""
+# Links come out of message text, so the scan is bounded to the newest N
+# link-bearing messages rather than the whole (unbounded) history.
+_LINK_SCAN_LIMIT = 500
+
 _INLINE_MIME_PREFIXES = ("image/", "video/", "audio/")
 
 
@@ -58,6 +67,27 @@ def _safe_filename(name: str | None) -> str:
 
 def _is_inline(mime_type: str) -> bool:
     return mime_type.startswith(_INLINE_MIME_PREFIXES)
+
+
+def _extract_links(content: str) -> list[tuple[str, str]]:
+    """(url, domain) pairs found in message text, de-duplicated, order preserved.
+
+    The URLs are NEVER fetched: no titles, no favicons, no metadata requests.
+    Fetching user-supplied URLs server-side would hand every user an SSRF probe
+    into the deployment's private network.
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw in _URL_RE.findall(content or ""):
+        url = raw.rstrip(_URL_TRAILING)
+        if not url or url in seen:
+            continue
+        domain = (urlparse(url).hostname or "").lower()
+        if not domain:
+            continue
+        seen.add(url)
+        out.append((url, domain))
+    return out
 
 
 @router.post("/upload")
@@ -208,6 +238,64 @@ async def serve_attachment_thumb(
     return RedirectResponse(url, status_code=307)
 
 
+def _deletion_join(user_id):
+    return and_(MessageDeletion.message_id == Message.id, MessageDeletion.user_id == user_id)
+
+
+async def _sender_names(db: AsyncSession, messages) -> dict:
+    sender_ids = {m.sender_id for m in messages if m.sender_id}
+    if not sender_ids:
+        return {}
+    rows = (await db.execute(select(User.id, User.display_name).where(User.id.in_(sender_ids)))).all()
+    return {row.id: row.display_name for row in rows}
+
+
+async def _conversation_links(db: AsyncSession, conv_id, user_id, page: int, limit: int) -> dict:
+    """Links shared in a conversation, extracted from message text server-side."""
+    deletion_join = _deletion_join(user_id)
+    messages = (
+        (
+            await db.execute(
+                select(Message)
+                .outerjoin(MessageDeletion, deletion_join)
+                .where(
+                    Message.conversation_id == conv_id,
+                    Message.type != MessageType.system,
+                    Message.deleted_at.is_(None),
+                    MessageDeletion.message_id.is_(None),  # exclude the caller's delete-for-me
+                    Message.content.ilike("%http%"),  # literal pattern, no user input
+                )
+                .order_by(Message.created_at.desc())
+                .limit(_LINK_SCAN_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    sender_names = await _sender_names(db, messages)
+
+    items: list[dict] = []
+    for msg in messages:
+        content = (msg.content or "").strip()
+        for url, domain in _extract_links(content):
+            items.append(
+                {
+                    "message_id": str(msg.id),
+                    "url": url,
+                    # No fetching means no remote <title>: the surrounding message
+                    # text is the only local context, with the domain as fallback.
+                    "title": content[:200] or domain,
+                    "domain": domain,
+                    "sender_name": sender_names.get(msg.sender_id, "Unknown"),
+                    "created_at": iso_z(msg.created_at),
+                }
+            )
+
+    total = len(items)
+    offset = (page - 1) * limit
+    return {"data": items[offset : offset + limit], "total": total, "has_more": offset + limit < total}
+
+
 @router.get("/conversations/{conv_id}/media")
 async def conversation_media(
     conv_id: str,
@@ -219,23 +307,23 @@ async def conversation_media(
     conv_uuid = parse_uuid(conv_id)
     if conv_uuid is None:
         raise HTTPException(status_code=400, detail="Invalid conversation ID")
-    if media_type not in _MEDIA_LIST_TYPES:
+    if media_type not in _MEDIA_LIST_TYPES and media_type != _LINK_TYPE:
         # Deliberate fix vs the Mongo build, which accepted any type string
         # (type=text returned text messages reshaped as media items).
         raise HTTPException(status_code=400, detail="Invalid media type")
     conv = await tenant.require_membership(conv_uuid)
     db = tenant.db
 
+    if media_type == _LINK_TYPE:
+        return await _conversation_links(db, conv.id, tenant.user.id, page, limit)
+
+    deletion_join = _deletion_join(tenant.user.id)
     filters = [
         Message.conversation_id == conv.id,
         Message.type == MessageType(media_type),
         Message.deleted_at.is_(None),
         MessageDeletion.message_id.is_(None),  # exclude the caller's delete-for-me
     ]
-    deletion_join = and_(
-        MessageDeletion.message_id == Message.id,
-        MessageDeletion.user_id == tenant.user.id,
-    )
 
     total = (
         await db.execute(
@@ -258,12 +346,7 @@ async def conversation_media(
         .scalars()
         .all()
     )
-
-    sender_ids = {m.sender_id for m in messages if m.sender_id}
-    sender_names: dict = {}
-    if sender_ids:
-        rows = (await db.execute(select(User.id, User.display_name).where(User.id.in_(sender_ids)))).all()
-        sender_names = {row.id: row.display_name for row in rows}
+    sender_names = await _sender_names(db, messages)
 
     data = []
     for msg in messages:

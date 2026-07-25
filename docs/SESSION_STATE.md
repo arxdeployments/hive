@@ -30,17 +30,43 @@ cd backend && export RXHIVE_LIVEKIT_API_KEY=devkey \
 cd frontend && npx vite --port 5173 --host 127.0.0.1 &
 ```
 
-Or one command via Docker: `docker compose -f infra/docker-compose.yml up --build`.
+Or one command via Docker: `docker compose -f infra/docker-compose.yml up --build`
+(the compose file already includes the `livekit` service).
 
 Local super-admin: `admin@rhythmrx.ai` / `ChangeMe-Dev-Password1`.
+
+**LiveKit is not optional for calls, and it is the easiest piece to forget** —
+everything else works without it, so the only symptom is that calls fail. Verify
+the whole stack in one request:
+
+```bash
+curl -s localhost:8000/api/health
+# → "database":"connected", "redis":"connected", "livekit":"connected",
+#   "calls_available":true
+```
+
+`livekit` never affects the healthy/unhealthy verdict (messaging is fine without
+it); a stopped SFU shows as `"livekit":"unreachable"`, `"calls_available":false`
+on an otherwise `healthy` 200. See the troubleshooting table in the README for
+what each browser toast means.
 
 ## Tests
 
 ```bash
-cd backend  && .venv/bin/pytest -q                      # 51 passing
-cd frontend && E2E_NO_SERVER=1 npx playwright test      # 4 passing (needs stack up)
+cd backend  && .venv/bin/pytest -q                      # 51 + 6 health = 57 passing
+cd frontend && E2E_NO_SERVER=1 npx playwright test      # needs stack up
 python scripts/check_contracts.py                       # frontend→backend route drift
 ```
+
+Calling E2E only (needs livekit-server up; skips loudly if it isn't):
+
+```bash
+cd frontend && E2E_SUPERADMIN_PASSWORD=ChangeMe-Dev-Password1 \
+  E2E_API_URL=http://127.0.0.1:8000 E2E_NO_SERVER=1 npx playwright test calling
+```
+
+Four cases: 1:1 video, 1:1 voice (audio-only, asserts the camera is never
+requested), dead-SFU diagnostics, and blocked-microphone diagnostics.
 
 ## Verified in a real browser
 
@@ -73,6 +99,8 @@ Each passed every static check and the backend suite:
 | `POST /api/notifications/unsubscribe` vs API's `DELETE …/subscribe` | Push unsubscribe silently 404'd |
 | `call:accepted` sent only to the caller | Callee never joined the SFU; every 1:1 call silent/black on one side |
 | Flex child `min-height:auto` overflowing the call overlay | End Call button 186px below the fold — user could not hang up |
+| LiveKit absent from `/api/health` and from the startup docs | A stopped SFU was invisible: calls failed with one generic toast and nothing else reported it |
+| `createLocalTracks` failure swallowed with a bare `console.error` | A blocked microphone produced a "connected" call that carried no audio, indistinguishable from a dead SFU |
 
 ## Method that found them
 
