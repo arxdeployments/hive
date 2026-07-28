@@ -114,6 +114,87 @@ async def test_mute_toggle(client, two_orgs_with_users):
     assert (await client.put(f"/api/conversations/{conv}/mute")).json() == {"is_muted": False}
 
 
+async def test_conversation_pin_order_and_isolation(client, two_orgs_with_users):
+    """Conversation pinning: round-trip, ordering, per-user isolation, cap.
+
+    There was no functional test for this at all — only a tenant-isolation 404.
+    """
+    users = two_orgs_with_users
+    erin = await make_user("erin@a.com", org_id=users["org_a"].id, display_name="Erin")
+
+    await login(client, "alice@a.com")
+    conv_bob = await _direct(client, users["bob"].id)
+    conv_erin = await _direct(client, erin.id)
+
+    # Give conv_bob the more recent message, so recency alone would rank it first.
+    await _send(client, conv_erin, "older")
+    await _send(client, conv_bob, "newer")
+
+    async def order():
+        resp = await client.get("/api/conversations")
+        assert resp.status_code == 200, resp.text
+        return [c["_id"] for c in resp.json()["data"]]
+
+    assert (await order())[0] == conv_bob, "recency should rank conv_bob first"
+
+    # Pinning the OLDER chat must lift it above the newer one.
+    resp = await client.put(f"/api/conversations/{conv_erin}/pin")
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"is_pinned": True, "pin_order": 0}
+    assert (await order())[0] == conv_erin
+
+    # A second pin goes ABOVE the first (newest pin takes min-1).
+    resp = await client.put(f"/api/conversations/{conv_bob}/pin")
+    assert resp.json() == {"is_pinned": True, "pin_order": -1}
+    assert (await order())[:2] == [conv_bob, conv_erin]
+
+    # The chosen order must SURVIVE a new message in the lower-ranked pin —
+    # this is what a boolean alone could not express.
+    await _send(client, conv_erin, "bump me")
+    assert (await order())[:2] == [conv_bob, conv_erin]
+
+    # Unpin clears the ordinal so a stale position cannot resurrect later.
+    resp = await client.put(f"/api/conversations/{conv_bob}/pin")
+    assert resp.json() == {"is_pinned": False, "pin_order": None}
+    assert (await order())[0] == conv_erin, "conv_erin is still pinned"
+
+    # is_pinned/pin_order are MINE: Bob sees his own state, not Alice's.
+    async with _client_for("bob@a.com") as bob:
+        resp = await bob.get("/api/conversations")
+        mine = [c for c in resp.json()["data"] if c["_id"] == conv_erin]
+        # Bob is not a participant of Alice<->Erin, so it must not appear at all.
+        assert mine == []
+        bobs = [c for c in resp.json()["data"] if c["_id"] == conv_bob][0]
+        assert bobs["is_pinned"] is False
+        assert bobs["pin_order"] is None
+
+
+async def test_conversation_pin_cap(client, two_orgs_with_users):
+    from app.api.conversations import MAX_PINNED_CONVERSATIONS
+
+    users = two_orgs_with_users
+    await login(client, "alice@a.com")
+
+    convs = []
+    for i in range(MAX_PINNED_CONVERSATIONS):
+        peer = await make_user(f"cap{i}@a.com", org_id=users["org_a"].id, display_name=f"Cap{i}")
+        conv = await _direct(client, peer.id)
+        convs.append(conv)
+        resp = await client.put(f"/api/conversations/{conv}/pin")
+        assert resp.status_code == 200, resp.text
+
+    one_too_many = await _direct(
+        client, (await make_user("capX@a.com", org_id=users["org_a"].id, display_name="CapX")).id
+    )
+    resp = await client.put(f"/api/conversations/{one_too_many}/pin")
+    assert resp.status_code == 400, resp.text
+    assert str(MAX_PINNED_CONVERSATIONS) in resp.json()["detail"]
+
+    # Unpinning one frees a slot.
+    assert (await client.put(f"/api/conversations/{convs[0]}/pin")).status_code == 200
+    assert (await client.put(f"/api/conversations/{one_too_many}/pin")).status_code == 200
+
+
 async def test_permissions_read_write_and_non_admin_403(client, two_orgs_with_users):
     users = two_orgs_with_users
     await login(client, "alice@a.com")

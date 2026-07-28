@@ -29,12 +29,15 @@ import {
   Link2,
   LogOut,
   MoreVertical,
+  Pin,
+  PinOff,
   Search,
   Users,
   X,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import client from '../../api/client';
+import useChatStore from '../../stores/chatStore';
 import { ScheduleCallModal } from '../calls/CallsTab';
 import { MenuDivider, MenuItem, MenuSurface, apiError, createAndCopyCallLink } from './menuKit';
 
@@ -42,12 +45,14 @@ export const ChatHeaderMenu = ({ type, conversation, onAction, disabled = false 
   const [open, setOpen] = useState(false);
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [mutePending, setMutePending] = useState(false);
+  const [pinPending, setPinPending] = useState(false);
   // Mute is a toggle we own until the store catches up; null = trust the prop.
   const [mutedOverride, setMutedOverride] = useState(null);
   const triggerRef = useRef(null);
 
   const convId = conversation?._id;
   const serverMuted = !!conversation?.is_muted;
+  const isPinned = !!conversation?.is_pinned;
   // `cross_org` groups are groups: anything that isn't a DM gets the group menu.
   const isDirect = (type || conversation?.type) === 'direct';
   const isMuted = mutedOverride ?? serverMuted;
@@ -74,6 +79,33 @@ export const ChatHeaderMenu = ({ type, conversation, onAction, disabled = false 
     }
   }, [convId, mutePending, isMuted, emit]);
 
+  /**
+   * Pin / unpin THIS chat for me.
+   *
+   * PUT /pin already existed server-side, fully per-user, and had zero frontend
+   * callers — this is the missing entry point. The store action re-sorts, because
+   * updateConversation does not and the row would otherwise keep its position
+   * until the next inbound message.
+   *
+   * The server's 400 detail is surfaced verbatim: hitting the pin cap is a
+   * message worth reading, not a generic failure.
+   */
+  const togglePin = useCallback(async () => {
+    if (!convId || pinPending) return;
+    setPinPending(true);
+    try {
+      const { data } = await client.put(`/api/conversations/${convId}/pin`);
+      const next = typeof data?.is_pinned === 'boolean' ? data.is_pinned : !isPinned;
+      useChatStore.getState().setConversationPinned(convId, next, data?.pin_order ?? null);
+      toast.success(next ? 'Chat pinned' : 'Chat unpinned');
+      emit('pin', { is_pinned: next, pin_order: data?.pin_order ?? null });
+    } catch (err) {
+      toast.error(apiError(err, 'Failed to update pin'));
+    } finally {
+      setPinPending(false);
+    }
+  }, [convId, pinPending, isPinned, emit]);
+
   const handle = useCallback(
     (action) => {
       setOpen(false);
@@ -81,6 +113,9 @@ export const ChatHeaderMenu = ({ type, conversation, onAction, disabled = false 
         case 'mute':
           // Emits from inside, once the server has confirmed the new value.
           toggleMute();
+          return;
+        case 'pin':
+          togglePin();
           return;
         case 'new-window':
           if (convId) {
@@ -102,7 +137,7 @@ export const ChatHeaderMenu = ({ type, conversation, onAction, disabled = false 
       }
       emit(action);
     },
-    [convId, emit, toggleMute]
+    [convId, emit, toggleMute, togglePin]
   );
 
   const items = useMemo(() => {
@@ -111,6 +146,12 @@ export const ChatHeaderMenu = ({ type, conversation, onAction, disabled = false 
       label: isMuted ? 'Unmute notifications' : 'Mute notifications',
       icon: isMuted ? Bell : BellOff,
       disabled: mutePending,
+    };
+    const pin = {
+      action: 'pin',
+      label: isPinned ? 'Unpin chat' : 'Pin chat',
+      icon: isPinned ? PinOff : Pin,
+      disabled: pinPending,
     };
     const tail = [
       { divider: true },
@@ -123,6 +164,7 @@ export const ChatHeaderMenu = ({ type, conversation, onAction, disabled = false 
         { action: 'info', label: 'Contact info', icon: Info },
         { action: 'search', label: 'Search', icon: Search },
         { action: 'select', label: 'Select messages', icon: CheckSquare },
+        pin,
         mute,
         { divider: true },
         { action: 'new-group-call', label: 'New group call', icon: Users },
@@ -135,11 +177,12 @@ export const ChatHeaderMenu = ({ type, conversation, onAction, disabled = false 
       { action: 'info', label: 'Group info', icon: Info },
       { action: 'search', label: 'Search', icon: Search },
       { action: 'select', label: 'Select messages', icon: CheckSquare },
+      pin,
       mute,
       { action: 'exit', label: 'Exit group', icon: LogOut, danger: true },
       ...tail,
     ];
-  }, [isDirect, isMuted, mutePending]);
+  }, [isDirect, isMuted, mutePending, isPinned, pinPending]);
 
   const participantIds = useMemo(
     () => (conversation?.participants || []).map((p) => p.user_id).filter(Boolean),

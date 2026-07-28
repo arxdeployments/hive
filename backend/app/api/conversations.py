@@ -23,7 +23,7 @@ from anyio import to_thread
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
-from sqlalchemy import and_, literal, or_, select
+from sqlalchemy import and_, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,6 +40,7 @@ from app.db.models import (
     User,
 )
 from app.db.session import get_db
+from app.realtime.redis_bus import publish_to_users
 from app.services import enrich, messaging, presence
 from app.services.conversations import get_or_create_direct
 from app.utils import iso_z, parse_uuid
@@ -50,6 +51,12 @@ router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 # once, so an uncapped transcript of a busy group is hundreds of MB per
 # concurrent request. Cap it and tell the reader when history was cut.
 EXPORT_MAX_MESSAGES = 20_000
+
+# How many chats one user may pin. The pinned block sorts above everything else,
+# so an unbounded count lets the "pinned" section become the whole list and the
+# feature stops meaning anything. Mirrors the existing MAX_PINS_PER_CONVERSATION
+# precedent for message pins; raise this single constant if it proves tight.
+MAX_PINNED_CONVERSATIONS = 10
 
 
 def _escape_like(value: str) -> str:
@@ -107,7 +114,14 @@ async def list_conversations(
                 ),
             ),
         )
-        .order_by(my_cp.is_pinned.desc(), Conversation.last_message_at.desc().nulls_last())
+        .order_by(
+            my_cp.is_pinned.desc(),
+            # Explicit user order within the pinned block. NULLS LAST so pins
+            # made before pin_order existed fall back to recency instead of
+            # jumping to the top.
+            my_cp.pin_order.asc().nulls_last(),
+            Conversation.last_message_at.desc().nulls_last(),
+        )
     )
 
     if filter_ == "groups":
@@ -193,15 +207,71 @@ async def create_direct_conversation(
 
 @router.put("/{conv_id}/pin")
 async def toggle_pin(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
+    """Toggle MY pin on this conversation, maintaining MY pin order.
+
+    Per-participant, so it cannot perturb anyone else's ordering — the list query
+    joins only the caller's participant row.
+
+    A newly pinned chat goes to the TOP of the pinned block: it takes
+    min(pin_order) - 1 rather than max + 1. That is O(1) and needs no renumbering
+    of the other pins, which matters because renumbering would be a write per
+    pinned row on every pin. Ordinals may go negative; nothing reads them as a
+    magnitude, only as a sort key.
+
+    Unpinning clears pin_order back to NULL so a stale ordinal cannot resurrect a
+    position if the chat is pinned again later.
+    """
     conv_uuid = _conv_uuid(conv_id)
     conv = await tenant.require_membership(conv_uuid)
     if not conv.is_active:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     me = await tenant.db.get(ConversationParticipant, (conv_uuid, tenant.user.id))
-    me.is_pinned = not me.is_pinned
+
+    if me.is_pinned:
+        me.is_pinned = False
+        me.pin_order = None
+    else:
+        pinned_count = await tenant.db.scalar(
+            select(func.count())
+            .select_from(ConversationParticipant)
+            .where(
+                ConversationParticipant.user_id == tenant.user.id,
+                ConversationParticipant.is_pinned.is_(True),
+            )
+        )
+        if (pinned_count or 0) >= MAX_PINNED_CONVERSATIONS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"You can pin up to {MAX_PINNED_CONVERSATIONS} chats. "
+                    "Unpin one first."
+                ),
+            )
+        lowest = await tenant.db.scalar(
+            select(func.min(ConversationParticipant.pin_order)).where(
+                ConversationParticipant.user_id == tenant.user.id,
+                ConversationParticipant.is_pinned.is_(True),
+            )
+        )
+        me.is_pinned = True
+        me.pin_order = (lowest - 1) if lowest is not None else 0
+
     await tenant.db.commit()
-    return {"is_pinned": me.is_pinned}
+
+    # Tell MY other tabs/devices only — a pin is per-user, so no other
+    # participant has any interest in it. Mirrors message_pin_update, without
+    # which a second device kept showing the old order until it refetched.
+    await publish_to_users(
+        [tenant.user.id],
+        {
+            "type": "conversation_pin_update",
+            "conversation_id": str(conv_uuid),
+            "is_pinned": me.is_pinned,
+            "pin_order": me.pin_order,
+        },
+    )
+    return {"is_pinned": me.is_pinned, "pin_order": me.pin_order}
 
 
 @router.put("/{conv_id}/mute")

@@ -352,6 +352,18 @@ class RxHiveWebSocket {
         break;
       }
 
+      // A CONVERSATION pin (the sidebar kind), not a message pin. Sent only to
+      // the acting user's own sockets, since a pin is per-user — this is what
+      // keeps a second tab or device in the same order instead of showing the old
+      // one until it refetches.
+      case 'conversation_pin_update': {
+        const { conversation_id: cpConvId, is_pinned: cpPinned, pin_order: cpOrder } = data;
+        if (cpConvId) {
+          store.setConversationPinned(cpConvId, cpPinned, cpOrder ?? null);
+        }
+        break;
+      }
+
       // Retained deliberately even though message deletion has been removed as a
       // feature and no server code can emit this frame any more.
       //

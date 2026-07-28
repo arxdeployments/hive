@@ -15,6 +15,41 @@ export const EMPTY_TYPING = {};
 const sameConversationList = (prev, next) =>
   prev.length === next.length && prev.every((c, i) => c === next[i]);
 
+/**
+ * The sidebar's ordering, kept deliberately identical to the server's ORDER BY in
+ * backend/app/api/conversations.py:
+ *
+ *   is_pinned DESC, pin_order ASC NULLS LAST, last_message_at DESC
+ *
+ * The list arrives pre-sorted from the API, so this only has to reproduce that
+ * order when the client mutates it locally — an inbound message bumping a row, or
+ * a pin toggle. Previously this logic lived inline in bumpConversation and knew
+ * nothing about pin_order, so it kept pinned rows in whatever order they happened
+ * to arrive in and a user's chosen order was lost on the first message.
+ *
+ * Keep the two in sync: if the ORDER BY changes, change this.
+ */
+const conversationTime = (c) =>
+  c.last_message?.created_at || c.last_message_at || c.created_at || '';
+
+export const sortConversations = (convs) => {
+  const sorted = [...convs];
+  sorted.sort((a, b) => {
+    const ap = !!a.is_pinned;
+    const bp = !!b.is_pinned;
+    if (ap !== bp) return ap ? -1 : 1;
+    if (ap && bp) {
+      // NULLS LAST, matching Postgres.
+      const an = a.pin_order === null || a.pin_order === undefined;
+      const bn = b.pin_order === null || b.pin_order === undefined;
+      if (an !== bn) return an ? 1 : -1;
+      if (!an && a.pin_order !== b.pin_order) return a.pin_order - b.pin_order;
+    }
+    return conversationTime(b).localeCompare(conversationTime(a));
+  });
+  return sorted;
+};
+
 const useChatStore = create((set) => ({
   conversations: [],
   activeConversationId: null,
@@ -165,15 +200,25 @@ const useChatStore = create((set) => ({
         ? { ...c, last_message: lastMessage, last_message_at: lastMessage.created_at }
         : c
     );
-    // Sort: pinned first, then by last_message_at desc
-    const pinned = convs.filter(c => c.is_pinned);
-    const unpinned = convs.filter(c => !c.is_pinned);
-    unpinned.sort((a, b) => {
-      const at = a.last_message?.created_at || a.created_at || '';
-      const bt = b.last_message?.created_at || b.created_at || '';
-      return bt.localeCompare(at);
-    });
-    const conversations = [...pinned, ...unpinned];
+    const conversations = sortConversations(convs);
+    return sameConversationList(state.conversations, conversations) ? state : { conversations };
+  }),
+
+  /**
+   * Apply a pin change (from my own toggle, or from a conversation_pin_update
+   * frame sent by another of my tabs) and re-sort.
+   *
+   * updateConversation deliberately does NOT re-sort, so using it here would flip
+   * the pin badge while leaving the row where it was until the next inbound
+   * message or refetch.
+   */
+  setConversationPinned: (convId, isPinned, pinOrder) => set((state) => {
+    const convs = state.conversations.map(c => (
+      c._id === convId
+        ? { ...c, is_pinned: !!isPinned, pin_order: pinOrder ?? null }
+        : c
+    ));
+    const conversations = sortConversations(convs);
     return sameConversationList(state.conversations, conversations) ? state : { conversations };
   }),
 

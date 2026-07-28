@@ -195,6 +195,10 @@ async def serialize_conversation(
         "last_message": last_msgs.get(conv.id),
         "unread_count": unread.get(conv.id, 0),
         "is_pinned": bool(me and me.is_pinned),
+        # My explicit position within the pinned block, or null when unordered.
+        # Sent so the client's own re-sort in bumpConversation can reproduce the
+        # server's ORDER BY instead of keeping pins in arrival order.
+        "pin_order": me.pin_order if me else None,
         # Mute was stored and toggleable but never sent back, so every client read
         # it as False after a reload — and since PUT /mute is a blind flip, the
         # menu offered "Mute" on an already-muted chat and unmuted it instead.

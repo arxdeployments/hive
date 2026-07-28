@@ -195,13 +195,29 @@ class ConversationParticipant(Base):
     )
     last_read_at: Mapped[dt.datetime | None]
     is_pinned: Mapped[bool] = mapped_column(default=False)
+    # Explicit position within MY pinned block, lowest first. NULL means "pinned
+    # but unordered" — either not pinned at all, or pinned before this column
+    # existed. The list query sorts NULLS LAST so those fall back to recency.
+    # A boolean alone could not express order, so pinned chats reshuffled
+    # whenever any of them received a message.
+    pin_order: Mapped[int | None] = mapped_column(default=None)
     is_muted: Mapped[bool] = mapped_column(default=False)
     joined_at: Mapped[dt.datetime] = _now()
 
     conversation: Mapped[Conversation] = relationship(back_populates="participants")
     user: Mapped[User] = relationship()
 
-    __table_args__ = (Index("ix_participants_user_id", "user_id"),)
+    __table_args__ = (
+        Index("ix_participants_user_id", "user_id"),
+        # Matches the sidebar's ORDER BY, and partial because only a handful of a
+        # user's participant rows are ever pinned.
+        Index(
+            "ix_participants_pin_order",
+            "user_id",
+            "pin_order",
+            postgresql_where=text("is_pinned"),
+        ),
+    )
 
 
 class Message(Base):
