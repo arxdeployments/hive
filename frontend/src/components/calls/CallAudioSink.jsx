@@ -25,7 +25,7 @@ import livekitClient from '../../services/livekitClient';
  * call views: two elements on one stream produce echo and comb filtering.
  */
 
-const RemoteAudio = ({ stream }) => {
+const RemoteAudio = ({ stream, muted }) => {
   const audioRef = useRef(null);
 
   useEffect(() => {
@@ -43,11 +43,25 @@ const RemoteAudio = ({ stream }) => {
     if (played && typeof played.catch === 'function') played.catch(() => {});
   }, [stream]);
 
-  return <audio ref={audioRef} autoPlay playsInline style={{ display: 'none' }} data-testid="call-audio-sink-el" />;
+  // `muted` is the speaker toggle. Muting the sink is the honest web equivalent
+  // of a speaker button: setSinkId needs a concrete output device id and is
+  // unsupported on Safari/iOS, so routing was never an option here — and the
+  // previous implementation did nothing at all.
+  return (
+    <audio
+      ref={audioRef}
+      autoPlay
+      playsInline
+      muted={muted}
+      style={{ display: 'none' }}
+      data-testid="call-audio-sink-el"
+    />
+  );
 };
 
 export const CallAudioSink = () => {
   const remoteParticipants = useCallStore((s) => s.remoteParticipants);
+  const speakerOn = useCallStore((s) => s.speakerOn);
   const containerRef = useRef(null);
 
   const audible = Array.isArray(remoteParticipants)
@@ -89,7 +103,7 @@ export const CallAudioSink = () => {
   return (
     <span ref={containerRef} data-testid="call-audio-sink" style={{ display: 'none' }}>
       {audible.map((p) => (
-        <RemoteAudio key={p.id} stream={p.stream} />
+        <RemoteAudio key={p.id} stream={p.stream} muted={!speakerOn} />
       ))}
     </span>
   );

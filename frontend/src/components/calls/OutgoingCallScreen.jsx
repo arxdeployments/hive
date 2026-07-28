@@ -9,9 +9,13 @@ import livekitClient from '../../services/livekitClient';
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 
 export const OutgoingCallScreen = () => {
-  const { callState, callId, callType, showCallUI, incomingCaller, isGroupCall } = useCallStore();
+  const { callState, callId, callType, showCallUI, incomingCaller, isGroupCall, isMinimized } = useCallStore();
 
-  const isVisible = callState === 'outgoing_ringing' && showCallUI;
+  // isMinimized is part of the condition now. Without it the ChevronDown at the
+  // top of this screen was DEAD: it flipped the flag, but this view kept
+  // rendering over everything, so nothing appeared to happen. The minimised
+  // window handles 'outgoing_ringing' so there is always something on screen.
+  const isVisible = callState === 'outgoing_ringing' && showCallUI && !isMinimized;
 
   // Play ringback tone while ringing
   useEffect(() => {

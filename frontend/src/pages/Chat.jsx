@@ -4,6 +4,7 @@ import { ChatSidebar } from '../components/chat/ChatSidebar';
 import { ChatPanel } from '../components/chat/ChatPanel';
 import { ChatErrorBoundary } from '../components/shared/ErrorBoundary';
 import useChatStore from '../stores/chatStore';
+import useCallStore from '../stores/callStore';
 import { useAuth } from '../contexts/AuthContext';
 import wsClient from '../services/websocket';
 
@@ -33,7 +34,16 @@ export default function Chat() {
     if (!userId) return undefined;
     wsClient.connect();
     return () => {
-      wsClient.disconnect();
+      // Do NOT tear the socket down while a call is live. disconnect() sets
+      // _intentionalClose, which suppresses the reconnect entirely — so
+      // navigating /chat -> /settings mid-call left LiveKit media up but
+      // signalling permanently down: a hang-up from the mini window was queued
+      // and never sent, and the peer's call:ended never arrived. The mini window
+      // is deliberately reachable from every route, so the socket has to outlive
+      // this one.
+      if (useCallStore.getState().callState === 'idle') {
+        wsClient.disconnect();
+      }
     };
   }, [userId]);
 

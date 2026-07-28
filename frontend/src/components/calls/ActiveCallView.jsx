@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   PhoneOff, Mic, MicOff, Video, VideoOff, Volume2,
@@ -6,6 +6,7 @@ import {
   Monitor, MonitorOff, MonitorUp, MessageSquare
 } from 'lucide-react';
 import useCallStore from '../../stores/callStore';
+import { StreamVideo } from './StreamVideo';
 import livekitClient from '../../services/livekitClient';
 import callSounds from '../../services/callSounds';
 import wsClient from '../../services/websocket';
@@ -38,17 +39,8 @@ const localProfile = () => {
   }
 };
 
-/* Renders only the video tracks of a MediaStream; audio is handled separately
-   by CallAudioSink so a stream is never played through two elements at once. */
-const StreamVideo = ({ stream, muted = false, className }) => {
-  const videoRef = useRef(null);
-  useEffect(() => {
-    const el = videoRef.current;
-    if (!el) return;
-    el.srcObject = stream ? new MediaStream(stream.getVideoTracks()) : null;
-  }, [stream]);
-  return <video ref={videoRef} autoPlay playsInline muted={muted} className={className} />;
-};
+/* StreamVideo moved to ./StreamVideo so the minimised call window can render the
+   remote video without a second copy of the srcObject effect. */
 
 /* RemoteAudio / RemoteAudioSink moved OUT of this file to
    components/calls/CallAudioSink.jsx, mounted at App level.
@@ -99,7 +91,10 @@ export const ActiveCallView = () => {
   } = useCallStore();
 
   const [showMore, setShowMore] = useState(false);
-  const [speakerOn, setSpeakerOn] = useState(true);
+  // Speaker lives in the store now: as local state it was destroyed on every
+  // minimise, and it was purely cosmetic — nothing acted on the flag. CallAudioSink
+  // mutes its elements from it, so the button now does something real.
+  const speakerOn = useCallStore((s) => s.speakerOn);
 
   const isConnecting = callState === 'connecting';
   const isConnected = callState === 'connected';
@@ -249,7 +244,7 @@ export const ActiveCallView = () => {
             <CallControl icon={isMuted ? MicOff : Mic} active={isMuted} onClick={handleToggleMute} label={isMuted ? 'Unmute' : 'Mute'} testId="call-mute-btn" />
             <CallControl icon={isCameraOn ? Video : VideoOff} active={!isCameraOn} onClick={handleToggleCamera} label="Camera" testId="call-camera-btn" />
             <CallControl icon={isScreenSharing ? MonitorOff : Monitor} active={isScreenSharing} onClick={handleToggleScreenShare} label="Share" testId="call-screenshare-btn" />
-            <CallControl icon={Volume2} active={speakerOn} onClick={() => setSpeakerOn((v) => !v)} label="Speaker" />
+            <CallControl icon={Volume2} active={speakerOn} onClick={() => useCallStore.getState().toggleSpeaker()} label="Speaker" />
           </div>
           <div className="flex justify-center">
             <button onClick={handleEnd} data-testid="call-end-btn" aria-label="End call" className="w-16 h-16 rounded-full bg-[#EF4444] flex items-center justify-center active:scale-90 transition-transform">
@@ -298,7 +293,7 @@ export const ActiveCallView = () => {
             <CallControl icon={isMuted ? MicOff : Mic} active={isMuted} onClick={handleToggleMute} label={isMuted ? 'Unmute' : 'Mute'} testId="call-mute-btn" />
             {isVideo && <CallControl icon={isCameraOn ? Video : VideoOff} active={!isCameraOn} onClick={handleToggleCamera} label="Camera" testId="call-camera-btn" />}
             <CallControl icon={isScreenSharing ? MonitorOff : Monitor} active={isScreenSharing} onClick={handleToggleScreenShare} label="Share" testId="call-screenshare-btn" />
-            <CallControl icon={Volume2} active={speakerOn} onClick={() => setSpeakerOn((v) => !v)} label="Speaker" />
+            <CallControl icon={Volume2} active={speakerOn} onClick={() => useCallStore.getState().toggleSpeaker()} label="Speaker" />
           </div>
           <div className="flex justify-center">
             <button onClick={handleEnd} data-testid="call-end-btn" aria-label="End call" className="w-16 h-16 rounded-full bg-[#EF4444] flex items-center justify-center active:scale-90 transition-transform">
@@ -379,7 +374,7 @@ export const ActiveCallView = () => {
           <div className="flex items-center justify-evenly mb-8 max-w-sm mx-auto">
             <CallControl icon={MoreHorizontal} onClick={() => setShowMore(true)} label="More" />
             <CallControl icon={isScreenSharing ? MonitorOff : Monitor} active={isScreenSharing} onClick={handleToggleScreenShare} label="Share" testId="call-screenshare-btn" />
-            <CallControl icon={Volume2} active={speakerOn} onClick={() => setSpeakerOn((v) => !v)} label="Speaker" />
+            <CallControl icon={Volume2} active={speakerOn} onClick={() => useCallStore.getState().toggleSpeaker()} label="Speaker" />
             <CallControl icon={isMuted ? MicOff : Mic} active={isMuted} onClick={handleToggleMute} label={isMuted ? 'Unmute' : 'Mute'} testId="call-mute-btn" />
           </div>
 

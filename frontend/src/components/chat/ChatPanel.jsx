@@ -701,12 +701,18 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         call_type: callType,
         conversation_id: conversationId,
       });
-      useCallStore.getState().initiateCall(null, callType, false, conversationId);
+      // The peer label is what the minimised window shows; without it every
+      // outgoing call read as the literal string 'Active call'.
+      useCallStore.getState().initiateCall(null, callType, false, conversationId, {
+        display_name: otherParticipant?.display_name || 'Unknown',
+      });
     } else if (isGroupLike) {
       wsClient.send({ type: 'call:group_initiate', conversation_id: conversationId, call_type: callType });
-      useCallStore.getState().initiateCall(null, callType, true, conversationId);
+      useCallStore.getState().initiateCall(null, callType, true, conversationId, {
+        display_name: conversation?.name || 'Group call',
+      });
     }
-  }, [conversationId, isDirect, isGroupLike, otherParticipant]);
+  }, [conversationId, isDirect, isGroupLike, otherParticipant, conversation]);
 
   /** CallButtonDropdown: send-call-link and schedule-call are done inside it. */
   const handleCallAction = useCallback((action) => {
@@ -1517,7 +1523,9 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
             return;
           }
           wsClient.send({ type: 'call:group_initiate', conversation_id: group._id, call_type: 'video' });
-          useCallStore.getState().initiateCall(null, 'video', true, group._id);
+          useCallStore.getState().initiateCall(null, 'video', true, group._id, {
+            display_name: group.name || 'Group call',
+          });
         }}
       />
     </div>
