@@ -108,8 +108,13 @@ test('direct chat: header menu, message menu and multi-select are all wired', as
   await bubble.hover();
   await page.getByTestId('message-menu-trigger').last().click();
   await expect(page.getByTestId('message-menu')).toBeVisible();
-  for (const a of ['reply', 'react', 'star', 'pin', 'forward', 'copy', 'delete-me', 'select']) {
+  // 'delete-me' and 'delete-all' are gone: message deletion was removed as a
+  // feature, so neither row exists in the menu any more.
+  for (const a of ['reply', 'react', 'star', 'pin', 'forward', 'copy', 'select']) {
     await expect(page.getByTestId(`message-menu-${a}`)).toBeVisible();
+  }
+  for (const a of ['delete-me', 'delete-all']) {
+    await expect(page.getByTestId(`message-menu-${a}`)).toHaveCount(0);
   }
 
   // reply -> composer reply preview

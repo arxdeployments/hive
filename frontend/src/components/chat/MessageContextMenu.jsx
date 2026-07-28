@@ -18,8 +18,7 @@
  * onAction(actionName, message[, meta]) — `actionName` is exactly one of:
  *
  *   reply | react | star | pin | forward | copy |
- *   reply-privately | message-user | report |
- *   delete-me | delete-all | select
+ *   reply-privately | message-user | report | select
  *
  * (plus `edit` and `info`, carried over from the previous menu — see the note below.)
  *
@@ -41,9 +40,6 @@
  *     reply-privately   -> POST /api/conversations/direct { user_id: message.sender_id },
  *                          open that DM and pre-fill the composer quoting `message`
  *     message-user      -> same DM open, without the quote
- *     delete-me         -> confirm, then DELETE .../messages/{id}?for_everyone=false
- *     delete-all        -> confirm, then DELETE .../messages/{id}?for_everyone=true
- *                          (only offered inside 60 minutes of created_at)
  *     select            -> enter multi-select mode
  *
  * Two extra rows are carried over from the menu this replaced, because ChatPanel still
@@ -57,8 +53,10 @@
  *   - Copy shows for text messages only.
  *   - Reply privately / Message <Sender> / Report show in GROUP chats only, and never on
  *     your own messages.
- *   - Delete for everyone shows on your own messages only, within 60 minutes of created_at.
  *   - Star/Pin labels flip to Unstar/Unpin from message.is_starred / message.is_pinned.
+ *
+ * Message deletion (Delete for me / Delete for everyone) was removed as a
+ * feature; neither action nor its DELETE endpoint exists any more.
  *
  * data-testids: `message-menu` on the surface, `message-menu-<action>` on every row.
  * (The hover trigger itself is `message-menu-trigger`, and lives in MessageBubble.)
@@ -68,14 +66,12 @@ import { createPortal } from 'react-dom';
 import { motion } from 'framer-motion';
 import {
   Reply, SmilePlus, Star, StarOff, Pin, PinOff, Forward, Copy,
-  MessageCircle, Flag, Trash, Trash2, ListChecks, Pencil, Info,
+  MessageCircle, Flag, ListChecks, Pencil, Info,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import client from '../../api/client';
 import useChatStore from '../../stores/chatStore';
 
-// "Delete for everyone" window, mirroring the backend's own limit.
-const DELETE_FOR_EVERYONE_MS = 60 * 60 * 1000;
 const EDGE_GAP = 8;
 
 /**
@@ -165,9 +161,6 @@ export const MessageContextMenu = ({ message, isOwn, isGroup, position, onAction
     ? isGroup
     : conversation?.type === 'group' || conversation?.type === 'cross_org';
 
-  const canDeleteForEveryone = !!isOwn && !!message?.created_at &&
-    (Date.now() - new Date(message.created_at).getTime()) < DELETE_FOR_EVERYONE_MS;
-
   const senderName = message?.sender_name || 'sender';
   const canEdit = !!isOwn && !message?.is_deleted && ['text', 'image', 'file'].includes(message?.type);
 
@@ -192,14 +185,16 @@ export const MessageContextMenu = ({ message, isOwn, isGroup, position, onAction
       { action: 'report', icon: Flag, label: 'Report' },
     ] : [];
 
-    const destructive = [
-      { action: 'delete-me', icon: Trash, label: 'Delete for me' },
-      canDeleteForEveryone && { action: 'delete-all', icon: Trash2, label: 'Delete for everyone', danger: true },
+    // Message deletion was removed as a feature, so this section no longer holds
+    // anything destructive — Select is all that is left of it. Kept as its own
+    // section so the divider above it, and therefore the menu's visual rhythm,
+    // is unchanged.
+    const trailing = [
       { action: 'select', icon: ListChecks, label: 'Select messages' },
-    ].filter(Boolean);
+    ];
 
-    return [primary, social, destructive].filter((s) => s.length > 0);
-  }, [isText, isStarred, isPinned, groupChat, isOwn, senderName, canDeleteForEveryone, canEdit]);
+    return [primary, social, trailing].filter((s) => s.length > 0);
+  }, [isText, isStarred, isPinned, groupChat, isOwn, senderName, canEdit]);
 
   /**
    * Flip instead of clip: measure the rendered menu and mirror it back across the

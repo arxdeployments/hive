@@ -49,9 +49,12 @@ async def test_cross_org_message_actions_all_404(client, two_orgs_with_users):
             json={"message_id": msg_id, "conversation_ids": [], "contact_ids": []},
         )
         assert resp.status_code == 404
-        # delete-for-me on foreign message
+        # Message deletion was removed as a feature, so DELETE on this path is no
+        # longer routable at all — Starlette answers 405 because the path exists
+        # (PUT edits a message) but the method does not. Still asserted: a
+        # non-member must not be able to reach a delete, and now nobody can.
         resp = await carol.delete(f"/api/conversations/messages/{msg_id}")
-        assert resp.status_code == 404
+        assert resp.status_code == 405
         # message info
         resp = await carol.get(f"/api/conversations/messages/{msg_id}/info")
         assert resp.status_code == 404

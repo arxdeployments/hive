@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { motion } from 'framer-motion';
 import {
-  ArrowLeft, Search, ChevronDown, X, Check, Pin, Star, StarOff, Forward, Trash2,
+  ArrowLeft, Search, ChevronDown, X, Check, Pin, Star, StarOff, Forward,
 } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { Virtuoso } from 'react-virtuoso';
@@ -119,7 +119,6 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   const [reactionPicker, setReactionPicker] = useState(null);
   const [forwardBatch, setForwardBatch] = useState(null);
   const [msgInfo, setMsgInfo] = useState(null);
-  const [deleteConfirm, setDeleteConfirm] = useState(null);
   const [showConvSearch, setShowConvSearch] = useState(false);
   // Info drawers. `section` is re-armed on every open so "Group info" lands on
   // Info while "Select people" lands straight on Members.
@@ -131,8 +130,6 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   // Multi-select
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState(() => new Set());
-  const [batchDelete, setBatchDelete] = useState(false);
-  const [batchBusy, setBatchBusy] = useState(false);
   // Pinned banner
   const [pinnedFromApi, setPinnedFromApi] = useState(EMPTY_PINNED);
   const [pinCursor, setPinCursor] = useState(0);
@@ -561,28 +558,8 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       : `${targets.length} message${targets.length === 1 ? '' : 's'} unstarred`);
   }, [selectedMessages, allSelectedStarred, patchMessage, exitSelection]);
 
-  const handleBatchDelete = useCallback(async () => {
-    const targets = selectedMessages;
-    if (targets.length === 0) { setBatchDelete(false); return; }
-    setBatchBusy(true);
-    const results = await Promise.allSettled(
-      targets.map(m => client.delete(`/api/conversations/messages/${m._id}?for_everyone=false`))
-    );
-    const deleted = new Set(
-      targets.filter((_, i) => results[i].status === 'fulfilled').map(m => m._id)
-    );
-    if (deleted.size > 0) {
-      const store = useChatStore.getState();
-      store.setMessages(conversationId,
-        (store.messages[conversationId] || EMPTY_MESSAGES).filter(m => !deleted.has(m._id))
-      );
-    }
-    setBatchBusy(false);
-    setBatchDelete(false);
-    exitSelection();
-    if (deleted.size < targets.length) toast.error('Some messages could not be deleted');
-    else toast.success(`${deleted.size} message${deleted.size === 1 ? '' : 's'} deleted`);
-  }, [selectedMessages, conversationId, exitSelection]);
+  // handleBatchDelete removed with the message-deletion feature. Selection mode
+  // keeps its Star/Unstar and Forward bulk actions.
 
   // ── Message context menu ──────────────────────────────────────────────────
   const handleContextMenu = useCallback((e, msg) => {
@@ -662,12 +639,6 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         } catch {
           toast.error('Failed to load message info');
         }
-        break;
-      case 'delete-me':
-        setDeleteConfirm({ message: msg, forEveryone: false });
-        break;
-      case 'delete-all':
-        setDeleteConfirm({ message: msg, forEveryone: true });
         break;
       case 'select':
         enterSelection(msg);
@@ -810,24 +781,8 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     }
   }, [reactionPicker]);
 
-  // Delete handler
-  const handleDelete = async () => {
-    if (!deleteConfirm) return;
-    try {
-      await client.delete(`/api/conversations/messages/${deleteConfirm.message._id}?for_everyone=${deleteConfirm.forEveryone}`);
-      if (!deleteConfirm.forEveryone) {
-        // Remove from local view
-        const store = useChatStore.getState();
-        store.setMessages(conversationId,
-          (store.messages[conversationId] || EMPTY_MESSAGES).filter(m => m._id !== deleteConfirm.message._id)
-        );
-      }
-      toast.success(deleteConfirm.forEveryone ? 'Message deleted for everyone' : 'Message deleted');
-    } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to delete');
-    }
-    setDeleteConfirm(null);
-  };
+  // handleDelete removed with the message-deletion feature; there is no DELETE
+  // endpoint left to call.
 
   // Cancel an in-progress edit
   const cancelEdit = () => {
@@ -1224,15 +1179,8 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
               {allSelectedStarred ? <StarOff size={16} /> : <Star size={16} />}
               {allSelectedStarred ? 'Unstar' : 'Star'}
             </button>
-            <button
-              type="button"
-              onClick={() => setBatchDelete(true)}
-              disabled={selectedCount === 0}
-              data-testid="selection-delete-btn"
-              className="flex items-center gap-2 px-3 py-2 text-sm text-[#EF4444] rounded-[6px] hover:bg-[#EF4444]/10 transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
-            >
-              <Trash2 size={16} /> Delete
-            </button>
+            {/* The bulk Delete action was removed with the message-deletion
+                feature. Star/Unstar and Forward remain. */}
           </div>
         </div>
       ) : editingMessage ? (
@@ -1346,42 +1294,8 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         onClose={() => setMsgInfo(null)}
       />
 
-      {/* Delete Confirmation (single message) */}
-      {deleteConfirm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={() => setDeleteConfirm(null)}>
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-[4px]" />
-          <div className="relative bg-[#141414] border border-[#1F1F1F] rounded-[8px] p-6 max-w-sm" onClick={(e) => e.stopPropagation()}>
-            <p className="text-sm text-[#F5F5F5] mb-4">
-              {deleteConfirm.forEveryone
-                ? "Delete this message for everyone? This can't be undone."
-                : "Delete this message for you?"}
-            </p>
-            <div className="flex justify-end gap-3">
-              <button onClick={() => setDeleteConfirm(null)}
-                className="px-4 py-2 text-sm text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors">Cancel</button>
-              <button onClick={handleDelete}
-                data-testid="delete-message-confirm"
-                className={`px-4 py-2 text-sm font-medium rounded-[6px] transition-all ${
-                  deleteConfirm.forEveryone ? 'bg-[#EF4444] text-white hover:opacity-90' : 'bg-[#1A1A1A] text-[#F5F5F5] border border-[#2D2D2D] hover:bg-[#2D2D2D]'
-                }`}>
-                {deleteConfirm.forEveryone ? 'Delete for Everyone' : 'Delete for Me'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Batch delete confirmation (selection mode) */}
-      <ConfirmDialog
-        open={batchDelete}
-        title={`Delete ${selectedCount} message${selectedCount === 1 ? '' : 's'}?`}
-        body="They will be removed from your copy of this chat. Everyone else keeps theirs."
-        confirmLabel="Delete for me"
-        busy={batchBusy}
-        onConfirm={handleBatchDelete}
-        onCancel={() => setBatchDelete(false)}
-        testId="selection-delete-confirm"
-      />
+      {/* Both delete confirmations (single message and selection-mode batch) were
+          removed with the message-deletion feature. */}
 
       {/* Exit group confirmation (header menu) */}
       <ConfirmDialog

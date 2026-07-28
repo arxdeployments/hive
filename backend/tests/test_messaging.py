@@ -78,39 +78,45 @@ async def test_edit_message(client, two_orgs_with_users):
         assert resp.status_code == 403
 
 
-async def test_delete_for_me_actually_filters(client, two_orgs_with_users):
+# test_delete_for_me_actually_filters removed with the delete-for-me feature —
+# nothing can create a MessageDeletion row any more, so the behaviour it asserted
+# is unreachable. The read-side filter it protected is still in place (media.py
+# and messages.py still exclude the caller's MessageDeletion rows) so that anyone
+# who deleted a message for themselves before the removal keeps it hidden; that
+# path simply has no way to be set up from the API now.
+
+
+async def test_delete_message_endpoint_is_gone(client, two_orgs_with_users):
+    """Message deletion was removed as a feature.
+
+    Replaces test_delete_for_everyone_tombstones_and_only_sender, which exercised
+    DELETE /api/conversations/messages/{id}. This asserts the route is actually
+    unroutable rather than merely unlinked from the UI — a removed feature that
+    still answers on the API is not removed.
+
+    The read side is untouched on purpose: is_deleted is still serialized so that
+    messages tombstoned before the removal keep rendering as deleted. That is
+    covered wherever serialize_message is asserted, and cannot be re-tested here
+    because nothing can create a tombstone any more.
+    """
     users = two_orgs_with_users
     await login(client, "alice@a.com")
     conv = await _direct(client, users["bob"].id)
-    msg = await _send(client, conv, "delete me for alice only")
+    msg = await _send(client, conv, "not deletable")
 
     resp = await client.delete(f"/api/conversations/messages/{msg['_id']}")
-    assert resp.status_code == 200
+    assert resp.status_code == 405, resp.text
 
+    resp = await client.delete(
+        f"/api/conversations/messages/{msg['_id']}", params={"for_everyone": "true"}
+    )
+    assert resp.status_code == 405, resp.text
+
+    # And the message is still there, intact and not tombstoned.
     resp = await client.get(f"/api/conversations/{conv}/messages")
-    assert msg["_id"] not in [m["_id"] for m in resp.json()["messages"]]
-
-    async with _client_for("bob@a.com") as bob:
-        resp = await bob.get(f"/api/conversations/{conv}/messages")
-        assert msg["_id"] in [m["_id"] for m in resp.json()["messages"]]
-
-
-async def test_delete_for_everyone_tombstones_and_only_sender(client, two_orgs_with_users):
-    users = two_orgs_with_users
-    await login(client, "alice@a.com")
-    conv = await _direct(client, users["bob"].id)
-    msg = await _send(client, conv, "retracted")
-
-    async with _client_for("bob@a.com") as bob:
-        resp = await bob.delete(f"/api/conversations/messages/{msg['_id']}", params={"for_everyone": "true"})
-        assert resp.status_code == 403
-
-    resp = await client.delete(f"/api/conversations/messages/{msg['_id']}", params={"for_everyone": "true"})
-    assert resp.status_code == 200
-
-    resp = await client.get(f"/api/conversations/{conv}/messages")
-    tomb = [m for m in resp.json()["messages"] if m["_id"] == msg["_id"]][0]
-    assert tomb["is_deleted"] is True and tomb["content"] == ""
+    still = [m for m in resp.json()["messages"] if m["_id"] == msg["_id"]][0]
+    assert still["is_deleted"] is False
+    assert still["content"] == "not deletable"
 
 
 async def test_reaction_toggle_and_shape(client, two_orgs_with_users):

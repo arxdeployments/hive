@@ -355,16 +355,9 @@ async def forward_message(
     return {"forwarded_to": forwarded}
 
 
-@router.delete("/messages/{msg_id}")
-async def delete_message(
-    msg_id: str,
-    for_everyone: bool = Query(default=False),
-    tenant: TenantContext = Depends(get_tenant),
-):
-    await messaging.delete_message(
-        tenant.db, message_id=_msg_uuid(msg_id), actor=tenant.user, for_everyone=for_everyone
-    )
-    return {"message": "Deleted"}
+# DELETE /messages/{msg_id} removed along with the message-deletion feature. The
+# read side still understands tombstones written before the removal — see the note
+# above messaging.edit_message.
 
 
 @router.put("/messages/{msg_id}")

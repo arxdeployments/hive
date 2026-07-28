@@ -352,6 +352,15 @@ class RxHiveWebSocket {
         break;
       }
 
+      // Retained deliberately even though message deletion has been removed as a
+      // feature and no server code can emit this frame any more.
+      //
+      // Two reasons. Deploys are not atomic — the frontend and the API are
+      // separate containers, so during a rollout an older API could still be
+      // serving a delete while this bundle is live. And a message tombstoned
+      // before the removal must keep rendering as "This message was deleted"
+      // rather than reverting to its original content. Dropping this handler buys
+      // nothing and risks a rendering desync, so it stays as a read-side no-op.
       case 'message_deleted': {
         const { message_id: dMsgId, conversation_id: dConvId } = data;
         if (dConvId && dMsgId) {

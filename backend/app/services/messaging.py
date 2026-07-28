@@ -18,7 +18,6 @@ from app.db.models import (
     ConversationParticipant,
     Message,
     MessageAttachment,
-    MessageDeletion,
     MessagePin,
     MessageReaction,
     MessageStar,
@@ -33,8 +32,6 @@ from app.utils import now_utc, sanitize_text
 
 _MEDIA_TYPES = {"image", "video", "audio", "file"}
 _UPLOAD_URL_RE = re.compile(r"/api/media/up/([0-9a-f-]{36})")
-
-DELETE_FOR_EVERYONE_WINDOW_SECONDS = 3600
 
 # Pins are conversation-wide and the whole set is fetched on conversation open,
 # so they must stay bounded — otherwise one member can pin every message and
@@ -369,7 +366,7 @@ async def _member_message(db: AsyncSession, message_id: uuid.UUID, actor: User) 
     """Load a message iff the actor participates in its conversation.
 
     404 either way — a non-member must not be able to tell a foreign message
-    from a nonexistent one (same posture as toggle_reaction/delete_message).
+    from a nonexistent one (same posture as toggle_reaction).
     """
     msg = await db.get(Message, message_id)
     if msg is None:
@@ -451,47 +448,29 @@ async def toggle_pin(db: AsyncSession, *, message_id: uuid.UUID, actor: User) ->
     return pinned
 
 
-async def delete_message(db: AsyncSession, *, message_id: uuid.UUID, actor: User, for_everyone: bool) -> None:
-    msg = await db.get(Message, message_id)
-    if msg is None:
-        raise SendError(status_code=404, detail="Message not found")
-    me = await db.get(ConversationParticipant, (msg.conversation_id, actor.id))
-    if me is None:
-        raise SendError(status_code=404, detail="Message not found")
-
-    if for_everyone:
-        if msg.sender_id != actor.id:
-            raise SendError(status_code=403, detail="Can only delete your own messages")
-        created = msg.created_at if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=dt.UTC)
-        if (now_utc() - created).total_seconds() > DELETE_FOR_EVERYONE_WINDOW_SECONDS:
-            raise SendError(status_code=400, detail="Can only delete within 60 minutes")
-        msg.deleted_at = now_utc()
-        msg.content = ""
-        await db.commit()
-        participants = (
-            (
-                await db.execute(
-                    select(ConversationParticipant.user_id).where(
-                        ConversationParticipant.conversation_id == msg.conversation_id
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        await publish_to_users(
-            participants,
-            {
-                "type": "message_deleted",
-                "message_id": str(message_id),
-                "conversation_id": str(msg.conversation_id),
-            },
-        )
-    else:
-        existing = await db.get(MessageDeletion, (message_id, actor.id))
-        if existing is None:
-            db.add(MessageDeletion(message_id=message_id, user_id=actor.id))
-        await db.commit()
+# Message deletion was REMOVED as a product feature. `delete_message` and the
+# DELETE /messages/{id} route that called it are gone, so nothing can tombstone a
+# message (Message.deleted_at) any more.
+#
+# NOTE: delete-for-me as a MECHANISM is still live and still reachable — "Clear
+# chat" (POST /conversations/{id}/clear -> _hide_all_messages_for_caller) writes
+# MessageDeletion rows for the caller. That is a separate feature and was left
+# alone; only the per-message Delete for me / Delete for everyone actions were
+# removed. So the MessageDeletion read filters below are load-bearing, not legacy.
+#
+# The READ side is deliberately untouched, because rows already exist:
+#   * Message.deleted_at stays on the model and in the schema. Dropping it would
+#     need a destructive migration, and any message deleted before this change
+#     would lose its tombstone and reappear with its original content — the one
+#     outcome a user who deleted a message must never get.
+#   * enrich.serialize_message keeps emitting is_deleted and blanking content, so
+#     historical tombstones still render as "This message was deleted".
+#   * MessageDeletion rows stay filtered out of every read path — required both
+#     for history hidden before this change and for Clear chat, which still
+#     writes them.
+#   * edit_message and forward_message keep refusing to operate on a tombstone.
+# The result is that removing the feature changes what users can DO without
+# changing what they SEE.
 
 
 async def edit_message(db: AsyncSession, *, message_id: uuid.UUID, actor: User, content: str) -> dict:

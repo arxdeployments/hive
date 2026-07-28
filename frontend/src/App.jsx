@@ -121,6 +121,28 @@ const LoginRedirect = () => {
   return <Login />;
 };
 
+/**
+ * Landing route for "/".
+ *
+ * There was no "/" route at all, so the bare domain fell through to the "*"
+ * catch-all and rendered NotFound — every visitor who typed rxhive.org got a 404
+ * with a "Go to Chat" button as the only way out.
+ *
+ * Role routing mirrors LoginRedirect exactly (superadmin -> /admin, everyone
+ * else -> /chat) so the two entry points can never disagree about where a given
+ * user belongs. Unauthenticated visitors are sent to /login rather than being
+ * rendered the login form in place, so the address bar matches what is on screen
+ * and a refresh does not bounce them.
+ */
+const RootRedirect = () => {
+  const { user, loading } = useAuth();
+  if (loading) return <RouteFallback />;
+  if (!user) return <Navigate to="/login" replace />;
+  return user.role === 'superadmin'
+    ? <Navigate to="/admin" replace />
+    : <Navigate to="/chat" replace />;
+};
+
 const OrgAdminRoute = ({ children }) => {
   const { user, loading } = useAuth();
   if (loading) return <div className="min-h-screen bg-[#0A0A0A] flex items-center justify-center"><Loader2 className="w-8 h-8 text-[#10B981] animate-spin" /></div>;
@@ -164,6 +186,10 @@ function App() {
         <AnimatePresence mode="wait">
           <Suspense fallback={<RouteFallback />}>
           <Routes>
+            {/* Bare domain. Must come before the "*" catch-all below, which was
+                previously the only thing matching "/". */}
+            <Route path="/" element={<RootRedirect />} />
+
             <Route path="/login" element={<LoginRedirect />} />
 
             <Route

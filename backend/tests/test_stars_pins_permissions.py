@@ -207,10 +207,17 @@ async def test_groups_in_common(client, two_orgs_with_users):
 
 
 async def test_export_transcript_is_plain_text_and_respects_delete_for_me(client, two_orgs_with_users):
+    """Export format, plus: export honours the caller's own delete-for-me rows.
+
+    The per-message "Delete for me" action was removed, so the hiding is driven
+    through "Clear chat" instead — the surviving feature that still writes
+    MessageDeletion rows. The property under test is unchanged: one participant's
+    hidden history must not affect anyone else's transcript.
+    """
     users = two_orgs_with_users
     await login(client, "alice@a.com")
     conv = await _direct(client, users["bob"].id)
-    first = await _send(client, conv, "hello")
+    await _send(client, conv, "hello")
     await _send(client, conv, "world")
 
     resp = await client.get(f"/api/conversations/{conv}/export")
@@ -221,11 +228,19 @@ async def test_export_transcript_is_plain_text_and_respects_delete_for_me(client
     assert lines[0].startswith("[") and "System: Conversation started" in lines[0]
     assert lines[1].endswith("Alice: hello") and lines[2].endswith("Alice: world")
 
-    await client.delete(f"/api/conversations/messages/{first['_id']}")
-    assert "hello" not in (await client.get(f"/api/conversations/{conv}/export")).text
+    # Hide Alice's copy of the history.
+    resp = await client.post(f"/api/conversations/{conv}/clear")
+    assert resp.status_code == 200, resp.text
 
+    alice_after = (await client.get(f"/api/conversations/{conv}/export")).text
+    assert "hello" not in alice_after
+    assert "world" not in alice_after
+
+    # Bob's transcript is untouched.
     async with _client_for("bob@a.com") as bob:
-        assert "hello" in (await bob.get(f"/api/conversations/{conv}/export")).text
+        bob_after = (await bob.get(f"/api/conversations/{conv}/export")).text
+        assert "hello" in bob_after
+        assert "world" in bob_after
 
 
 async def test_clear_chat_is_delete_for_me_only(client, two_orgs_with_users):
