@@ -24,13 +24,11 @@ import {
   Link2,
   Loader2,
   Star,
-  Trash2,
 } from 'lucide-react';
 import { toast } from 'sonner';
 import client from '../../../api/client';
 import { ForwardModal } from '../ForwardModal';
 import {
-  ConfirmDialog,
   EmptyState,
   LoadingState,
   Portal,
@@ -68,7 +66,6 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState([]);
   const [forwardTargets, setForwardTargets] = useState(null);
-  const [confirmDelete, setConfirmDelete] = useState(false);
   const [working, setWorking] = useState(false);
 
   const load = useCallback(async () => {
@@ -165,25 +162,10 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
     exitSelect();
   };
 
-  const handleDelete = async () => {
-    if (selectedMessageIds.length === 0) return;
-    setWorking(true);
-    let ok = 0;
-    for (const id of selectedMessageIds) {
-      try {
-        await client.delete(`/api/conversations/messages/${id}`, { params: { for_everyone: false } });
-        ok += 1;
-      } catch {
-        /* reported in aggregate below */
-      }
-    }
-    setWorking(false);
-    setConfirmDelete(false);
-    if (ok > 0) toast.success(`Deleted ${ok} ${ok === 1 ? 'item' : 'items'} for you`);
-    if (ok < selectedMessageIds.length) toast.error('Some items could not be deleted');
-    exitSelect();
-    load();
-  };
+  // handleDelete removed with the message-deletion feature. It called
+  // DELETE /api/conversations/messages/{id}, which no longer exists, so every
+  // item would have failed with 405 and reported "Some items could not be
+  // deleted". Star and Forward remain as the panel's bulk actions.
 
   const empty = EMPTY_COPY[tab];
 
@@ -248,15 +230,6 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
               className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-[#F5F5F5] rounded-[6px] hover:bg-[#1A1A1A] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
             >
               {working ? <Loader2 size={14} className="animate-spin" /> : <Star size={14} />} Star
-            </button>
-            <button
-              type="button"
-              disabled={selected.length === 0 || working}
-              onClick={() => setConfirmDelete(true)}
-              data-testid={`${testIdPrefix}-delete`}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-[#EF4444] rounded-[6px] hover:bg-[#EF4444]/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            >
-              <Trash2 size={14} /> Delete
             </button>
           </div>
         </div>
@@ -422,16 +395,6 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
         </Portal>
       )}
 
-      <ConfirmDialog
-        open={confirmDelete}
-        title={`Delete ${selectedMessageIds.length} ${selectedMessageIds.length === 1 ? 'item' : 'items'}?`}
-        body="They will be removed from your copy of this chat. Everyone else keeps theirs."
-        confirmLabel="Delete for me"
-        busy={working}
-        onConfirm={handleDelete}
-        onCancel={() => setConfirmDelete(false)}
-        testId={`${testIdPrefix}-delete-confirm`}
-      />
     </div>
   );
 };
