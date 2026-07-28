@@ -384,3 +384,62 @@ async def test_cross_tenant_404_on_every_new_endpoint(client, two_orgs_with_user
     # Nothing leaked and nothing changed: Alice's view is untouched.
     assert (await client.get(f"/api/conversations/{group}/pinned")).json() == {"data": []}
     assert (await client.get(f"/api/conversations/{group}/permissions")).json()["send_messages"] is True
+
+
+async def test_mute_suppresses_push_dispatch(client, two_orgs_with_users, monkeypatch):
+    """A muted recipient must not be pushed.
+
+    is_muted lived on the participant row and was served on every conversation,
+    and nothing anywhere read it — so "Mute notifications" silenced nothing. This
+    asserts the send path now filters muted recipients out of the push fan-out.
+    """
+    from app.services import messaging as messaging_mod
+
+    users = two_orgs_with_users
+    dispatched: list[list] = []
+
+    def fake_dispatch(user_ids, payload):
+        dispatched.append(list(user_ids))
+
+    # push is imported lazily inside send_message, so patch it on its own module.
+    import app.services.push as push_mod
+    monkeypatch.setattr(push_mod, "dispatch_push_to_users", fake_dispatch)
+
+    # Bob must look OFFLINE or he is never a push candidate in the first place.
+    async def fake_statuses(user_ids):
+        return {str(u): "offline" for u in user_ids}
+
+    monkeypatch.setattr(messaging_mod.presence, "get_statuses", fake_statuses)
+
+    await login(client, "alice@a.com")
+    conv = await _direct(client, users["bob"].id)
+
+    await _send(client, conv, "should push")
+    assert dispatched, "an offline recipient should have been pushed"
+    assert users["bob"].id in dispatched[-1]
+
+    # Bob mutes the conversation.
+    async with _client_for("bob@a.com") as bob:
+        resp = await bob.put(f"/api/conversations/{conv}/mute")
+        assert resp.json() == {"is_muted": True}
+
+    dispatched.clear()
+    await _send(client, conv, "should NOT push")
+    assert dispatched == [] or users["bob"].id not in dispatched[-1], (
+        "a muted recipient must be excluded from the push fan-out"
+    )
+
+    # And the payload carries the conversation id for deep-linking.
+    async with _client_for("bob@a.com") as bob:
+        await bob.put(f"/api/conversations/{conv}/mute")  # unmute
+
+    captured: list[dict] = []
+
+    def capture(user_ids, payload):
+        captured.append(payload)
+
+    monkeypatch.setattr(push_mod, "dispatch_push_to_users", capture)
+    await _send(client, conv, "with conv id")
+    assert captured, "expected a push payload"
+    assert captured[-1]["conversation_id"] == conv
+    assert conv in captured[-1]["url"]

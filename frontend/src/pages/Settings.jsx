@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
 import { PageTransition } from '../components/common/PageTransition';
 import client from '../api/client';
+import { enablePushNotifications, disablePushNotifications } from '../lib/pwa';
 
 const FONT_PX = { small: '14px', medium: '16px', large: '18px' };
 const FONT_SCALE = { small: 0.9, medium: 1, large: 1.12 };
@@ -40,6 +41,7 @@ export default function SettingsPage() {
   const navigate = useNavigate();
   const [notifSound, setNotifSound] = useState(() => localStorage.getItem('rxhive_notif_sound') !== 'false');
   const [desktopNotif, setDesktopNotif] = useState(() => localStorage.getItem('rxhive_desktop_notif') !== 'false');
+  const [notifBusy, setNotifBusy] = useState(false);
   const [enterSends, setEnterSends] = useState(() => localStorage.getItem('rxhive_enter_sends') !== 'false');
   const [fontSize, setFontSize] = useState(() => localStorage.getItem('rxhive_font_size') || 'medium');
 
@@ -60,11 +62,41 @@ export default function SettingsPage() {
     applyFontSize(fontSize);
   }, [fontSize]);
 
-  const handleDesktopNotif = (val) => {
-    if (val && typeof Notification !== 'undefined' && Notification.permission === 'default') {
-      Notification.requestPermission();
-    }
+  /**
+   * Desktop notifications toggle.
+   *
+   * This used to only flip a localStorage flag and request permission — it never
+   * subscribed. enablePushNotifications() had ZERO call sites in the entire repo,
+   * so pushManager.subscribe() never ran, no PushSubscription row was ever
+   * created, and the server's push fan-out always short-circuited on an empty
+   * subscription set. The toggle read as "on" while push was completely inert.
+   *
+   * Optimistic with rollback: if subscribing throws (unsupported browser, denied
+   * permission, VAPID not provisioned server-side) the switch goes back off
+   * rather than lying about the state. The thrown message is shown verbatim
+   * because each one is separately actionable.
+   *
+   * Called straight from the toggle's onChange so Notification.requestPermission()
+   * still runs inside the user gesture — Safari rejects it otherwise.
+   */
+  const handleDesktopNotif = async (val) => {
+    if (notifBusy) return;
+    setNotifBusy(true);
     setDesktopNotif(val);
+    try {
+      if (val) {
+        await enablePushNotifications();
+        toast.success('Desktop notifications enabled');
+      } else {
+        await disablePushNotifications();
+        toast.success('Desktop notifications disabled');
+      }
+    } catch (err) {
+      setDesktopNotif(!val);
+      toast.error(err?.message || 'Could not change notification settings');
+    } finally {
+      setNotifBusy(false);
+    }
   };
 
   const handleChangePassword = async (e) => {
@@ -132,7 +164,7 @@ export default function SettingsPage() {
                     <div><p className="text-sm text-[#F5F5F5]">Desktop Notifications</p>
                       <p className="text-xs text-[#525252]">Show browser notifications</p></div>
                   </div>
-                  <Toggle checked={desktopNotif} onChange={handleDesktopNotif} />
+                  <Toggle checked={desktopNotif} onChange={handleDesktopNotif} disabled={notifBusy} />
                 </div>
               </div>
             </section>

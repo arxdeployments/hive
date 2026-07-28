@@ -173,12 +173,24 @@ class RxHiveWebSocket {
           type: msg.type
         });
 
-        if (store.activeConversationId !== convId) {
-          store.incrementUnread(convId);
+        // One rule for unread / sound / notification / read-receipt, instead of
+        // four decisions derived from a single "is this conversation open" test.
+        const looking = store.activeConversationId === convId
+          && document.visibilityState === 'visible';
+
+        if (looking) {
+          // Only receipt when the user can actually SEE it. This used to fire for
+          // an open-but-hidden tab, so a locked phone or a background window
+          // marked messages read and suppressed the notification entirely.
+          this.sendReadReceipt(convId, msg._id);
+          break;
+        }
+
+        store.incrementUnread(convId);
+
+        if (this._shouldNotify(msg, convId, store)) {
           this._playNotificationSound();
           this._showBrowserNotification(msg, convId, store);
-        } else {
-          this.sendReadReceipt(convId, msg._id);
         }
         break;
       }
@@ -669,6 +681,31 @@ class RxHiveWebSocket {
     }, delay);
   }
 
+  /**
+   * Whether an inbound message should make noise.
+   *
+   * The unread badge is deliberately NOT gated on this — a muted conversation
+   * still counts as unread, it just does not interrupt you. Three guards that
+   * were missing entirely:
+   *
+   *  - system messages: send_system_message fans new_message out to EVERY
+   *    participant including the actor, so renaming a group used to beep on your
+   *    own other tabs with a notification titled "System".
+   *  - my own messages: the same fan-out echoes what I just sent to my other
+   *    tabs, which then notified me about myself.
+   *  - muted conversations: is_muted has been served on every conversation all
+   *    along (enrich.serialize_conversation) and nothing ever read it, so "Mute
+   *    notifications" silenced nothing at all.
+   */
+  _shouldNotify(msg, convId, store) {
+    if (!msg || msg.type === 'system') return false;
+    const me = this._currentUserId();
+    if (me && msg.sender_id === me) return false;
+    const conv = store.conversations.find(c => c._id === convId);
+    if (conv?.is_muted) return false;
+    return true;
+  }
+
   _playNotificationSound() {
     try {
       if (localStorage.getItem('rxhive_notif_sound') === 'off') return;
@@ -688,11 +725,24 @@ class RxHiveWebSocket {
     }
   }
 
-  _showBrowserNotification(msg, convId, store) {
+  /**
+   * Raise a desktop notification.
+   *
+   * Service-worker-first: `new Notification(...)` is UNSUPPORTED on Android
+   * Chrome, where the constructor throws — and the throw was swallowed by the
+   * try/catch here, so mobile silently got nothing at all. showNotification() on
+   * the registration works everywhere and is also what sw.js's existing
+   * notificationclick handler is written against. The constructor stays as the
+   * fallback for contexts with no service worker.
+   */
+  async _showBrowserNotification(msg, convId, store) {
     try {
       if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
       if (localStorage.getItem('rxhive_desktop_notif') === 'off') return;
-      if (document.hasFocus()) return;
+      // hasFocus() alone is not enough: a focused window on another tab still
+      // means the user cannot see this conversation.
+      if (document.hasFocus() && document.visibilityState === 'visible'
+        && store.activeConversationId === convId) return;
 
       const conv = store.conversations.find(c => c._id === convId);
       let title = msg.sender_name || 'New message';
@@ -711,7 +761,29 @@ class RxHiveWebSocket {
         body = `${msg.sender_name}: ${body}`;
       }
 
-      const notif = new Notification(title, { body, tag: convId, renotify: true });
+      const options = {
+        body,
+        tag: convId,
+        renotify: true,
+        icon: '/icons/icon-192.png',
+        badge: '/icons/icon-192.png',
+        // sw.js's notificationclick reads data.convId to focus the right chat.
+        data: { convId, url: `/chat?c=${encodeURIComponent(convId)}` },
+      };
+
+      if ('serviceWorker' in navigator) {
+        try {
+          const reg = await navigator.serviceWorker.ready;
+          if (reg && typeof reg.showNotification === 'function') {
+            await reg.showNotification(title, options);
+            return;
+          }
+        } catch {
+          // fall through to the constructor
+        }
+      }
+
+      const notif = new Notification(title, options);
       notif.onclick = () => {
         window.focus();
         store.setActiveConversation(convId);

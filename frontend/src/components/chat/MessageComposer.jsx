@@ -10,6 +10,9 @@ import useChatStore from '../../stores/chatStore';
 // Reused so a staged document shows the SAME icon, colour and size formatting it
 // will have once it is a bubble.
 import { FILE_ICONS, formatFileSize } from './DocumentBubble';
+import { AudioRecorderBar } from './AudioRecorderBar';
+import useAudioRecorder from '../../hooks/useAudioRecorder';
+import { canRecordAudio } from '../../utils/audioFormat';
 
 // Client-side size hints (server still enforces its own limits).
 const MAX_IMAGE_SIZE = 16 * 1024 * 1024;   // 16MB
@@ -101,6 +104,14 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   // double send impossible.
   const sendingFilesRef = useRef(false);
   const sendingTextRef = useRef(false);
+  const sendingVoiceRef = useRef(false);
+
+  // Voice notes. `micSupported` is computed once: without MediaRecorder, without
+  // getUserMedia, or outside a secure context the button is hidden rather than
+  // offered and then failing on click.
+  const recorder = useAudioRecorder();
+  const [micSupported] = useState(() => canRecordAudio());
+  const [voiceSending, setVoiceSending] = useState(false);
 
   // Release every object URL we own on unmount, so closing a chat mid-selection
   // does not leak the decoded previews.
@@ -247,7 +258,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
 
   // Upload a single file, then create the message carrying media_url (the fix).
   // `caption` overrides the derived content (the image preview strip's caption).
-  const sendMediaFile = async (file, replyId, caption = '') => {
+  const sendMediaFile = async (file, replyId, caption = '', duration = null) => {
     const uploadResult = await uploadFile(file, setUploadProgress);
     const msgType = mapMessageType(uploadResult.file_type);
     const content = caption || (msgType === 'file' ? (uploadResult.filename || '') : '');
@@ -263,6 +274,9 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
         temp_id: tempId,
         media_url: uploadResult.file_url,
         reply_to: replyId,
+        // Only voice notes send this. Measured by wall clock in the recorder,
+        // because a MediaRecorder blob cannot be asked its own length.
+        duration,
       });
       // Media is created over HTTP, so there is no WS message_ack to reconcile
       // against the way a text send has. Discarding this response left the bubble
@@ -340,6 +354,40 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     e.target.value = '';
     if (files.length === 0) return;
     stageFiles(files);
+  };
+
+  // ── Voice notes ───────────────────────────────────────────────────────────
+  const handleMicClick = async () => {
+    if (disabled || !conversationId) return;
+    const { ok, error } = await recorder.start();
+    if (!ok && error) toast.error(error);
+  };
+
+  const handleSendVoice = async () => {
+    const rec = recorder.result;
+    if (!rec || !conversationId) return;
+    // Same reentrancy guard as text and files: the button is disabled while
+    // sending, but a double-click can land before React re-renders.
+    if (sendingVoiceRef.current) return;
+    sendingVoiceRef.current = true;
+    setVoiceSending(true);
+    try {
+      // The extension is what the server classifies on, so it must come from the
+      // recorder's chosen format — see utils/audioFormat.js for why .webm is
+      // never used here.
+      const file = new File(
+        [rec.blob],
+        `voice-${Date.now()}.${rec.extension}`,
+        { type: rec.mimeType }
+      );
+      await sendMediaFile(file, replyTo?._id || null, '', Math.round(rec.duration * 10) / 10);
+      recorder.reset();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || err.message || 'Failed to send voice message');
+    } finally {
+      setVoiceSending(false);
+      sendingVoiceRef.current = false;
+    }
   };
 
   // ── Confirm Send ──────────────────────────────────────────────────────────
@@ -615,7 +663,20 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
         )}
       </AnimatePresence>
 
-      {/* Main composer bar */}
+      {/* While recording or reviewing a voice note the recorder REPLACES the
+          composer row, so there is no ambiguity about what Send would send. */}
+      {recorder.state !== 'idle' ? (
+        <AudioRecorderBar
+          stage={recorder.state}
+          elapsed={recorder.elapsed}
+          result={recorder.result}
+          onCancel={recorder.cancel}
+          onStop={recorder.stop}
+          onSend={handleSendVoice}
+          sending={voiceSending}
+        />
+      ) : (
+      /* Main composer bar */
       <div className="bg-[#0F0F0F] border-t border-[#1F1F1F] px-3 sm:px-4 py-3 safe-bottom">
         <div className="flex items-end gap-2">
           {/* Emoji button */}
@@ -701,23 +762,33 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
             style={{ maxHeight: 120, minHeight: 40 }}
           />
 
-          {/* Send / Mic / Loading */}
+          {/* Send / Mic / Loading.
+              The Mic half used to be `onClick={hasText ? handleSend : undefined}` —
+              with an empty box the button rendered a microphone and its handler was
+              literally undefined, so clicking it did nothing at all. It also had no
+              aria-label in either role. Both roles are now labelled, and the mic
+              records. When recording is unsupported (no MediaRecorder, no
+              getUserMedia, or an insecure context) the button falls back to
+              send-only rather than offering a control that cannot work. */}
           <button
-            onClick={hasText ? handleSend : undefined}
-            disabled={uploading}
-            data-testid="message-send-btn"
+            onClick={hasText ? handleSend : (micSupported ? handleMicClick : undefined)}
+            disabled={uploading || (!hasText && !micSupported)}
+            aria-label={hasText ? 'Send message' : 'Record voice message'}
+            title={hasText ? 'Send' : (micSupported ? 'Record voice message' : 'Recording is not supported in this browser')}
+            data-testid={hasText ? 'message-send-btn' : 'voice-record-btn'}
             className={`p-2.5 rounded-full flex-shrink-0 mb-0.5 transition-all duration-150 ${
               uploading
                 ? 'text-[#A3A3A3]'
                 : hasText
                   ? 'bg-[#10B981] text-white hover:bg-[#059669] active:scale-[0.95]'
-                  : 'text-[#A3A3A3] hover:text-[#F5F5F5]'
+                  : 'text-[#A3A3A3] hover:text-[#F5F5F5] disabled:opacity-40'
             }`}
           >
             {uploading ? <Loader2 size={18} className="animate-spin" /> : hasText ? <Send size={18} /> : <Mic size={20} />}
           </button>
         </div>
       </div>
+      )}
     </div>
   );
 };

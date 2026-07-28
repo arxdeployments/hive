@@ -105,6 +105,7 @@ async def send_message(
     temp_id: str | None = None,
     media_url: str | None = None,
     media_urls: list[str] | None = None,
+    duration: float | None = None,
 ) -> dict:
     """Persist a message and fan it out. Returns the serialized message
     (with temp_id + status echoed for the sender's optimistic UI)."""
@@ -162,6 +163,9 @@ async def send_message(
                 filename=upload.filename,
                 mime_type=upload.mime_type,
                 file_size=upload.file_size,
+                # Only meaningful for audio/video, and only the first attachment
+                # can carry it — a voice note is always a single file.
+                duration_seconds=duration if not seen_keys or len(seen_keys) == 1 else None,
             )
         )
 
@@ -203,6 +207,13 @@ async def send_message(
     # are remote HTTPS POSTs to third-party push services, and a slow or dead
     # endpoint must not delay — or fail — the sender's send.
     offline = [uid for uid in others if uid not in set(online)]
+    # Respect each recipient's mute. is_muted has been on the participant row and
+    # served on every conversation all along, and NOTHING read it — so "Mute
+    # notifications" silenced neither the in-app path nor push. Filter here rather
+    # than inside push_to_users so the mute is evaluated against this
+    # conversation's participants, which we already hold.
+    muted = {p.user_id for p in participants if p.is_muted}
+    offline = [uid for uid in offline if uid not in muted]
     if offline:
         from app.services.push import dispatch_push_to_users
 
@@ -213,7 +224,10 @@ async def send_message(
                 "title": sender.display_name,
                 "body": preview,
                 "tag": str(conv.id),
-                "url": "/chat",
+                # conversation_id lets sw.js tell a focused tab WHICH chat to open;
+                # the url is the fallback for when it has to open a new window.
+                "conversation_id": str(conv.id),
+                "url": f"/chat?c={conv.id}",
             },
         )
 
@@ -563,6 +577,9 @@ async def forward_message(
                     filename=a.filename,
                     mime_type=a.mime_type,
                     file_size=a.file_size,
+                    # Carried, or a forwarded voice note loses its length and the
+                    # bubble falls back to reading it out of the file.
+                    duration_seconds=a.duration_seconds,
                 )
             )
         conv.last_message_at = now

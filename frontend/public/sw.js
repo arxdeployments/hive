@@ -1,5 +1,8 @@
 /* RX HIVE service worker — offline shell + Web Push. */
-const CACHE = 'rxhive-shell-v1';
+// Bumped whenever this file changes: the activate handler below deletes every
+// cache whose key is not this one, so a new name is what makes clients adopt the
+// new push/notificationclick handlers instead of keeping the old shell.
+const CACHE = 'rxhive-shell-v2';
 const SHELL = ['/', '/index.html', '/favicon.svg', '/manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {
@@ -53,18 +56,35 @@ self.addEventListener('push', (event) => {
     badge: '/icons/icon-192.png',
     tag: payload.tag || 'rxhive',
     renotify: true,
-    data: { url: payload.url || '/chat' },
+    // convId is carried separately from the url so notificationclick can tell a
+    // focused tab WHICH conversation to open, which a url alone cannot do.
+    data: { url: payload.url || '/chat', convId: payload.conversation_id || null },
   };
   event.waitUntil(self.registration.showNotification(title, options));
 });
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const target = event.notification.data?.url || '/chat';
+  const data = event.notification.data || {};
+  const target = data.url || '/chat';
+  const convId = data.convId || null;
+
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
-      for (const c of clients) {
-        if (c.url.includes(target) && 'focus' in c) return c.focus();
+      // Match on ORIGIN, not on the full url. The previous `c.url.includes(target)`
+      // test could not match once target carried a `?c=<id>` query — a tab sitting
+      // on /chat does not contain that string — so every click opened yet another
+      // window instead of focusing the app the user already had open. Same reason
+      // a tab on /settings was never matched.
+      const origin = self.location.origin;
+      const existing = clients.find((c) => c.url.startsWith(origin) && 'focus' in c);
+      if (existing) {
+        // Tell the page which conversation to select; a focus() alone leaves the
+        // user looking at whatever they had open.
+        if (convId && 'postMessage' in existing) {
+          existing.postMessage({ type: 'rxhive:open-conversation', convId });
+        }
+        return existing.focus();
       }
       return self.clients.openWindow(target);
     })

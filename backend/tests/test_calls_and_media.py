@@ -145,3 +145,54 @@ async def test_upload_rejects_unsupported_type(client, two_orgs_with_users):
         files = {"file": ("evil.exe", io.BytesIO(b"MZ..."), "application/octet-stream")}
         resp = await alice.post("/api/upload", files=files)
         assert resp.status_code == 400
+
+
+async def test_voice_note_duration_round_trip(client, two_orgs_with_users):
+    """A voice note's length is stored and served, and .weba classifies as audio.
+
+    `.webm` is deliberately VIDEO in storage.py, so the recorder names its Opus
+    fallback `.weba`. If that ever stops classifying as audio, voice notes silently
+    render in the video bubble.
+    """
+    from app.services import storage
+
+    assert storage.classify(".m4a") == "audio"
+    assert storage.classify(".weba") == "audio", ".weba must be audio, not video"
+    assert storage.classify(".webm") == "video", ".webm stays video by design"
+    assert storage.MIME_BY_EXT[".weba"] == "audio/webm"
+
+    users = two_orgs_with_users
+    await login(client, "alice@a.com")
+    resp = await client.post(
+        "/api/conversations/direct", json={"participant_id": str(users["bob"].id)}
+    )
+    assert resp.status_code == 200, resp.text
+    conv = resp.json()["_id"]
+
+    resp = await client.post(
+        "/api/upload",
+        files={"file": ("voice-123.m4a", io.BytesIO(b"\x00\x00\x00\x20ftypM4A " + b"x" * 64), "audio/mp4")},
+    )
+    assert resp.status_code == 200, resp.text
+    up = resp.json()
+    assert up["file_type"] == "audio", up
+
+    resp = await client.post(
+        f"/api/conversations/{conv}/messages",
+        json={
+            "content": "",
+            "type": "audio",
+            "media_url": up["file_url"],
+            "duration": 12.4,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    sent = resp.json()
+    assert sent["type"] == "audio"
+    assert sent["duration"] == 12.4, sent
+    assert sent["attachments"][0]["duration"] == 12.4
+
+    # And it survives a reload, which is the point of storing it at all.
+    resp = await client.get(f"/api/conversations/{conv}/messages")
+    loaded = [m for m in resp.json()["messages"] if m["_id"] == sent["_id"]][0]
+    assert loaded["duration"] == 12.4

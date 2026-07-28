@@ -2,6 +2,7 @@ import React, { memo, useCallback, useEffect, useRef } from 'react';
 import { Check, CheckCheck, Clock, Ban, Mic, ChevronDown, Star, Pin } from 'lucide-react';
 import { ImageBubble } from './ImageBubble';
 import { DocumentBubble } from './DocumentBubble';
+import { AudioPlayer } from './AudioPlayer';
 
 const LONG_PRESS_MS = 500;
 
@@ -323,6 +324,11 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
               )}
             </div>
           ) : isAudio ? (
+            /* Was a bare `<audio controls>` at 32px inside a 260px bubble: no
+               scrub, no length before the file loaded, and completely different
+               native chrome in Safari vs Chrome. AudioPlayer is the same component
+               the pre-send preview uses, so what the sender heard is what the
+               recipient sees, and only one clip can sound at a time. */
             <div data-testid="audio-bubble" className="w-[260px] flex items-center gap-2.5 p-1.5">
               <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 ${isOwn ? 'bg-white/15' : 'bg-[#10B981]/15'}`}>
                 <Mic size={18} className={isOwn ? 'text-white' : 'text-[#10B981]'} />
@@ -330,11 +336,13 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
               <div className="flex-1 min-w-0">
                 {/* pr-6 keeps the filename clear of the chevron's corner */}
                 <p className={`text-xs truncate pr-6 ${isOwn ? 'text-white/90' : 'text-[#F5F5F5]'}`}>{audioName}</p>
-                <audio
-                  controls
-                  preload="metadata"
+                <AudioPlayer
                   src={resolveUrl(message.media_url)}
-                  className="w-full h-8 mt-1"
+                  /* Server-sent, because a MediaRecorder container has no duration
+                     in its header and the element would report Infinity/NaN. */
+                  fallbackDuration={message.duration ?? message.attachments?.[0]?.duration ?? null}
+                  tone={isOwn ? 'own' : 'dark'}
+                  className="mt-1"
                 />
               </div>
             </div>

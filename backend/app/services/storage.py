@@ -24,7 +24,12 @@ Image.MAX_IMAGE_PIXELS = 40_000_000  # ~40 MP
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".m4v"}
-AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".aac", ".opus"}
+# .weba is the audio-only WebM extension. It exists here because ".webm" is
+# deliberately VIDEO above, and MediaRecorder's Chrome default is
+# audio/webm;codecs=opus — uploaded as .webm a voice note would be classified as
+# a VIDEO and render in the video bubble. The recorder names its Opus fallback
+# .weba so the two can never collide.
+AUDIO_EXTS = {".mp3", ".m4a", ".wav", ".ogg", ".aac", ".opus", ".weba"}
 DOC_EXTS = {
     ".pdf",
     ".doc",
@@ -61,6 +66,7 @@ MIME_BY_EXT = {
     ".ogg": "audio/ogg",
     ".aac": "audio/aac",
     ".opus": "audio/opus",
+    ".weba": "audio/webm",
     ".pdf": "application/pdf",
     ".txt": "text/plain",
     ".csv": "text/csv",

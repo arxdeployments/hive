@@ -102,7 +102,27 @@ export default function Chat() {
   // Update document title with unread count
   useEffect(() => {
     document.title = totalUnread > 0 ? `RxHive (${totalUnread})` : 'RxHive';
+    // OS-level badge (installed PWA / macOS dock / Android launcher). Guarded:
+    // unsupported on Firefox and older Safari, and setAppBadge rejects rather
+    // than throwing synchronously.
+    if ('setAppBadge' in navigator) {
+      const p = totalUnread > 0 ? navigator.setAppBadge(totalUnread) : navigator.clearAppBadge();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    }
   }, [totalUnread]);
+
+  // A notification click cannot open the right chat by URL alone when it just
+  // focuses an existing tab, so sw.js postMessages the conversation id instead.
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return undefined;
+    const onMessage = (event) => {
+      if (event.data?.type !== 'rxhive:open-conversation') return;
+      const convId = event.data.convId;
+      if (convId) setActiveConversation(convId);
+    };
+    navigator.serviceWorker.addEventListener('message', onMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', onMessage);
+  }, [setActiveConversation]);
 
   // Keyboard shortcuts
   useEffect(() => {

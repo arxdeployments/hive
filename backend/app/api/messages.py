@@ -117,6 +117,12 @@ class SendMessageRequest(BaseModel):
     temp_id: str | None = None
     media_url: str | None = None
     media_urls: list[str] | None = None
+    # Recorded length in seconds, for voice notes. Measured client-side by wall
+    # clock rather than read from the file: MediaRecorder writes streaming
+    # containers with no duration in the header, so audio.duration reads
+    # Infinity/NaN until a seek hack. Stored so a bubble can show "0:34" without
+    # fetching the audio at all.
+    duration: float | None = None
     # Legacy fields, accepted but ignored: media metadata comes from the upload claim.
     thumbnail_url: str | None = None
     file_size: int | None = None
@@ -286,6 +292,7 @@ async def send_message(
         reply_to=body.reply_to,
         temp_id=body.temp_id,
         media_url=body.media_url,
+        duration=body.duration,
         media_urls=body.media_urls,
     )
 

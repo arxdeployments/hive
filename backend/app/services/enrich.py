@@ -238,6 +238,7 @@ def _attachment_fields(attachments: list[MessageAttachment]) -> dict:
         "thumbnail_url": None,
         "file_size": None,
         "filename": None,
+        "duration": None,
         "attachments": [],
     }
     for a in attachments:
@@ -248,6 +249,10 @@ def _attachment_fields(attachments: list[MessageAttachment]) -> dict:
             "filename": a.filename,
             "mime_type": a.mime_type,
             "file_size": a.file_size,
+            # Recorded length in seconds for audio/video. Sent so a voice-note
+            # bubble can render "0:34" without an authenticated /api/media
+            # redirect plus a presigned S3 GET just to read the container.
+            "duration": a.duration_seconds,
         }
         out["attachments"].append(item)
     if attachments:
@@ -256,6 +261,7 @@ def _attachment_fields(attachments: list[MessageAttachment]) -> dict:
         out["thumbnail_url"] = thumb_url_for(first.id) if first.thumbnail_key else None
         out["file_size"] = first.file_size
         out["filename"] = first.filename
+        out["duration"] = first.duration_seconds
     return out
 
 
