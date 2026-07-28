@@ -38,7 +38,14 @@ resource "aws_db_instance" "main" {
   # Major version only: AWS resolves this to the latest available 16.x at create
   # time and auto_minor_version_upgrade keeps it patched from there. Pinning a
   # minor version here would just create drift every time AWS deprecates one.
-  engine_version              = "16"
+  engine_version = "16"
+
+  # WARNING, only if you drop var.db_backup_retention_period to 0: RDS takes the
+  # pre-upgrade and post-upgrade snapshots that make a minor-version upgrade
+  # reversible ONLY when retention > 0. At 0, an unattended Sunday upgrade has
+  # no rollback point and engine upgrades cannot be reverted. If you must run at
+  # 0, set this to false and apply minor upgrades by hand after a manual
+  # snapshot. At the default of 1 this is safe as written.
   auto_minor_version_upgrade  = true
   allow_major_version_upgrade = false
 
@@ -63,9 +70,19 @@ resource "aws_db_instance" "main" {
   publicly_accessible = false
   multi_az            = false
 
-  backup_retention_period = 7
+  # Days of automated backups. See var.db_backup_retention_period — the default
+  # is 1 rather than 7 because an AWS Free plan account rejects 7 outright:
+  #   FreeTierRestrictionError: The specified backup retention period exceeds
+  #   the maximum available to free tier customers.
+  #
+  # At 1 point-in-time recovery still works at full ~5-minute granularity and
+  # only the reach-back window shrinks to a rolling ~24 hours. At 0 there is no
+  # PITR at all and no automated snapshots — see the WARNING below.
+  backup_retention_period = var.db_backup_retention_period
+
   # UTC. Backup and maintenance windows must not overlap, and both are placed in
   # the small hours of the lowest-traffic day for a clinic-hours workload.
+  # The backup window is only honoured while retention > 0.
   backup_window         = "07:00-08:00"
   maintenance_window    = "sun:08:30-sun:09:30"
   copy_tags_to_snapshot = true
