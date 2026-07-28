@@ -11,6 +11,7 @@ import useChatStore from '../../stores/chatStore';
 // will have once it is a bubble.
 import { FILE_ICONS, formatFileSize } from './DocumentBubble';
 import { AudioRecorderBar } from './AudioRecorderBar';
+import { StagedFilePreview } from './StagedFilePreview';
 import useAudioRecorder from '../../hooks/useAudioRecorder';
 import { canRecordAudio } from '../../utils/audioFormat';
 
@@ -112,6 +113,9 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   const recorder = useAudioRecorder();
   const [micSupported] = useState(() => canRecordAudio());
   const [voiceSending, setVoiceSending] = useState(false);
+  // Index of the staged file being previewed full-size, or null. Nothing has been
+  // uploaded at this point, so the preview reads the tray's own object URL.
+  const [previewIndex, setPreviewIndex] = useState(null);
 
   // Release every object URL we own on unmount, so closing a chat mid-selection
   // does not leak the decoded previews.
@@ -332,6 +336,14 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     });
   };
 
+  // A staged file can disappear under the preview (removed, or the batch sent),
+  // and an index pointing past the end would render nothing at all.
+  useEffect(() => {
+    if (previewIndex !== null && previewIndex >= stagedFiles.length) {
+      setPreviewIndex(stagedFiles.length > 0 ? stagedFiles.length - 1 : null);
+    }
+  }, [stagedFiles.length, previewIndex]);
+
   // Cancel: drop the whole batch, revoking every object URL we created for it.
   const clearStaged = () => {
     setStagedFiles(prev => {
@@ -530,7 +542,10 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
           >
             {/* Header + Cancel */}
             <div className="flex items-center justify-between mb-3">
-              <span className="text-sm text-[#F5F5F5] font-medium">{describeStaged(stagedFiles)}</span>
+              <span className="text-sm text-[#F5F5F5] font-medium">
+                {describeStaged(stagedFiles)}
+                <span className="ml-2 text-[11px] font-normal text-[#525252]">tap to preview</span>
+              </span>
               <button
                 onClick={clearStaged}
                 disabled={uploading}
@@ -552,8 +567,19 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                 return (
                   <div
                     key={f.id}
-                    title={`${f.name}${f.size ? ` (${formatFileSize(f.size)})` : ''}`}
-                    className="relative flex-shrink-0 w-[60px] h-[60px] rounded-lg overflow-hidden border border-[#2D2D2D] bg-[#1A1A1A]"
+                    title={`${f.name}${f.size ? ` (${formatFileSize(f.size)})` : ''} — click to preview`}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setPreviewIndex(stagedFiles.findIndex(x => x.id === f.id))}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setPreviewIndex(stagedFiles.findIndex(x => x.id === f.id));
+                      }
+                    }}
+                    aria-label={`Preview ${f.name}`}
+                    data-testid="staged-file-tile"
+                    className="relative flex-shrink-0 w-[60px] h-[60px] rounded-lg overflow-hidden border border-[#2D2D2D] bg-[#1A1A1A] cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-[#10B981] hover:border-[#10B981]/60 transition-colors"
                   >
                     {f.category === 'image' && (
                       <img src={f.url} alt={f.name} className="w-full h-full object-cover" />
@@ -584,7 +610,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                       </span>
                     )}
                     <button
-                      onClick={() => removeStagedFile(f.id)}
+                      onClick={(e) => { e.stopPropagation(); removeStagedFile(f.id); }}
                       disabled={uploading}
                       aria-label={`Remove ${f.name}`}
                       className="absolute top-0 right-0 w-5 h-5 bg-black/70 rounded-bl flex items-center justify-center text-white hover:bg-[#EF4444] transition-colors disabled:opacity-40"
@@ -635,6 +661,18 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
               </>
             )}
           </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Full-size look at a staged file, before anything is uploaded. */}
+      <AnimatePresence>
+        {previewIndex !== null && stagedFiles[previewIndex] && (
+          <StagedFilePreview
+            files={stagedFiles}
+            index={previewIndex}
+            onIndex={setPreviewIndex}
+            onClose={() => setPreviewIndex(null)}
+          />
         )}
       </AnimatePresence>
 

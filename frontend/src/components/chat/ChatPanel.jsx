@@ -746,6 +746,14 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         if (isDirect) setContactInfo({ open: true, section: 'info' });
         else setGroupInfo({ open: true, section: 'info' });
         break;
+      // Opens the info drawer straight on its Media/Links/Docs section. That
+      // gallery already existed but the ONLY way in was Contact/Group info ->
+      // left rail, which nobody finds — so "where are the files I sent?" had no
+      // answer in the UI.
+      case 'media':
+        if (isDirect) setContactInfo({ open: true, section: 'media' });
+        else setGroupInfo({ open: true, section: 'media' });
+        break;
       case 'search':
         setShowConvSearch(true);
         break;

@@ -13,8 +13,20 @@ handle /ws* {
 }
 
 # Presigned object-storage URLs (path-style: /s3/<bucket>/<key>?X-Amz-...)
+#
+# header_up Host is LOAD-BEARING, exactly as in Caddyfile.prod. SigV4 signs the
+# Host header, and the API presigns against RXHIVE_S3_ENDPOINT=http://minio:9000,
+# so the signature covers "minio:9000". Caddy otherwise forwards the browser's own
+# Host (localhost), MinIO recomputes the signature over that and rejects it:
+#
+#   403 SignatureDoesNotMatch
+#
+# Which showed up as every sent image failing to render, since /api/media/{id}
+# 307-redirects to this route. Must match the signed host and port exactly.
 handle_path /s3/* {
-	reverse_proxy minio:9000
+	reverse_proxy minio:9000 {
+		header_up Host minio:9000
+	}
 }
 
 # LiveKit signal WebSocket

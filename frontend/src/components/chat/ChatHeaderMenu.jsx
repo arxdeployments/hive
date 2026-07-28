@@ -28,6 +28,7 @@ import {
   Info,
   Link2,
   LogOut,
+  Images,
   MoreVertical,
   Pin,
   PinOff,
@@ -163,6 +164,7 @@ export const ChatHeaderMenu = ({ type, conversation, onAction, disabled = false 
       return [
         { action: 'info', label: 'Contact info', icon: Info },
         { action: 'search', label: 'Search', icon: Search },
+        { action: 'media', label: 'Media, links & docs', icon: Images },
         { action: 'select', label: 'Select messages', icon: CheckSquare },
         pin,
         mute,
@@ -176,6 +178,7 @@ export const ChatHeaderMenu = ({ type, conversation, onAction, disabled = false 
     return [
       { action: 'info', label: 'Group info', icon: Info },
       { action: 'search', label: 'Search', icon: Search },
+      { action: 'media', label: 'Media, links & docs', icon: Images },
       { action: 'select', label: 'Select messages', icon: CheckSquare },
       pin,
       mute,
