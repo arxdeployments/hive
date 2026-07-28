@@ -59,7 +59,8 @@ const connectErrorReason = (err) => {
 
 // Media layer for calls: the backend mints a scoped room token, this service
 // connects to the LiveKit SFU and mirrors room state into callStore so the
-// call UI just renders store state. Replaces webrtcManager + meshCallManager.
+// call UI just renders store state. Replaced the earlier webrtcManager +
+// meshCallManager, both now deleted.
 class LiveKitClient {
   constructor() {
     this.room = null;
