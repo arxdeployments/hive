@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { motion } from 'framer-motion';
 import {
-  ArrowLeft, Search, ChevronDown, X, Check, Pin, Star, StarOff, Forward,
+  ArrowLeft, Search, ChevronDown, X, Check, Pin, PinOff, Star, StarOff, Forward,
 } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import { Virtuoso } from 'react-virtuoso';
@@ -93,6 +93,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   const convMessages = useChatStore(s => s.messages[conversationId] || EMPTY_MESSAGES);
   const convTyping = useChatStore(s => s.typingUsers?.[conversationId] || EMPTY_TYPING);
   const wsConnected = useChatStore(s => s.wsConnected);
+  const pinnedVersion = useChatStore(s => s.pinnedVersion[conversationId] || 0);
   // Actions are created once with the store, so selecting them never re-renders.
   const setMessages = useChatStore(s => s.setMessages);
   const prependMessages = useChatStore(s => s.prependMessages);
@@ -133,6 +134,10 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   // Pinned banner
   const [pinnedFromApi, setPinnedFromApi] = useState(EMPTY_PINNED);
   const [pinCursor, setPinCursor] = useState(0);
+  // Id of the row to flash after a jump. A primitive, not a Set: MessageBubble is
+  // memoised and compares props by reference.
+  const [highlightedId, setHighlightedId] = useState(null);
+  const highlightTimerRef = useRef(null);
 
   const virtuosoRef = useRef(null);
 
@@ -267,7 +272,11 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         if (!cancelled) setPinnedFromApi(EMPTY_PINNED);
       });
     return () => { cancelled = true; };
-  }, [conversationId]);
+    // pinnedVersion is bumped by the message_pin_update WS handler, which makes
+    // this fetch self-healing: a pin (or unpin) of a message outside the loaded
+    // window used to never reach the banner, and an out-of-window unpin left a
+    // phantom entry that toasted "not loaded yet" for ever.
+  }, [conversationId, pinnedVersion]);
 
   // `pendingDraftRef` survives the conversation switch that "Reply privately"
   // triggers — the reset effect below would otherwise wipe it on arrival.
@@ -843,6 +852,11 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     const idx = itemsRef.current.findIndex(item => item.type === 'message' && item.message._id === originalMsgId);
     if (idx >= 0 && virtuosoRef.current) {
       virtuosoRef.current.scrollToIndex({ index: idx, behavior: 'smooth' });
+      // Flash the target: landing mid-thread with no cue left the user guessing
+      // which row they had been sent to.
+      if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+      setHighlightedId(originalMsgId);
+      highlightTimerRef.current = setTimeout(() => setHighlightedId(null), 1600);
       return true;
     }
     // Silently doing nothing here read as "the app is broken"; say why instead.
@@ -869,6 +883,26 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     ? pinnedMessages[Math.min(pinCursor, pinnedMessages.length - 1)]
     : null;
 
+  /**
+   * Unpin the pin currently shown in the banner.
+   *
+   * Until now the ONLY way to unpin was the bubble's own context menu, which
+   * requires the message to be rendered — so a pin outside the loaded window was
+   * visible in the banner and impossible to remove. The refetch triggered by the
+   * server's message_pin_update reconciles the list, so nothing is patched here.
+   */
+  const handleUnpinActive = useCallback(async (e) => {
+    e.stopPropagation();
+    if (!activePin || !conversationId) return;
+    try {
+      await client.post(`/api/conversations/messages/${activePin._id}/pin`);
+      setPinCursor(0);
+      toast.success('Unpinned');
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || 'Failed to unpin');
+    }
+  }, [activePin, conversationId]);
+
   const handlePinnedBannerClick = useCallback(() => {
     const list = pinnedMessages;
     if (list.length === 0) return;
@@ -893,6 +927,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         onReactionClick={handleReactionClick}
         onReplyClick={handleJumpToMessage}
         onRetry={handleRetry}
+        highlighted={item.message._id === highlightedId}
       />
     );
 
@@ -937,7 +972,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         </div>
       </div>
     );
-  }, [isGroup, myUserId, handleContextMenu, handleReactionClick, handleJumpToMessage, handleRetry,
+  }, [isGroup, myUserId, handleContextMenu, handleReactionClick, handleJumpToMessage, handleRetry, highlightedId,
     selectionMode, selectedIds, toggleSelected]);
 
   if (!conversationId) {
@@ -1076,24 +1111,39 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
 
       {/* Pinned messages banner */}
       {activePin && !selectionMode && (
-        <button
-          type="button"
-          onClick={handlePinnedBannerClick}
-          data-testid="pinned-messages-banner"
-          className="flex items-center gap-3 px-4 py-2 bg-[#141414] border-b border-[#1F1F1F] text-left hover:bg-[#1A1A1A] focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[#10B981] transition-colors flex-shrink-0"
-        >
-          <Pin size={14} className="text-[#10B981] flex-shrink-0" />
-          <span className="min-w-0 flex-1">
-            <span className="block text-[11px] text-[#10B981]">
-              {pinnedMessages.length > 1
-                ? `Pinned message ${Math.min(pinCursor, pinnedMessages.length - 1) + 1} of ${pinnedMessages.length}`
-                : 'Pinned message'}
+        /* A row, not one big button: the unpin control has to be a SIBLING of the
+           jump button rather than nested inside it (nested interactive elements
+           are invalid and the outer click would swallow the inner one). */
+        <div className="flex items-stretch bg-[#141414] border-b border-[#1F1F1F] flex-shrink-0">
+          <button
+            type="button"
+            onClick={handlePinnedBannerClick}
+            data-testid="pinned-messages-banner"
+            className="flex items-center gap-3 px-4 py-2 text-left hover:bg-[#1A1A1A] focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[#10B981] transition-colors min-w-0 flex-1"
+          >
+            <Pin size={14} className="text-[#10B981] flex-shrink-0" />
+            <span className="min-w-0 flex-1">
+              <span className="block text-[11px] text-[#10B981]">
+                {pinnedMessages.length > 1
+                  ? `Pinned message ${Math.min(pinCursor, pinnedMessages.length - 1) + 1} of ${pinnedMessages.length}`
+                  : 'Pinned message'}
+              </span>
+              <span className="block text-[13px] text-[#A3A3A3] truncate">
+                {activePin.sender_name ? `${activePin.sender_name}: ` : ''}{messagePreview(activePin)}
+              </span>
             </span>
-            <span className="block text-[13px] text-[#A3A3A3] truncate">
-              {activePin.sender_name ? `${activePin.sender_name}: ` : ''}{messagePreview(activePin)}
-            </span>
-          </span>
-        </button>
+          </button>
+          <button
+            type="button"
+            onClick={handleUnpinActive}
+            data-testid="pinned-banner-unpin"
+            aria-label="Unpin this message"
+            title="Unpin"
+            className="px-3 flex items-center text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[#10B981] transition-colors flex-shrink-0"
+          >
+            <PinOff size={14} />
+          </button>
+        </div>
       )}
 
       {/* Message Area */}

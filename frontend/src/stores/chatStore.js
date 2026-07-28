@@ -212,6 +212,23 @@ const useChatStore = create((set) => ({
    * the pin badge while leaving the row where it was until the next inbound
    * message or refetch.
    */
+  /**
+   * Bumped whenever a message_pin_update arrives for a conversation, so
+   * ChatPanel's /pinned fetch can re-run.
+   *
+   * The WS handler can only patch is_pinned on messages already in the store,
+   * which left two live bugs: a remote pin of a message OUTSIDE my loaded window
+   * never appeared in the banner until I reopened the chat, and a remote UNPIN of
+   * a message in my /pinned list but not loaded left a PHANTOM pin in the banner
+   * for ever — tapping it just toasted "not loaded yet". A version counter is
+   * enough to make the fetch self-healing without teaching the socket layer about
+   * the banner's data shape.
+   */
+  pinnedVersion: {},
+  bumpPinnedVersion: (convId) => set((state) => ({
+    pinnedVersion: { ...state.pinnedVersion, [convId]: (state.pinnedVersion[convId] || 0) + 1 },
+  })),
+
   setConversationPinned: (convId, isPinned, pinOrder) => set((state) => {
     const convs = state.conversations.map(c => (
       c._id === convId

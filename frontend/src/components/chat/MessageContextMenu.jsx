@@ -249,11 +249,16 @@ export const MessageContextMenu = ({ message, isOwn, isGroup, position, onAction
         patchMessage(convId, message._id, { [field]: value });
         if (onAction) onAction(kind, message, { [resultKey]: value });
       })
-      .catch(() => {
+      .catch((err) => {
         patchMessage(convId, message._id, { [field]: previous });
-        toast.error(isStar
+        // Surface the server's own detail. Hitting the 50-pin cap returns a 400
+        // with "This conversation already has N pinned messages…", which the
+        // generic string below turned into something indistinguishable from a
+        // network error — the user had no idea why the pin refused.
+        const detail = err?.response?.data?.detail;
+        toast.error(detail || (isStar
           ? `Failed to ${optimistic ? 'star' : 'unstar'} message`
-          : `Failed to ${optimistic ? 'pin' : 'unpin'} message`);
+          : `Failed to ${optimistic ? 'pin' : 'unpin'} message`));
       });
   }, [message, isPending, onAction]);
 

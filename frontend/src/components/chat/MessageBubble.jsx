@@ -120,7 +120,7 @@ const MenuTrigger = ({ isOwn, onOpen, overMedia }) => (
   </button>
 );
 
-const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUserId, onContextMenu, onReactionClick, onReplyClick, onEdit, onRetry }) => {
+const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUserId, onContextMenu, onReactionClick, onReplyClick, onEdit, onRetry, highlighted = false }) => {
   // Long-press is the touch equivalent of right-click. Android fires `contextmenu`
   // after a long press as well, so the timer sets a flag that swallows the
   // duplicate rather than opening the menu twice.
@@ -233,7 +233,14 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
   };
 
   return (
-    <div className={`flex ${isOwn ? 'justify-end' : 'justify-start'} mb-1 px-3 sm:px-8 md:px-16`}
+    /* `highlighted` flashes the row after a jump (pinned banner, reply preview,
+       search hit) so the user can see which message they landed on. A ring plus
+       a tint rather than a background swap, so it reads on both the green own
+       bubble and the dark received one. */
+    <div className={`flex ${isOwn ? 'justify-end' : 'justify-start'} mb-1 px-3 sm:px-8 md:px-16 transition-colors duration-500 ${
+      highlighted ? 'bg-[#10B981]/15 rounded-[6px]' : ''
+    }`}
+      data-highlighted={highlighted || undefined}
       onContextMenu={handleContextMenu}
       onTouchStart={handleTouchStart}
       onTouchMove={clearLongPress}

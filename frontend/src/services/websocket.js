@@ -349,6 +349,10 @@ class RxHiveWebSocket {
             m._id === pMsgId ? { ...m, is_pinned: pinned } : m
           ));
         }
+        // Also nudge the open thread to re-fetch /pinned. The patch above only
+        // reaches messages already loaded, so without this a pin (or unpin) of a
+        // message outside the loaded window never reached the pinned banner.
+        if (pConvId) store.bumpPinnedVersion(pConvId);
         break;
       }
 
