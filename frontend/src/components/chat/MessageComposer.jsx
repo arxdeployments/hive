@@ -7,6 +7,9 @@ import EmojiPicker from 'emoji-picker-react';
 import wsClient from '../../services/websocket';
 import client from '../../api/client';
 import useChatStore from '../../stores/chatStore';
+// Reused so a staged document shows the SAME icon, colour and size formatting it
+// will have once it is a bubble.
+import { FILE_ICONS, formatFileSize } from './DocumentBubble';
 
 // Client-side size hints (server still enforces its own limits).
 const MAX_IMAGE_SIZE = 16 * 1024 * 1024;   // 16MB
@@ -17,11 +20,27 @@ const VIDEO_ACCEPT = '.mp4,.mov,.webm,.m4v';
 const AUDIO_ACCEPT = '.mp3,.m4a,.wav,.ogg,.aac';
 const DOC_ACCEPT = '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip';
 
-// How many images the preview strip will hold at once. Each staged image holds
-// an object URL and a decoded thumbnail, so this is a memory bound, not a
-// server one — videos and documents are not staged and have no such cap.
-// Anything beyond this is reported to the user rather than dropped in silence.
-const MAX_PREVIEW_IMAGES = 10;
+// How many files the confirmation tray will hold at once. Images and video each
+// hold a live object URL that the browser decodes for the thumbnail, so this is
+// a memory bound rather than a server one. Anything beyond it is reported to the
+// user instead of being dropped in silence.
+const MAX_STAGED_FILES = 10;
+
+// Human label for the confirmation tray header, so it never says "images" about
+// a PDF.
+const CATEGORY_LABEL = {
+  image: 'image',
+  video: 'video',
+  audio: 'audio',
+  document: 'file',
+};
+
+const describeStaged = (staged) => {
+  if (staged.length === 0) return '';
+  const kinds = new Set(staged.map(s => s.category));
+  const noun = kinds.size === 1 ? CATEGORY_LABEL[[...kinds][0]] || 'file' : 'file';
+  return `${staged.length} ${noun}${staged.length > 1 ? 's' : ''} selected`;
+};
 
 // Map the upload service's file_type onto the message `type` the API/bubbles expect.
 const mapMessageType = (fileType) => {
@@ -63,7 +82,10 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [dragOver, setDragOver] = useState(false);
-  const [previewImages, setPreviewImages] = useState([]);
+  // Files chosen but NOT yet uploaded. Every category stages here now — nothing
+  // reaches the network until the user confirms. Shape:
+  //   { id, file, url, name, category, size }
+  const [stagedFiles, setStagedFiles] = useState([]);
   const [previewCaption, setPreviewCaption] = useState('');
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -71,6 +93,22 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   const docInputRef = useRef(null);
   const typingRef = useRef(false);
   const typingTimerRef = useRef(null);
+
+  // Duplicate-send guards. These are refs, not state, deliberately: a second
+  // click or keypress in the same tick must see the flag already set, and a
+  // setState would not have been applied yet. `uploading` state still drives the
+  // spinner and the disabled attribute; these refs are what actually make a
+  // double send impossible.
+  const sendingFilesRef = useRef(false);
+  const sendingTextRef = useRef(false);
+
+  // Release every object URL we own on unmount, so closing a chat mid-selection
+  // does not leak the decoded previews.
+  const stagedRef = useRef(stagedFiles);
+  stagedRef.current = stagedFiles;
+  useEffect(() => () => {
+    stagedRef.current.forEach(s => URL.revokeObjectURL(s.url));
+  }, []);
 
   const adjustHeight = useCallback(() => {
     const el = textareaRef.current;
@@ -135,28 +173,38 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   // ── Text send ────────────────────────────────────────────────────────────
   const handleSend = () => {
     if (!text.trim() || disabled || !conversationId) return;
-    const tempId = uuidv4();
-    const body = text.trim();
-    const replyId = replyTo?._id || null;
-    stopTyping();
+    // Reentrancy guard: the send button's onClick and the Enter keydown both land
+    // here, and setText('') below is asynchronous — so two events in the same
+    // tick would each still see the old non-empty `text` and send it twice.
+    // Cleared in a finally so an early return can never wedge the composer.
+    if (sendingTextRef.current) return;
+    sendingTextRef.current = true;
+    try {
+      const tempId = uuidv4();
+      const body = text.trim();
+      const replyId = replyTo?._id || null;
+      stopTyping();
     // Optimistic bubble (ChatPanel clears replyTo after this). ChatPanel also
     // owns the HTTP fallback, which it applies when the socket is down.
-    onSend(body, tempId);
-    // Deliver over WS only while the socket is genuinely open, forwarding
-    // reply_to so threaded replies actually persist.
-    //
-    // The guard is the fix for a double-send: this used to call sendMessage
-    // unconditionally, and wsClient.send() QUEUES a frame written to a closed
-    // socket, which _onOpen then replays on reconnect. Offline, that meant
-    // ChatPanel's HTTP fallback created the message and the replayed frame
-    // created it again. Both this check and ChatPanel's read wsClient.isOpen()
-    // in the same synchronous call stack, so exactly one transport owns
-    // any given send.
-    if (wsClient.isOpen()) {
-      wsClient.sendMessage(conversationId, body, tempId, replyId);
+      onSend(body, tempId);
+      // Deliver over WS only while the socket is genuinely open, forwarding
+      // reply_to so threaded replies actually persist.
+      //
+      // The guard is the fix for a double-send: this used to call sendMessage
+      // unconditionally, and wsClient.send() QUEUES a frame written to a closed
+      // socket, which _onOpen then replays on reconnect. Offline, that meant
+      // ChatPanel's HTTP fallback created the message and the replayed frame
+      // created it again. Both this check and ChatPanel's read wsClient.isOpen()
+      // in the same synchronous call stack, so exactly one transport owns
+      // any given send.
+      if (wsClient.isOpen()) {
+        wsClient.sendMessage(conversationId, body, tempId, replyId);
+      }
+      setText('');
+      if (textareaRef.current) textareaRef.current.style.height = 'auto';
+    } finally {
+      sendingTextRef.current = false;
     }
-    setText('');
-    if (textareaRef.current) textareaRef.current.style.height = 'auto';
   };
 
   const handleKeyDown = (e) => {
@@ -227,134 +275,126 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     }
   };
 
-  // Send a batch of non-image files (video / audio / documents) directly.
+  // NOTE: the former `sendFilesDirectly` batch sender is gone. It existed only to
+  // upload video/audio/documents the instant they were picked, which is exactly
+  // the behaviour feature 1 removes — every category now goes through the
+  // confirmation tray and handleConfirmSend, so there is one send path instead of
+  // two that had to be kept in sync.
+
+  // Stage files for confirmation. NOTHING here touches the network — that is the
+  // entire point of the confirmation step. Shared by the picker, drag-and-drop
+  // and paste so all four categories behave identically.
   //
-  // Each file is awaited in turn but failures are caught PER FILE: one rejected
-  // upload used to abort the whole loop from here, so picking four videos and
-  // having the second fail silently discarded the third and fourth.
-  const sendFilesDirectly = async (files) => {
-    if (!conversationId || files.length === 0) return;
-    const valid = files.filter(validateSize);
-    if (valid.length === 0) return;
-
-    setUploading(true);
-    // Attach the reply only to the first file in the batch.
-    const replyId = replyTo?._id || null;
-    let failed = 0;
-    try {
-      for (let i = 0; i < valid.length; i++) {
-        try {
-          await sendMediaFile(valid[i], i === 0 ? replyId : null);
-        } catch (err) {
-          failed += 1;
-          toast.error(
-            `${valid[i].name || 'File'}: ${err?.response?.data?.detail || err.message || 'Upload failed'}`
-          );
-        }
-      }
-    } finally {
-      setUploading(false);
-      setUploadProgress(0);
-    }
-    if (failed > 0 && valid.length > failed) {
-      toast.error(`${failed} of ${valid.length} files failed to send`);
-    }
-  };
-
-  // Stage images into the preview strip, enforcing the cap visibly. Shared by
-  // the picker, drag-and-drop and paste so all three behave identically.
-  const stageImages = (images) => {
-    const sized = images.filter(validateSize);
+  // APPENDS rather than replaces, so choosing a video and then an image builds
+  // one batch instead of silently discarding the first pick (and leaking its
+  // object URL, which the previous replace-based version did).
+  const stageFiles = (files) => {
+    const sized = files.filter(validateSize);
     if (sized.length === 0) return;
-    const staged = sized.slice(0, MAX_PREVIEW_IMAGES);
-    if (sized.length > staged.length) {
-      toast.error(
-        `Only ${MAX_PREVIEW_IMAGES} images can be attached at once — ${sized.length - staged.length} were not added`
-      );
-    }
-    setPreviewImages(staged.map(f => ({
-      file: f,
-      url: URL.createObjectURL(f),
-      // Clipboard images often arrive with no filename at all.
-      name: f.name || 'Pasted image',
-    })));
+    setStagedFiles(prev => {
+      const room = MAX_STAGED_FILES - prev.length;
+      if (room <= 0) {
+        toast.error(`Only ${MAX_STAGED_FILES} files can be attached at once`);
+        return prev;
+      }
+      const accepted = sized.slice(0, room);
+      if (sized.length > accepted.length) {
+        toast.error(
+          `Only ${MAX_STAGED_FILES} files can be attached at once — ${sized.length - accepted.length} were not added`
+        );
+      }
+      return [
+        ...prev,
+        ...accepted.map(f => ({
+          id: uuidv4(),
+          file: f,
+          url: URL.createObjectURL(f),
+          // Clipboard images often arrive with no filename at all.
+          name: f.name || 'Pasted image',
+          category: categorizeFile(f),
+          size: f.size,
+        })),
+      ];
+    });
   };
 
-  // ── Image selection (preview strip) ───────────────────────────────────────
+  // Cancel: drop the whole batch, revoking every object URL we created for it.
+  const clearStaged = () => {
+    setStagedFiles(prev => {
+      prev.forEach(s => URL.revokeObjectURL(s.url));
+      return [];
+    });
+    setPreviewCaption('');
+  };
+
+  // ── Selection — every category stages for confirmation ────────────────────
   //
-  // The picker accepts video as well as images, so one selection can mix them.
-  // Images are staged for captioning; anything else is batch-sent immediately,
-  // matching what drag-and-drop already did. Previously non-images chosen here
-  // were filtered out and thrown away without a word.
-  const handleImageSelect = (e) => {
+  // Previously images went to a preview strip while video, audio and documents
+  // were uploaded and posted the instant they were chosen, with no confirmation
+  // and no chance to add a caption or back out. All three pickers now funnel
+  // into the same staging tray.
+  const handleFileSelect = (e) => {
     const files = Array.from(e.target.files || []);
     setShowAttachMenu(false);
+    // Reset the input so re-picking the same file still fires a change event.
     e.target.value = '';
     if (files.length === 0) return;
-
-    const images = files.filter(f => (f.type || '').startsWith('image/'));
-    const others = files.filter(f => !(f.type || '').startsWith('image/'));
-
-    if (images.length === 0 && others.length === 0) {
-      toast.error('No valid files selected');
-      return;
-    }
-    if (images.length > 0) stageImages(images);
-    if (others.length > 0) sendFilesDirectly(others);
+    stageFiles(files);
   };
 
-  // ── Media (video / audio) + Document selection — sent directly ────────────
-  const handleDirectSelect = async (e) => {
-    const files = Array.from(e.target.files || []);
-    setShowAttachMenu(false);
-    e.target.value = '';
-    if (files.length === 0) return;
-    await sendFilesDirectly(files);
-  };
+  // ── Confirm Send ──────────────────────────────────────────────────────────
+  //
+  // The only path that uploads a chosen file. Nothing before this point has hit
+  // the network, so Cancel is genuinely free.
+  //
+  // Failures are caught per file: a single bad file used to abort the loop, so
+  // the remaining files were never sent AND the tray was never cleared. Only the
+  // files that actually failed stay staged, so the user can retry just those.
+  const handleConfirmSend = async () => {
+    if (stagedFiles.length === 0) return;
+    // Reentrancy guard — see sendingTextRef. The button is also disabled while
+    // uploading, but a rapid double-click or an Enter in the caption field can
+    // both land before React re-renders with the disabled attribute applied.
+    if (sendingFilesRef.current) return;
+    sendingFilesRef.current = true;
 
-  // ── Send preview images ───────────────────────────────────────────────────
-  // Failures are caught per image, for the same reason as sendFilesDirectly: a
-  // single bad file used to abort the loop, so the remaining images were never
-  // sent AND the strip was never cleared, stranding them with no way to retry
-  // except removing the offender by hand. Only the images that actually failed
-  // stay staged.
-  const handleSendImages = async () => {
-    if (previewImages.length === 0) return;
+    const batch = stagedFiles;
     setUploading(true);
     const replyId = replyTo?._id || null;
     const caption = previewCaption.trim();
     const stillFailed = [];
     try {
-      for (let i = 0; i < previewImages.length; i++) {
+      for (let i = 0; i < batch.length; i++) {
         try {
-          // Shared with the direct-send path so the optimistic bubble is reconciled
-          // with the created message in exactly one place.
+          // Shared with every other send path so the optimistic bubble is
+          // reconciled with the created message in exactly one place.
           await sendMediaFile(
-            previewImages[i].file,
+            batch[i].file,
             i === 0 ? replyId : null,
             i === 0 ? caption : ''
           );
-          // Sent successfully — release the preview's object URL.
-          URL.revokeObjectURL(previewImages[i].url);
+          // Sent — release this preview's object URL.
+          URL.revokeObjectURL(batch[i].url);
         } catch (err) {
-          stillFailed.push(previewImages[i]);
+          stillFailed.push(batch[i]);
           toast.error(
-            `${previewImages[i].name || 'Image'}: ${err?.response?.data?.detail || err.message || 'Upload failed'}`
+            `${batch[i].name || 'File'}: ${err?.response?.data?.detail || err.message || 'Upload failed'}`
           );
         }
       }
     } finally {
       setUploading(false);
       setUploadProgress(0);
+      sendingFilesRef.current = false;
     }
 
-    const sent = previewImages.length - stillFailed.length;
-    setPreviewImages(stillFailed);
+    const sent = batch.length - stillFailed.length;
+    setStagedFiles(stillFailed);
     if (stillFailed.length === 0) {
       setPreviewCaption('');
-      toast.success(sent > 1 ? 'Images sent' : 'Image sent');
+      toast.success(sent > 1 ? `${sent} files sent` : 'File sent');
     } else if (sent > 0) {
-      toast.error(`${stillFailed.length} of ${previewImages.length} images failed — still attached`);
+      toast.error(`${stillFailed.length} of ${batch.length} failed — still attached`);
     }
   };
 
@@ -367,16 +407,9 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     setDragOver(false);
     const files = Array.from(e.dataTransfer.files || []);
     if (files.length === 0) return;
-
-    const images = files.filter(f => (f.type || '').startsWith('image/'));
-    const others = files.filter(f => !(f.type || '').startsWith('image/'));
-
-    // Same staging rules as the picker, including the visible cap.
-    if (images.length > 0) stageImages(images);
-    if (others.length > 0) {
-      // Video / audio / documents send straight through.
-      sendFilesDirectly(others);
-    }
+    // Everything staged for confirmation — dropping a video no longer sends it
+    // before the user has seen it.
+    stageFiles(files);
   };
 
   // ── Clipboard paste ───────────────────────────────────────────────────────
@@ -387,9 +420,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     if (imageItems.length > 0) {
       e.preventDefault();
       const files = imageItems.map(item => item.getAsFile()).filter(Boolean);
-      // Through the shared stager so paste obeys the same cap, and reports
-      // going over it, exactly as the picker and drag-and-drop do.
-      stageImages(files);
+      stageFiles(files);
     }
   };
 
@@ -399,9 +430,13 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     textareaRef.current?.focus();
   };
 
-  const removePreviewImage = (index) => {
-    setPreviewImages(prev => {
-      const updated = prev.filter((_, i) => i !== index);
+  // Remove one staged file, revoking its object URL — previously this dropped
+  // the entry and leaked the URL for the lifetime of the tab.
+  const removeStagedFile = (id) => {
+    setStagedFiles(prev => {
+      const target = prev.find(s => s.id === id);
+      if (target) URL.revokeObjectURL(target.url);
+      const updated = prev.filter(s => s.id !== id);
       if (updated.length === 0) setPreviewCaption('');
       return updated;
     });
@@ -433,50 +468,104 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
         )}
       </AnimatePresence>
 
-      {/* Image Preview Modal */}
+      {/* Attachment confirmation tray — every category lands here BEFORE any
+          upload happens, so Cancel costs nothing and a caption is always
+          possible. */}
       <AnimatePresence>
-        {previewImages.length > 0 && (
+        {stagedFiles.length > 0 && (
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: 20 }}
+            data-testid="attachment-preview"
             className="absolute bottom-full left-0 right-0 bg-[#0A0A0A] border border-[#1F1F1F] rounded-t-[12px] p-4 z-30 max-h-[60vh] flex flex-col"
           >
-            {/* Preview header */}
+            {/* Header + Cancel */}
             <div className="flex items-center justify-between mb-3">
-              <span className="text-sm text-[#F5F5F5] font-medium">{previewImages.length} image{previewImages.length > 1 ? 's' : ''} selected</span>
-              <button onClick={() => { setPreviewImages([]); setPreviewCaption(''); }}
-                className="p-1.5 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded transition-colors">
+              <span className="text-sm text-[#F5F5F5] font-medium">{describeStaged(stagedFiles)}</span>
+              <button
+                onClick={clearStaged}
+                disabled={uploading}
+                data-testid="cancel-attachments-btn"
+                aria-label="Cancel attachments"
+                className="p-1.5 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded transition-colors disabled:opacity-40"
+              >
                 <X size={16} />
               </button>
             </div>
 
-            {/* Thumbnail strip */}
-            <div className="flex gap-2 overflow-x-auto pb-3">
-              {previewImages.map((img, idx) => (
-                <div key={idx} className="relative flex-shrink-0 w-[60px] h-[60px] rounded-lg overflow-hidden border border-[#2D2D2D]">
-                  <img src={img.url} alt="" className="w-full h-full object-cover" />
-                  <button onClick={() => removePreviewImage(idx)}
-                    className="absolute top-0 right-0 w-5 h-5 bg-black/70 rounded-bl flex items-center justify-center text-white hover:bg-[#EF4444] transition-colors">
-                    <X size={10} />
-                  </button>
-                </div>
-              ))}
+            {/* Per-category preview tiles. Images and video get a real visual
+                preview from the object URL; audio and documents get the same
+                icon language they will have as bubbles. */}
+            <div className="flex gap-2 overflow-x-auto pb-3 scrollable-area">
+              {stagedFiles.map((f) => {
+                const iconMeta = FILE_ICONS[(f.name.split('.').pop() || '').toLowerCase()];
+                const DocIcon = iconMeta?.icon || FileText;
+                return (
+                  <div
+                    key={f.id}
+                    title={`${f.name}${f.size ? ` (${formatFileSize(f.size)})` : ''}`}
+                    className="relative flex-shrink-0 w-[60px] h-[60px] rounded-lg overflow-hidden border border-[#2D2D2D] bg-[#1A1A1A]"
+                  >
+                    {f.category === 'image' && (
+                      <img src={f.url} alt={f.name} className="w-full h-full object-cover" />
+                    )}
+                    {f.category === 'video' && (
+                      <>
+                        {/* preload=metadata renders the first frame without
+                            downloading or playing the whole file. */}
+                        <video src={f.url} muted playsInline preload="metadata" className="w-full h-full object-cover" />
+                        <span className="absolute inset-0 flex items-center justify-center bg-black/30 pointer-events-none">
+                          <Film size={18} className="text-white" />
+                        </span>
+                      </>
+                    )}
+                    {f.category === 'audio' && (
+                      <span className="w-full h-full flex items-center justify-center">
+                        <Mic size={20} className="text-[#A855F7]" />
+                      </span>
+                    )}
+                    {f.category === 'document' && (
+                      <span className="w-full h-full flex items-center justify-center">
+                        <DocIcon size={20} style={{ color: iconMeta?.color || '#A3A3A3' }} />
+                      </span>
+                    )}
+                    {f.category !== 'image' && f.category !== 'video' && (
+                      <span className="absolute bottom-0 left-0 right-0 px-1 pb-0.5 text-[8px] leading-tight text-[#A3A3A3] truncate bg-black/60">
+                        {f.name}
+                      </span>
+                    )}
+                    <button
+                      onClick={() => removeStagedFile(f.id)}
+                      disabled={uploading}
+                      aria-label={`Remove ${f.name}`}
+                      className="absolute top-0 right-0 w-5 h-5 bg-black/70 rounded-bl flex items-center justify-center text-white hover:bg-[#EF4444] transition-colors disabled:opacity-40"
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                );
+              })}
             </div>
 
-            {/* Caption + Send */}
+            {/* Caption + Confirm Send */}
             <div className="flex items-center gap-2">
               <input
                 type="text"
                 value={previewCaption}
                 onChange={(e) => setPreviewCaption(e.target.value)}
                 placeholder="Add a caption..."
-                className="flex-1 h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#525252] focus:border-[#10B981] focus:outline-none"
-                onKeyDown={(e) => { if (e.key === 'Enter' && !uploading) handleSendImages(); }}
+                disabled={uploading}
+                className="flex-1 h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#525252] focus:border-[#10B981] focus:outline-none disabled:opacity-60"
+                onKeyDown={(e) => { if (e.key === 'Enter' && !uploading) handleConfirmSend(); }}
               />
               <button
-                onClick={handleSendImages}
+                onClick={handleConfirmSend}
                 disabled={uploading}
+                aria-busy={uploading}
+                aria-label={uploading ? 'Sending' : 'Send attachments'}
+                /* Test id kept as send-images-btn: the existing e2e suite hooks
+                   this selector and the button's role has not changed. */
                 data-testid="send-images-btn"
                 className="w-10 h-10 rounded-full bg-[#10B981] text-white flex items-center justify-center hover:bg-[#059669] disabled:opacity-50 transition-colors"
               >
@@ -484,11 +573,18 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
               </button>
             </div>
 
-            {/* Upload progress */}
+            {/* Sending state: determinate bar plus an explicit count, so a
+                multi-file batch shows progress THROUGH the batch and not just
+                within the current file. */}
             {uploading && (
-              <div className="mt-2 h-1 bg-[#1A1A1A] rounded-full overflow-hidden">
-                <div className="h-full bg-[#10B981] transition-all" style={{ width: `${uploadProgress}%` }} />
-              </div>
+              <>
+                <div className="mt-2 h-1 bg-[#1A1A1A] rounded-full overflow-hidden">
+                  <div className="h-full bg-[#10B981] transition-all" style={{ width: `${uploadProgress}%` }} />
+                </div>
+                <p className="mt-1.5 text-[11px] text-[#A3A3A3]" data-testid="attachment-sending-status">
+                  Sending {stagedFiles.length} {stagedFiles.length === 1 ? 'file' : 'files'}…
+                </p>
+              </>
             )}
           </motion.div>
         )}
@@ -580,11 +676,11 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
 
           {/* Hidden file inputs */}
           {/* Photos & videos: one picker for both so a mixed batch is a single
-              selection. handleImageSelect stages the images and batch-sends the
-              rest. */}
-          <input ref={fileInputRef} type="file" accept={`image/*,video/*,${VIDEO_ACCEPT}`} multiple className="hidden" onChange={handleImageSelect} />
-          <input ref={mediaInputRef} type="file" accept={`video/*,audio/*,${VIDEO_ACCEPT},${AUDIO_ACCEPT}`} multiple className="hidden" onChange={handleDirectSelect} />
-          <input ref={docInputRef} type="file" accept={`${DOC_ACCEPT},${VIDEO_ACCEPT},${AUDIO_ACCEPT}`} multiple className="hidden" onChange={handleDirectSelect} />
+              selection. All three pickers share handleFileSelect, which stages
+              every category for confirmation instead of sending anything. */}
+          <input ref={fileInputRef} type="file" accept={`image/*,video/*,${VIDEO_ACCEPT}`} multiple className="hidden" onChange={handleFileSelect} />
+          <input ref={mediaInputRef} type="file" accept={`video/*,audio/*,${VIDEO_ACCEPT},${AUDIO_ACCEPT}`} multiple className="hidden" onChange={handleFileSelect} />
+          <input ref={docInputRef} type="file" accept={`${DOC_ACCEPT},${VIDEO_ACCEPT},${AUDIO_ACCEPT}`} multiple className="hidden" onChange={handleFileSelect} />
 
           {/* Text input */}
           <textarea

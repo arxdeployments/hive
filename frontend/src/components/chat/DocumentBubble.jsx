@@ -8,7 +8,10 @@ const resolveUrl = (url) => {
   return url.startsWith('http') ? url : `${backendUrl}${url}`;
 };
 
-const FILE_ICONS = {
+// Exported so the pre-send attachment preview can render the SAME icon and
+// colour a document will have once it is a bubble — one mapping, not two that
+// drift apart.
+export const FILE_ICONS = {
   pdf: { icon: FileText, color: '#EF4444' },
   doc: { icon: FileText, color: '#3B82F6' },
   docx: { icon: FileText, color: '#3B82F6' },
@@ -21,7 +24,7 @@ const FILE_ICONS = {
   zip: { icon: FileArchive, color: '#A855F7' },
 };
 
-const formatFileSize = (bytes) => {
+export const formatFileSize = (bytes) => {
   if (!bytes) return '';
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;

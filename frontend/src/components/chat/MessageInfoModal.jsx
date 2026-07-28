@@ -43,7 +43,11 @@ export const MessageInfoModal = ({ info, isOpen, onClose }) => {
             {info.read_by?.length > 0 && (
               <div>
                 <div className="flex items-center gap-1.5 mb-2">
-                  <CheckCheck size={14} className="text-[#10B981]" />
+                  {/* White, matching the read tick on the bubble (see
+                      MessageBubble StatusIcon) so "read" reads the same
+                      everywhere. Delivered above keeps the dimmer grey, which
+                      mirrors the bubble's dim/bright relationship. */}
+                  <CheckCheck size={14} className="text-white" />
                   <p className="text-xs text-[#A3A3A3]">Read by</p>
                 </div>
                 {info.read_by.map((r, i) => (

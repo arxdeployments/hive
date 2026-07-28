@@ -32,8 +32,25 @@ const formatTime = (dateStr) => {
   return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
 };
 
-// WhatsApp tick semantics. These only ever render on your own (green) bubble,
-// so "grey" is white/70 against that background; blue (#53BDEB) means read.
+// WhatsApp tick semantics. These only ever render on your own bubble, which is
+// bg-[#10B981] green, so every tick colour below is judged against THAT
+// background rather than against the page.
+//
+// The double tick is white. Read is pure white; delivered stays the dimmer
+// white/70 it already was, because the two states share one icon (CheckCheck)
+// and would otherwise be indistinguishable — the brightness step is the only
+// thing left carrying the difference once the colour is common.
+//
+// Measured contrast against #10B981 (WCAG relative luminance):
+//   old read  #53BDEB  1.19:1   <- barely visible; blue on green is near-tonal
+//   new read  #FFFFFF  2.56:1   <- more than twice the contrast
+//   delivered white/70 1.92:1
+// So going white is a legibility win here, not just a restyle.
+//
+// The app ships one fixed dark palette — tailwind.config.js declares
+// darkMode: ['class'] but no `dark:` variant is used anywhere in src/ and there
+// is no theme toggle — so there is no light-theme case for these to fail on.
+// They are always white-on-green.
 const StatusIcon = ({ status }) => {
   switch (status) {
     case 'sending':
@@ -41,7 +58,7 @@ const StatusIcon = ({ status }) => {
     case 'delivered':
       return <CheckCheck size={12} className="text-white/70" data-testid="message-status" data-status="delivered" aria-label="Delivered" />;
     case 'read':
-      return <CheckCheck size={12} className="text-[#53BDEB]" data-testid="message-status" data-status="read" aria-label="Read" />;
+      return <CheckCheck size={12} className="text-white" data-testid="message-status" data-status="read" aria-label="Read" />;
     case 'sent':
     default:
       return <Check size={12} className="text-white/70" data-testid="message-status" data-status="sent" aria-label="Sent" />;
