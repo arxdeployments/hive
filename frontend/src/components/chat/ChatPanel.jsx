@@ -356,8 +356,26 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       type: 'text'
     });
 
-    // If WS not connected, fall back to HTTP (carry the real type/media + reply target)
-    if (!wsConnected) {
+    // Text is delivered over the WebSocket by whoever called us; this fallback
+    // POSTs it while the socket is down.
+    //
+    // CAVEAT, pre-existing and NOT addressed here: wsClient.send() QUEUES the
+    // frame rather than dropping it (services/websocket.js:533-538) and _onOpen
+    // replays the whole queue on reconnect (:78-81), so a composer text send
+    // made while offline still lands twice. The cure is to gate
+    // MessageComposer.jsx:139 on wsConnected the way handleRetry below does —
+    // deliberately left for its own change, since it alters the text path and
+    // needs reconnect testing.
+    //
+    // Media is deliberately NOT delivered here, at any connection state. Every
+    // media path POSTs the message itself, because it has to attach the
+    // uploaded media_url: MessageComposer.sendMediaFile for a fresh send, and
+    // handleRetry below for a retry. Falling back for media as well meant one
+    // file became TWO server messages whenever the socket was down — the send
+    // path does not dedupe on temp_id (services/messaging.py only echoes it
+    // back), and _claim_upload does not reject an already-claimed upload, so
+    // both POSTs persisted as separate messages sharing one storage key.
+    if (!wsConnected && msgType === 'text') {
       try {
         const { data } = await client.post(`/api/conversations/${conversationId}/messages`, {
           content,
@@ -400,22 +418,38 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     // Re-add the optimistic bubble (+ HTTP fallback when disconnected) via the shared path.
     handleSend(failedMsg.content, newTempId, msgType, failedMsg.media_url || null, failedMsg.thumbnail_url || null, replyCtx);
 
-    // When connected, deliver over the active transport (mirrors MessageComposer's responsibility).
-    if (wsConnected) {
-      if (msgType === 'text') {
+    // Deliver over whichever transport owns this message type, mirroring the
+    // split in MessageComposer.
+    if (msgType === 'text') {
+      // Only when connected: handleSend's HTTP fallback above covers the
+      // disconnected case, and doing both would double-send.
+      if (wsConnected) {
         wsClient.sendMessage(conversationId, failedMsg.content, newTempId, replyId);
-      } else {
-        client.post(`/api/conversations/${conversationId}/messages`, {
-          content: failedMsg.content,
-          type: msgType,
-          media_url: failedMsg.media_url || null,
-          thumbnail_url: failedMsg.thumbnail_url || null,
-          temp_id: newTempId,
-          reply_to: replyId,
-        }).catch(() => {
-          useChatStore.getState().replaceOptimisticMessage(conversationId, newTempId, { status: 'failed' });
-        });
       }
+    } else {
+      // Media is always created over HTTP, connected or not, because handleSend
+      // deliberately does not POST for media. Previously this sat inside the
+      // `if (wsConnected)` branch and relied on that fallback while offline;
+      // now that the fallback is text-only, retry owns media delivery outright.
+      client.post(`/api/conversations/${conversationId}/messages`, {
+        content: failedMsg.content,
+        type: msgType,
+        media_url: failedMsg.media_url || null,
+        thumbnail_url: failedMsg.thumbnail_url || null,
+        temp_id: newTempId,
+        reply_to: replyId,
+      }).then(({ data }) => {
+        // Media has no WS message_ack to reconcile against, so this response is
+        // the only thing that can hand the bubble its real _id and status —
+        // exactly the reasoning in MessageComposer.sendMediaFile. Without it the
+        // bubble sits on 'sending' forever holding a temp uuid, and every
+        // id-keyed action (star, pin, delete, reply) then sends that dead id to
+        // the API. Retrying media used to be reconciled by handleSend's HTTP
+        // fallback; now that the fallback is text-only, this path owns it.
+        useChatStore.getState().replaceOptimisticMessage(conversationId, newTempId, data);
+      }).catch(() => {
+        useChatStore.getState().replaceOptimisticMessage(conversationId, newTempId, { status: 'failed' });
+      });
     }
   }, [conversationId, wsConnected, handleSend]);
 
