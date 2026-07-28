@@ -138,12 +138,23 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   // memoised and compares props by reference.
   const [highlightedId, setHighlightedId] = useState(null);
   const highlightTimerRef = useRef(null);
+  // True when the loaded window is NOT anchored to the newest message — i.e. we
+  // arrived here via an `around` jump and newer history exists but is unloaded.
+  // Kept per conversation for the same reason hasMoreByConv is: a single flag
+  // leaked the previous thread's state onto the next.
+  const [hasNewerByConv, setHasNewerByConv] = useState({});
+  // A jump whose target is not in `items` yet. setMessages only takes effect on
+  // the next render, so the scroll has to wait for the row to exist — resolved by
+  // the effect below rather than a setTimeout guess.
+  const pendingJumpRef = useRef(null);
+  const [jumpLoading, setJumpLoading] = useState(false);
 
   const virtuosoRef = useRef(null);
 
   const myUserId = user?.id;
   const myName = user?.name;
   const hasMore = hasMoreByConv[conversationId] ?? false;
+  const hasNewer = hasNewerByConv[conversationId] ?? false;
   const callBusy = callState !== 'idle';
 
   const otherParticipant = conversation?.participants?.find(
@@ -227,6 +238,10 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         .filter(m => m.status === 'failed');
       setMessages(conversationId, failedLocal.length ? [...fetched, ...failedLocal] : fetched);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
+      // The default window is anchored to the newest message, so by definition
+      // nothing newer is missing. This also clears the flag after a "jump to
+      // latest" from an around-window.
+      setHasNewerByConv(prev => ({ ...prev, [conversationId]: false }));
       loadedWindowsRef.current.add(conversationId);
     } catch (err) {
       console.error('Failed to fetch messages', err);
@@ -293,6 +308,10 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     setSelectionMode(false);
     setSelectedIds(new Set());
     setPinCursor(0);
+    // A jump parked for the previous thread must not fire against this one.
+    pendingJumpRef.current = null;
+    setHighlightedId(null);
+    if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
     setDraft(pendingDraftRef.current);
     pendingDraftRef.current = null;
   }, [conversationId]);
@@ -847,22 +866,89 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   const itemsRef = useRef(items);
   itemsRef.current = items;
 
+  // atBottomStateChange only fires on a scroll transition, so a jump that sets
+  // hasNewer while the user is already at the bottom would leave them with no way
+  // back to the live end until they happened to scroll.
+  useEffect(() => {
+    if (hasNewer) setShowScrollDown(true);
+  }, [hasNewer]);
+
+  // Complete a jump that had to load its window first. Runs after the render that
+  // introduced the row, which is the earliest point Virtuoso can scroll to it.
+  useEffect(() => {
+    const target = pendingJumpRef.current;
+    if (!target) return;
+    const idx = items.findIndex(i => i.type === 'message' && i.message._id === target);
+    if (idx < 0) return;
+    pendingJumpRef.current = null;
+    scrollToLoaded(target);
+  }, [items, scrollToLoaded]);
+
   // Reply / search / pinned-banner click -> scroll to the original message.
-  const handleJumpToMessage = useCallback((originalMsgId) => {
-    const idx = itemsRef.current.findIndex(item => item.type === 'message' && item.message._id === originalMsgId);
-    if (idx >= 0 && virtuosoRef.current) {
-      virtuosoRef.current.scrollToIndex({ index: idx, behavior: 'smooth' });
-      // Flash the target: landing mid-thread with no cue left the user guessing
-      // which row they had been sent to.
-      if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
-      setHighlightedId(originalMsgId);
-      highlightTimerRef.current = setTimeout(() => setHighlightedId(null), 1600);
-      return true;
-    }
-    // Silently doing nothing here read as "the app is broken"; say why instead.
-    toast.message('That message is not loaded yet — scroll up to load older messages');
-    return false;
+  /** Scroll to a loaded row and flash it. Returns false if it is not loaded. */
+  const scrollToLoaded = useCallback((msgId) => {
+    const idx = itemsRef.current.findIndex(
+      item => item.type === 'message' && item.message._id === msgId
+    );
+    if (idx < 0 || !virtuosoRef.current) return false;
+    virtuosoRef.current.scrollToIndex({ index: idx, behavior: 'smooth' });
+    // Flash the target: landing mid-thread with no cue left the user guessing
+    // which row they had been sent to.
+    if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
+    setHighlightedId(msgId);
+    highlightTimerRef.current = setTimeout(() => setHighlightedId(null), 1600);
+    return true;
   }, []);
+
+  /**
+   * Jump to a message, loading it first if it is outside the current window.
+   *
+   * Previously this could only reach rows already in `items` and otherwise
+   * toasted "not loaded yet — scroll up", which is exactly the case an old pin,
+   * an old reply target or a search hit always hits. GET /messages now accepts
+   * `around=<id>` and returns a window centred on the message, so the jump
+   * fetches that window, swaps it in, and scrolls once the row actually exists.
+   *
+   * The scroll cannot happen inline: setMessages only lands on the next render,
+   * so `items` has no such row yet. pendingJumpRef parks the target and the
+   * effect below fires as soon as it appears.
+   */
+  const handleJumpToMessage = useCallback(async (originalMsgId) => {
+    if (!originalMsgId) return false;
+    if (scrollToLoaded(originalMsgId)) return true;
+    if (!conversationId) return false;
+
+    setJumpLoading(true);
+    try {
+      const { data } = await client.get(`/api/conversations/${conversationId}/messages`, {
+        params: { around: originalMsgId, limit: 50 },
+      });
+      if (!data?.anchor_id) {
+        // The server could not resolve the anchor — the message is gone, or was
+        // never in this conversation. Say so rather than silently doing nothing.
+        toast.error('That message is no longer available');
+        return false;
+      }
+      const fetched = withDerivedStatuses(data.messages, myUserId);
+      // Keep 'failed' bubbles for the same reason fetchMessages does: the server
+      // has never seen them, so a wholesale replace would delete the user's
+      // unsent message.
+      const failedLocal = (useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES)
+        .filter(m => m.status === 'failed');
+      setMessages(conversationId, failedLocal.length ? [...fetched, ...failedLocal] : fetched);
+      setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
+      setHasNewerByConv(prev => ({ ...prev, [conversationId]: !!data.has_newer }));
+      loadedWindowsRef.current.add(conversationId);
+      pendingJumpRef.current = originalMsgId;
+      return true;
+    } catch (err) {
+      console.error('Failed to jump to message', err);
+      toast.error('Could not load that message');
+      return false;
+    } finally {
+      setJumpLoading(false);
+    }
+  }, [conversationId, scrollToLoaded, setMessages, myUserId]);
 
   /**
    * Banner list: everything currently pinned. Live store state wins (an optimistic
@@ -1167,9 +1253,16 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
             style={{ height: '100%' }}
             data={items}
             initialTopMostItemIndex={items.length - 1}
-            followOutput="smooth"
+            /* Do not auto-follow while the loaded window is mid-history: a
+               newly arrived message is appended to a window that is not adjacent
+               to it, and following would yank the user away from the message
+               they just jumped to. The "Jump to latest" button is the way back. */
+            followOutput={hasNewer ? false : 'smooth'}
             atBottomStateChange={(bottom) => {
-              setShowScrollDown(!bottom && items.length > 10);
+              // Also show it while sitting at the bottom of an around-window:
+              // there ARE newer messages, they just are not loaded, so the user
+              // needs a way back to the live end of the thread.
+              setShowScrollDown((!bottom && items.length > 10) || hasNewer);
             }}
             startReached={() => {
               if (hasMore) loadMore();
@@ -1191,8 +1284,21 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
             initial={{ opacity: 0, scale: 0.8 }}
             animate={{ opacity: 1, scale: 1 }}
             exit={{ opacity: 0, scale: 0.8 }}
-            onClick={() => virtuosoRef.current?.scrollToIndex({ index: 'LAST', behavior: 'smooth' })}
-            aria-label="Scroll to latest message"
+            onClick={() => {
+              // After an `around` jump the loaded window is mid-history, so
+              // scrolling to the last ROW would land on the newest LOADED
+              // message, not the newest message. Refetch the default window
+              // first; force, because the cache is that stale window.
+              if (hasNewer) {
+                fetchMessages({ force: true }).then(() => {
+                  virtuosoRef.current?.scrollToIndex({ index: 'LAST', behavior: 'auto' });
+                });
+                return;
+              }
+              virtuosoRef.current?.scrollToIndex({ index: 'LAST', behavior: 'smooth' });
+            }}
+            aria-label={hasNewer ? 'Jump to latest messages' : 'Scroll to latest message'}
+            data-testid="scroll-to-latest"
             className="absolute bottom-4 right-4 w-10 h-10 rounded-full bg-[#10B981] text-white flex items-center justify-center shadow-lg hover:bg-[#059669] transition-colors z-10"
           >
             <ChevronDown size={20} />

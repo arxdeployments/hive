@@ -11,7 +11,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, tuple_
 
 from app.core.deps import TenantContext, get_tenant
 from app.db.models import (
@@ -141,47 +141,134 @@ class EditMessageRequest(BaseModel):
 async def list_messages(
     conv_id: str,
     before: str | None = Query(default=None),
+    around: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=100),
     tenant: TenantContext = Depends(get_tenant),
 ):
+    """A window of history, oldest-first.
+
+    Three modes:
+      * default        — the newest `limit` messages.
+      * before=<id>    — the `limit` messages strictly older than that message.
+      * around=<id>    — a window CENTRED on that message.
+
+    `around` exists so a client can jump to a message it has not loaded: pinned
+    messages, reply targets and search hits can all be arbitrarily far back, and
+    with only `before` the only way to reach one was to page backwards until it
+    happened to appear.
+
+    Ordering and cursor comparisons use the (created_at, id) TUPLE, not created_at
+    alone. Bulk-inserted or same-instant messages share a timestamp, and a
+    scalar comparison there either drops rows or returns them twice at the seam
+    between the two halves of an `around` window.
+
+    `has_more` means older messages exist, `has_newer` means newer ones do.
+    has_newer is always false in the default and `before` modes, since both are
+    anchored to the newest end — so the shape stays backwards-compatible.
+    """
     conv_uuid = _conv_uuid(conv_id)
     conv = await tenant.require_membership(conv_uuid)
     _require_org_access(conv, tenant)
     db = tenant.db
 
-    stmt = (
-        select(Message)
-        .options(*enrich.MESSAGE_LOAD_OPTIONS)
-        .outerjoin(
-            MessageDeletion,
-            and_(
-                MessageDeletion.message_id == Message.id,
-                MessageDeletion.user_id == tenant.user.id,
-            ),
+    def base():
+        return (
+            select(Message)
+            .options(*enrich.MESSAGE_LOAD_OPTIONS)
+            .outerjoin(
+                MessageDeletion,
+                and_(
+                    MessageDeletion.message_id == Message.id,
+                    MessageDeletion.user_id == tenant.user.id,
+                ),
+            )
+            .where(
+                Message.conversation_id == conv_uuid,
+                # Delete-for-me rows are filtered out; tombstones (deleted_at set)
+                # ARE returned, serialized with is_deleted=true and blank content.
+                MessageDeletion.message_id.is_(None),
+            )
         )
-        .where(
-            Message.conversation_id == conv_uuid,
-            # Delete-for-me rows are filtered out; tombstones (deleted_at set)
-            # ARE returned, serialized with is_deleted=true and blank content.
-            MessageDeletion.message_id.is_(None),
-        )
-    )
-    before_uuid = parse_uuid(before)
-    if before_uuid is not None:
-        anchor = await db.get(Message, before_uuid)
-        # Invalid or foreign-conversation anchors are silently ignored (contract).
-        if anchor is not None and anchor.conversation_id == conv_uuid:
-            stmt = stmt.where(Message.created_at < anchor.created_at)
-    stmt = stmt.order_by(Message.created_at.desc()).limit(limit + 1)
 
-    rows = (await db.execute(stmt)).scalars().all()
-    has_more = len(rows) > limit
-    page = list(rows[:limit])
-    page.reverse()  # wire order is oldest-first
+    async def resolve_anchor(raw: str | None) -> Message | None:
+        parsed = parse_uuid(raw)
+        if parsed is None:
+            return None
+        found = await db.get(Message, parsed)
+        # Invalid or foreign-conversation anchors are silently ignored (contract).
+        if found is None or found.conversation_id != conv_uuid:
+            return None
+        return found
+
+    key = tuple_(Message.created_at, Message.id)
+
+    around_anchor = await resolve_anchor(around)
+    if around_anchor is not None:
+        anchor_key = (around_anchor.created_at, around_anchor.id)
+        # Split the budget around the anchor, which is itself included in the
+        # older half so it is always present in the result even at limit=1.
+        older_budget = (limit + 1) // 2
+        newer_budget = limit - older_budget
+
+        older_rows = (
+            await db.execute(
+                base()
+                .where(key <= anchor_key)
+                .order_by(Message.created_at.desc(), Message.id.desc())
+                .limit(older_budget + 1)
+            )
+        ).scalars().all()
+        has_more = len(older_rows) > older_budget
+        older = list(older_rows[:older_budget])
+        older.reverse()
+
+        newer: list[Message] = []
+        has_newer = False
+        if newer_budget > 0:
+            newer_rows = (
+                await db.execute(
+                    base()
+                    .where(key > anchor_key)
+                    .order_by(Message.created_at.asc(), Message.id.asc())
+                    .limit(newer_budget + 1)
+                )
+            ).scalars().all()
+            has_newer = len(newer_rows) > newer_budget
+            newer = list(newer_rows[:newer_budget])
+        else:
+            # limit=1 leaves no newer budget; report truthfully whether any exist.
+            has_newer = (
+                await db.scalar(
+                    select(Message.id)
+                    .where(Message.conversation_id == conv_uuid, key > anchor_key)
+                    .limit(1)
+                )
+            ) is not None
+
+        page = older + newer
+    else:
+        stmt = base()
+        before_anchor = await resolve_anchor(before)
+        if before_anchor is not None:
+            stmt = stmt.where(key < (before_anchor.created_at, before_anchor.id))
+        stmt = stmt.order_by(Message.created_at.desc(), Message.id.desc()).limit(limit + 1)
+
+        rows = (await db.execute(stmt)).scalars().all()
+        has_more = len(rows) > limit
+        page = list(rows[:limit])
+        page.reverse()  # wire order is oldest-first
+        has_newer = False
 
     participants = await _participants_of(db, conv_uuid)
     messages = await _serialize_page(db, page, user_id=tenant.user.id, participants=participants)
-    return {"messages": messages, "has_more": has_more}
+    return {
+        "messages": messages,
+        "has_more": has_more,
+        "has_newer": has_newer,
+        # Echoed so a client can tell "your anchor was resolved" from "it wasn't,
+        # here is the newest window instead" without diffing the payload.
+        "anchor_id": str(around_anchor.id) if around_anchor is not None else None,
+    }
 
 
 @router.post("/{conv_id}/messages")

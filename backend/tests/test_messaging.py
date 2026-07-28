@@ -219,3 +219,88 @@ async def test_group_lifecycle_roles_and_admin_only(client, two_orgs_with_users)
             json={"content": "member speaking", "type": "text"},
         )
         assert resp.status_code == 403
+
+
+async def test_messages_around_cursor_centres_window(client, two_orgs_with_users):
+    """`around=<id>` returns a window centred on a message, not just the tail.
+
+    This is what makes "jump to a pinned/replied/search-hit message" possible at
+    all: with only `before`, reaching an old message meant paging backwards until
+    it happened to appear.
+    """
+    users = two_orgs_with_users
+    await login(client, "alice@a.com")
+    conv = await _direct(client, users["bob"].id)
+
+    sent = [await _send(client, conv, f"m{i:02d}") for i in range(40)]
+    target = sent[10]
+
+    # Default window is the newest tail, and does NOT reach back to m10.
+    resp = await client.get(f"/api/conversations/{conv}/messages", params={"limit": 10})
+    body = resp.json()
+    assert body["has_more"] is True
+    assert body["has_newer"] is False, "the default window is anchored to the newest end"
+    assert body["anchor_id"] is None
+    assert target["_id"] not in [m["_id"] for m in body["messages"]]
+
+    # around= centres on the target and reports both directions.
+    resp = await client.get(
+        f"/api/conversations/{conv}/messages", params={"around": target["_id"], "limit": 10}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    ids = [m["_id"] for m in body["messages"]]
+    assert target["_id"] in ids, "the anchor must be inside its own window"
+    assert len(ids) == 10
+    assert body["anchor_id"] == target["_id"]
+    assert body["has_more"] is True, "m00..m09 are older"
+    assert body["has_newer"] is True, "m12..m39 are newer"
+
+    # Oldest-first, no duplicates, and contiguous around the anchor.
+    assert ids == sorted(set(ids), key=ids.index), "no duplicate rows"
+    contents = [m["content"] for m in body["messages"]]
+    assert contents == sorted(contents), "wire order is oldest-first"
+    assert "m10" in contents
+    # 10 slots split 5 older-inclusive / 5 newer => m06..m15.
+    assert contents == [f"m{i:02d}" for i in range(6, 16)], contents
+
+
+async def test_messages_around_edges_and_bad_anchor(client, two_orgs_with_users):
+    users = two_orgs_with_users
+    await login(client, "alice@a.com")
+    conv = await _direct(client, users["bob"].id)
+    sent = [await _send(client, conv, f"e{i}") for i in range(5)]
+
+    # Anchor on the very first real message: nothing older except the system row.
+    resp = await client.get(
+        f"/api/conversations/{conv}/messages", params={"around": sent[0]["_id"], "limit": 50}
+    )
+    body = resp.json()
+    assert body["has_newer"] is False, "the whole conversation fits in one window"
+    assert sent[0]["_id"] in [m["_id"] for m in body["messages"]]
+
+    # Anchor on the newest message: nothing newer.
+    resp = await client.get(
+        f"/api/conversations/{conv}/messages", params={"around": sent[-1]["_id"], "limit": 3}
+    )
+    body = resp.json()
+    assert body["has_newer"] is False
+    assert sent[-1]["_id"] in [m["_id"] for m in body["messages"]]
+
+    # limit=1 must still return the anchor itself.
+    resp = await client.get(
+        f"/api/conversations/{conv}/messages", params={"around": sent[2]["_id"], "limit": 1}
+    )
+    body = resp.json()
+    assert [m["_id"] for m in body["messages"]] == [sent[2]["_id"]]
+    assert body["has_newer"] is True and body["has_more"] is True
+
+    # A garbage or foreign anchor is ignored, not an error — the caller gets the
+    # newest window and anchor_id=null tells it the anchor did not resolve.
+    for bad in ("not-a-uuid", "00000000-0000-0000-0000-000000000000"):
+        resp = await client.get(
+            f"/api/conversations/{conv}/messages", params={"around": bad, "limit": 3}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["anchor_id"] is None
+        assert resp.json()["has_newer"] is False

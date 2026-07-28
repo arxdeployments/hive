@@ -119,10 +119,17 @@ const useChatStore = create((set) => ({
 
   prependMessages: (convId, olderMessages) => set((state) => {
     const existing = state.messages[convId] || EMPTY_MESSAGES;
+    // Dedupe against what is already loaded. The `before` cursor is exclusive so
+    // pages should not overlap, but an `around` window followed by a backwards
+    // page makes overlap possible, and a duplicate _id renders the row twice and
+    // breaks Virtuoso's keying.
+    const seen = new Set(existing.map(m => m._id));
+    const fresh = olderMessages.filter(m => !seen.has(m._id));
+    if (fresh.length === 0) return state;
     return {
       messages: {
         ...state.messages,
-        [convId]: [...olderMessages, ...existing]
+        [convId]: [...fresh, ...existing]
       }
     };
   }),
