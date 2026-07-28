@@ -44,6 +44,14 @@ zip -r -q "$ARCHIVE" "$BASE" \
   -x "$BASE/.env" -x "$BASE/**/.env" -x "$BASE/**/.env.local" \
   -x "$BASE/data/*"
 
+# The deploy guide and the audit are what a recipient needs first, and nobody
+# finds them three directories down. Copy them to the archive root as well —
+# `zip -j` stores them with no path. The originals stay in rxhive/docs/ so the
+# repo itself is unchanged and nothing goes stale in only one place.
+zip -j -q "$ARCHIVE" \
+  "$REPO_ROOT/docs/AWS_DEPLOY.md" \
+  "$REPO_ROOT/docs/AUDIT_FINDINGS.md"
+
 echo "wrote $ARCHIVE"
 
 # Fail loudly rather than silently shipping a secret or a 300MB dependency tree.
