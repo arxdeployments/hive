@@ -34,8 +34,12 @@ export const OfflineBanner = () => {
               : 'bg-[#10B981]/15 text-[#10B981]'
           }`}
         >
+          {/* The offline copy deliberately does NOT promise "will be sent when
+              you reconnect": nothing queues an offline send any more. A message
+              typed with the network down fails and stays on screen as a
+              retryable bubble. */}
           {isOffline ? (
-            <><WifiOff size={14} /> You are offline. Messages will be sent when you reconnect.</>
+            <><WifiOff size={14} /> You are offline. Sending will fail until you reconnect.</>
           ) : (
             <><Wifi size={14} /> Back online</>
           )}

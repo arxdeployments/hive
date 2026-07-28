@@ -204,7 +204,26 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       });
       // Loaded messages have no `status` — derive the ticks from the read_by /
       // delivered_to receipts the API sends, or every own message reads as unread.
-      setMessages(conversationId, withDerivedStatuses(data.messages, myUserId));
+      const fetched = withDerivedStatuses(data.messages, myUserId);
+
+      // Carry over 'failed' bubbles, which the server has never seen.
+      //
+      // A text send can now fail on BOTH transports — socket not open AND the
+      // HTTP fallback rejected, i.e. the whole network is down — and when it
+      // does, the optimistic bubble is the only record of it: nothing queues the
+      // frame for replay any more. This refetch is force-run the moment the
+      // socket reconnects, and setMessages replaces the array wholesale, so
+      // without this the user's message was deleted on reconnect with no bubble,
+      // no error and no way to retry.
+      //
+      // These cannot be auto-reconciled: the GET carries no temp_id (the API
+      // only echoes it on the send response), so they stay until the user
+      // retries or reloads. Scoped to 'failed' only, deliberately NOT
+      // 'sending' — there is no ack timeout anywhere, so a preserved 'sending'
+      // bubble would hang for ever.
+      const failedLocal = (useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES)
+        .filter(m => m.status === 'failed');
+      setMessages(conversationId, failedLocal.length ? [...fetched, ...failedLocal] : fetched);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
       loadedWindowsRef.current.add(conversationId);
     } catch (err) {
@@ -359,13 +378,14 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     // Text is delivered over the WebSocket by whoever called us; this fallback
     // POSTs it while the socket is down.
     //
-    // CAVEAT, pre-existing and NOT addressed here: wsClient.send() QUEUES the
-    // frame rather than dropping it (services/websocket.js:533-538) and _onOpen
-    // replays the whole queue on reconnect (:78-81), so a composer text send
-    // made while offline still lands twice. The cure is to gate
-    // MessageComposer.jsx:139 on wsConnected the way handleRetry below does —
-    // deliberately left for its own change, since it alters the text path and
-    // needs reconnect testing.
+    // The condition is wsClient.isOpen(), NOT the wsConnected store value, and
+    // that matters. Every caller that might also send over the socket checks
+    // the same isOpen() inside this same synchronous call stack — no await
+    // separates them, so readyState cannot change in between and the two can
+    // never disagree. Two independent React reads could: a stale-true pair
+    // duplicates the message, a stale-false pair loses it. wsConnected is also
+    // false for the whole CONNECTING window, where a queued frame would later
+    // replay on top of this POST.
     //
     // Media is deliberately NOT delivered here, at any connection state. Every
     // media path POSTs the message itself, because it has to attach the
@@ -375,7 +395,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     // path does not dedupe on temp_id (services/messaging.py only echoes it
     // back), and _claim_upload does not reject an already-claimed upload, so
     // both POSTs persisted as separate messages sharing one storage key.
-    if (!wsConnected && msgType === 'text') {
+    if (msgType === 'text' && !wsClient.isOpen()) {
       try {
         const { data } = await client.post(`/api/conversations/${conversationId}/messages`, {
           content,
@@ -398,7 +418,12 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
 
     // Clear reply state after sending (only when driven by the composer, not a retry override)
     if (replyOverride === undefined) setReplyTo(null);
-  }, [conversationId, myUserId, myName, wsConnected, addOptimisticMessage, bumpConversation]);
+    // No wsConnected dependency: the transport decision now reads the live
+    // socket via wsClient.isOpen(), so this keeps a stable identity across
+    // connect/disconnect. It is handed to a memoised composer, which previously
+    // re-rendered — and re-rendered the message list with it — on every socket
+    // state change.
+  }, [conversationId, myUserId, myName, addOptimisticMessage, bumpConversation]);
 
   // Retry a failed send: drop the failed bubble and re-send down the same path as handleSend.
   const handleRetry = useCallback((failedMsg) => {
@@ -421,9 +446,11 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     // Deliver over whichever transport owns this message type, mirroring the
     // split in MessageComposer.
     if (msgType === 'text') {
-      // Only when connected: handleSend's HTTP fallback above covers the
-      // disconnected case, and doing both would double-send.
-      if (wsConnected) {
+      // Only when the socket is open: handleSend's HTTP fallback above covers
+      // the closed case, and doing both would double-send. Same isOpen() call
+      // handleSend just made, in the same synchronous stack, so the two
+      // decisions cannot diverge.
+      if (wsClient.isOpen()) {
         wsClient.sendMessage(conversationId, failedMsg.content, newTempId, replyId);
       }
     } else {
@@ -451,7 +478,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         useChatStore.getState().replaceOptimisticMessage(conversationId, newTempId, { status: 'failed' });
       });
     }
-  }, [conversationId, wsConnected, handleSend]);
+  }, [conversationId, handleSend]);
 
   // ── Multi-select ──────────────────────────────────────────────────────────
   const enterSelection = useCallback((seedMessage) => {

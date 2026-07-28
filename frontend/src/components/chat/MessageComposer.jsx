@@ -139,10 +139,22 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     const body = text.trim();
     const replyId = replyTo?._id || null;
     stopTyping();
-    // Optimistic bubble (ChatPanel clears replyTo after this).
+    // Optimistic bubble (ChatPanel clears replyTo after this). ChatPanel also
+    // owns the HTTP fallback, which it applies when the socket is down.
     onSend(body, tempId);
-    // Deliver over WS, forwarding reply_to so threaded replies actually persist.
-    wsClient.sendMessage(conversationId, body, tempId, replyId);
+    // Deliver over WS only while the socket is genuinely open, forwarding
+    // reply_to so threaded replies actually persist.
+    //
+    // The guard is the fix for a double-send: this used to call sendMessage
+    // unconditionally, and wsClient.send() QUEUES a frame written to a closed
+    // socket, which _onOpen then replays on reconnect. Offline, that meant
+    // ChatPanel's HTTP fallback created the message and the replayed frame
+    // created it again. Both this check and ChatPanel's read wsClient.isOpen()
+    // in the same synchronous call stack, so exactly one transport owns
+    // any given send.
+    if (wsClient.isOpen()) {
+      wsClient.sendMessage(conversationId, body, tempId, replyId);
+    }
     setText('');
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
   };

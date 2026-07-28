@@ -547,8 +547,36 @@ class RxHiveWebSocket {
     }
   }
 
+  // True only if a frame written right now would actually leave the browser.
+  //
+  // This is the live socket, deliberately NOT the React store's wsConnected
+  // copy of it. The store lags the socket (it is set from the open/close
+  // handlers, and is false for the whole CONNECTING window), and two components
+  // reading two React values can disagree about a single send — which would
+  // either duplicate the message or drop it entirely. Both send paths call this
+  // instead, inside the same synchronous call stack, so they always agree.
+  isOpen() {
+    return !!this.ws && this.ws.readyState === WebSocket.OPEN;
+  }
+
+  // Chat messages are the ONE frame type that must never be queued.
+  //
+  // Every other frame below (typing, read receipts, presence) is harmless to
+  // replay on reconnect. A message is not: the sender falls back to POSTing it
+  // over HTTP whenever the socket is down, so a frame parked in messageQueue
+  // and replayed by _onOpen creates the very same message a second time — the
+  // API does not dedupe on temp_id. That was a real double-send on every text
+  // message typed while offline.
+  //
+  // Callers gate on isOpen(); refusing to queue here makes the invariant
+  // impossible to break by accident from a future call site. Returns whether
+  // the frame was handed to the socket.
   sendMessage(conversationId, content, tempId, replyTo = null) {
-    this.send({
+    if (!this.isOpen()) {
+      console.warn('[WS] sendMessage called while the socket is not open — dropped; the HTTP fallback owns this message');
+      return false;
+    }
+    this._rawSend({
       type: 'message',
       conversation_id: conversationId,
       content,
@@ -556,6 +584,7 @@ class RxHiveWebSocket {
       temp_id: tempId,
       reply_to: replyTo
     });
+    return true;
   }
 
   sendTypingStart(conversationId) {
