@@ -13,6 +13,34 @@ const client = axios.create({
   },
 });
 
+// Request interceptor — never let the JSON default above ride on a FormData body.
+//
+// axios 1.x transformRequest does:
+//     return hasJSONContentType ? JSON.stringify(formDataToJSON(data)) : data;
+// (axios 1.18.1, dist line 1512). Because this instance sets Content-Type:
+// application/json as a DEFAULT ON EVERY REQUEST, any FormData body was being
+// serialised into JSON before it left the browser — the File never became a
+// multipart part, so FastAPI's File(None) resolved to None and /api/upload
+// answered 400 "No file provided" for every attachment and every avatar.
+//
+// Clearing the header here (interceptors run before transformRequest) makes
+// hasJSONContentType false, so the FormData passes through untouched; the xhr
+// adapter then sets multipart/form-data itself, with the boundary that only the
+// browser can generate. Doing it centrally means a new upload call site cannot
+// reintroduce the bug by forgetting a per-request header override.
+client.interceptors.request.use((config) => {
+  if (typeof FormData !== 'undefined' && config.data instanceof FormData) {
+    // config.headers is an AxiosHeaders instance in axios 1.x (case-insensitive
+    // .delete); the plain-object branch is a guard for older/mocked shapes.
+    if (typeof config.headers?.delete === 'function') {
+      config.headers.delete('Content-Type');
+    } else if (config.headers) {
+      delete config.headers['Content-Type'];
+    }
+  }
+  return config;
+});
+
 // Response interceptor — on 401, refresh the cookie session once (single-flight)
 // and replay the failed requests.
 let isRefreshing = false;

@@ -17,6 +17,12 @@ const VIDEO_ACCEPT = '.mp4,.mov,.webm,.m4v';
 const AUDIO_ACCEPT = '.mp3,.m4a,.wav,.ogg,.aac';
 const DOC_ACCEPT = '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip';
 
+// How many images the preview strip will hold at once. Each staged image holds
+// an object URL and a decoded thumbnail, so this is a memory bound, not a
+// server one — videos and documents are not staged and have no such cap.
+// Anything beyond this is reported to the user rather than dropped in silence.
+const MAX_PREVIEW_IMAGES = 10;
+
 // Map the upload service's file_type onto the message `type` the API/bubbles expect.
 const mapMessageType = (fileType) => {
   switch (fileType) {
@@ -210,6 +216,10 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   };
 
   // Send a batch of non-image files (video / audio / documents) directly.
+  //
+  // Each file is awaited in turn but failures are caught PER FILE: one rejected
+  // upload used to abort the whole loop from here, so picking four videos and
+  // having the second fail silently discarded the third and fourth.
   const sendFilesDirectly = async (files) => {
     if (!conversationId || files.length === 0) return;
     const valid = files.filter(validateSize);
@@ -218,34 +228,67 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     setUploading(true);
     // Attach the reply only to the first file in the batch.
     const replyId = replyTo?._id || null;
+    let failed = 0;
     try {
       for (let i = 0; i < valid.length; i++) {
-        await sendMediaFile(valid[i], i === 0 ? replyId : null);
+        try {
+          await sendMediaFile(valid[i], i === 0 ? replyId : null);
+        } catch (err) {
+          failed += 1;
+          toast.error(
+            `${valid[i].name || 'File'}: ${err?.response?.data?.detail || err.message || 'Upload failed'}`
+          );
+        }
       }
-    } catch (err) {
-      toast.error(err?.response?.data?.detail || err.message || 'Upload failed');
     } finally {
       setUploading(false);
       setUploadProgress(0);
     }
+    if (failed > 0 && valid.length > failed) {
+      toast.error(`${failed} of ${valid.length} files failed to send`);
+    }
+  };
+
+  // Stage images into the preview strip, enforcing the cap visibly. Shared by
+  // the picker, drag-and-drop and paste so all three behave identically.
+  const stageImages = (images) => {
+    const sized = images.filter(validateSize);
+    if (sized.length === 0) return;
+    const staged = sized.slice(0, MAX_PREVIEW_IMAGES);
+    if (sized.length > staged.length) {
+      toast.error(
+        `Only ${MAX_PREVIEW_IMAGES} images can be attached at once — ${sized.length - staged.length} were not added`
+      );
+    }
+    setPreviewImages(staged.map(f => ({
+      file: f,
+      url: URL.createObjectURL(f),
+      // Clipboard images often arrive with no filename at all.
+      name: f.name || 'Pasted image',
+    })));
   };
 
   // ── Image selection (preview strip) ───────────────────────────────────────
+  //
+  // The picker accepts video as well as images, so one selection can mix them.
+  // Images are staged for captioning; anything else is batch-sent immediately,
+  // matching what drag-and-drop already did. Previously non-images chosen here
+  // were filtered out and thrown away without a word.
   const handleImageSelect = (e) => {
     const files = Array.from(e.target.files || []);
     setShowAttachMenu(false);
     e.target.value = '';
     if (files.length === 0) return;
-    const images = files.filter(f => (f.type || '').startsWith('image/'));
-    if (images.length === 0) { toast.error('No valid images selected'); return; }
-    const valid = images.filter(validateSize).slice(0, 5);
-    if (valid.length === 0) return;
 
-    setPreviewImages(valid.map(f => ({
-      file: f,
-      url: URL.createObjectURL(f),
-      name: f.name,
-    })));
+    const images = files.filter(f => (f.type || '').startsWith('image/'));
+    const others = files.filter(f => !(f.type || '').startsWith('image/'));
+
+    if (images.length === 0 && others.length === 0) {
+      toast.error('No valid files selected');
+      return;
+    }
+    if (images.length > 0) stageImages(images);
+    if (others.length > 0) sendFilesDirectly(others);
   };
 
   // ── Media (video / audio) + Document selection — sent directly ────────────
@@ -258,28 +301,48 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   };
 
   // ── Send preview images ───────────────────────────────────────────────────
+  // Failures are caught per image, for the same reason as sendFilesDirectly: a
+  // single bad file used to abort the loop, so the remaining images were never
+  // sent AND the strip was never cleared, stranding them with no way to retry
+  // except removing the offender by hand. Only the images that actually failed
+  // stay staged.
   const handleSendImages = async () => {
     if (previewImages.length === 0) return;
     setUploading(true);
     const replyId = replyTo?._id || null;
+    const caption = previewCaption.trim();
+    const stillFailed = [];
     try {
       for (let i = 0; i < previewImages.length; i++) {
-        // Shared with the direct-send path so the optimistic bubble is reconciled
-        // with the created message in exactly one place.
-        await sendMediaFile(
-          previewImages[i].file,
-          i === 0 ? replyId : null,
-          i === 0 ? previewCaption.trim() : ''
-        );
+        try {
+          // Shared with the direct-send path so the optimistic bubble is reconciled
+          // with the created message in exactly one place.
+          await sendMediaFile(
+            previewImages[i].file,
+            i === 0 ? replyId : null,
+            i === 0 ? caption : ''
+          );
+          // Sent successfully — release the preview's object URL.
+          URL.revokeObjectURL(previewImages[i].url);
+        } catch (err) {
+          stillFailed.push(previewImages[i]);
+          toast.error(
+            `${previewImages[i].name || 'Image'}: ${err?.response?.data?.detail || err.message || 'Upload failed'}`
+          );
+        }
       }
-      setPreviewImages([]);
-      setPreviewCaption('');
-      toast.success(previewImages.length > 1 ? 'Images sent' : 'Image sent');
-    } catch (err) {
-      toast.error(err?.response?.data?.detail || err.message || 'Upload failed');
     } finally {
       setUploading(false);
       setUploadProgress(0);
+    }
+
+    const sent = previewImages.length - stillFailed.length;
+    setPreviewImages(stillFailed);
+    if (stillFailed.length === 0) {
+      setPreviewCaption('');
+      toast.success(sent > 1 ? 'Images sent' : 'Image sent');
+    } else if (sent > 0) {
+      toast.error(`${stillFailed.length} of ${previewImages.length} images failed — still attached`);
     }
   };
 
@@ -296,12 +359,8 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     const images = files.filter(f => (f.type || '').startsWith('image/'));
     const others = files.filter(f => !(f.type || '').startsWith('image/'));
 
-    if (images.length > 0) {
-      const valid = images.filter(validateSize).slice(0, 5);
-      if (valid.length > 0) {
-        setPreviewImages(valid.map(f => ({ file: f, url: URL.createObjectURL(f), name: f.name })));
-      }
-    }
+    // Same staging rules as the picker, including the visible cap.
+    if (images.length > 0) stageImages(images);
     if (others.length > 0) {
       // Video / audio / documents send straight through.
       sendFilesDirectly(others);
@@ -316,10 +375,9 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     if (imageItems.length > 0) {
       e.preventDefault();
       const files = imageItems.map(item => item.getAsFile()).filter(Boolean);
-      const valid = files.filter(validateSize);
-      if (valid.length > 0) {
-        setPreviewImages(valid.map(f => ({ file: f, url: URL.createObjectURL(f), name: f.name || 'Pasted image' })));
-      }
+      // Through the shared stager so paste obeys the same cap, and reports
+      // going over it, exactly as the picker and drag-and-drop do.
+      stageImages(files);
     }
   };
 
@@ -486,7 +544,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                       data-testid="attach-image-btn"
                       className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-[#F5F5F5] hover:bg-[#2D2D2D] transition-colors"
                     >
-                      <Image size={16} className="text-[#10B981]" /> Image
+                      <Image size={16} className="text-[#10B981]" /> Photos &amp; Videos
                     </button>
                     <button
                       onClick={() => mediaInputRef.current?.click()}
@@ -509,7 +567,10 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
           </div>
 
           {/* Hidden file inputs */}
-          <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden" onChange={handleImageSelect} />
+          {/* Photos & videos: one picker for both so a mixed batch is a single
+              selection. handleImageSelect stages the images and batch-sends the
+              rest. */}
+          <input ref={fileInputRef} type="file" accept={`image/*,video/*,${VIDEO_ACCEPT}`} multiple className="hidden" onChange={handleImageSelect} />
           <input ref={mediaInputRef} type="file" accept={`video/*,audio/*,${VIDEO_ACCEPT},${AUDIO_ACCEPT}`} multiple className="hidden" onChange={handleDirectSelect} />
           <input ref={docInputRef} type="file" accept={`${DOC_ACCEPT},${VIDEO_ACCEPT},${AUDIO_ACCEPT}`} multiple className="hidden" onChange={handleDirectSelect} />
 
