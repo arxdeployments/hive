@@ -262,6 +262,10 @@ class MessageAttachment(Base):
     width: Mapped[int | None]
     height: Mapped[int | None]
     duration_seconds: Mapped[float | None]
+    # PDF page count, so a document bubble can say "13 pages" and the viewer
+    # knows how many pages to request. NULL means "not a PDF, or uploaded before
+    # previews existed" — never coerce it to 0.
+    page_count: Mapped[int | None]
     created_at: Mapped[dt.datetime] = _now()
 
     message: Mapped[Message] = relationship(back_populates="attachments")
@@ -471,6 +475,9 @@ class Upload(Base):
     mime_type: Mapped[str] = mapped_column(String(150))
     file_type: Mapped[str] = mapped_column(String(20))  # image|video|audio|document
     file_size: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Carried from upload to MessageAttachment when the upload is claimed, so a
+    # PDF's page count survives the staging hop. NULL for everything else.
+    page_count: Mapped[int | None]
     claimed: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[dt.datetime] = _now()
 

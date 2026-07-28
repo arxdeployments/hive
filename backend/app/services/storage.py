@@ -12,6 +12,7 @@ from functools import lru_cache
 from urllib.parse import urlsplit
 
 import anyio
+import pypdfium2 as pdfium
 from minio import Minio
 from minio.credentials import IamAwsProvider
 from PIL import Image
@@ -174,6 +175,120 @@ async def make_thumbnail(data: bytes) -> bytes | None:
             return None
 
     return await anyio.to_thread.run_sync(_thumb)
+
+
+# --- PDF rasterisation -------------------------------------------------------
+#
+# Renders PDF pages to JPEG server-side, which is what lets a document bubble
+# show page 1 and the viewer show the whole file. Rendering on the CLIENT was
+# rejected: a virtualised scrollback of ten 20MB PDFs would download 200MB just
+# to draw ten thumbnails.
+
+PDF_THUMB_PX = 400    # page-1 preview inside the bubble
+PDF_PAGE_PX = 1600    # long edge for full-viewer pages
+# Hard clamp. The page count comes out of a parser fed untrusted input, so a
+# hostile file reporting a huge count would otherwise turn the count itself into
+# an attack on both the DOM and the per-page endpoint.
+PDF_MAX_PAGES = 2000
+PDF_WINDOW = 10       # pages rendered per on-demand pass
+
+# PDFium is NOT thread-safe and pypdfium2 ships no lock of its own. anyio's
+# default thread limiter allows 40, so without this two renders could overlap.
+# Same idiom as services/push.py's send limiter.
+_PDF_LIMITER = anyio.CapacityLimiter(1)
+
+
+def _render_pdf_page(page, long_px: int) -> bytes:
+    w_pt, h_pt = page.get_size()
+    # Scale is derived from the page box, so the OUTPUT raster is bounded by
+    # construction however large the page claims to be. This is the
+    # enormous-page guard — Pillow's MAX_IMAGE_PIXELS does not apply here,
+    # because nothing is being decoded from an image file.
+    scale = min(long_px / max(w_pt, 1.0), long_px / max(h_pt, 1.0))
+    # draw_annots=False is deliberate for a clinical product: comments, stamps
+    # and redaction overlays stay out of the rendered page.
+    bitmap = page.render(scale=scale, draw_annots=False, may_draw_forms=False)
+    img = bitmap.to_pil().convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=80)
+    return buf.getvalue()
+
+
+async def make_pdf_preview(data: bytes) -> tuple[bytes | None, int | None]:
+    """(JPEG of page 1, page count). (None, None) on any parse failure —
+    encrypted, truncated and plain-garbage files all land there."""
+
+    def _go() -> tuple[bytes | None, int | None]:
+        pdf = page = None
+        try:
+            pdf = pdfium.PdfDocument(data)
+            n = min(len(pdf), PDF_MAX_PAGES)
+            page = pdf[0]
+            return _render_pdf_page(page, PDF_THUMB_PX), n
+        except Exception:
+            return None, None
+        finally:
+            if page is not None:
+                page.close()
+            if pdf is not None:
+                pdf.close()
+
+    return await anyio.to_thread.run_sync(_go, limiter=_PDF_LIMITER)
+
+
+async def render_pdf_window(data: bytes, start: int) -> dict[int, bytes]:
+    """1-indexed pages start..start+PDF_WINDOW-1 as JPEGs; {} on failure.
+
+    A window rather than one page at a time: opening the document dominates the
+    cost, so rendering ten pages per open is far cheaper than ten opens.
+    """
+
+    def _go() -> dict[int, bytes]:
+        out: dict[int, bytes] = {}
+        pdf = None
+        try:
+            pdf = pdfium.PdfDocument(data)
+            n = min(len(pdf), PDF_MAX_PAGES)
+            for i in range(start, min(start + PDF_WINDOW, n + 1)):
+                page = pdf[i - 1]
+                try:
+                    out[i] = _render_pdf_page(page, PDF_PAGE_PX)
+                finally:
+                    page.close()
+            return out
+        except Exception:
+            # Return whatever rendered before the failure rather than nothing.
+            return out
+        finally:
+            if pdf is not None:
+                pdf.close()
+
+    return await anyio.to_thread.run_sync(_go, limiter=_PDF_LIMITER)
+
+
+async def get_object(key: str) -> bytes:
+    """Fetch an object's bytes. Used to re-read a PDF for page rendering."""
+
+    def _get() -> bytes:
+        resp = _client().get_object(get_settings().s3_bucket, key)
+        try:
+            return resp.read()
+        finally:
+            resp.close()
+            resp.release_conn()
+
+    return await anyio.to_thread.run_sync(_get)
+
+
+async def object_exists(key: str) -> bool:
+    def _stat() -> bool:
+        try:
+            _client().stat_object(get_settings().s3_bucket, key)
+            return True
+        except Exception:
+            return False
+
+    return await anyio.to_thread.run_sync(_stat)
 
 
 async def presign_get(key: str, *, filename: str | None = None, inline: bool = True) -> str:

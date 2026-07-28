@@ -128,12 +128,19 @@ async def upload_file(
     key = storage.new_storage_key(user.org_id, ext)
     await storage.put_object(key, payload, content_type)
 
+    # Branch on CONTENT TYPE, not file_type: ".pdf" classifies as "document", and
+    # file_type is a key into size_limit_for / _TOO_LARGE_MESSAGES, so inventing a
+    # "pdf" file_type would KeyError there.
     thumbnail_key = None
+    page_count = None
+    thumb = None
     if file_type == "image":
         thumb = await storage.make_thumbnail(payload)
-        if thumb is not None:
-            thumbnail_key = f"{key}_thumb.jpg"
-            await storage.put_object(thumbnail_key, thumb, "image/jpeg")
+    elif content_type == "application/pdf":
+        thumb, page_count = await storage.make_pdf_preview(payload)
+    if thumb is not None:
+        thumbnail_key = f"{key}_thumb.jpg"
+        await storage.put_object(thumbnail_key, thumb, "image/jpeg")
 
     upload = Upload(
         uploader_id=user.id,
@@ -144,6 +151,7 @@ async def upload_file(
         mime_type=content_type,
         file_type=file_type,
         file_size=len(payload),
+        page_count=page_count,
     )
     db.add(upload)
     await db.commit()
@@ -160,6 +168,13 @@ async def upload_file(
     if file_type == "image":
         # Contract: thumbnail_url falls back to the file itself if thumbnailing failed.
         response["thumbnail_url"] = f"{file_url}/thumb" if thumbnail_key else file_url
+    elif content_type == "application/pdf":
+        # No fallback to the file itself here: the PDF bytes are not an image, so
+        # pointing thumbnail_url at them would render a broken tile. Absent means
+        # "no preview", which the bubble handles by keeping the icon.
+        if thumbnail_key:
+            response["thumbnail_url"] = f"{file_url}/thumb"
+        response["page_count"] = page_count
     return response
 
 
@@ -241,6 +256,45 @@ async def serve_attachment_thumb(
     if not attachment.thumbnail_key:
         raise _not_found()
     url = await storage.presign_get(attachment.thumbnail_key, inline=True)
+    return RedirectResponse(url, status_code=307)
+
+
+@router.get("/media/{attachment_id}/page/{page_no}")
+async def serve_pdf_page(
+    attachment_id: str,
+    page_no: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """One rendered page of a PDF attachment, as a JPEG.
+
+    Rendered on demand and cached back into object storage, so the first reader
+    of a page pays for it and everyone after gets a presigned redirect. Pages are
+    produced in windows (storage.PDF_WINDOW) because opening the document
+    dominates the cost.
+
+    Membership is enforced by _member_attachment exactly as for the file itself,
+    so this cannot become a way to read a PDF you were never sent.
+    """
+    attachment = await _member_attachment(db, attachment_id, user)
+    if attachment.mime_type != "application/pdf":
+        raise _not_found()
+    # page_count is parser output over untrusted input, so clamp it here as well
+    # as at render time — the count itself must never become the attack.
+    total = min(attachment.page_count or 0, storage.PDF_MAX_PAGES)
+    if page_no < 1 or page_no > total:
+        raise _not_found()
+
+    key = f"{attachment.storage_key}_p{page_no}.jpg"
+    if not await storage.object_exists(key):
+        data = await storage.get_object(attachment.storage_key)
+        pages = await storage.render_pdf_window(data, page_no)
+        if page_no not in pages:
+            raise _not_found()
+        for n, jpeg in pages.items():
+            await storage.put_object(f"{attachment.storage_key}_p{n}.jpg", jpeg, "image/jpeg")
+
+    url = await storage.presign_get(key, inline=True)
     return RedirectResponse(url, status_code=307)
 
 

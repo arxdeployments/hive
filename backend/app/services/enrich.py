@@ -239,6 +239,7 @@ def _attachment_fields(attachments: list[MessageAttachment]) -> dict:
         "file_size": None,
         "filename": None,
         "duration": None,
+        "page_count": None,
         "attachments": [],
     }
     for a in attachments:
@@ -253,6 +254,9 @@ def _attachment_fields(attachments: list[MessageAttachment]) -> dict:
             # bubble can render "0:34" without an authenticated /api/media
             # redirect plus a presigned S3 GET just to read the container.
             "duration": a.duration_seconds,
+            # PDF page count. NULL/absent means "not a PDF, or predates
+            # previews" — the bubble falls back to the plain icon.
+            "page_count": a.page_count,
         }
         out["attachments"].append(item)
     if attachments:
@@ -262,6 +266,7 @@ def _attachment_fields(attachments: list[MessageAttachment]) -> dict:
         out["file_size"] = first.file_size
         out["filename"] = first.filename
         out["duration"] = first.duration_seconds
+        out["page_count"] = first.page_count
     return out
 
 

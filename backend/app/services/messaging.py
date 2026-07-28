@@ -166,6 +166,8 @@ async def send_message(
                 # Only meaningful for audio/video, and only the first attachment
                 # can carry it — a voice note is always a single file.
                 duration_seconds=duration if not seen_keys or len(seen_keys) == 1 else None,
+                # PDF page count, carried across the upload -> attachment hop.
+                page_count=upload.page_count,
             )
         )
 
@@ -580,6 +582,9 @@ async def forward_message(
                     # Carried, or a forwarded voice note loses its length and the
                     # bubble falls back to reading it out of the file.
                     duration_seconds=a.duration_seconds,
+                    # Or a forwarded PDF loses its preview and page count, the
+                    # same way a forwarded voice note would lose its duration.
+                    page_count=a.page_count,
                 )
             )
         conv.last_message_at = now
