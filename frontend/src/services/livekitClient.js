@@ -279,6 +279,25 @@ class LiveKitClient {
     }
   }
 
+  /**
+   * Unblock audio playback after the browser refused it for want of a user
+   * gesture. LiveKit requires this be called from within a gesture handler —
+   * CallAudioSink drives it from a document-level pointerdown/keydown.
+   *
+   * Deliberately swallows everything: it is called speculatively on gestures
+   * that may have nothing to do with a call, and there is no room (or no
+   * blocked audio) most of the time.
+   */
+  startAudio() {
+    if (!this.room || typeof this.room.startAudio !== 'function') return;
+    try {
+      const p = this.room.startAudio();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch {
+      /* nothing actionable — the retry loop in CallAudioSink covers it */
+    }
+  }
+
   async setMicEnabled(enabled) {
     if (!this.room) return;
     await this.room.localParticipant.setMicrophoneEnabled(enabled);

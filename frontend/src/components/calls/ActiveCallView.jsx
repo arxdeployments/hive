@@ -39,7 +39,7 @@ const localProfile = () => {
 };
 
 /* Renders only the video tracks of a MediaStream; audio is handled separately
-   by <RemoteAudio> so a stream is never played through two elements at once. */
+   by CallAudioSink so a stream is never played through two elements at once. */
 const StreamVideo = ({ stream, muted = false, className }) => {
   const videoRef = useRef(null);
   useEffect(() => {
@@ -50,26 +50,13 @@ const StreamVideo = ({ stream, muted = false, className }) => {
   return <video ref={videoRef} autoPlay playsInline muted={muted} className={className} />;
 };
 
-/* Hidden audio sink for a remote participant so their voice is always heard,
-   even when their tile shows a camera-off placeholder or no video at all. */
-const RemoteAudio = ({ stream }) => {
-  const audioRef = useRef(null);
-  useEffect(() => {
-    const el = audioRef.current;
-    if (el) el.srcObject = stream || null;
-  }, [stream]);
-  return <audio ref={audioRef} autoPlay playsInline style={{ display: 'none' }} />;
-};
-
-const RemoteAudioSink = ({ participants }) => (
-  <>
-    {participants
-      .filter((p) => p.stream)
-      .map((p) => (
-        <RemoteAudio key={p.id} stream={p.stream} />
-      ))}
-  </>
-);
+/* RemoteAudio / RemoteAudioSink moved OUT of this file to
+   components/calls/CallAudioSink.jsx, mounted at App level.
+   They were rendered only inside the three return branches below, all of which
+   sit behind `isVisible` — and isVisible requires !isMinimized. So minimising a
+   call unmounted every audio element and the remote party went silent while
+   LiveKit carried on streaming. Do not add an <audio> back into this view: the
+   sink is a singleton and two elements on one stream echo. */
 
 const NetworkDot = ({ quality }) => {
   const color =
@@ -201,7 +188,6 @@ export const ActiveCallView = () => {
         initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
         className="fixed inset-0 z-[9998] bg-black flex flex-col"
       >
-        <RemoteAudioSink participants={remoteParticipants} />
 
         <div className="flex-1 min-h-0 relative overflow-hidden">
           {/* Remote full-bleed */}
@@ -282,7 +268,6 @@ export const ActiveCallView = () => {
         initial={{ opacity: 0 }} animate={{ opacity: 1 }}
         className="fixed inset-0 z-[9998] bg-[#0A0A0A] flex flex-col"
       >
-        <RemoteAudioSink participants={remoteParticipants} />
 
         <div className="flex items-center justify-between px-4 py-3 flex-shrink-0">
           <button onClick={handleMinimize} className="p-2 text-white/70"><ChevronDown size={20} /></button>
@@ -332,7 +317,6 @@ export const ActiveCallView = () => {
       className="fixed inset-0 z-[9998] flex flex-col"
       style={{ background: 'linear-gradient(180deg, #1a3a2a 0%, #0A0A0A 40%, #0A0A0A 100%)' }}
     >
-      <RemoteAudioSink participants={remoteParticipants} />
 
       {/* Top bar */}
       <div className="flex items-center justify-between px-4 pt-12 pb-2 flex-shrink-0">

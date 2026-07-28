@@ -3,9 +3,10 @@ import { MicOff, MonitorUp } from 'lucide-react';
 
 /*
  * Renders ONLY the video tracks of a stream. Remote audio is played by the
- * dedicated hidden <audio> elements in ActiveCallView, so every tile video is
- * effectively silent here (muted for the local tile, audio-less stream for the
- * rest) — this guarantees we never double-play a participant's voice.
+ * dedicated hidden <audio> elements in CallAudioSink (mounted at App level, so
+ * it survives minimise and navigation), so every tile video is effectively
+ * silent here (muted for the local tile, audio-less stream for the rest) — this
+ * guarantees we never double-play a participant's voice.
  */
 const TileVideo = ({ stream, muted, className }) => {
   const videoRef = useRef(null);

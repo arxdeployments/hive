@@ -44,6 +44,7 @@ import { OfflineBanner } from './components/shared/OfflineBanner';
 import { IncomingCallOverlay } from './components/calls/IncomingCallOverlay';
 import { OutgoingCallScreen } from './components/calls/OutgoingCallScreen';
 import { MinimizedCallBanner } from './components/calls/MinimizedCallBanner';
+import { CallAudioSink } from './components/calls/CallAudioSink';
 import { ActiveCallView } from './components/calls/ActiveCallView';
 
 // Route guards
@@ -161,6 +162,11 @@ function App() {
         <OutgoingCallScreen />
         <ActiveCallView />
         <MinimizedCallBanner />
+        {/* Remote call audio. Mounted here, outside every route and every
+            call-UI visibility gate, because it used to live inside
+            ActiveCallView — which returns null when the call is minimised, so
+            minimising silenced the other party while LiveKit kept streaming. */}
+        <CallAudioSink />
         {/* Toasts are confirmations, not reading material: they clear quickly and
             can always be dismissed outright. Rapid toggles (mute/unmute) used to
             stack and cover the content underneath, so cap how many show at once. */}
