@@ -133,12 +133,17 @@ services:
     # Migrations + idempotent superadmin seed run on every boot before uvicorn.
     # --forwarded-allow-ips=* trusts X-Forwarded-For from the only ingress
     # (Caddy on the Docker network); paired with RXHIVE_TRUST_PROXY above.
+    # NOTE the indentation: with YAML folded style (>), a line indented MORE than
+    # the first content line keeps its newline. The uvicorn flags used to be
+    # indented further, so `sh` received three commands, not one — uvicorn started
+    # with NEITHER --workers NOR --proxy-headers, and logged
+    # "sh: 4: --workers: not found". Keep every line flush with `sh -c`.
     command: >
       sh -c "alembic upgrade head &&
-             python -m app.seed &&
-             uvicorn app.main:app --host 0.0.0.0 --port 8000
-                     --workers ${API_WORKERS:-2}
-                     --proxy-headers --forwarded-allow-ips='*'"
+      python -m app.seed &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000
+      --workers ${API_WORKERS:-2}
+      --proxy-headers --forwarded-allow-ips='*'"
     healthcheck:
       # python:3.12-slim has neither curl nor wget, so probe with the stdlib.
       # /api/health reports database/redis/livekit and 503s when db or redis is
