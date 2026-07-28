@@ -879,17 +879,6 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     if (hasNewer) setShowScrollDown(true);
   }, [hasNewer]);
 
-  // Complete a jump that had to load its window first. Runs after the render that
-  // introduced the row, which is the earliest point Virtuoso can scroll to it.
-  useEffect(() => {
-    const target = pendingJumpRef.current;
-    if (!target) return;
-    const idx = items.findIndex(i => i.type === 'message' && i.message._id === target);
-    if (idx < 0) return;
-    pendingJumpRef.current = null;
-    scrollToLoaded(target);
-  }, [items, scrollToLoaded]);
-
   // Reply / search / pinned-banner click -> scroll to the original message.
   /** Scroll to a loaded row and flash it. Returns false if it is not loaded. */
   const scrollToLoaded = useCallback((msgId) => {
@@ -905,6 +894,24 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     highlightTimerRef.current = setTimeout(() => setHighlightedId(null), 1600);
     return true;
   }, []);
+
+  // Complete a jump that had to load its window first. Runs after the render that
+  // introduced the row, which is the earliest point Virtuoso can scroll to it.
+  //
+  // MUST sit below scrollToLoaded: this effect names it in its dependency array,
+  // and a `const` is in the temporal dead zone until its initializer runs. Placed
+  // above, evaluating the dep array threw
+  //   ReferenceError: Cannot access 'scrollToLoaded' before initialization
+  // on every render, which the ErrorBoundary surfaced as "Something went wrong in
+  // this panel." A build cannot catch it — it is a runtime error, not a syntax one.
+  useEffect(() => {
+    const target = pendingJumpRef.current;
+    if (!target) return;
+    const idx = items.findIndex(i => i.type === 'message' && i.message._id === target);
+    if (idx < 0) return;
+    pendingJumpRef.current = null;
+    scrollToLoaded(target);
+  }, [items, scrollToLoaded]);
 
   /**
    * Jump to a message, loading it first if it is outside the current window.

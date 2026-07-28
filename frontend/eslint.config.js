@@ -3,7 +3,7 @@ import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 
 export default [
-  { ignores: ['dist', 'node_modules', 'src/services/webrtcManager.js', 'src/services/meshCallManager.js'] },
+  { ignores: ['dist', 'node_modules'] },
   {
     files: ['src/**/*.{js,jsx}'],
     languageOptions: {
@@ -19,6 +19,15 @@ export default [
       'no-unused-vars': ['warn', { varsIgnorePattern: '^[A-Z_]', argsIgnorePattern: '^_' }],
       'no-empty': ['error', { allowEmptyCatch: true }],
       'react-hooks/exhaustive-deps': 'off',
+      // A `const` referenced above its initializer is a runtime ReferenceError
+      // (temporal dead zone), and neither the type-free build nor a smoke test
+      // catches it. This shipped once: a useEffect naming a useCallback in its
+      // dependency array sat ABOVE that callback, so ChatPanel threw
+      // "Cannot access 'scrollToLoaded' before initialization" on every render
+      // and the whole chat pane rendered as the error boundary's fallback.
+      // functions/classes stay allowed because hoisted function declarations and
+      // component definitions are legitimately referenced earlier.
+      'no-use-before-define': ['error', { functions: false, classes: false, variables: true }],
     },
   },
 ];
