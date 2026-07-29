@@ -36,3 +36,8 @@ xcuserdata/
 DerivedData/
 *.xcuserstate
 *.xcscmblueprint
+
+# iOS build products and Xcode local state
+ios/build/
+ios/RxHive.xcodeproj/project.xcworkspace/
+ios/RxHive.xcodeproj/xcuserdata/

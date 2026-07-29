@@ -3,7 +3,7 @@ import Foundation
 import os
 import SwiftUI
 
-/// Records a voice note to AAC-in-MP4 (`.m4a`).
+/// Records a voice note to AAC-in-MP4 (`.m4a`), with pause, resume and preview.
 ///
 /// The container is not a preference. The backend classifies an upload by its file
 /// **extension** (`app/services/storage.py`), and the web client's
@@ -13,28 +13,63 @@ import SwiftUI
 /// `audio/mp4`, and AAC-in-MP4 plays natively on every client that can receive it —
 /// which matters because a note recorded here has to be playable in Safari.
 ///
-/// Duration is measured from `AVAudioRecorder.currentTime` and sent with the message,
-/// so a bubble can print "0:34" without downloading the file.
+/// ## Why segments rather than one file
+///
+/// `AVAudioRecorder` does have `pause()`/`record()`, which would keep everything in a
+/// single file — but a paused MP4 has no finalised `moov` atom, so `AVAudioPlayer`
+/// cannot open it. That kills the whole point of pausing: reviewing what you have so
+/// far before you send it.
+///
+/// So each record→pause cycle writes its own finalised segment, and the segments are
+/// stitched with `AVMutableComposition`. Preview plays the composition directly (no
+/// export). Send exports it once to a single `.m4a`. A recording that was never paused
+/// takes a fast path that skips the export entirely and re-encodes nothing.
 @MainActor
 final class AudioRecorder: ObservableObject {
 
-    @Published private(set) var isRecording = false
+    enum Phase: Equatable {
+        case idle
+        case recording
+        /// Stopped but not discarded: the preview player and the resume button live here.
+        case paused
+    }
+
+    @Published private(set) var phase: Phase = .idle
+    /// Total captured length across every segment, including the one in progress.
     @Published private(set) var elapsed: TimeInterval = 0
-    /// Recent microphone levels, normalised 0…1, oldest first. Drives the waveform.
+    /// Every microphone sample taken so far, normalised 0…1, oldest first.
+    ///
+    /// The whole history rather than a window, because the paused state draws the
+    /// shape of the *entire* recording, not just its tail.
     @Published private(set) var levels: [Float] = []
 
-    /// Below this a press reads as a mis-tap on the mic rather than a recording, and
-    /// the caller is expected to discard it.
+    /// Below this a press reads as a mis-tap on the mic rather than a message.
     static let minimumDuration: TimeInterval = 0.6
 
-    /// How many bars the waveform keeps. At the 60ms sample interval this is a
-    /// ~2.4s window, which is enough movement to read as "live" without the bars
-    /// getting too thin to see.
-    private static let levelWindow = 40
+    /// Bars in the live meter, and therefore the width of its scrolling window: at the
+    /// 60ms sample interval, ~4.8 seconds of history.
+    ///
+    /// Sized to fill the hands-free bar edge to edge. `WaveformView` draws this many
+    /// bars across whatever width it is given (see its `capacity`), so the number is a
+    /// choice about how much time the meter shows, not about how wide it looks. It was
+    /// 40, which at a fixed bar pitch covered only half the screen.
+    static let liveWindow = 80
     private static let sampleInterval: Duration = .milliseconds(60)
 
+    var isRecording: Bool { phase == .recording }
+    /// Anything other than idle: the composer swaps to the recorder bar on this.
+    var isActive: Bool { phase != .idle }
+
+    /// The tail of `levels`, for the live meter.
+    var liveLevels: [Float] {
+        levels.suffix(Self.liveWindow)
+    }
+
     private var recorder: AVAudioRecorder?
-    private var fileURL: URL?
+    /// Finalised segments, in order.
+    private var segments: [URL] = []
+    /// Length of `segments`; the in-progress recorder's time is added on top.
+    private var completedDuration: TimeInterval = 0
     private var ticker: Task<Void, Never>?
     private var interruptionObserver: NSObjectProtocol?
 
@@ -53,16 +88,10 @@ final class AudioRecorder: ObservableObject {
 
     // MARK: - Permission
 
-    /// Ask for the microphone, or answer immediately from the standing decision.
-    ///
-    /// Wrapped in a continuation rather than relying on the async overload so this
-    /// compiles the same way regardless of how the SDK surfaces the callback API.
     func requestPermission() async -> Bool {
         switch AVAudioApplication.shared.recordPermission {
-        case .granted:
-            return true
-        case .denied:
-            return false
+        case .granted: return true
+        case .denied: return false
         default:
             return await withCheckedContinuation { continuation in
                 AVAudioApplication.requestRecordPermission { granted in
@@ -74,32 +103,140 @@ final class AudioRecorder: ObservableObject {
 
     // MARK: - Lifecycle
 
-    /// Begin recording. Returns false if the session or the recorder refused, in
-    /// which case nothing has been left running.
+    /// Begin a new recording, discarding anything held from before.
     @discardableResult
     func start() -> Bool {
-        guard !isRecording else { return true }
-
-        let session = AVAudioSession.sharedInstance()
-        previousCategory = session.category
-        previousMode = session.mode
-        previousOptions = session.categoryOptions
-        do {
-            // `.playAndRecord` rather than `.record` so the recording can be reviewed
-            // and so a call ringtone is not silenced mid-press; `.defaultToSpeaker`
-            // keeps playback out of the earpiece afterwards.
-            try session.setCategory(
-                .playAndRecord, mode: .default, options: [.allowBluetooth, .defaultToSpeaker]
-            )
-            try session.setActive(true)
-        } catch {
-            log.error("Audio session refused record mode: \(error.localizedDescription, privacy: .public)")
+        guard phase == .idle else { return phase == .recording }
+        discardSegments()
+        completedDuration = 0
+        elapsed = 0
+        levels = []
+        guard activateSession() else { return false }
+        guard startSegment() else {
             restoreSession()
             return false
         }
+        phase = .recording
+        startTicking()
+        observeInterruptions()
+        return true
+    }
 
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("voice-\(Int(Date().timeIntervalSince1970)).m4a")
+    /// Stop capturing but keep what we have. Finalises the current segment so the
+    /// preview player can open it.
+    func pause() {
+        guard phase == .recording, let recorder else { return }
+        completedDuration += recorder.currentTime
+        recorder.stop()
+        self.recorder = nil
+        ticker?.cancel()
+        ticker = nil
+        elapsed = completedDuration
+        phase = .paused
+        // The session stays active: the user is about to either resume or preview,
+        // and tearing it down between the two produces an audible click.
+    }
+
+    /// Continue into a new segment.
+    @discardableResult
+    func resume() -> Bool {
+        guard phase == .paused else { return false }
+        guard activateSession(), startSegment() else { return false }
+        phase = .recording
+        startTicking()
+        return true
+    }
+
+    /// Finish and hand back one file. nil when nothing usable was captured — a muted
+    /// device, or a press too short to be a message — in which case temporary files
+    /// have already been cleaned up.
+    ///
+    /// Async because stitching segments is an export. The single-segment case, which
+    /// is the overwhelming majority, returns without exporting.
+    func finish() async -> (url: URL, duration: TimeInterval)? {
+        if phase == .recording, let recorder {
+            // Read the length BEFORE stopping: `currentTime` reports 0 on a stopped
+            // recorder, which silently sent every voice note with duration 0.
+            completedDuration += recorder.currentTime
+            recorder.stop()
+        }
+        self.recorder = nil
+        let captured = segments
+        let duration = completedDuration
+        teardown()
+
+        guard duration >= Self.minimumDuration, !captured.isEmpty else {
+            captured.forEach { try? FileManager.default.removeItem(at: $0) }
+            segments = []
+            return nil
+        }
+
+        // One segment: nothing to stitch, so hand the file over untouched rather than
+        // re-encoding it.
+        if captured.count == 1 {
+            let url = captured[0]
+            segments = []
+            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
+            guard size > 0 else {
+                try? FileManager.default.removeItem(at: url)
+                return nil
+            }
+            return (url, duration)
+        }
+
+        guard let merged = await export(segments: captured) else {
+            log.error("Merging \(captured.count) voice-note segments failed")
+            captured.forEach { try? FileManager.default.removeItem(at: $0) }
+            segments = []
+            return nil
+        }
+        captured.forEach { try? FileManager.default.removeItem(at: $0) }
+        segments = []
+        return (merged, duration)
+    }
+
+    /// Throw everything away and release the microphone.
+    func cancel() {
+        recorder?.stop()
+        recorder = nil
+        teardown()
+        discardSegments()
+        completedDuration = 0
+    }
+
+    // MARK: - Preview
+
+    /// An asset spanning every captured segment, for reviewing while paused.
+    ///
+    /// A composition rather than a merged file: `AVPlayerItem` plays one directly, so
+    /// pausing does not have to pay for an export the user may never send.
+    func previewAsset() -> AVAsset? {
+        guard !segments.isEmpty else { return nil }
+        let composition = AVMutableComposition()
+        guard let track = composition.addMutableTrack(
+            withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else { return nil }
+
+        var cursor = CMTime.zero
+        for url in segments {
+            let asset = AVURLAsset(url: url)
+            // Deprecated sync accessor on purpose: this runs on already-written local
+            // files, and the async loader would make `previewAsset()` async for every
+            // caller including the ones that just need a duration.
+            guard let source = asset.tracks(withMediaType: .audio).first else { continue }
+            let range = CMTimeRange(start: .zero, duration: asset.duration)
+            try? track.insertTimeRange(range, of: source, at: cursor)
+            cursor = CMTimeAdd(cursor, asset.duration)
+        }
+        return cursor > .zero ? composition : nil
+    }
+
+    // MARK: - Internals
+
+    private func startSegment() -> Bool {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "voice-\(UUID().uuidString).m4a"
+        )
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
             AVSampleRateKey: 44_100,
@@ -110,76 +247,60 @@ final class AudioRecorder: ObservableObject {
             AVEncoderBitRateKey: 32_000,
             AVEncoderAudioQualityKey: AVAudioQuality.medium.rawValue,
         ]
-
         do {
             let recorder = try AVAudioRecorder(url: url, settings: settings)
             recorder.isMeteringEnabled = true
             guard recorder.record() else {
                 log.error("AVAudioRecorder refused to start")
-                restoreSession()
                 return false
             }
             self.recorder = recorder
-            self.fileURL = url
+            segments.append(url)
+            return true
         } catch {
             log.error("Could not create recorder: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+    }
+
+    private func activateSession() -> Bool {
+        let session = AVAudioSession.sharedInstance()
+        if previousCategory == nil {
+            previousCategory = session.category
+            previousMode = session.mode
+            previousOptions = session.categoryOptions
+        }
+        do {
+            // `.playAndRecord` rather than `.record` so the recording can be reviewed
+            // without a category switch mid-flow; `.defaultToSpeaker` keeps that
+            // playback out of the earpiece.
+            try session.setCategory(
+                .playAndRecord, mode: .default, options: [.allowBluetooth, .defaultToSpeaker]
+            )
+            try session.setActive(true)
+            return true
+        } catch {
+            log.error("Audio session refused record mode: \(error.localizedDescription, privacy: .public)")
             restoreSession()
             return false
         }
-
-        isRecording = true
-        elapsed = 0
-        levels = []
-        startTicking()
-        observeInterruptions()
-        return true
     }
 
-    /// Finish and hand back the file. nil when nothing usable was captured — a muted
-    /// device, or a press too short to be a message — in which case the file has
-    /// already been deleted.
-    func stop() -> (url: URL, duration: TimeInterval)? {
-        guard let recorder, let fileURL else {
-            finish()
-            return nil
-        }
-        // Read the length BEFORE stopping: `currentTime` reports 0 on a stopped
-        // recorder, which silently sent every voice note with duration 0.
-        let duration = recorder.currentTime
-        recorder.stop()
-        finish()
-        self.fileURL = nil
-
-        let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
-        let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
-        guard duration >= Self.minimumDuration, size > 0 else {
-            try? FileManager.default.removeItem(at: fileURL)
-            return nil
-        }
-        return (fileURL, duration)
-    }
-
-    /// Throw the recording away and release the microphone.
-    func cancel() {
-        recorder?.stop()
-        finish()
-        if let fileURL { try? FileManager.default.removeItem(at: fileURL) }
-        fileURL = nil
-    }
-
-    // MARK: - Internals
-
-    /// Common teardown for both exit paths. Leaves `fileURL` alone — `stop` needs it
-    /// and `cancel` deletes it.
-    private func finish() {
+    /// Common teardown. Leaves `segments` alone — `finish` consumes them and `cancel`
+    /// deletes them.
+    private func teardown() {
         ticker?.cancel()
         ticker = nil
         stopObservingInterruptions()
-        recorder = nil
-        isRecording = false
+        phase = .idle
         elapsed = 0
         levels = []
         restoreSession()
+    }
+
+    private func discardSegments() {
+        segments.forEach { try? FileManager.default.removeItem(at: $0) }
+        segments = []
     }
 
     /// Put the audio session back the way we found it.
@@ -209,20 +330,21 @@ final class AudioRecorder: ObservableObject {
         ticker = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: Self.sampleInterval)
-                guard let self, self.isRecording, let recorder = self.recorder else { return }
+                guard let self, self.phase == .recording, let recorder = self.recorder else { return }
                 recorder.updateMeters()
-                self.elapsed = recorder.currentTime
-                var next = self.levels
-                next.append(Self.normalise(recorder.averagePower(forChannel: 0)))
-                if next.count > Self.levelWindow { next.removeFirst(next.count - Self.levelWindow) }
-                self.levels = next
+                self.elapsed = self.completedDuration + recorder.currentTime
+                self.levels.append(Self.normalise(recorder.averagePower(forChannel: 0)))
             }
         }
     }
 
-    /// A phone call (or Siri) takes the microphone away mid-recording. Without this
-    /// the timer keeps counting against a recorder that has stopped capturing, and the
-    /// user sends silence.
+    /// A phone call (or Siri) takes the microphone away mid-recording. Without this the
+    /// timer keeps counting against a recorder that has stopped capturing, and the user
+    /// sends silence.
+    ///
+    /// Pauses rather than cancels: the user still has whatever was captured before the
+    /// interruption, and throwing away a half-finished message without asking is worse
+    /// than handing it back paused.
     private func observeInterruptions() {
         stopObservingInterruptions()
         interruptionObserver = NotificationCenter.default.addObserver(
@@ -234,7 +356,7 @@ final class AudioRecorder: ObservableObject {
                 let raw = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
                 AVAudioSession.InterruptionType(rawValue: raw) == .began
             else { return }
-            Task { @MainActor in self?.cancel() }
+            Task { @MainActor in self?.pause() }
         }
     }
 
@@ -243,6 +365,52 @@ final class AudioRecorder: ObservableObject {
             NotificationCenter.default.removeObserver(interruptionObserver)
         }
         interruptionObserver = nil
+    }
+
+    /// Stitch segments into one `.m4a`.
+    private func export(segments: [URL]) async -> URL? {
+        let composition = AVMutableComposition()
+        guard let track = composition.addMutableTrack(
+            withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else { return nil }
+
+        var cursor = CMTime.zero
+        for url in segments {
+            let asset = AVURLAsset(url: url)
+            guard let source = asset.tracks(withMediaType: .audio).first else { continue }
+            do {
+                try track.insertTimeRange(
+                    CMTimeRange(start: .zero, duration: asset.duration), of: source, at: cursor
+                )
+                cursor = CMTimeAdd(cursor, asset.duration)
+            } catch {
+                log.error("Could not append segment: \(error.localizedDescription, privacy: .public)")
+                return nil
+            }
+        }
+        guard cursor > .zero else { return nil }
+
+        let output = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "voice-\(UUID().uuidString).m4a"
+        )
+        // AppleM4A is the only preset that produces the AAC-in-MP4 the server's
+        // extension map expects; a passthrough export would keep the segment
+        // boundaries as separate edits.
+        guard let session = AVAssetExportSession(
+            asset: composition, presetName: AVAssetExportPresetAppleM4A
+        ) else { return nil }
+        session.outputURL = output
+        session.outputFileType = .m4a
+
+        await withCheckedContinuation { continuation in
+            session.exportAsynchronously { continuation.resume() }
+        }
+        guard session.status == .completed else {
+            log.error("Export failed: \(session.error?.localizedDescription ?? "unknown", privacy: .public)")
+            try? FileManager.default.removeItem(at: output)
+            return nil
+        }
+        return output
     }
 
     /// dBFS (-160…0) to 0…1. Floored at -50 dB rather than the full range: real room

@@ -39,6 +39,14 @@ struct SignInView: View {
                 .padding(.horizontal, Theme.Layout.gutter)
                 // Room for the keyboard without the card jumping under it.
                 .padding(.bottom, Theme.Layout.spacing8)
+                // Makes the content at least as tall as the scroll container, which is
+                // what lets the Spacers above and below actually expand and centre the
+                // card — the web app's `items-center justify-center`. Without it a
+                // ScrollView sizes to its content, both Spacers collapse to their
+                // minLength, and the card sits pinned to the top of the screen.
+                // Still scrollable: once the keyboard shrinks the container below the
+                // card's height, this stops being the taller constraint.
+                .containerRelativeFrame(.vertical, alignment: .center)
             }
             .scrollDismissesKeyboard(.interactively)
             .scrollBounceBehavior(.basedOnSize)

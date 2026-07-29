@@ -28,6 +28,23 @@ enum MediaFormatting {
         return String(format: "%.1f MB", Double(bytes) / (1024 * 1024))
     }
 
+    /// The document bubble's metadata line: "14 pages • 638 KB • pdf".
+    ///
+    /// Same three facts as the web's `DocumentBubble.jsx` subtitle, in the order the
+    /// design reference uses (count, size, format) with a bullet separator. Each part
+    /// drops out when unknown, so a docx with no page count reads "42.1 KB • docx"
+    /// rather than carrying an empty segment or a stray separator.
+    static func documentSubtitle(pageCount: Int?, fileSize: Int?, filename: String) -> String {
+        let ext = (filename as NSString).pathExtension.lowercased()
+        let pages = (pageCount ?? 0) > 0
+            ? "\(pageCount!) page\(pageCount! == 1 ? "" : "s")"
+            : nil
+        let size = byteLabel(fileSize)
+        return [pages, size.isEmpty ? nil : size, ext.isEmpty ? nil : ext]
+            .compactMap { $0 }
+            .joined(separator: " • ")
+    }
+
     /// `m:ss`. Voice notes and clips are short, so there is no hours case — the same
     /// decision `utils/audioFormat.js:formatDuration` made.
     static func clockLabel(_ seconds: TimeInterval) -> String {
@@ -156,6 +173,11 @@ enum MediaFormatting {
 /// player for a clip.
 struct ImageAttachmentView: View {
     let attachment: Attachment
+    /// Shown in the full-screen viewer's header, as in the reference ("Michele /
+    /// 27/07/26, 11:25 AM"). Optional and defaulted so the three-argument call site
+    /// keeps compiling and a gallery tile can open the viewer without a sender.
+    var senderName: String?
+    var timestamp: Date?
 
     /// Bubble media width. Fixed rather than intrinsic: the thumbnail's aspect ratio
     /// is unknown until it has loaded, and a bubble that resizes underneath the
@@ -167,8 +189,10 @@ struct ImageAttachmentView: View {
 
     /// Spelled out rather than relying on the synthesised memberwise initialiser,
     /// which private stored properties can quietly demote to `private`.
-    init(attachment: Attachment) {
+    init(attachment: Attachment, senderName: String? = nil, timestamp: Date? = nil) {
         self.attachment = attachment
+        self.senderName = senderName
+        self.timestamp = timestamp
     }
 
     private var isVideo: Bool { MediaFormatting.isVideo(attachment) }
@@ -188,7 +212,7 @@ struct ImageAttachmentView: View {
         .buttonStyle(PressScaleStyle())
         .accessibilityLabel(isVideo ? "Video, \(attachment.filename)" : "Photo, \(attachment.filename)")
         .fullScreenCover(isPresented: $showViewer) {
-            ImageViewer(attachment: attachment)
+            ImageViewer(attachment: attachment, senderName: senderName, timestamp: timestamp)
         }
         .fullScreenCover(isPresented: $showPlayer) {
             MediaVideoPlayerSheet(path: attachment.mediaURL, filename: attachment.filename)
@@ -224,13 +248,20 @@ struct ImageAttachmentView: View {
         }
         .overlay(alignment: .bottomLeading) {
             if let label = MediaFormatting.durationLabel(attachment.duration) {
-                Text(label)
-                    .font(Theme.Typography.micro)
-                    .foregroundStyle(Theme.Color.text)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Capsule().fill(Theme.Color.bg.opacity(0.55)))
-                    .padding(Theme.Layout.spacing2)
+                // Glyph + duration, as in the reference. The camera icon is what
+                // distinguishes "0:09 of video" from a timestamp at a glance, which
+                // matters because the sent-time sits in the opposite corner.
+                HStack(spacing: 3) {
+                    Image(systemName: "video.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                    Text(label)
+                        .font(Theme.Typography.micro)
+                }
+                .foregroundStyle(Theme.Color.text)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(Theme.Color.bg.opacity(0.55)))
+                .padding(Theme.Layout.spacing2)
             }
         }
         .allowsHitTesting(false)
@@ -384,12 +415,18 @@ private struct PlayerViewControllerHost: UIViewControllerRepresentable {
 /// information, and emerald-on-emerald in a sent bubble would be unreadable.
 struct AudioAttachmentView: View {
     let attachment: Attachment
+    /// For the unplayed state's avatar. Optional so a gallery row, which has no sender
+    /// context, can still render the player.
+    var senderName: String?
+    var senderAvatarPath: String?
 
     @EnvironmentObject private var toasts: ToastCenter
     @StateObject private var playback = AudioAttachmentPlayback()
 
-    init(attachment: Attachment) {
+    init(attachment: Attachment, senderName: String? = nil, senderAvatarPath: String? = nil) {
         self.attachment = attachment
+        self.senderName = senderName
+        self.senderAvatarPath = senderAvatarPath
     }
 
     private var total: TimeInterval {
@@ -408,48 +445,74 @@ struct AudioAttachmentView: View {
         (playback.isPlaying || playback.position > 0) ? max(0, total - playback.position) : total
     }
 
+    /// True once this note has been played at all.
+    ///
+    /// Drives the leading control, exactly as the reference does: an **unplayed** note
+    /// shows the sender's avatar with a mic badge, and the **speed pill** replaces it
+    /// only once playback has begun. Offering "2x" on a note nobody has heard yet is
+    /// a control for a decision the listener has not had the chance to make.
+    private var hasStarted: Bool { playback.hasPlayed }
+
     var body: some View {
-        HStack(spacing: Theme.Layout.spacing3) {
-            Button {
-                Task { @MainActor in
-                    if let message = await playback.toggle(path: attachment.mediaURL) {
-                        toasts.error(message)
-                    }
-                }
-            } label: {
-                ZStack {
-                    Circle().fill(Theme.Color.primaryTint)
-                    if playback.isLoading {
-                        ProgressView().tint(Theme.Color.primary).scaleEffect(0.7)
-                    } else {
-                        Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(Theme.Color.primary)
-                    }
-                }
-                .frame(width: 34, height: 34)
-            }
-            .buttonStyle(PressScaleStyle())
-            .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: Theme.Layout.spacing3) {
+                leadingControl
 
-            ScrubBar(fraction: fraction, isEnabled: total > 0) { target in
-                playback.seek(toFraction: target, total: total)
-            }
-            .accessibilityLabel("Playback position")
-            .accessibilityValue(MediaFormatting.clockLabel(playback.position))
+                Button {
+                    Task { @MainActor in
+                        if let message = await playback.toggle(path: attachment.mediaURL) {
+                            toasts.error(message)
+                        }
+                    }
+                } label: {
+                    Group {
+                        if playback.isLoading {
+                            ProgressView().tint(Theme.Color.primary).scaleEffect(0.7)
+                        } else {
+                            Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(Theme.Color.primary)
+                        }
+                    }
+                    .frame(width: 30, height: 34)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(PressScaleStyle())
+                .accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
 
+                ScrubbableWaveform(
+                    samples: playback.waveform,
+                    fraction: fraction,
+                    isEnabled: total > 0
+                ) { target in
+                    playback.seek(toFraction: target, total: total)
+                }
+                .frame(height: 26)
+                .accessibilityLabel("Playback position")
+                .accessibilityValue(MediaFormatting.clockLabel(playback.position))
+            }
+
+            // Elapsed sits under the waveform rather than beside it, as in the
+            // reference — inline it competes with the bubble's own timestamp.
             Text(MediaFormatting.clockLabel(shownTime))
                 .font(Theme.Typography.micro)
                 .monospacedDigit()
                 .foregroundStyle(Theme.Color.textMuted)
+                .padding(.leading, 74)
         }
         .padding(.horizontal, Theme.Layout.spacing3)
         .padding(.vertical, Theme.Layout.spacing2)
-        .frame(width: 250)
+        .frame(width: 258)
         .background(
-            Capsule().fill(Theme.Color.surface2)
-                .overlay(Capsule().stroke(Theme.Color.border2, lineWidth: 1))
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Theme.Color.surface2)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(Theme.Color.border2, lineWidth: 1)
+                )
         )
+        // Decoded once per note and cached, so scrolling back to it is free.
+        .task { await playback.loadWaveform(path: attachment.mediaURL) }
         .onDisappear { playback.stop() }
         // Only one voice note is audible at a time. Subscribed from the view so the
         // teardown is SwiftUI's problem rather than a token this object has to
@@ -461,26 +524,61 @@ struct AudioAttachmentView: View {
     }
 }
 
-/// A thin draggable progress bar. Built rather than using `Slider` so the track,
-/// knob and hit area come from `Theme` and match the rest of the product.
-private struct ScrubBar: View {
+private extension AudioAttachmentView {
+
+    /// Avatar-with-mic before first play, speed pill after — see `hasStarted`.
+    @ViewBuilder
+    var leadingControl: some View {
+        if hasStarted {
+            Button {
+                playback.cycleSpeed()
+            } label: {
+                Text(playback.speed.label)
+                    .font(Theme.Typography.pill)
+                    .monospacedDigit()
+                    .foregroundStyle(Theme.Color.text)
+                    .frame(width: 40, height: 26)
+                    .background(Capsule().fill(Theme.Color.border2))
+            }
+            .buttonStyle(PressScaleStyle())
+            .accessibilityLabel("Playback speed \(playback.speed.label). Tap to change")
+        } else {
+            ZStack(alignment: .bottomTrailing) {
+                Avatar(name: senderName ?? "?", urlPath: senderAvatarPath, size: 38)
+                Image(systemName: "mic.fill")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(Theme.Color.primary)
+                    .padding(2)
+                    .background(Circle().fill(Theme.Color.surface2))
+            }
+            .frame(width: 40, height: 38)
+            .accessibilityHidden(true)
+        }
+    }
+}
+
+/// The waveform, draggable to seek.
+///
+/// Replaces the thin progress line: a voice note's bars are the only cue for *where* in
+/// a message something was said, which is what makes scrubbing to it possible at all.
+private struct ScrubbableWaveform: View {
+    let samples: [Float]
     let fraction: Double
     let isEnabled: Bool
     let onSeek: (Double) -> Void
 
     var body: some View {
         GeometryReader { geo in
-            let width: CGFloat = max(1, geo.size.width)
-            let progress: CGFloat = CGFloat(min(1, max(0, fraction)))
-            ZStack(alignment: .leading) {
-                Capsule().fill(Theme.Color.border2).frame(height: 3)
-                Capsule().fill(Theme.Color.primary)
-                    .frame(width: width * progress, height: 3)
-                Circle().fill(Theme.Color.primary)
-                    .frame(width: 10, height: 10)
-                    .offset(x: min(width - 10, max(0, width * progress - 5)))
-            }
-            .frame(height: geo.size.height, alignment: .center)
+            let width = max(CGFloat(1), geo.size.width)
+            WaveformView(
+                samples: samples,
+                progress: fraction,
+                playedColor: Theme.Color.primary,
+                pendingColor: Theme.Color.textMuted.opacity(0.45),
+                showsHandle: true,
+                handleColor: Theme.Color.primary
+            )
+            .frame(height: geo.size.height)
             .contentShape(Rectangle())
             .gesture(
                 DragGesture(minimumDistance: 0)
@@ -490,8 +588,7 @@ private struct ScrubBar: View {
                     }
             )
         }
-        // Tall enough to be draggable without swallowing the bubble's own gestures.
-        .frame(height: 22)
+        .frame(height: 26)
         .opacity(isEnabled ? 1 : 0.5)
     }
 }
@@ -513,6 +610,18 @@ private final class AudioAttachmentPlayback: ObservableObject {
     @Published private(set) var isPlaying = false
     @Published private(set) var isLoading = false
     @Published private(set) var position: TimeInterval = 0
+    /// Current playback rate. Persists across pauses, as the reference does — pausing
+    /// at 2x and resuming must not silently drop back to 1x.
+    @Published private(set) var speed: PlaybackSpeed = .normal
+    /// Latches on first play and never clears.
+    ///
+    /// Not `position > 0`: reaching the end rewinds to 0, so deriving it from position
+    /// made a note you had just listened to all the way through flip back to looking
+    /// unplayed — avatar returned, speed pill vanished, and the rate you had chosen
+    /// disappeared with it.
+    @Published private(set) var hasPlayed = false
+    /// Real amplitudes, decoded from the file. Empty until `loadWaveform` finishes.
+    @Published private(set) var waveform: [Float] = []
     /// What the decoder reports, used only when the server sent no duration.
     @Published private(set) var intrinsicDuration: TimeInterval = 0
 
@@ -560,12 +669,51 @@ private final class AudioAttachmentPlayback: ObservableObject {
 
         do {
             let player = try AVAudioPlayer(data: data)
+            // Must be set before `prepareToPlay`, or `rate` is silently ignored and
+            // every speed above 1x plays at normal pitch and normal speed.
+            player.enableRate = true
+            player.rate = speed.rawValue
             player.prepareToPlay()
             intrinsicDuration = player.duration.isFinite ? player.duration : 0
             self.player = player
             return start(player)
         } catch {
             return "This audio can't be played on this device."
+        }
+    }
+
+    /// Advance 1x → 1.5x → 2x → 1x, applying it mid-playback.
+    func cycleSpeed() {
+        speed = speed.next
+        player?.rate = speed.rawValue
+    }
+
+    /// Real amplitudes for the waveform.
+    ///
+    /// The server sends none — there is no column for it — so they are decoded from the
+    /// audio itself. Reuses the same `Data` cache the player fills, so opening a note
+    /// that has already been played costs no network at all; the bytes are written to a
+    /// temporary file only because `AVAssetReader` needs a URL.
+    func loadWaveform(path: String) async {
+        guard waveform.isEmpty else { return }
+        if let hit = WaveformExtractor.cached(for: path) {
+            waveform = hit
+            return
+        }
+        let data: Data
+        if let cached = Self.cache.object(forKey: path as NSString) {
+            data = cached as Data
+        } else {
+            guard let fetched = try? await RxHiveAPI.attachmentData(path: path) else { return }
+            Self.cache.setObject(fetched as NSData, forKey: path as NSString, cost: fetched.count)
+            data = fetched
+        }
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wave-\(UUID().uuidString).m4a")
+        guard (try? data.write(to: scratch)) != nil else { return }
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        if let samples = await WaveformExtractor.extract(from: scratch, key: path) {
+            waveform = samples
         }
     }
 
@@ -602,6 +750,7 @@ private final class AudioAttachmentPlayback: ObservableObject {
         NotificationCenter.default.post(name: .rxAudioAttachmentStarted, object: token)
         guard player.play() else { return "Couldn't start playback." }
         isPlaying = true
+        hasPlayed = true
         startTicking(player)
         return nil
     }
@@ -638,6 +787,10 @@ struct DocumentAttachmentView: View {
     @EnvironmentObject private var toasts: ToastCenter
     @State private var isFetching = false
     @State private var shareTarget: MediaShareTarget?
+    @State private var showReader = false
+    /// The page-1 thumbnail 404s for a PDF uploaded before previews existed. Falling
+    /// back to the icon row is better than a permanently empty preview plate.
+    @State private var previewFailed = false
 
     init(attachment: Attachment) {
         self.attachment = attachment
@@ -647,19 +800,113 @@ struct DocumentAttachmentView: View {
         MediaFormatting.glyph(forFilename: attachment.filename)
     }
 
+    /// Only PDFs ever get a preview: the backend rasterises page 1 at upload time and
+    /// nothing else has a thumbnail. docx/xlsx/zip therefore fall through to the icon
+    /// row unchanged, and so do PDFs sent *before* previews existed — their
+    /// `page_count` is nil, which is exactly what `hasPDFPreview` tests.
+    private var showsPreview: Bool { attachment.hasPDFPreview && !previewFailed }
+
+    private var subtitle: String {
+        MediaFormatting.documentSubtitle(
+            pageCount: attachment.pageCount,
+            fileSize: attachment.fileSize,
+            filename: attachment.filename
+        )
+    }
+
     var body: some View {
+        Group {
+            if showsPreview { previewBubble } else { iconRowBubble }
+        }
+        .sheet(item: $shareTarget) { target in
+            MediaShareSheet(url: target.url)
+        }
+        .fullScreenCover(isPresented: $showReader) {
+            PdfReaderView(attachment: attachment)
+        }
+    }
+
+    // MARK: - PDF with a page-1 preview
+
+    /// Tapping the bubble opens the reader; the download arrow is its own control.
+    /// Two nested buttons rather than one, because "open" and "save" are different
+    /// intents and the reference gives them separate targets.
+    private var previewBubble: some View {
+        VStack(spacing: Theme.Layout.spacing2) {
+            AuthenticatedImage(path: attachment.thumbnailURL ?? "") {
+                ZStack {
+                    Rectangle().fill(Color.white.opacity(0.06))
+                    ProgressView().tint(Theme.Color.textMuted).scaleEffect(0.8)
+                }
+            }
+            // A white plate under the page: a rasterised page is white-on-white at
+            // the margins, and without this it bleeds into the bubble.
+            .background(Color.white)
+            .frame(width: 250, height: 150)
+            // `.top` alignment matters — a cropped portrait page must show the TOP of
+            // page 1, where the title is, not its middle.
+            .clipped()
+            .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+
+            metaRow
+        }
+        .padding(5)
+        .frame(width: 262)
+        .background(
+            RoundedRectangle(cornerRadius: Theme.Layout.radiusInput)
+                .fill(Theme.Color.surface2)
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.Layout.radiusInput)
+                        .stroke(Theme.Color.border2, lineWidth: 1)
+                )
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { showReader = true }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(attachment.filename), \(subtitle). Open")
+        .accessibilityAddTraits(.isButton)
+    }
+
+    private var metaRow: some View {
+        HStack(spacing: Theme.Layout.spacing3) {
+            fileChip
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(attachment.filename)
+                    .font(Theme.Typography.subheadline)
+                    .foregroundStyle(Theme.Color.text)
+                    // Two lines, wrapping — the reference wraps long report names
+                    // rather than eliding them, and a filename is the whole point of
+                    // the bubble.
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(subtitle)
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(Theme.Color.textMuted)
+                    // One line, as in the reference. "26 pages • 43.1 MB • pdf" is
+                    // about 8pt wider than the column at 13pt, and wrapping a
+                    // three-part metadata line onto a second row so the word "pdf"
+                    // can sit alone reads as a layout bug — shrink a hair instead.
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            downloadControl
+        }
+        .padding(.horizontal, 5)
+        .padding(.bottom, 3)
+    }
+
+    // MARK: - Everything else: the plain icon row
+
+    private var iconRowBubble: some View {
         Button {
             share()
         } label: {
             HStack(spacing: Theme.Layout.spacing3) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: Theme.Layout.radiusInput)
-                        .fill(glyph.tint.opacity(0.12))
-                    Image(systemName: glyph.systemImage)
-                        .font(.system(size: 18))
-                        .foregroundStyle(glyph.tint)
-                }
-                .frame(width: 40, height: 40)
+                fileChip
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(attachment.filename)
@@ -667,7 +914,7 @@ struct DocumentAttachmentView: View {
                         .foregroundStyle(Theme.Color.text)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(MediaFormatting.byteLabel(attachment.fileSize))
+                    Text(subtitle)
                         .font(Theme.Typography.caption)
                         .foregroundStyle(Theme.Color.textMuted)
                 }
@@ -693,10 +940,43 @@ struct DocumentAttachmentView: View {
             )
         }
         .buttonStyle(PressScaleStyle())
-        .accessibilityLabel("\(attachment.filename), \(MediaFormatting.byteLabel(attachment.fileSize)). Share or save")
-        .sheet(item: $shareTarget) { target in
-            MediaShareSheet(url: target.url)
+        .accessibilityLabel("\(attachment.filename), \(subtitle). Share or save")
+    }
+
+    // MARK: - Shared pieces
+
+    /// 40x40 rounded chip, filled with the file-type colour at the web's literal
+    /// `${color}20` alpha (0x20/255 = 12.5%, not 20%).
+    private var fileChip: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: Theme.Layout.radiusInput)
+                .fill(glyph.tint.opacity(32.0 / 255.0))
+            Image(systemName: glyph.systemImage)
+                .font(.system(size: 18))
+                .foregroundStyle(glyph.tint)
         }
+        .frame(width: 40, height: 40)
+    }
+
+    private var downloadControl: some View {
+        Button {
+            share()
+        } label: {
+            Group {
+                if isFetching {
+                    ProgressView().tint(Theme.Color.textMuted).scaleEffect(0.7)
+                } else {
+                    Image(systemName: "arrow.down.circle")
+                        .font(.system(size: 16))
+                        .foregroundStyle(Theme.Color.textMuted)
+                }
+            }
+            // A 44pt target around a 16pt glyph, and it must not enlarge the row.
+            .frame(width: 32, height: 32)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Download \(attachment.filename)")
     }
 
     private func share() {

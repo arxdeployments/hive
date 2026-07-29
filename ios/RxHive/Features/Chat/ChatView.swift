@@ -40,7 +40,6 @@ struct ChatView: View {
     @State private var sheet: ChatSheet?
     @State private var reportTarget: Message?
     @State private var showReportAlert = false
-    @State private var showClearConfirm = false
     @State private var showLeaveConfirm = false
     /// Pushed destinations. One binding, so only one push is ever pending — the info
     /// panels, the search/starred/pinned lists and a jumped-to DM are all screens with
@@ -125,6 +124,13 @@ struct ChatView: View {
         .background(Theme.Color.bg)
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
+        // The tab bar must go too, not just the nav bar. It is drawn over the bottom
+        // of this view, and the composer is the bottom of this view — so leaving it
+        // visible does not merely look wrong, it makes the message field
+        // untappable: taps in that strip select a tab instead. (Found on device;
+        // typing went to a tab switch.) Every messenger hides the tab bar inside a
+        // thread for the same reason.
+        .toolbar(.hidden, for: .tabBar)
         .task { await open() }
         .onChange(of: messages.count) { _, _ in newMessagesArrived() }
         .navigationDestination(item: $route) { destination in
@@ -152,22 +158,6 @@ struct ChatView: View {
             Hairline()
         }
         .background(Theme.Color.sidebar)
-        .alert("Clear this chat?", isPresented: $showClearConfirm) {
-            Button("Cancel", role: .cancel) {}
-            Button("Clear", role: .destructive) {
-                Task {
-                    if await chat.clearHistory(conversationID: conversationID) {
-                        pinned = []
-                        unreadAnchorID = nil
-                        toasts.success("Chat cleared")
-                    } else {
-                        toasts.error("Couldn't clear this chat")
-                    }
-                }
-            }
-        } message: {
-            Text("Messages are removed for you only. Everyone else keeps their copy.")
-        }
         .alert("Exit \"\(title)\"?", isPresented: $showLeaveConfirm) {
             Button("Cancel", role: .cancel) {}
             Button("Exit group", role: .destructive) { Task { await leaveGroup() } }
@@ -329,12 +319,6 @@ struct ChatView: View {
             } label: {
                 let muted = conversation?.isMuted == true
                 Label(muted ? "Unmute" : "Mute", systemImage: muted ? "bell" : "bell.slash")
-            }
-            Button { Task { await exportTranscript() } } label: {
-                Label("Export chat", systemImage: "square.and.arrow.up")
-            }
-            Button(role: .destructive) { showClearConfirm = true } label: {
-                Label("Clear history", systemImage: "trash")
             }
 
             if isGroup {
@@ -660,8 +644,6 @@ struct ChatView: View {
                 }
             )
 
-        case .share(let url):
-            MediaShareSheet(url: url)
         }
     }
 
@@ -986,20 +968,6 @@ struct ChatView: View {
         }
     }
 
-    private func exportTranscript() async {
-        do {
-            let data = try await RxHiveAPI.exportConversation(id: conversationID)
-            // A real extension, and no path separators from a group name.
-            let safeTitle = title.replacingOccurrences(of: "/", with: "-").trimmed
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent("\(safeTitle.isEmpty ? "chat" : safeTitle) transcript.txt")
-            try data.write(to: url, options: .atomic)
-            sheet = .share(url)
-        } catch {
-            toasts.failure(error, fallback: "Couldn't export this chat")
-        }
-    }
-
     // MARK: - Pins
 
     /// Pins are fetched rather than filtered out of the loaded window: a pin can sit
@@ -1063,8 +1031,6 @@ private enum ChatSheet: Identifiable {
     case forward([String])
     case info(MessageInfo)
     case reactions(Message)
-    /// The exported transcript, once its bytes are on disk.
-    case share(URL)
 
     var id: String {
         switch self {
@@ -1072,7 +1038,6 @@ private enum ChatSheet: Identifiable {
         case .forward(let ids): return "forward-\(ids.joined(separator: ","))"
         case .info: return "info"
         case .reactions(let message): return "reactions-\(message.id)"
-        case .share(let url): return "share-\(url.lastPathComponent)"
         }
     }
 }

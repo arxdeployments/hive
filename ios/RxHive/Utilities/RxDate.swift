@@ -66,7 +66,10 @@ extension Date {
         if let weekAgo = calendar.date(byAdding: .day, value: -6, to: Date()), self > weekAgo {
             return formatted(.dateTime.weekday(.abbreviated))
         }
-        return formatted(.dateTime.day().month(.numeric).year(.twoDigits))
+        // `.defaultDigits`, not `.numeric` — `Month` has no `.numeric` case, and the
+        // digit-form spellings differ per symbol (Day has `.defaultDigits`, Year has
+        // `.twoDigits`). Renders as 7/29/26 in en-US and reorders per locale.
+        return formatted(.dateTime.day().month(.defaultDigits).year(.twoDigits))
     }
 
     /// The time inside a message bubble.

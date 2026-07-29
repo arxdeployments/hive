@@ -56,6 +56,21 @@ struct MessageComposer: View {
     /// permission prompt sits between the two, and a finger lifted during the prompt
     /// must not start a recording nobody is holding.
     @State private var micHeld = false
+    /// Hands-free: the finger has let go but the recorder is still running.
+    @State private var isLocked = false
+    /// Upward travel of the hold gesture, for the lock affordance.
+    @State private var slideUp: CGFloat = 0
+
+    /// Which recorder state the bar should show, or nil for the normal composer.
+    ///
+    /// Paused outranks locked: pausing is reached *from* locked, and the paused bar is
+    /// the one with the preview player and the resume button.
+    private var recorderMode: VoiceRecorderBar.Mode? {
+        if recorder.phase == .paused { return .paused }
+        guard recorder.isRecording else { return nil }
+        if isLocked { return .locked }
+        return .holding(dragX: slideOffset, dragY: slideUp)
+    }
     @State private var cancelArmed = false
     @State private var slideOffset: CGFloat = 0
 
@@ -103,16 +118,27 @@ struct MessageComposer: View {
 
             if !canPost {
                 blockedNotice
-            } else if recorder.isRecording {
-                recordingBar
+            } else if let mode = recorderMode, mode == .locked || mode == .paused {
+                // Hands-free and paused take the whole row: the finger is off the
+                // screen, so there is no mic button to keep under it.
+                VoiceRecorderBar(
+                    recorder: recorder,
+                    mode: mode,
+                    onCancel: discardRecording,
+                    onPause: pauseRecording,
+                    onResume: resumeRecording,
+                    onSend: finishAndSend
+                )
             } else {
+                // Includes the holding state, which keeps the mic button in place —
+                // the finger is still on it, and the lock target sits above it.
                 composerRow
             }
         }
         .background(Theme.Color.sidebar)
         .animation(Theme.Motion.ease, value: showsReplyStrip)
         .animation(Theme.Motion.ease, value: uploads.count)
-        .animation(Theme.Motion.ease, value: recorder.isRecording)
+        .animation(Theme.Motion.ease, value: recorder.phase)
         .onChange(of: replyTo?.id) { _, _ in
             replyDismissed = false
             replyConsumed = false
@@ -166,27 +192,50 @@ struct MessageComposer: View {
 
     private var composerRow: some View {
         HStack(alignment: .bottom, spacing: Theme.Layout.spacing2) {
-            attachmentMenu
+            // Hidden while holding: the paperclip is directly under the sliding
+            // "slide to cancel" label, and a tappable target there is a trap.
+            if !micHeld {
+                attachmentMenu
+            }
 
-            TextField("Message", text: $text, axis: .vertical)
-                .lineLimit(1...6)
-                .font(Theme.Typography.body)
-                .foregroundStyle(Theme.Color.text)
-                .tint(Theme.Color.primary)
-                .focused($isFocused)
-                .padding(.horizontal, Theme.Layout.spacing4)
-                .padding(.vertical, 10)
-                .background(
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .fill(Theme.Color.surface2)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                                .stroke(isFocused ? Theme.Color.primary : Theme.Color.border2, lineWidth: 1)
-                        )
+            if micHeld {
+                VoiceRecorderBar(
+                    recorder: recorder,
+                    mode: .holding(dragX: slideOffset, dragY: slideUp),
+                    onCancel: discardRecording,
+                    onPause: pauseRecording,
+                    onResume: resumeRecording,
+                    onSend: finishAndSend
                 )
-                .animation(Theme.Motion.ease, value: isFocused)
+            } else {
+                TextField("Message", text: $text, axis: .vertical)
+                    .lineLimit(1...6)
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Color.text)
+                    .tint(Theme.Color.primary)
+                    .focused($isFocused)
+                    .padding(.horizontal, Theme.Layout.spacing4)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .fill(Theme.Color.surface2)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                    .stroke(isFocused ? Theme.Color.primary : Theme.Color.border2, lineWidth: 1)
+                            )
+                    )
+                    .animation(Theme.Motion.ease, value: isFocused)
+            }
 
             sendOrMicButton
+                // The lock column floats above the mic, anchored to the button rather
+                // than to the bar, so "slide up" points at something.
+                .overlay(alignment: .bottom) {
+                    if micHeld && !isLocked {
+                        VoiceRecorderBar.lockAffordance(dragY: slideUp)
+                            .transition(.opacity)
+                    }
+                }
         }
         .padding(.horizontal, Theme.Layout.spacing3)
         .padding(.vertical, Theme.Layout.spacing2)
@@ -231,15 +280,42 @@ struct MessageComposer: View {
         .scaleEffect(micHeld ? 1.25 : 1)
         .animation(Theme.Motion.interactive, value: micHeld)
         .contentShape(Circle())
-        // Two different controls in one place: a tap target when there is text, a
-        // press-and-hold recorder when there is not.
-        .onTapGesture {
-            if hasText { sendText() }
-        }
-        // `.subviews` disables this gesture while keeping the tap above it live, which
-        // is how one control can be a button with text and a recorder without.
-        .gesture(micGesture, including: hasText ? GestureMask.subviews : GestureMask.all)
+        // Recording starts and stops on the PRESS STATE, not on a drag update.
+        //
+        // This is the fix for "press and hold does nothing". A `DragGesture` only calls
+        // `onChanged` when the touch actually moves, so a press that never moves — a
+        // mouse click-and-hold in the Simulator, or a very still thumb — produced no
+        // callback at all and never began recording. Sliding worked, which is what made
+        // the bug look like it wasn't there.
+        //
+        // `onLongPressGesture(pressing:)` fires the moment the touch lands and again
+        // when it lifts, with no movement required. `maximumDistance` is deliberately
+        // enormous so sliding away to cancel or to lock does not end the press.
+        // `minimumDuration` is a large finite number, NOT `.infinity`: an infinite
+        // timer never arms, and the gesture then never reports a press at all — which
+        // is how this looked identical to the original bug. An hour never elapses
+        // during a voice note, so `perform` never fires and `pressing(false)` arrives
+        // only when the finger actually lifts. (Were `perform` to fire, SwiftUI would
+        // end the gesture and report un-pressing, cutting the recording short.)
+        .onLongPressGesture(
+            minimumDuration: 3600,
+            maximumDistance: 10_000,
+            pressing: { isPressing in
+                guard !hasText else { return }
+                if isPressing {
+                    beginRecording()
+                } else if !isLocked {
+                    endRecording()
+                } else {
+                    micHeld = false
+                }
+            },
+            perform: {}
+        )
+        // Runs alongside the press so the same touch can both hold and slide.
+        .simultaneousGesture(micGesture)
         .accessibilityLabel(hasText ? "Send message" : "Hold to record a voice message")
+        .accessibilityHint(hasText ? "" : "Slide up to record hands-free, or slide left to cancel")
     }
 
     private var blockedNotice: some View {
@@ -272,16 +348,78 @@ struct MessageComposer: View {
 
     // MARK: - Voice notes
 
+    /// Distance below which an ended drag counts as a tap rather than a slide.
+    private static let tapSlop: CGFloat = 12
+
+    /// Tracks *where* the finger goes. Starting and stopping the recording is the
+    /// press gesture's job (see `sendOrMicButton`) — this only reads translation, so a
+    /// motionless hold is not dependent on it.
     private var micGesture: some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
-                if !micHeld { beginRecording() }
-                // Only leftward travel counts, so a wobble downwards while holding does
-                // not arm the cancel.
+                guard !hasText, !isLocked else { return }
                 slideOffset = min(0, value.translation.width)
-                cancelArmed = value.translation.width < -80
+                slideUp = min(0, value.translation.height)
+                cancelArmed = value.translation.width < -VoiceRecorderBar.cancelThreshold
+
+                // Slide up to go hands-free. Checked before cancel so a diagonal drag
+                // that clears the lock threshold locks rather than being read as a
+                // half-hearted cancel.
+                if value.translation.height < -VoiceRecorderBar.lockThreshold, !cancelArmed {
+                    lockRecording()
+                }
             }
-            .onEnded { _ in endRecording() }
+            .onEnded { value in
+                guard hasText else { return }
+                // A lift with no travel is the tap that sends the typed message.
+                let travelled = max(abs(value.translation.width), abs(value.translation.height))
+                if travelled < Self.tapSlop { sendText() }
+            }
+    }
+
+    /// Hands-free. The bar takes over the composer row and the gesture stops mattering.
+    private func lockRecording() {
+        guard !isLocked else { return }
+        isLocked = true
+        micHeld = false
+        cancelArmed = false
+        slideOffset = 0
+        slideUp = 0
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    }
+
+    /// Pause, resume and trash from the locked/paused bar.
+    private func pauseRecording() {
+        recorder.pause()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    private func resumeRecording() {
+        if !recorder.resume() {
+            toasts.error("Couldn't continue recording.")
+        }
+    }
+
+    private func discardRecording() {
+        recorder.cancel()
+        isLocked = false
+        micHeld = false
+        cancelArmed = false
+        slideOffset = 0
+        slideUp = 0
+    }
+
+    /// Send whatever has been captured, from either the locked or the paused bar.
+    private func finishAndSend() {
+        isLocked = false
+        micHeld = false
+        Task { @MainActor in
+            guard let result = await recorder.finish() else {
+                toasts.show("That recording was too short to send")
+                return
+            }
+            await sendVoiceNote(url: result.url, duration: result.duration)
+        }
     }
 
     private func beginRecording() {
@@ -302,29 +440,37 @@ struct MessageComposer: View {
             // The finger may already be back up — either because the prompt stole the
             // press, or because it was a stray tap.
             guard micHeld else { return }
-            if !recorder.start() {
+            if recorder.start() {
+                // The strip appearing is easy to miss with a thumb over it, so confirm
+                // the hold in the hand as well as on screen.
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            } else {
                 micHeld = false
                 toasts.error("Couldn't start recording. Try again.")
             }
         }
     }
 
+    /// Finger lifted without locking: send, or discard if the slide-to-cancel was armed.
     private func endRecording() {
         let armed = cancelArmed
         micHeld = false
         cancelArmed = false
         slideOffset = 0
-        guard recorder.isRecording else { return }
+        slideUp = 0
+        guard recorder.isActive else { return }
 
         if armed {
             recorder.cancel()
             return
         }
-        guard let result = recorder.stop() else {
-            toasts.show("Hold to record, release to send")
-            return
+        Task { @MainActor in
+            guard let result = await recorder.finish() else {
+                toasts.show("Hold to record, release to send")
+                return
+            }
+            await sendVoiceNote(url: result.url, duration: result.duration)
         }
-        Task { @MainActor in await sendVoiceNote(url: result.url, duration: result.duration) }
     }
 
     @MainActor
@@ -345,44 +491,6 @@ struct MessageComposer: View {
             duration: (duration * 10).rounded() / 10,
             replyID: consumeReplyID()
         )
-    }
-
-    private var recordingBar: some View {
-        HStack(spacing: Theme.Layout.spacing3) {
-            Image(systemName: cancelArmed ? "trash.fill" : "mic.fill")
-                .font(.system(size: 16))
-                .foregroundStyle(Theme.Color.danger)
-                .frame(width: 28)
-
-            Text(MediaFormatting.clockLabel(recorder.elapsed))
-                .font(Theme.Typography.font(size: 15, weight: .medium))
-                .monospacedDigit()
-                .foregroundStyle(Theme.Color.text)
-
-            RecordingWaveform(levels: recorder.levels)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .clipped()
-
-            HStack(spacing: 2) {
-                if !cancelArmed {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 10, weight: .semibold))
-                }
-                Text(cancelArmed ? "Release to cancel" : "Slide to cancel")
-                    .font(Theme.Typography.caption)
-            }
-            .foregroundStyle(cancelArmed ? Theme.Color.danger : Theme.Color.textMuted)
-
-            // A spacer the width of the mic button: the finger is still on that button,
-            // which lives in the row this bar replaces.
-            Color.clear.frame(width: Theme.Layout.minTouchTarget, height: 1)
-        }
-        .padding(.horizontal, Theme.Layout.spacing3)
-        .padding(.vertical, Theme.Layout.spacing2)
-        .frame(minHeight: Theme.Layout.minTouchTarget + Theme.Layout.spacing4)
-        .offset(x: slideOffset / 3)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("Recording, \(MediaFormatting.clockLabel(recorder.elapsed)). Slide left to cancel.")
     }
 
     // MARK: - Staging attachments

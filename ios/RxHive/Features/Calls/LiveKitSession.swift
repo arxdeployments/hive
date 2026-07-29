@@ -343,10 +343,14 @@ final class LiveKitSession: NSObject, ObservableObject {
             guard let identity = participant.identity?.stringValue else { continue }
             let screen = participant.firstScreenShareVideoTrack
             let camera = participant.firstCameraVideoTrack
+            // `name` is optional in the LiveKit SDK and is often empty anyway: the
+            // token we mint sets only an identity, so fall back to that rather than
+            // rendering a blank tile label.
+            let publishedName = participant.name ?? ""
             states.append(
                 CallParticipantState(
                     id: identity,
-                    displayName: participant.name.isEmpty ? identity : participant.name,
+                    displayName: publishedName.isEmpty ? identity : publishedName,
                     avatarPath: nil,
                     isMuted: participant.firstAudioPublication?.isMuted ?? true,
                     isCameraOff: camera == nil || (participant.firstCameraPublication?.isMuted ?? true),

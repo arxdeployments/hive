@@ -406,7 +406,7 @@ struct EncryptionNoticeView: View {
         Point(
             systemImage: "externaldrive.badge.icloud",
             title: "Stored on RX HIVE servers",
-            body: "History is retained on the server so you can search it and pick it up on another device. Clearing a chat hides your copy; everyone else keeps theirs."
+            body: "History is retained on the server so you can search it and pick it up on another device. Deleting a chat hides your copy; everyone else keeps theirs."
         )
     ]
 
@@ -522,7 +522,6 @@ struct ContactInfoView: View {
     @State private var groups: [Conversation] = []
     @State private var groupsState: InfoLoadState = .idle
     @State private var mutePending = false
-    @State private var confirmClear = false
     @State private var confirmDelete = false
     @State private var isWorking = false
 
@@ -570,16 +569,6 @@ struct ContactInfoView: View {
         .task(id: person?.userId) {
             await loadDirectoryRow()
             await loadGroupsInCommon()
-        }
-        .confirmationDialog(
-            "Clear this chat?",
-            isPresented: $confirmClear,
-            titleVisibility: .visible
-        ) {
-            Button("Clear chat", role: .destructive) { Task { await clearHistory() } }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Every message will be removed from your copy of this chat. \(displayName) keeps theirs.")
         }
         .confirmationDialog(
             "Delete this chat?",
@@ -691,16 +680,6 @@ struct ContactInfoView: View {
             ) { _ in
                 Task { await toggleMute() }
             }
-            InfoRowDivider(inset: Theme.Layout.spacing4)
-            // Present and inert, exactly as on the web: the product has no
-            // disappearing-messages support, and hiding the row makes people hunt
-            // for a setting that does not exist.
-            InfoRowLabel(
-                systemImage: "timer",
-                title: "Disappearing messages",
-                subtitle: "Not available on RX HIVE yet",
-                trailingText: "Off"
-            )
         }
     }
 
@@ -801,15 +780,6 @@ struct ContactInfoView: View {
     private var dangerSection: some View {
         InfoCard {
             InfoActionRow(
-                systemImage: "eraser",
-                title: "Clear chat",
-                subtitle: "Remove all messages from your copy of this chat",
-                isEnabled: !isWorking
-            ) {
-                confirmClear = true
-            }
-            InfoRowDivider()
-            InfoActionRow(
                 systemImage: "trash",
                 title: "Delete chat",
                 subtitle: "Remove this conversation from your list",
@@ -868,16 +838,6 @@ struct ContactInfoView: View {
             toasts.success(muted ? "Notifications muted" : "Notifications unmuted")
         } else {
             toasts.error("Failed to change mute")
-        }
-    }
-
-    private func clearHistory() async {
-        isWorking = true
-        defer { isWorking = false }
-        if await chat.clearHistory(conversationID: live.id) {
-            toasts.success("Chat cleared")
-        } else {
-            toasts.error("Failed to clear chat")
         }
     }
 

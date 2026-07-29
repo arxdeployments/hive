@@ -397,18 +397,21 @@ private struct ChangePasswordSheet: View {
                 try await RxHiveAPI.changePassword(current: current, new: new)
                 toasts.success("Password changed")
                 dismiss()
-            } catch APIError.unauthorized {
+            } catch APIError.credentials {
                 // `/api/auth/change-password` answers 401 for "current password is
-                // wrong", and `APIClient.isAuthPath` correctly declines to treat
-                // that as an expired session — but `.unauthorized.userMessage` still
-                // reads "Your session expired", which would be a lie here.
+                // wrong". `APIClient` classifies that as `.credentials` rather than
+                // `.unauthorized` precisely so it cannot be read as an expiry; the
+                // server's own wording is generic, so name the field here.
                 error = "Your current password is incorrect."
             } catch let apiError as APIError {
                 // A 400 is the policy rejection; its detail is the server's own
                 // sentence and is the only place the real minimum length appears.
                 error = apiError.userMessage
             } catch {
-                error = "Couldn't change your password. Please try again."
+                // A bare `catch` implicitly binds `error`, which shadows the @State
+                // property of the same name — hence `self.error`, or this would be
+                // trying to assign to the caught constant.
+                self.error = "Couldn't change your password. Please try again."
             }
         }
     }

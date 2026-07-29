@@ -86,10 +86,18 @@ final class RealtimeClient: NSObject, ObservableObject {
     private let log = Logger(subsystem: "ai.rhythmrx.rxhive", category: "ws")
 
     /// Called when the socket closes because the access token expired (4001).
-    /// Returning true means "a refresh succeeded, reconnect now".
-    var onTokenExpired: (() async -> Bool)?
-    /// Called when the socket is closed for a reason a refresh cannot fix.
-    var onUnauthorized: (() -> Void)?
+    /// `.valid` means reconnect now; `.unreachable` means the check itself could not
+    /// be delivered, so back off and try again rather than ending the session.
+    var onTokenExpired: (() async -> AuthStore.SessionCheck)?
+    /// Called when the socket is closed for a reason a refresh cannot fix. Carries
+    /// the server's close reason — `hub.py` sends "Mobile access revoked" there, and
+    /// that sentence is the difference between the right screen and a wrong one.
+    var onUnauthorized: ((String) -> Void)?
+
+    /// The most recent close reason, captured by the delegate. `closeCode` alone
+    /// cannot distinguish "token expired" from "mobile access revoked": the server
+    /// sends 4001 for both and puts the difference in the reason.
+    private var lastCloseReason = ""
 
     private let pingInterval: Duration = .seconds(25)
     /// Server closes with 4001 for both "invalid token" and "token expired", and
@@ -151,27 +159,30 @@ final class RealtimeClient: NSObject, ObservableObject {
     // MARK: - Receiving
 
     private func receiveLoop(on socket: URLSessionWebSocketTask) {
+        // This `Task` inherits the enclosing @MainActor context, so `isCurrent`,
+        // `handle` and `socketFailed` are already main-actor-isolated and are called
+        // without `await`. Only `socket.receive()` actually suspends.
         Task { [weak self] in
             while !Task.isCancelled {
                 do {
                     let message = try await socket.receive()
                     guard let self else { return }
                     // A different socket took over while this loop was suspended.
-                    guard await self.isCurrent(socket) else { return }
+                    guard self.isCurrent(socket) else { return }
                     switch message {
                     case .string(let text):
-                        await self.handle(text: text)
+                        self.handle(text: text)
                     case .data(let data):
                         if let text = String(data: data, encoding: .utf8) {
-                            await self.handle(text: text)
+                            self.handle(text: text)
                         }
                     @unknown default:
                         break
                     }
                 } catch {
                     guard let self else { return }
-                    guard await self.isCurrent(socket) else { return }
-                    await self.socketFailed(socket, error: error)
+                    guard self.isCurrent(socket) else { return }
+                    self.socketFailed(socket, error: error)
                     return
                 }
             }
@@ -209,15 +220,28 @@ final class RealtimeClient: NSObject, ObservableObject {
             // The 15-minute access token lapsed — the common case. Refresh and
             // reconnect immediately rather than backing off, because the user is
             // very likely looking at the screen right now.
+            let reason = lastCloseReason
             Task { [weak self] in
                 guard let self else { return }
-                let refreshed = await self.onTokenExpired?() ?? false
-                if refreshed {
+                switch await self.onTokenExpired?() ?? .unreachable {
+                case .valid:
                     self.attempt = 0
                     self.openSocket()
-                } else {
+
+                case .unreachable:
+                    // We could not confirm the session, which is not the same as
+                    // losing it. Back off and try again: this close arrives every 15
+                    // minutes for every connected user, so treating one unanswered
+                    // check as a sign-out meant a single dead spot ended the session.
+                    // Worse, the old code then parked at `.offline` without ever
+                    // scheduling a reconnect, so there was no way back even once the
+                    // network returned.
+                    self.log.notice("Token refresh undeliverable; backing off instead of signing out")
+                    self.scheduleReconnect()
+
+                case .rejected:
                     self.state = .offline
-                    self.onUnauthorized?()
+                    self.onUnauthorized?(reason)
                 }
             }
             return
@@ -293,6 +317,13 @@ final class RealtimeClient: NSObject, ObservableObject {
 
     func applicationWillEnterForeground() {
         guard !intentionallyClosed else { return }
+        // `scenePhase` reaches `.active` for far more than a real return from the
+        // background — the app switcher, Control Center, a notification banner, a
+        // permission alert. Without this guard each flicker opened another socket on
+        // top of the live one, and the orphan lingered server-side until the 65s
+        // heartbeat timeout, each one an extra presence connection and an extra
+        // chance to trip the auth paths above.
+        guard state != .connected, state != .connecting else { return }
         attempt = 0
         openSocket()
     }
@@ -466,10 +497,16 @@ extension RealtimeClient: URLSessionWebSocketDelegate {
         didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
         reason: Data?
     ) {
-        // The receive loop's throw is the single path that handles closure, so
-        // there is nothing to do here beyond leaving a trace.
+        // The receive loop's throw is the single path that handles closure, but the
+        // reason string arrives *only* here, and it is the only thing that separates
+        // a routine token expiry from a withdrawn mobile grant. Stash it for
+        // `socketFailed`, which runs immediately afterwards on the same close.
         let text = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         Logger(subsystem: "ai.rhythmrx.rxhive", category: "ws")
             .notice("didClose \(closeCode.rawValue) \(text, privacy: .public)")
+        Task { @MainActor [weak self] in
+            guard let self, self.task === webSocketTask else { return }
+            self.lastCloseReason = text
+        }
     }
 }

@@ -300,6 +300,8 @@ struct Message: Codable, Identifiable, Hashable {
     var fileSize: Int?
     var filename: String?
     var duration: Double?
+    /// Mirrors `attachments[0].page_count` (`enrich.py` sets both).
+    var pageCount: Int?
     var attachments: [Attachment]
 
     /// Present only when the message is a reply.
@@ -328,6 +330,7 @@ struct Message: Codable, Identifiable, Hashable {
         case thumbnailURL = "thumbnail_url"
         case fileSize = "file_size"
         case filename, duration, attachments
+        case pageCount = "page_count"
         case replyToMessage = "reply_to_message"
     }
 }
@@ -343,6 +346,28 @@ struct Attachment: Codable, Identifiable, Hashable {
     /// Seconds, for audio/video. Sent so a voice note can render its length
     /// without fetching the file.
     let duration: Double?
+    /// PDF page count, from `pypdfium2` at upload time.
+    ///
+    /// **nil is meaningful and must not be coerced to 0** — it means "not a PDF, or
+    /// uploaded before previews existed" (`db/models.py` says so explicitly). The
+    /// bubble uses it to decide between the preview layout and the plain icon row,
+    /// and the reader uses it as the page count to request. A 0 would make a real
+    /// PDF render as an empty reader.
+    let pageCount: Int?
+
+    /// True when this is a PDF the server managed to rasterise, so a page-1 preview
+    /// and a page-by-page reader are both available.
+    var hasPDFPreview: Bool {
+        mimeType == "application/pdf" && (pageCount ?? 0) > 0
+            && !(thumbnailURL ?? "").isEmpty
+    }
+
+    /// `GET /api/media/{id}/page/{n}` — one rendered page, 1-indexed. The server
+    /// renders in windows of 10 and caches each page back to object storage, so
+    /// scrolling a long document does not re-render it.
+    func pdfPagePath(_ page: Int) -> String {
+        "\(mediaURL)/page/\(page)"
+    }
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -352,6 +377,7 @@ struct Attachment: Codable, Identifiable, Hashable {
         case mimeType = "mime_type"
         case fileSize = "file_size"
         case duration
+        case pageCount = "page_count"
     }
 }
 

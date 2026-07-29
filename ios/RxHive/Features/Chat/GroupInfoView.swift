@@ -45,7 +45,6 @@ struct GroupInfoView: View {
     @State private var showAddMembers = false
 
     @State private var mutePending = false
-    @State private var confirmClear = false
     @State private var confirmLeave = false
     @State private var isWorking = false
 
@@ -138,12 +137,6 @@ struct GroupInfoView: View {
             ) { ids in
                 await addMembers(ids)
             }
-        }
-        .confirmationDialog("Clear this chat?", isPresented: $confirmClear, titleVisibility: .visible) {
-            Button("Clear chat", role: .destructive) { Task { await clearHistory() } }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Every message will be removed from your copy of this chat. Other members keep theirs.")
         }
         .confirmationDialog(leaveTitle, isPresented: $confirmLeave, titleVisibility: .visible) {
             Button(leaveLabel, role: .destructive) { Task { await leaveGroup() } }
@@ -301,13 +294,6 @@ struct GroupInfoView: View {
             ) { _ in
                 Task { await toggleMute() }
             }
-            InfoRowDivider(inset: Theme.Layout.spacing4)
-            InfoRowLabel(
-                systemImage: "timer",
-                title: "Disappearing messages",
-                subtitle: "Not available on RX HIVE yet",
-                trailingText: "Off"
-            )
         }
     }
 
@@ -525,15 +511,6 @@ struct GroupInfoView: View {
 
     private var dangerSection: some View {
         InfoCard {
-            InfoActionRow(
-                systemImage: "eraser",
-                title: "Clear chat",
-                subtitle: "Remove all messages from your copy of this chat",
-                isEnabled: !isWorking
-            ) {
-                confirmClear = true
-            }
-            InfoRowDivider()
             if isCrossOrg {
                 InfoRowLabel(
                     systemImage: "info.circle",
@@ -608,16 +585,6 @@ struct GroupInfoView: View {
         }
     }
 
-    private func clearHistory() async {
-        isWorking = true
-        defer { isWorking = false }
-        if await chat.clearHistory(conversationID: live.id) {
-            toasts.success("Chat cleared")
-        } else {
-            toasts.error("Failed to clear chat")
-        }
-    }
-
     private func leaveGroup() async {
         isWorking = true
         defer { isWorking = false }
@@ -626,7 +593,10 @@ struct GroupInfoView: View {
             toasts.success(leaveLabel == "Delete group" ? "Group deleted" : "Left group")
             // The `member_left` broadcast does not reach us — we are no longer a
             // participant — so the list is corrected here rather than by an event.
-            _ = await chat.deleteConversation(id: live.id)
+            // Re-read it rather than calling `deleteConversation`: leaving has already
+            // removed my participant row, so the DELETE would 404 and the stale row
+            // would survive.
+            await chat.loadConversations()
             dismiss()
         } catch {
             toasts.failure(error, fallback: "Failed to leave group")

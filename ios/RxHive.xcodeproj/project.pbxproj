@@ -10,9 +10,20 @@
 		1A0000000000000000000012 /* LiveKit in Frameworks */ = {isa = PBXBuildFile; productRef = 1A0000000000000000000011 /* LiveKit */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		1A000000000000000000001E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1A0000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1A0000000000000000000005;
+			remoteInfo = RxHive;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		1A0000000000000000000004 /* RxHive.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = RxHive.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0000000000000000000013 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		1A0000000000000000000014 /* RxHiveTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RxHiveTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -29,6 +40,15 @@
 			path = RxHive;
 			sourceTree = "<group>";
 		};
+		/*
+		  Same arrangement for the tests: drop a .swift file into ios/RxHiveTests/
+		  and it is compiled into the test bundle without touching this file.
+		*/
+		1A0000000000000000000015 /* RxHiveTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = RxHiveTests;
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -40,6 +60,18 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		/*
+		  Empty on purpose. XCTest is linked implicitly by the unit-test product type,
+		  and the test bundle must NOT link LiveKit: it exercises Core/ against a
+		  scripted URLProtocol and gets everything else from the app it is hosted by.
+		*/
+		1A0000000000000000000018 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -47,6 +79,7 @@
 			isa = PBXGroup;
 			children = (
 				1A0000000000000000000009 /* RxHive */,
+				1A0000000000000000000015 /* RxHiveTests */,
 				1A0000000000000000000013 /* Info.plist */,
 				1A0000000000000000000003 /* Products */,
 			);
@@ -56,6 +89,7 @@
 			isa = PBXGroup;
 			children = (
 				1A0000000000000000000004 /* RxHive.app */,
+				1A0000000000000000000014 /* RxHiveTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -86,6 +120,29 @@
 			productReference = 1A0000000000000000000004 /* RxHive.app */;
 			productType = "com.apple.product-type.application";
 		};
+		1A0000000000000000000016 /* RxHiveTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1A000000000000000000001A /* Build configuration list for PBXNativeTarget "RxHiveTests" */;
+			buildPhases = (
+				1A0000000000000000000017 /* Sources */,
+				1A0000000000000000000018 /* Frameworks */,
+				1A0000000000000000000019 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				1A000000000000000000001D /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				1A0000000000000000000015 /* RxHiveTests */,
+			);
+			name = RxHiveTests;
+			packageProductDependencies = (
+			);
+			productName = RxHiveTests;
+			productReference = 1A0000000000000000000014 /* RxHiveTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -98,6 +155,10 @@
 				TargetAttributes = {
 					1A0000000000000000000005 = {
 						CreatedOnToolsVersion = 16.0;
+					};
+					1A0000000000000000000016 = {
+						CreatedOnToolsVersion = 16.0;
+						TestTargetID = 1A0000000000000000000005;
 					};
 				};
 			};
@@ -118,12 +179,20 @@
 			projectRoot = "";
 			targets = (
 				1A0000000000000000000005 /* RxHive */,
+				1A0000000000000000000016 /* RxHiveTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		1A0000000000000000000008 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1A0000000000000000000019 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -140,7 +209,23 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		/* Empty: the sources come from the synchronized RxHiveTests group above. */
+		1A0000000000000000000017 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		1A000000000000000000001D /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1A0000000000000000000005 /* RxHive */;
+			targetProxy = 1A000000000000000000001E /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		1A000000000000000000000C /* Debug */ = {
@@ -218,9 +303,14 @@
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.rhythmrx.rxhive;
 				PRODUCT_NAME = "$(TARGET_NAME)";
-				/* Local development default. Override per-machine in a .xcconfig or
-				   in the scheme rather than editing this file. */
-				RXHIVE_API_URL = "http://localhost:8000";
+				/* Local development default: Caddy, NOT the API's own port.
+				   `infra/docker-compose.yml` does not publish api:8000 to the host —
+				   Caddy owns :80 and reverse-proxies /api/* and the /api/ws upgrade to
+				   it, exactly as in production. Pointing at :8000 gives connection
+				   refused unless you add a ports mapping yourself.
+				   For a bare `uvicorn` run outside compose, use http://localhost:8000.
+				   Override per-machine in a .xcconfig rather than editing this file. */
+				RXHIVE_API_URL = "http://localhost";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -254,6 +344,53 @@
 			};
 			name = Release;
 		};
+		/*
+		  Unit-test bundle, hosted by the app.
+		    TEST_HOST     — the app's executable, so the tests run inside the app
+		                    process and get its Info.plist (AppConfig.apiBaseURL reads
+		                    RXHIVE_API_URL from Bundle.main, which is the *app* here).
+		    BUNDLE_LOADER — the same binary, so @testable import RxHive resolves the
+		                    app's symbols at link time instead of duplicating sources.
+		  No SPM product is declared: nothing under RxHiveTests/ touches LiveKit.
+		*/
+		1A000000000000000000001B /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.rhythmrx.rxhive.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/RxHive.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/RxHive";
+			};
+			name = Debug;
+		};
+		1A000000000000000000001C /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.rhythmrx.rxhive.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/RxHive.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/RxHive";
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -271,6 +408,15 @@
 			buildConfigurations = (
 				1A000000000000000000000E /* Debug */,
 				1A000000000000000000000F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1A000000000000000000001A /* Build configuration list for PBXNativeTarget "RxHiveTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1A000000000000000000001B /* Debug */,
+				1A000000000000000000001C /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

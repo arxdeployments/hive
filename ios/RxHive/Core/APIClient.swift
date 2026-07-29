@@ -20,12 +20,24 @@ import os
 ///
 /// ## Refresh
 ///
-/// A 401 on any call means the 15-minute access cookie lapsed. One refresh runs
-/// at a time (`RefreshCoordinator`) and every caller that raced into a 401 awaits
-/// that same refresh and then replays once. Without the single-flight, a screen
-/// that fires five parallel requests on appear would trigger five refreshes —
-/// and since the backend *rotates* refresh tokens single-use, four of them would
-/// present an already-consumed token and force a spurious sign-out.
+/// A 401 from our own API means the 15-minute access cookie lapsed. One refresh
+/// runs at a time (`RefreshCoordinator`) and every caller that raced into a 401
+/// awaits that same refresh and then replays once. Without the single-flight, a
+/// screen that fires five parallel requests on appear would trigger five
+/// refreshes — and since the backend *rotates* refresh tokens single-use, four of
+/// them would present an already-consumed token and force a spurious sign-out.
+///
+/// ## Reached-and-refused vs never-asked
+///
+/// The refresh result is deliberately three-valued, because collapsing it to a
+/// Bool is what made this client sign people out for no reason. "Refresh failed"
+/// conflates *the server rejected my token* with *I could not reach the server* —
+/// offline, DNS, timeout, a proxy 502 mid-deploy, a 429 from a rate limiter keyed
+/// on a shared clinic IP, a 500 because Redis blinked. Only the first proves the
+/// session is over. For the rest the 30-day refresh token is still perfectly
+/// good, so the request fails as `.transport` (retryable) and nothing is
+/// discarded. Deleting a valid credential because the network hiccuped costs the
+/// user their password, and it is not recoverable once the cookie is gone.
 actor APIClient {
 
     static let shared = APIClient()
@@ -39,7 +51,19 @@ actor APIClient {
     /// Fires when the session is unrecoverable. `AuthStore` listens and tears the
     /// UI back to sign-in. A notification rather than a closure because any layer
     /// (a socket, a background upload) can discover expiry.
+    ///
+    /// `userInfo[detailKey]` carries the server's own sentence when it sent one, so
+    /// a revoked mobile grant can reach the screen written to explain it instead of
+    /// being flattened into "your session expired".
     static let sessionExpiredNotification = Notification.Name("RxHiveSessionExpired")
+    static let detailKey = "detail"
+    static let statusKey = "status"
+
+    /// Bumped on every successful refresh. A request that was already on the wire
+    /// when someone else refreshed comes back 401 through no fault of the session;
+    /// comparing the generation it was sent under against the current one tells us
+    /// to simply replay rather than burn a second rotation.
+    private var refreshGeneration = 0
 
     init(session: URLSession? = nil) {
         if let session {
@@ -70,7 +94,10 @@ actor APIClient {
 
         encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .custom { date, encoder in
-            try encoder.singleValueContainer().encode(RxDate.format(date))
+            // `encode` is mutating on SingleValueEncodingContainer, so the container
+            // has to be bound to a var — it cannot be called on the returned value.
+            var container = encoder.singleValueContainer()
+            try container.encode(RxDate.format(date))
         }
     }
 
@@ -209,6 +236,10 @@ actor APIClient {
     }
 
     private func performRaw(_ request: URLRequest, isRetry: Bool = false) async throws -> Data {
+        // Read before the request leaves, so a refresh that lands while we are in
+        // flight is detectable when we come back holding a 401.
+        let sentUnderGeneration = refreshGeneration
+
         let data: Data
         let response: URLResponse
         do {
@@ -223,21 +254,44 @@ actor APIClient {
 
         if (200..<300).contains(http.statusCode) { return data }
 
-        // 401 on a non-auth path: refresh once, then replay once.
-        //
-        // Auth paths are excluded because /login and /refresh answer 401 to mean
-        // "these credentials are wrong" — refreshing in response to that would
-        // loop. This mirrors the web client's `isAuthPath` guard in api/client.js.
-        if http.statusCode == 401, !isRetry, !Self.isAuthPath(request.url) {
-            let refreshed = await refreshCoordinator.refresh { [weak self] in
-                guard let self else { return false }
-                return await self.performRefresh()
-            }
-            if refreshed {
+        if http.statusCode == 401, !isRetry, Self.isOurAPI(request.url), !Self.skipsRefresh(request.url) {
+            // Somebody else already rotated while this request was on the wire: the
+            // cookie it carried was merely stale, so replay instead of refreshing
+            // again. Rotating a second time here would be wasted and, on a busy
+            // screen, would churn the server's refresh table for nothing.
+            if refreshGeneration != sentUnderGeneration {
                 return try await performRaw(request, isRetry: true)
             }
-            await Self.announceSessionExpired()
-            throw APIError.unauthorized
+
+            let outcome = await refreshCoordinator.refresh { [weak self] in
+                guard let self else { return .unreachable(reason: "Client released") }
+                return await self.performRefresh()
+            }
+
+            switch outcome {
+            case .refreshed:
+                return try await performRaw(request, isRetry: true)
+
+            case .rejected(let status, let detail):
+                // The server was reached and said no. This is the only branch that
+                // may end the session.
+                await Self.announceSessionEnded(status: status, detail: detail)
+                throw status == 403 ? APIError.forbidden(detail: detail) : APIError.unauthorized
+
+            case .unreachable(let reason):
+                // Nothing was established. Report it as what it is — a delivery
+                // failure — so `isRetryable` holds and AuthStore leaves the session
+                // (and the refresh cookie) exactly where they are.
+                log.notice("Refresh undelivered (\(reason, privacy: .public)); session left intact")
+                throw APIError.transport(underlying: reason)
+            }
+        }
+
+        // 401 on an auth path, or on a replay: report what the server said rather
+        // than asserting an expiry. `signIn` shows this verbatim.
+        if http.statusCode == 401 {
+            let detail = (try? decoder.decode(APIErrorBody.self, from: data))?.detail ?? ""
+            if Self.skipsRefresh(request.url) { throw APIError.credentials(detail: detail) }
         }
 
         throw Self.error(status: http.statusCode, data: data, headers: http, decoder: decoder)
@@ -245,35 +299,120 @@ actor APIClient {
 
     /// The bare refresh call. Deliberately does not go through `performRaw`, so a
     /// 401 here cannot recurse back into the refresh path.
-    private func performRefresh() async -> Bool {
+    private func performRefresh() async -> RefreshOutcome {
+        let presented = refreshCookieValue()
+        var outcome = await postRefresh()
+
+        // A 401 can also mean our cookie was rotated out from under us between
+        // reading the jar and posting — another process sharing this app's cookie
+        // store, or a rotation whose response we lost and have since re-received.
+        // If the jar has moved on, the token we just presented was simply the old
+        // one; try the new one once before declaring the session dead.
+        if case .rejected(let status, _) = outcome, status == 401 {
+            let current = refreshCookieValue()
+            if let current, current != presented {
+                log.notice("Refresh token rotated underneath us; retrying with the current one")
+                outcome = await postRefresh()
+            }
+        }
+
+        if case .refreshed = outcome { refreshGeneration &+= 1 }
+        return outcome
+    }
+
+    private func postRefresh() async -> RefreshOutcome {
         guard var request = try? makeRequest(.post, "/api/auth/refresh", query: [:], body: nil) else {
-            return false
+            return .unreachable(reason: "Could not build the refresh request")
         }
         request.httpBody = Data("{}".utf8)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
         do {
-            let (_, response) = try await session.data(for: request)
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if status == 200 { return true }
-            // 403 here is the mobile grant being revoked mid-session, which the
-            // backend enforces on refresh. Same outcome as 401: back to sign-in.
-            log.notice("Refresh rejected with \(status); session is over")
-            return false
+            let (body, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return .unreachable(reason: "Non-HTTP response to refresh")
+            }
+            switch http.statusCode {
+            case 200:
+                return .refreshed
+
+            case 401, 403:
+                // Reached and refused: an unknown/consumed/expired token (401), or
+                // the mobile grant withdrawn mid-session (403). The detail is the
+                // backend's own prose and is carried through to the screen.
+                let detail = (try? decoder.decode(APIErrorBody.self, from: body))?.detail ?? ""
+                log.notice("Refresh refused with \(http.statusCode); session is over")
+                return .rejected(status: http.statusCode, detail: detail)
+
+            case 429:
+                // Shared-IP throttling. Dozens of phones off one clinic NAT all
+                // foreground at shift change and each needs a refresh; treating the
+                // bucket being full as proof of expiry would sign the whole ward out.
+                let retryAfter = http.value(forHTTPHeaderField: "Retry-After") ?? "unspecified"
+                return .unreachable(reason: "Refresh throttled (retry after \(retryAfter))")
+
+            default:
+                // 5xx, or anything else. A proxy 502 during a deploy and a 500 from
+                // a Redis blip both land here, and neither says anything about the
+                // token we hold.
+                return .unreachable(reason: "Refresh answered \(http.statusCode)")
+            }
+        } catch let error as URLError {
+            return .unreachable(reason: error.localizedDescription)
         } catch {
-            // Offline. Not a session problem — do not sign the user out for it.
-            log.notice("Refresh could not reach the server: \(error.localizedDescription)")
-            return false
+            return .unreachable(reason: error.localizedDescription)
         }
     }
 
-    private static func isAuthPath(_ url: URL?) -> Bool {
+    private func refreshCookieValue() -> String? {
+        session.configuration.httpCookieStorage?
+            .cookies(for: AppConfig.apiBaseURL)?
+            .first { $0.name == Self.refreshCookieName }?
+            .value
+    }
+
+    /// Endpoints whose 401 means "the credentials in this request are wrong", not
+    /// "the access cookie lapsed" — refreshing in response to one of these would be
+    /// pointless at best and a loop at worst.
+    ///
+    /// Note what is *not* here: `/api/auth/me`. It was previously excluded along
+    /// with the rest of `/api/auth/`, which meant the one call every cold launch
+    /// and every foreground revalidation makes could never trigger a refresh. A
+    /// user returning after the 15-minute access cookie lapsed was sent to sign-in
+    /// while holding a refresh token good for another 30 days.
+    private static let nonRefreshablePaths: Set<String> = [
+        "/api/auth/login",
+        "/api/auth/refresh",
+        "/api/auth/change-password",
+    ]
+
+    private static func skipsRefresh(_ url: URL?) -> Bool {
         guard let path = url?.path else { return false }
-        return path.hasPrefix("/api/auth/")
+        // Tolerate a trailing slash so routing cosmetics cannot change the
+        // classification of an auth endpoint.
+        let normalised = path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
+        return nonRefreshablePaths.contains(normalised)
+    }
+
+    /// True only for our own API origin. `data(fromAbsoluteURL:)` fetches presigned
+    /// storage URLs, and a 401 from object storage or a CDN must not be able to
+    /// drive a session refresh — let alone sign the user out of the app.
+    private static func isOurAPI(_ url: URL?) -> Bool {
+        guard let url, let base = URLComponents(url: AppConfig.apiBaseURL, resolvingAgainstBaseURL: false),
+              let target = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else { return false }
+        return target.scheme == base.scheme
+            && target.host?.lowercased() == base.host?.lowercased()
+            && target.port == base.port
     }
 
     @MainActor
-    private static func announceSessionExpired() {
-        NotificationCenter.default.post(name: sessionExpiredNotification, object: nil)
+    private static func announceSessionEnded(status: Int, detail: String) {
+        NotificationCenter.default.post(
+            name: sessionExpiredNotification,
+            object: nil,
+            userInfo: [statusKey: status, detailKey: detail]
+        )
     }
 
     private static func error(
@@ -299,12 +438,19 @@ actor APIClient {
     // MARK: - Cookie lifecycle
 
     /// Drop every RX HIVE cookie. Called after logout so the next sign-in starts
-    /// clean, and after a hard session failure so a stale `rx_refresh` can't be
-    /// replayed. Scoped to the API host — this app shares the process cookie jar.
+    /// clean, and after a *proven* session failure so a stale `rx_refresh` can't be
+    /// replayed. Never call this for a delivery failure: the cookie it deletes is
+    /// the only credential the user has, and losing it costs them their password.
+    ///
+    /// `cookies(for:)` rather than filtering `cookies` by hand: it applies real
+    /// cookie-domain matching, so a session shared from a parent domain (a
+    /// deployment that sets `RXHIVE_COOKIE_DOMAIN=.rxhive.example.com` to share
+    /// with the web app) is actually cleared. The previous substring test asked
+    /// whether ".rxhive.example.com" contained "api.rxhive.example.com", which is
+    /// false, so Sign Out silently left the session alive.
     func clearSessionCookies() {
         guard let storage = session.configuration.httpCookieStorage else { return }
-        let host = AppConfig.apiBaseURL.host
-        for cookie in storage.cookies ?? [] where cookie.domain.contains(host ?? "\u{0}") {
+        for cookie in storage.cookies(for: AppConfig.apiBaseURL) ?? [] {
             storage.deleteCookie(cookie)
         }
     }
@@ -314,8 +460,24 @@ actor APIClient {
     func hasPersistedSession() -> Bool {
         guard let storage = session.configuration.httpCookieStorage,
               let cookies = storage.cookies(for: AppConfig.apiBaseURL) else { return false }
-        return cookies.contains { $0.name == "rx_refresh" || $0.name == "rx_access" }
+        return cookies.contains { $0.name == Self.refreshCookieName }
     }
+
+    /// The refresh cookie alone is enough to restore a session; the access cookie
+    /// carries a 15-minute Max-Age and is routinely absent, so its absence must not
+    /// be read as "signed out".
+    private static let refreshCookieName = "rx_refresh"
+}
+
+/// What a refresh attempt actually established.
+///
+/// Three cases, not a Bool, and the distinction is the whole point: `rejected` is
+/// the server refusing a token we successfully delivered, `unreachable` is never
+/// having got an answer. Only the former is evidence about the session.
+enum RefreshOutcome {
+    case refreshed
+    case rejected(status: Int, detail: String)
+    case unreachable(reason: String)
 }
 
 // MARK: - Supporting types
@@ -333,15 +495,17 @@ struct EmptyResponse: Codable { init() {} }
 /// merely wasteful — the losers present a consumed token, get 401, and sign the
 /// user out of a session that was fine.
 private actor RefreshCoordinator {
-    private var inFlight: Task<Bool, Never>?
+    private var inFlight: Task<RefreshOutcome, Never>?
 
-    func refresh(_ operation: @escaping () async -> Bool) async -> Bool {
+    func refresh(_ operation: @escaping () async -> RefreshOutcome) async -> RefreshOutcome {
         if let inFlight { return await inFlight.value }
         let task = Task { await operation() }
         inFlight = task
-        let result = await task.value
-        inFlight = nil
-        return result
+        // `defer` rather than clearing after the await: if this ever becomes a
+        // throwing or cancellable task, an early exit would otherwise leave a
+        // completed task cached here and wedge every future refresh on its result.
+        defer { inFlight = nil }
+        return await task.value
     }
 }
 

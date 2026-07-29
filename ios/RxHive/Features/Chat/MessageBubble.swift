@@ -156,7 +156,53 @@ struct MessageBubble: View {
 
     // MARK: Bubble
 
+    /// The bubble hugs its content.
+    ///
+    /// Two footer placements, because one does not fit both kinds of message:
+    ///
+    ///  - **Photo/video:** the footer is *overlaid* on the media's bottom-right with a
+    ///    scrim, as in the reference. The media is the bubble, so anything below it
+    ///    would add a band of empty colour.
+    ///  - **Everything else:** the footer sits to the bottom-right of the content in an
+    ///    `HStack(alignment: .bottom)`, which is what keeps a short "hi" from
+    ///    stretching to the full column while still letting long text wrap.
     private var bubble: some View {
+        HStack(alignment: .bottom, spacing: Theme.Layout.spacing2) {
+            bubbleContent
+            if !isOverlaidFooter { footer }
+        }
+        .padding(.horizontal, isRichMedia ? Theme.Layout.spacing1 : Theme.Layout.spacing3)
+        .padding(.vertical, isRichMedia ? Theme.Layout.spacing1 : Theme.Layout.spacing2)
+        .background(isOwn ? Theme.Color.bubbleSent : Theme.Color.bubbleReceived)
+        .clipShape(bubbleShape)
+        .overlay(
+            // The received bubble is only one step lighter than the page, so it
+            // needs a hairline to hold its edge; the emerald one does not.
+            bubbleShape.stroke(isOwn ? Color.clear : Theme.Color.border, lineWidth: 1)
+        )
+        // The picker floats above the bubble, anchored to the sender's side so it
+        // never covers the message it belongs to.
+        .overlay(alignment: isOwn ? .topTrailing : .topLeading) {
+            if isReacting {
+                ReactionPicker(
+                    mine: myReactionEmoji,
+                    onPick: onToggleReaction,
+                    onDismiss: onDismissReactionPicker
+                )
+                .fixedSize()
+                .offset(y: -46)
+                .zIndex(2)
+            }
+        }
+    }
+
+    /// Photo and video only. A document card and an audio player both carry their own
+    /// text, which a timestamp sitting on top of would collide with.
+    private var isOverlaidFooter: Bool {
+        message.type == .image || message.type == .video
+    }
+
+    private var bubbleContent: some View {
         VStack(alignment: .leading, spacing: Theme.Layout.spacing1) {
             if message.isForwarded {
                 HStack(spacing: 3) {
@@ -187,27 +233,17 @@ struct MessageBubble: View {
             }
 
             typeBody
-
-            footer
-        }
-        .padding(.horizontal, isRichMedia ? Theme.Layout.spacing1 : Theme.Layout.spacing3)
-        .padding(.vertical, isRichMedia ? Theme.Layout.spacing1 : Theme.Layout.spacing2)
-        .background(isOwn ? Theme.Color.bubbleSent : Theme.Color.bubbleReceived)
-        .clipShape(bubbleShape)
-        .overlay(
-            // The received bubble is only one step lighter than the page, so it
-            // needs a hairline to hold its edge; the emerald one does not.
-            bubbleShape.stroke(isOwn ? Color.clear : Theme.Color.border, lineWidth: 1)
-        )
-        // The picker floats above the bubble, anchored to the sender's side so it
-        // never covers the message it belongs to.
-        .overlay(alignment: isOwn ? .topTrailing : .topLeading) {
-            if isReacting {
-                ReactionPicker(mine: myReactionEmoji, onPick: onToggleReaction, onDismiss: onDismissReactionPicker)
-                    .fixedSize()
-                    .offset(y: -46)
-                    .zIndex(2)
-            }
+                .overlay(alignment: .bottomTrailing) {
+                    if isOverlaidFooter {
+                        footer
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            // A scrim, because a photo can be white where the
+                            // timestamp lands and white-on-white is unreadable.
+                            .background(Capsule().fill(Color.black.opacity(0.45)))
+                            .padding(6)
+                    }
+                }
         }
         // Applied conditionally rather than emitting an empty menu: a
         // `.contextMenu` with no rows still lifts the bubble on long-press and then
@@ -245,7 +281,11 @@ struct MessageBubble: View {
         case .image, .video:
             VStack(alignment: .leading, spacing: Theme.Layout.spacing1) {
                 ForEach(message.renderableAttachments) { attachment in
-                    ImageAttachmentView(attachment: attachment)
+                    ImageAttachmentView(
+                        attachment: attachment,
+                        senderName: message.senderName,
+                        timestamp: message.createdAt
+                    )
                 }
                 if let caption = message.mediaCaption {
                     Text(caption)
@@ -257,7 +297,11 @@ struct MessageBubble: View {
 
         case .audio:
             if let attachment = message.renderableAttachments.first {
-                AudioAttachmentView(attachment: attachment)
+                AudioAttachmentView(
+                    attachment: attachment,
+                    senderName: message.senderName,
+                    senderAvatarPath: message.senderAvatar
+                )
             } else {
                 // The message says audio but carries no media — a half-written row.
                 // Say so rather than rendering an empty bubble.
@@ -311,7 +355,14 @@ struct MessageBubble: View {
             if isOwn { status }
         }
         .foregroundStyle(metaColor)
-        .frame(maxWidth: .infinity, alignment: .trailing)
+        // NOT `.frame(maxWidth: .infinity)`.
+        //
+        // A VStack takes the width of its widest child, so an infinitely-wide footer
+        // stretched *every* bubble to the full column: a photo sat in a bubble with a
+        // wide empty gutter beside it, and "hi" spanned the screen with its timestamp
+        // stranded at the far edge. Trailing alignment now comes from the enclosing
+        // VStack(alignment: .trailing) instead, which leaves the bubble sized by its
+        // real content — the media, or the text.
         .padding(.horizontal, isRichMedia ? Theme.Layout.spacing2 : 0)
     }
 
@@ -483,7 +534,8 @@ extension Message {
                 filename: filename ?? defaultFilename,
                 mimeType: inferredMimeType,
                 fileSize: fileSize ?? 0,
-                duration: duration
+                duration: duration,
+                pageCount: pageCount
             )
         ]
     }

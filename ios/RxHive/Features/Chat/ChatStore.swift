@@ -264,8 +264,8 @@ final class ChatStore: ObservableObject {
             replyTo: placeholder.replyTo,
             mediaURL: placeholder.mediaURL,
             duration: placeholder.duration,
-            filename: placeholder.filename,
-            fileSize: placeholder.fileSize
+            fileSize: placeholder.fileSize,
+            filename: placeholder.filename
         )
     }
 
@@ -352,18 +352,6 @@ final class ChatStore: ObservableObject {
             try await RxHiveAPI.deleteConversation(id: id)
             conversations.removeAll { $0.id == id }
             messages[id] = nil
-            return true
-        } catch {
-            return false
-        }
-    }
-
-    func clearHistory(conversationID: String) async -> Bool {
-        do {
-            try await RxHiveAPI.clearConversation(id: conversationID)
-            messages[conversationID] = []
-            hasMoreHistory[conversationID] = false
-            replaceConversation(id: conversationID) { $0.applying(unreadCount: 0) }
             return true
         } catch {
             return false

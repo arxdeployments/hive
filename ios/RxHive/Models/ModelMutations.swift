@@ -95,6 +95,9 @@ extension Message {
             fileSize: fileSize,
             filename: filename,
             duration: duration,
+            // A locally-composed message has no page count: only the server can
+            // produce one, and it arrives when the real message replaces this.
+            pageCount: nil,
             attachments: [],
             replyToMessage: nil
         )

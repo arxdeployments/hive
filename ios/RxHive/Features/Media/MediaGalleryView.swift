@@ -44,6 +44,7 @@ struct MediaGalleryView: View {
 
     @State private var viewerStart: ViewerStart?
     @State private var videoTarget: VideoTarget?
+    @State private var pdfTarget: PdfTarget?
     @State private var shareTarget: MediaShareTarget?
     @State private var downloadingID: String?
 
@@ -131,6 +132,12 @@ struct MediaGalleryView: View {
         let filename: String
     }
 
+    private struct PdfTarget: Identifiable {
+        let id = UUID()
+        let attachment: Attachment
+        let messageID: String?
+    }
+
     // MARK: Body
 
     var body: some View {
@@ -147,6 +154,20 @@ struct MediaGalleryView: View {
         }
         .fullScreenCover(item: $videoTarget) { target in
             MediaVideoPlayerSheet(path: target.path, filename: target.filename)
+        }
+        .fullScreenCover(item: $pdfTarget) { target in
+            PdfReaderView(
+                attachment: target.attachment,
+                // Only offered when there is a thread to go back to, and it dismisses
+                // the gallery too — otherwise the user lands on the message with the
+                // gallery still stacked over it.
+                onJumpToMessage: (target.messageID != nil && onJumpToMessage != nil)
+                    ? {
+                        if let messageID = target.messageID { onJumpToMessage?(messageID) }
+                        dismiss()
+                    }
+                    : nil
+            )
         }
         .sheet(item: $shareTarget) { target in
             MediaShareSheet(url: target.url)
@@ -353,8 +374,17 @@ struct MediaGalleryView: View {
             openURL(url)
 
         default:
-            // Audio and documents: go to the message, which is where the audio player
-            // and the file bubble already live. Falls back to a download for a
+            // A rasterisable PDF opens the reader in place. Jumping to the message
+            // just to tap the same document again is a worse answer when the row
+            // already knows everything the reader needs, and the backend sends
+            // mime_type/page_count on gallery rows specifically so this can work.
+            // The reader keeps a "go to message" control so that affordance survives.
+            if entry.item.isReadablePDF, let attachment = entry.item.asAttachment {
+                pdfTarget = PdfTarget(attachment: attachment, messageID: entry.item.messageID)
+                return
+            }
+            // Audio and everything else: go to the message, which is where the audio
+            // player and the file bubble already live. Falls back to a download for a
             // standalone presentation with no thread to jump to.
             if let messageID = entry.item.messageID, let onJumpToMessage {
                 onJumpToMessage(messageID)
@@ -573,7 +603,11 @@ private struct DocumentRow: View {
 
     private var subtitle: String {
         [
-            MediaFormatting.byteLabel(item.fileSize),
+            // Page count first for a PDF, so a gallery row carries the same
+            // "14 pages • 638 KB • pdf" information the bubble does.
+            MediaFormatting.documentSubtitle(
+                pageCount: item.pageCount, fileSize: item.fileSize, filename: filename
+            ),
             item.senderName ?? "",
             item.createdAt?.conversationListLabel ?? "",
         ]

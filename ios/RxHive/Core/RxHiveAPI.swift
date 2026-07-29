@@ -77,15 +77,10 @@ enum RxHiveAPI {
         _ = try await api.sendIgnoringResponse(.delete, "/api/conversations/\(id)")
     }
 
-    /// Clear my copy of the history (writes delete-for-me rows).
-    static func clearConversation(id: String) async throws {
-        _ = try await api.sendIgnoringResponse(.post, "/api/conversations/\(id)/clear")
-    }
-
-    /// Plain-text transcript export.
-    static func exportConversation(id: String) async throws -> Data {
-        try await api.data(forPath: "/api/conversations/\(id)/export")
-    }
+    // clearConversation and exportConversation were removed along with the
+    // Clear chat and Export chat features. Their routes no longer exist on the
+    // server, so calling them would 404 at runtime with nothing to catch it at
+    // compile time. deleteConversation above still writes delete-for-me rows.
 
     /// Mark read up to now. The socket's `read_receipt` frame does the same thing;
     /// this exists for the cold path (opening a chat before the socket is up).

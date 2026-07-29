@@ -2,8 +2,17 @@ import Foundation
 
 /// A failed API call, classified by what the user (or the caller) should do about it.
 enum APIError: Error, Equatable {
-    /// No usable session. The caller should return to sign-in.
+    /// No usable session, *proven* — the server was reached and refused the
+    /// refresh token. Only this warrants returning to sign-in. A refresh that
+    /// could not be delivered is `.transport`, because it establishes nothing
+    /// about the session and must never cost the user their credentials.
     case unauthorized
+    /// A 401 from an endpoint where it means "the credentials you just typed are
+    /// wrong" rather than "your session lapsed": /login, /refresh, /change-password.
+    /// Separate from `.unauthorized` so the sign-in screen can say what the server
+    /// said ("Invalid email or password") instead of asserting an expiry that
+    /// never happened — the single most confusing symptom of the old behaviour.
+    case credentials(detail: String)
     /// Authenticated, but this client/account is not allowed. Carries the server's
     /// `detail`, which for the mobile gate is a sentence written to be shown as-is.
     case forbidden(detail: String)
@@ -24,6 +33,8 @@ enum APIError: Error, Equatable {
         switch self {
         case .unauthorized:
             return "Your session expired. Please sign in again."
+        case .credentials(let detail):
+            return detail.isEmpty ? "Those details didn't work. Please try again." : detail
         case .forbidden(let detail):
             // The backend's mobile-gate messages are already user-facing prose
             // ("Mobile access has not been enabled for this account…"), so they
@@ -51,7 +62,17 @@ enum APIError: Error, Equatable {
     var isRetryable: Bool {
         switch self {
         case .transport, .server, .rateLimited: return true
-        case .unauthorized, .forbidden, .notFound, .validation, .decoding: return false
+        case .unauthorized, .credentials, .forbidden, .notFound, .validation, .decoding: return false
+        }
+    }
+
+    /// True when the session is over as a matter of fact, not of guesswork — the
+    /// only condition under which stored credentials may be discarded.
+    var endsSession: Bool {
+        switch self {
+        case .unauthorized: return true
+        case .forbidden: return isMobileAccessDenied
+        default: return false
         }
     }
 

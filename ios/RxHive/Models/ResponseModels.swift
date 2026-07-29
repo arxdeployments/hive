@@ -264,11 +264,36 @@ struct MediaItem: Decodable, Identifiable, Hashable {
     let mimeType: String?
     let fileSize: Int?
     let duration: Double?
+    /// PDF page count, sent so the gallery can open the reader rather than only
+    /// jump to the message. nil for everything that is not a rasterisable PDF.
+    let pageCount: Int?
     let createdAt: Date?
     let senderName: String?
     /// Links tab only.
     let url: String?
     let content: String?
+
+    /// A PDF the server rasterised, so `PdfReaderView` has pages to show.
+    var isReadablePDF: Bool {
+        mimeType == "application/pdf" && (pageCount ?? 0) > 0
+    }
+
+    /// Lift a gallery row into the `Attachment` the media views take. The gallery and
+    /// the message payloads are different shapes for the same underlying file, and
+    /// this is the one place that bridges them.
+    var asAttachment: Attachment? {
+        guard let mediaURL, !mediaURL.isEmpty else { return nil }
+        return Attachment(
+            id: id,
+            mediaURL: mediaURL,
+            thumbnailURL: thumbnailURL,
+            filename: filename ?? "Document",
+            mimeType: mimeType ?? "application/octet-stream",
+            fileSize: fileSize ?? 0,
+            duration: duration,
+            pageCount: pageCount
+        )
+    }
 
     enum CodingKeys: String, CodingKey {
         case id = "_id"
@@ -280,6 +305,7 @@ struct MediaItem: Decodable, Identifiable, Hashable {
         case mimeType = "mime_type"
         case fileSize = "file_size"
         case duration
+        case pageCount = "page_count"
         case createdAt = "created_at"
         case senderName = "sender_name"
         case url, content
