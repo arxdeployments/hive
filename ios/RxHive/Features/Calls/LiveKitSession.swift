@@ -319,13 +319,16 @@ final class LiveKitSession: NSObject, ObservableObject {
     /// Rebuild published state from the room.
     ///
     /// **This — not the WebSocket — is the source of truth for who is in a call.**
-    /// `POST /api/livekit/webhook` is declared in `api/calls.py` but never mounted
-    /// in `main.py`, and no webhook is configured on the SFU, so the
-    /// `call:participant_joined` / `call:participant_left` frames that the webhook
-    /// would publish are never delivered. Those frames *do* still arrive for
-    /// explicit `call:join` / `call:leave` signalling, which is why `CallStore`
-    /// keeps them as a supplement — but if you ever find yourself "fixing" the
-    /// roster by trusting the socket over the room, that is the wrong direction.
+    ///
+    /// The SFU webhook *is* now wired (`main.py` mounts `calls.webhook_router` and
+    /// both `infra/livekit*.yaml` declare a `webhook:` block), so
+    /// `call:participant_joined` / `call:participant_left` do arrive. They are still
+    /// only a supplement, for two reasons that do not go away: they are delivered
+    /// server-to-server and can lag or be dropped, and this device may miss any
+    /// frame sent while its socket was reconnecting. The room object cannot be
+    /// stale in that way — it *is* the media session. So if you ever find yourself
+    /// "fixing" the roster by trusting the socket over the room, that is the wrong
+    /// direction.
     private func syncFromRoom() {
         guard let room else { return }
 

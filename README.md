@@ -169,6 +169,13 @@ silent/black. Messaging is unaffected.
   the three `RXHIVE_VAPID_*` vars.
 - LiveKit needs its media ports reachable by clients; set `use_external_ip` and
   open the UDP range in `infra/livekit.yaml` / your firewall.
+- LiveKit posts room events back to the API (`webhook:` in `infra/livekit*.yaml` →
+  `POST /api/livekit/webhook`). This is what finalizes a call nobody explicitly
+  ended: without it, a client killed mid-call leaves `call_history.status`
+  `'connected'` forever. `webhook.api_key` must equal `LIVEKIT_API_KEY`; those YAMLs
+  are in git and cannot read your `.env`, so changing one means changing the other.
+  A mismatch is visible in the API log as
+  `Rejected LiveKit webhook: verification failed` while calls otherwise work.
 - Run multiple API workers freely — all shared state (sessions, presence,
   realtime fan-out, call state) lives in Postgres and Redis.
 

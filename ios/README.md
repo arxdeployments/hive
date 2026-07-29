@@ -173,23 +173,38 @@ building UI for them would be building dead buttons.
   added later still sees the full pre-join history — so surfacing them would
   advertise privacy the server does not provide.
 
-## Known backend issue found while porting
+## Backend bug found while porting — since fixed
 
-`POST /api/livekit/webhook` is **declared but never mounted**: it lives on
-`calls.webhook_router` (`backend/app/api/calls.py:39`), and `main.py` includes
-`calls.router` but not `calls.webhook_router`. Neither `infra/livekit.yaml` nor
-`livekit.prod.yaml` configures a `webhook:` block either.
+`POST /api/livekit/webhook` was **declared but never mounted**: it lived on
+`calls.webhook_router` (`backend/app/api/calls.py`) and `main.py` included
+`calls.router` but not the webhook router. Neither LiveKit config declared a
+`webhook:` block either, so even a mounted route would have received nothing.
 
-Consequence: SFU-driven call reconciliation is dead code — `room_finished` never
-marks a call answered/ended, and the webhook's `participant_joined` /
-`participant_left` publishes never fire. The same two events *are* published from
-`services/calls.py` for explicit `call:join` / `call:leave` frames, so participant
-tracking partly works.
+Consequence while broken: all SFU-driven reconciliation was dead. `room_finished`
+never marked a call answered, so a client killed mid-call left `call_history.status`
+`'connected'` forever, and the roster drifted whenever a tab died without sending
+`call:leave`.
 
-The iOS client therefore treats the **LiveKit room delegate as authoritative** for
-who is in a call, and the WebSocket events as a supplement. That is the more robust
-design regardless, but it is a workaround for a real bug: mounting the router and
-adding the LiveKit webhook config would fix it for both clients.
+Both halves are now fixed and verified end to end:
+
+- `main.py` mounts `calls.webhook_router`.
+- `infra/livekit.yaml` and `infra/livekit.prod.yaml` declare a `webhook:` block
+  pointing at `http://api:8000/api/livekit/webhook` on the internal compose network.
+- `backend/tests/test_livekit_webhook.py` — 10 tests covering registration,
+  signature verification, body tampering, `room_finished` finalization, participant
+  stamping, and malformed payloads. Confirmed to **fail without the mount**.
+- Verified against a real `livekit/livekit-server:1.13.4`: it read the config,
+  delivered signed `room_started` / `room_finished`, and the captured payload was
+  replayed through the real handler, which finalized the call to `answered`.
+
+**If you change `LIVEKIT_API_KEY`,** change `webhook.api_key` in both LiveKit YAMLs
+too — they are in git and cannot read `.env`. A mismatch is not silent: the API logs
+`Rejected LiveKit webhook: verification failed` for every room event.
+
+The iOS client still treats the **LiveKit room delegate as authoritative** for who
+is in a call, with the socket events as a supplement. That is not a workaround any
+more — the room object is the media session and cannot be stale, whereas a socket
+frame can be dropped or missed during a reconnect.
 
 ## Architecture notes
 
@@ -220,7 +235,7 @@ checked, and where it hasn't.
 
 **Verified:**
 
-- All 48 Swift sources pass `swiftc -parse`. That is **syntax only**.
+- All 49 Swift sources pass `swiftc -parse`. That is **syntax only**.
 - Every `RxHiveAPI` path, query-parameter name and response envelope was checked
   against the FastAPI routers in `../backend`. Four were wrong and are fixed
   (`/starred` and `/pinned` return `{data}` not `{messages}`; `groups-in-common`
