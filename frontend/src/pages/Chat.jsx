@@ -4,9 +4,6 @@ import { ChatSidebar } from '../components/chat/ChatSidebar';
 import { ChatPanel } from '../components/chat/ChatPanel';
 import { ChatErrorBoundary } from '../components/shared/ErrorBoundary';
 import useChatStore from '../stores/chatStore';
-import useCallStore from '../stores/callStore';
-import { useAuth } from '../contexts/AuthContext';
-import wsClient from '../services/websocket';
 
 export default function Chat() {
   // Narrow selectors. This component renders the whole chat surface, so
@@ -19,33 +16,16 @@ export default function Chat() {
   const totalUnread = useChatStore(
     s => s.conversations.reduce((sum, c) => sum + (c.unread_count || 0), 0)
   );
-  const { user } = useAuth();
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
   const [showMessages, setShowMessages] = useState(false);
   const [notifAsked, setNotifAsked] = useState(false);
 
-  // Connect the realtime socket once we have a session. Auth rides in the
-  // httpOnly cookie sent with the WS handshake — there is no token in JS, so
-  // gating this on localStorage would silently never connect.
-  // Keyed on the user id, not the object: checkAuth() mints a new object on
-  // every profile refresh, which would otherwise cycle the socket needlessly.
-  const userId = user?.id;
-  useEffect(() => {
-    if (!userId) return undefined;
-    wsClient.connect();
-    return () => {
-      // Do NOT tear the socket down while a call is live. disconnect() sets
-      // _intentionalClose, which suppresses the reconnect entirely — so
-      // navigating /chat -> /settings mid-call left LiveKit media up but
-      // signalling permanently down: a hang-up from the mini window was queued
-      // and never sent, and the peer's call:ended never arrived. The mini window
-      // is deliberately reachable from every route, so the socket has to outlive
-      // this one.
-      if (useCallStore.getState().callState === 'idle') {
-        wsClient.disconnect();
-      }
-    };
-  }, [userId]);
+  // The realtime socket is NOT owned here any more — see
+  // components/shared/RealtimeSession.jsx, mounted in App.jsx outside <Routes>.
+  // Tying it to this page tied it to the route: navigating away disconnected
+  // with _intentionalClose set, which suppresses reconnection, and connect()
+  // was called from nowhere else. The user went silently offline until they
+  // came back. The call-state guard moved with it.
 
   // FIX: iOS virtual keyboard viewport lock
   useEffect(() => {

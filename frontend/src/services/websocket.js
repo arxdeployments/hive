@@ -2,7 +2,7 @@ import { toast } from 'sonner';
 import useChatStore from '../stores/chatStore';
 import useCallStore from '../stores/callStore';
 import livekitClient from './livekitClient';
-import { refreshSession } from '../api/client';
+import { refreshSession, sessionRejected } from '../api/client';
 import { withDerivedStatus, applyReadReceipt } from '../utils/messageStatus';
 import { handleCallJoinError, notifyCameraUnavailable } from '../utils/callErrors';
 
@@ -114,8 +114,18 @@ class RxHiveWebSocket {
         await refreshSession();
         this._scheduleReconnect(true);
       } catch (err) {
-        localStorage.removeItem('user');
-        window.location.href = '/login';
+        // Only the server refusing the refresh cookie proves the session is over.
+        // The server closes 4001 every time the 15-minute access cookie lapses, so
+        // this path runs constantly and samples network health each time; treating
+        // an undelivered refresh as expiry meant one dropped connection — or a 502
+        // during a deploy — signed the user out of a session good for 30 more days.
+        // Anything else backs off and retries like a normal disconnect.
+        if (sessionRejected(err)) {
+          localStorage.removeItem('user');
+          window.location.href = '/login';
+          return;
+        }
+        this._scheduleReconnect();
       }
       return;
     }
@@ -282,6 +292,23 @@ class RxHiveWebSocket {
             admin_only_messages: !permissions.send_messages
           });
         }
+        break;
+      }
+
+      // A super admin changed a rule or a send policy that affects this user.
+      //
+      // The payload carries no detail on purpose: what changed may be a
+      // department rule touching hundreds of pairs, and sending the resolved
+      // consequence to every affected client is both large and racy. A bare
+      // "something changed, re-read it" keeps the server authoritative.
+      //
+      // Soft by design — nothing is torn down. The roster and the send policy
+      // are re-fetched and the composer re-renders; a conversation that is no
+      // longer permitted goes read-only on its next send rather than
+      // disappearing mid-sentence. Losing this event costs a stale UI until the
+      // next fetch, never a lifted restriction: the server re-checks every send.
+      case 'access_changed': {
+        window.dispatchEvent(new CustomEvent('rxhive:access-changed'));
         break;
       }
 

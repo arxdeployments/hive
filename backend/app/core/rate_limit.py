@@ -3,12 +3,19 @@
 The Mongo build shipped a limiter attached to a route path that never matched —
 dead code. This one is a plain dependency wired directly onto the routes it
 protects, with a test proving it fires.
+
+It also fails OPEN now. The limiter runs BEFORE the work a request came to do, so
+an unhandled Redis error escaped it as a 500 on /api/auth/login and
+/api/auth/refresh, and both clients read a failed refresh as a dead session: one
+broker restart signed the whole estate out and made everyone retype their
+password. Rate limiting is a best-effort control, so an unenforced window during
+an outage is the cheaper failure by a wide margin.
 """
 
 from fastapi import HTTPException, Request
 
 from app.core.config import get_settings
-from app.realtime.redis_bus import get_redis
+from app.realtime.redis_bus import degrade_on_outage, get_redis
 
 
 def _client_ip(request: Request) -> str:
@@ -36,21 +43,44 @@ class RateLimiter:
     def _limit(self) -> int:
         return getattr(get_settings(), f"rate_limit_{self.scope}", self.default_times)
 
+    async def _hits(self, key: str) -> int | None:
+        """Hits in the current window, or None when the counter is unreachable.
+
+        None means "allow it through": the counter is an approximation of load, not
+        the authorization decision, and the endpoints behind it — sign-in and
+        session refresh — are the ones users cannot work around. Refusing every
+        authentication because a best-effort counter is down trades a throttling
+        gap for a total outage, so the gap wins.
+        """
+        hits: int | None = None
+        async with degrade_on_outage(f"rate limit ({self.scope})"):
+            redis = get_redis()
+            hits = await redis.incr(key)
+            if hits == 1:
+                await redis.expire(key, self.seconds)
+        return hits
+
+    async def _retry_after(self, key: str) -> int:
+        """Seconds until the window rolls over, falling back to the whole window if
+        Redis goes away between the increment and this read."""
+        ttl = self.seconds
+        async with degrade_on_outage(f"rate limit TTL ({self.scope})"):
+            ttl = await get_redis().ttl(key)
+        return max(ttl, 1)
+
     async def __call__(self, request: Request) -> None:
         limit = self._limit()
         if limit <= 0:
             return  # 0 disables the limiter for this scope
-        redis = get_redis()
         key = f"ratelimit:{self.scope}:{_client_ip(request)}"
-        count = await redis.incr(key)
-        if count == 1:
-            await redis.expire(key, self.seconds)
-        if count > limit:
-            ttl = await redis.ttl(key)
+        hits = await self._hits(key)
+        if hits is None:
+            return
+        if hits > limit:
             raise HTTPException(
                 status_code=429,
                 detail="Too many requests. Try again later.",
-                headers={"Retry-After": str(max(ttl, 1))},
+                headers={"Retry-After": str(await self._retry_after(key))},
             )
 
 
@@ -58,6 +88,3 @@ login_limiter = RateLimiter("login", default_times=10)
 refresh_limiter = RateLimiter("refresh", default_times=30)
 password_limiter = RateLimiter("password", default_times=5)
 upload_limiter = RateLimiter("upload", default_times=30)
-# Export materializes a whole transcript in memory, so it needs its own (tight)
-# bucket rather than sharing one with cheap reads.
-export_limiter = RateLimiter("export", default_times=10)

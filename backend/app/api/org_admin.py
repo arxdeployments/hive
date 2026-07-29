@@ -22,6 +22,7 @@ from app.core.deps import get_current_user
 from app.core.rate_limit import password_limiter
 from app.core.security import PasswordPolicyError, enforce_password_policy, hash_password
 from app.db.models import (
+    AdminDepartment,
     AuditLog,
     Conversation,
     Department,
@@ -101,6 +102,23 @@ def _serialize_org(org: Organization) -> dict:
     }
 
 
+async def managed_dept_ids(db: AsyncSession, admin: User) -> set[uuid.UUID] | None:
+    """Departments this admin administers, or None for organization-wide.
+
+    None and the empty set mean opposite things, so both callers below have to
+    branch rather than treating "no departments" as "no reach". An admin with no
+    AdminDepartment rows is org-wide — that is what every existing org_admin was
+    migrated to, since the migration cannot guess which departments each of them
+    should own and silently stripping them would be worse.
+    """
+    rows = (
+        (await db.execute(select(AdminDepartment.dept_id).where(AdminDepartment.user_id == admin.id)))
+        .scalars()
+        .all()
+    )
+    return set(rows) or None
+
+
 async def _load_org_user(db: AsyncSession, admin: User, user_id_raw: str) -> User:
     uid = parse_uuid(user_id_raw)
     if uid is None:
@@ -109,6 +127,17 @@ async def _load_org_user(db: AsyncSession, admin: User, user_id_raw: str) -> Use
         await db.execute(select(User).where(User.id == uid, User.org_id == admin.org_id))
     ).scalar_one_or_none()
     if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    # Department scoping, applied at the LOAD helper rather than at each route:
+    # every single-user mutation in this module (activate, deactivate, reset
+    # password, change department, change role) resolves its target through
+    # here, so enforcing once covers them all and a new route inherits it.
+    #
+    # 404 rather than 403, matching how this module already treats a user from
+    # another organization — an admin should not be able to probe for the
+    # existence of people outside their scope.
+    scope = await managed_dept_ids(db, admin)
+    if scope is not None and target.dept_id not in scope:
         raise HTTPException(status_code=404, detail="User not found")
     return target
 
@@ -216,6 +245,12 @@ async def list_users(
     db: AsyncSession = Depends(get_db),
 ):
     stmt = select(User).where(User.org_id == admin.org_id)
+    # A department-scoped admin sees only their own departments' people. Applied
+    # before the caller's own dept filter, so narrowing further is allowed but
+    # widening is not.
+    scope = await managed_dept_ids(db, admin)
+    if scope is not None:
+        stmt = stmt.where(User.dept_id.in_(scope))
     dept_uuid = parse_uuid(dept_id)
     if dept_uuid is not None:  # malformed dept_id is silently ignored (reference behavior)
         stmt = stmt.where(User.dept_id == dept_uuid)

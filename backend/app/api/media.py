@@ -29,7 +29,7 @@ from app.db.models import (
 )
 from app.db.session import get_db
 from app.services import storage
-from app.services.enrich import media_url_for, thumb_url_for
+from app.services.enrich import attachment_thumb_url, media_url_for
 from app.utils import iso_z, parse_uuid, sanitize_text
 
 router = APIRouter(prefix="/api", tags=["media"])
@@ -246,6 +246,70 @@ async def serve_attachment(
     return RedirectResponse(url, status_code=307)
 
 
+async def _ensure_pdf_preview(db: AsyncSession, attachment: MessageAttachment) -> None:
+    """Render and persist page 1 of a PDF that has never been processed.
+
+    A PDF uploaded before previews existed — or one that arrived by any path that
+    skipped thumbnailing — has no thumbnail_key. Rendering on first view and
+    persisting makes the feature self-healing rather than dependent on a backfill
+    having been run.
+
+    page_count doubles as the "already processed" marker: NULL means never tried,
+    0 means tried and the file could not be rendered. Without that, an
+    un-renderable PDF would be re-parsed on every single view.
+
+    Called from all three PDF routes rather than just /thumb. /page/{n} used to
+    clamp against `page_count or 0`, so for an unprocessed PDF every page 404'd
+    and the reader could only ever work if something had happened to fetch the
+    thumbnail first.
+    """
+    if (
+        attachment.thumbnail_key
+        or attachment.mime_type != "application/pdf"
+        or attachment.page_count is not None
+    ):
+        return
+    data = await storage.get_object(attachment.storage_key)
+    thumb, pages = await storage.make_pdf_preview(data)
+    if thumb is not None:
+        thumb_key = f"{attachment.storage_key}_thumb.jpg"
+        await storage.put_object(thumb_key, thumb, "image/jpeg")
+        attachment.thumbnail_key = thumb_key
+        attachment.page_count = pages
+    else:
+        attachment.page_count = 0
+    await db.commit()
+
+
+@router.get("/media/{attachment_id}/meta")
+async def attachment_meta(
+    attachment_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Current server-side facts about one attachment.
+
+    Exists because the lazy render above mutates state the client already holds.
+    A gallery or starred row is fetched with page_count NULL, rendering its
+    thumbnail heals page_count in the database, and the client's copy is now
+    stale — so opening the reader from that stale row showed "No preview
+    available" for a document whose page 1 was visibly on screen a moment ago.
+    The reader asks here when it was handed no page count.
+
+    Membership is enforced by _member_attachment, exactly as for the bytes.
+    """
+    attachment = await _member_attachment(db, attachment_id, user)
+    await _ensure_pdf_preview(db, attachment)
+    return {
+        "id": str(attachment.id),
+        "filename": attachment.filename,
+        "mime_type": attachment.mime_type,
+        "file_size": attachment.file_size,
+        "page_count": attachment.page_count,
+        "thumbnail_url": attachment_thumb_url(attachment),
+    }
+
+
 @router.get("/media/{attachment_id}/thumb")
 async def serve_attachment_thumb(
     attachment_id: str,
@@ -253,30 +317,7 @@ async def serve_attachment_thumb(
     db: AsyncSession = Depends(get_db),
 ):
     attachment = await _member_attachment(db, attachment_id, user)
-
-    # Lazy PDF preview. A PDF uploaded before previews existed — or one that
-    # arrived by any path that skipped thumbnailing — has no thumbnail_key. Render
-    # page 1 on first view and persist it, so the feature is self-healing rather
-    # than depending on a backfill having been run.
-    #
-    # page_count doubles as the "already processed" marker: NULL means never
-    # tried, 0 means tried and the file could not be rendered. Without that, an
-    # un-renderable PDF would be re-parsed on every single view.
-    if (
-        not attachment.thumbnail_key
-        and attachment.mime_type == "application/pdf"
-        and attachment.page_count is None
-    ):
-        data = await storage.get_object(attachment.storage_key)
-        thumb, pages = await storage.make_pdf_preview(data)
-        if thumb is not None:
-            thumb_key = f"{attachment.storage_key}_thumb.jpg"
-            await storage.put_object(thumb_key, thumb, "image/jpeg")
-            attachment.thumbnail_key = thumb_key
-            attachment.page_count = pages
-        else:
-            attachment.page_count = 0
-        await db.commit()
+    await _ensure_pdf_preview(db, attachment)
 
     if not attachment.thumbnail_key:
         raise _not_found()
@@ -304,6 +345,10 @@ async def serve_pdf_page(
     attachment = await _member_attachment(db, attachment_id, user)
     if attachment.mime_type != "application/pdf":
         raise _not_found()
+    # Heal first: an unprocessed PDF has page_count NULL, which the clamp below
+    # turns into a total of 0, which 404s every page. Before this, the reader
+    # worked only if something else had already fetched the thumbnail.
+    await _ensure_pdf_preview(db, attachment)
     # page_count is parser output over untrusted input, so clamp it here as well
     # as at render time — the count itself must never become the attack.
     total = min(attachment.page_count or 0, storage.PDF_MAX_PAGES)
@@ -370,6 +415,13 @@ async def _conversation_links(db: AsyncSession, conv_id, user_id, page: int, lim
         for url, domain in _extract_links(content):
             items.append(
                 {
+                    # iOS's MediaItem declares a non-optional `id` keyed to "_id"
+                    # with a synthesized decoder, so a payload without it throws
+                    # keyNotFound and takes the whole page down — the gallery has
+                    # never been able to decode this endpoint. One message can
+                    # yield several links, so the row index keeps it unique;
+                    # message_id below stays the thing to jump to.
+                    "_id": f"{msg.id}:{len(items)}",
                     "message_id": str(msg.id),
                     "url": url,
                     # No fetching means no remote <title>: the surrounding message
@@ -443,11 +495,28 @@ async def conversation_media(
         first = msg.attachments[0] if msg.attachments else None
         data.append(
             {
+                # See the links branch: iOS keys MediaItem.id to "_id" and cannot
+                # decode a row without it. One row per message here, so the
+                # message id is already unique.
+                "_id": str(msg.id),
                 "message_id": str(msg.id),
                 "media_url": media_url_for(first.id) if first else None,
-                "thumbnail_url": thumb_url_for(first.id) if first and first.thumbnail_key else None,
+                # Same helper the message serializer uses, deliberately: gating on
+                # thumbnail_key alone withheld the URL from PDFs whose page 1 has
+                # not been rendered yet, and that URL is precisely what triggers
+                # the render. The Docs tab showed a generic icon forever and the
+                # reader opened empty.
+                "thumbnail_url": attachment_thumb_url(first) if first else None,
                 "filename": first.filename if first else "",
                 "file_size": first.file_size if first else 0,
+                # Both added so the web gallery can open a document rather than
+                # only jump to its message: mime_type is how it decides a row is
+                # a PDF (the filename extension is user-controlled), and
+                # page_count is what PdfViewer pages over — without it the
+                # reader opens on "No preview available". Purely additive; the
+                # iOS client decodes this payload too and ignores unknown keys.
+                "mime_type": first.mime_type if first else None,
+                "page_count": first.page_count if first else None,
                 "sender_name": sender_names.get(msg.sender_id, "Unknown"),
                 "created_at": iso_z(msg.created_at),
             }

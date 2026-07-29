@@ -173,9 +173,26 @@ async def initiate_direct_call(
             await publish_to_users([caller.id], {"type": "call:error", "message": "Already in a call"})
             return
 
+        from fastapi import HTTPException
+
         from app.services.conversations import get_or_create_direct
 
-        conv = await get_or_create_direct(db, caller, callee)
+        try:
+            # Calls are a second reachability channel with their own org check,
+            # so a chat-only policy would have let a blocked pair ring each other
+            # over LiveKit. Routing through the shared helper closes that.
+            #
+            # Caught rather than allowed to propagate: this runs in a background
+            # task and reports failure over the socket, so an escaping
+            # HTTPException would be logged and the caller's phone would simply
+            # ring forever with no error — the same shape as the two guards above.
+            conv = await get_or_create_direct(db, caller, callee)
+        except HTTPException:
+            await publish_to_users(
+                [caller.id],
+                {"type": "call:error", "message": "You are not permitted to call this person"},
+            )
+            return
 
         ctype = CallType.video if call_type == "video" else CallType.voice
         call = Call(

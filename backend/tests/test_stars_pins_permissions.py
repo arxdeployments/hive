@@ -1,4 +1,4 @@
-"""Stars, pins, mute, group permissions, groups-in-common, export/clear, links.
+"""Stars, pins, mute, group permissions, groups-in-common, delete-for-me, links.
 
 Every one of these endpoints is membership-scoped, so the last test in this
 module re-runs the whole surface as a foreign-org caller and demands a 404.
@@ -287,52 +287,36 @@ async def test_groups_in_common(client, two_orgs_with_users):
         assert [c["_id"] for c in resp.json()["data"]] == [group]
 
 
-async def test_export_transcript_is_plain_text_and_respects_delete_for_me(client, two_orgs_with_users):
-    """Export format, plus: export honours the caller's own delete-for-me rows.
+async def test_export_and_clear_endpoints_are_gone(client, two_orgs_with_users):
+    """Export chat and Clear chat were removed as product features.
 
-    The per-message "Delete for me" action was removed, so the hiding is driven
-    through "Clear chat" instead — the surviving feature that still writes
-    MessageDeletion rows. The property under test is unchanged: one participant's
-    hidden history must not affect anyone else's transcript.
+    Asserted explicitly rather than by deleting the old tests: both routes were
+    also called by the shipped iOS client, so a silent reappearance is exactly
+    the kind of thing that should fail here.
     """
     users = two_orgs_with_users
     await login(client, "alice@a.com")
     conv = await _direct(client, users["bob"].id)
-    await _send(client, conv, "hello")
-    await _send(client, conv, "world")
 
-    resp = await client.get(f"/api/conversations/{conv}/export")
-    assert resp.status_code == 200, resp.text
-    assert resp.headers["content-type"].startswith("text/plain")
-    assert f'filename="rxhive-chat-{conv}.txt"' in resp.headers["content-disposition"]
-    lines = resp.text.strip().split("\n")
-    assert lines[0].startswith("[") and "System: Conversation started" in lines[0]
-    assert lines[1].endswith("Alice: hello") and lines[2].endswith("Alice: world")
-
-    # Hide Alice's copy of the history.
-    resp = await client.post(f"/api/conversations/{conv}/clear")
-    assert resp.status_code == 200, resp.text
-
-    alice_after = (await client.get(f"/api/conversations/{conv}/export")).text
-    assert "hello" not in alice_after
-    assert "world" not in alice_after
-
-    # Bob's transcript is untouched.
-    async with _client_for("bob@a.com") as bob:
-        bob_after = (await bob.get(f"/api/conversations/{conv}/export")).text
-        assert "hello" in bob_after
-        assert "world" in bob_after
+    assert (await client.get(f"/api/conversations/{conv}/export")).status_code == 404
+    assert (await client.post(f"/api/conversations/{conv}/clear")).status_code == 404
 
 
-async def test_clear_chat_is_delete_for_me_only(client, two_orgs_with_users):
+async def test_delete_conversation_is_delete_for_me_only(client, two_orgs_with_users):
+    """Delete-for-me still works and still touches only the caller's rows.
+
+    Previously driven through POST /clear. That endpoint is gone, so DELETE
+    /{conv_id} is now the ONLY thing that writes MessageDeletion rows — which is
+    precisely why the model, the table and every read-side exclusion filter had
+    to survive the removal.
+    """
     users = two_orgs_with_users
     await login(client, "alice@a.com")
     conv = await _direct(client, users["bob"].id)
     await _send(client, conv, "keep me for bob")
 
-    resp = await client.post(f"/api/conversations/{conv}/clear")
+    resp = await client.delete(f"/api/conversations/{conv}")
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"message": "Chat cleared"}
     assert await _messages(client, conv) == []
 
     async with _client_for("bob@a.com") as bob:
@@ -374,8 +358,11 @@ async def test_cross_tenant_404_on_every_new_endpoint(client, two_orgs_with_user
         assert (await carol.get(f"/api/conversations/{group}/permissions")).status_code == 404
         resp = await carol.put(f"/api/conversations/{group}/permissions", json={"send_messages": False})
         assert resp.status_code == 404
-        assert (await carol.get(f"/api/conversations/{group}/export")).status_code == 404
-        assert (await carol.post(f"/api/conversations/{group}/clear")).status_code == 404
+        # DELETE replaces the old /export and /clear assertions here. Those two
+        # routes no longer exist, so asserting 404 on them would have kept
+        # passing while testing nothing — a missing route and a tenant rejection
+        # are indistinguishable by status code.
+        assert (await carol.delete(f"/api/conversations/{group}")).status_code == 404
         resp = await carol.get(f"/api/conversations/{group}/media", params={"type": "link"})
         assert resp.status_code == 404
         resp = await carol.get(f"/api/users/{users['alice'].id}/groups-in-common")

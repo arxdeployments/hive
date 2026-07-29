@@ -6,6 +6,7 @@ the Mongo build: HTTP sends were stored but never broadcast).
 """
 
 import datetime as dt
+import os
 import re
 import uuid
 
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import (
     Conversation,
     ConversationParticipant,
+    ConversationType,
     Message,
     MessageAttachment,
     MessagePin,
@@ -27,7 +29,7 @@ from app.db.models import (
     User,
 )
 from app.realtime.redis_bus import publish_to_users
-from app.services import enrich, presence
+from app.services import access, enrich, presence
 from app.utils import now_utc, sanitize_text
 
 _MEDIA_TYPES = {"image", "video", "audio", "file"}
@@ -69,12 +71,40 @@ async def _require_send_access(
         .scalars()
         .all()
     )
+    # The sender's own account, checked per send. HTTP refuses a deactivated
+    # user at the auth dependency, but the websocket path reaches here with a
+    # User row loaded when the socket was opened — so without this a session
+    # that was live at deactivation could keep sending until the socket's
+    # periodic revalidation caught up. That revalidation is the backstop; this
+    # is the actual gate.
+    if not sender.is_active:
+        raise SendError(status_code=403, detail="Your account is no longer active")
+
     me = next((p for p in participants if p.user_id == sender.id), None)
     if me is None or not conv.is_active:
         raise SendError(status_code=404, detail="Conversation not found")
     # Org isolation: non-cross-org conversations must match the sender's org.
     if conv.type.value != "cross_org" and conv.org_id != sender.org_id:
         raise SendError(status_code=403, detail="Access denied")
+
+    # Reachability, re-checked per send rather than only at creation. A pair
+    # whose permission is revoked keeps its existing thread — the conversation
+    # stays visible and its history readable — but the composer stops working.
+    # That is the only degradation pattern with precedent here
+    # (admin_only_messages does the same), and it beats making a clinical
+    # conversation silently disappear from someone's sidebar.
+    #
+    # Direct conversations only. A group's membership is its own access list,
+    # and applying a pair rule inside one would mean a single blocked pair
+    # silencing a whole ward round.
+    if conv.type == ConversationType.direct:
+        other_id = next((p.user_id for p in participants if p.user_id != sender.id), None)
+        if other_id is not None:
+            other = await db.get(User, other_id)
+            if other is not None and not await access.can_converse(db, sender, other):
+                raise SendError(
+                    status_code=403, detail="You are not permitted to message this person"
+                )
     if (
         conv.admin_only_messages
         and conv.type.value in ("group", "cross_org")
@@ -148,9 +178,37 @@ async def send_message(
     db.add(msg)
     await db.flush()
 
+    # Send policy. Resolved once per message, then applied to every attachment.
+    #
+    # Enforced HERE, at claim time, and not at /api/upload: that endpoint is
+    # shared with the profile- and group-avatar flows, so a "no images" rule
+    # applied there would stop a restricted user changing their own avatar. The
+    # claim is also the point that cannot be bypassed — it is the only place an
+    # Upload becomes a MessageAttachment, and _claim_upload deliberately does
+    # not check upload.claimed (retry re-claims), so the check has to be inside
+    # this loop rather than a one-shot flag flip earlier.
+    #
+    # The honest cost of claiming late: disallowed bytes are already in object
+    # storage by the time we refuse, and a PDF has already been rasterised. They
+    # are left as unclaimed uploads, which the existing orphan cleanup covers.
+    policy = await access.resolve_send_policy(db, sender)
+    if msg_type == "text" and content and not policy.text:
+        raise SendError(status_code=403, detail="You are not permitted to send text messages")
+
     seen_keys: set[str] = set()
     for url in urls:
         upload = await _claim_upload(db, url, sender)
+        # Keyed off the UPLOAD, never off msg_type. The declared type is not
+        # evidence of anything: unknown values are silently coerced to "text"
+        # above and this loop runs regardless of type, so `{type: "text",
+        # media_url: "...pdf"}` produces a real PDF attachment on a row the
+        # database records as text. upload.filename is what was actually stored.
+        ext = os.path.splitext(upload.filename or "")[1].lower()
+        if not policy.allows_extension(ext):
+            raise SendError(
+                status_code=403,
+                detail=f"You are not permitted to send {ext or 'this type of'} files",
+            )
         if upload.storage_key in seen_keys:
             continue
         seen_keys.add(upload.storage_key)
@@ -468,11 +526,13 @@ async def toggle_pin(db: AsyncSession, *, message_id: uuid.UUID, actor: User) ->
 # DELETE /messages/{id} route that called it are gone, so nothing can tombstone a
 # message (Message.deleted_at) any more.
 #
-# NOTE: delete-for-me as a MECHANISM is still live and still reachable — "Clear
-# chat" (POST /conversations/{id}/clear -> _hide_all_messages_for_caller) writes
-# MessageDeletion rows for the caller. That is a separate feature and was left
-# alone; only the per-message Delete for me / Delete for everyone actions were
-# removed. So the MessageDeletion read filters below are load-bearing, not legacy.
+# NOTE: delete-for-me as a MECHANISM is still live and still reachable — deleting
+# a conversation (DELETE /conversations/{id} -> _hide_all_messages_for_caller)
+# writes MessageDeletion rows for the caller. That is a separate feature and was
+# left alone; only the per-message Delete for me / Delete for everyone actions
+# were removed. So the MessageDeletion read filters below are load-bearing, not
+# legacy. ("Clear chat" used to be the other writer and was itself removed later;
+# rows it created before then are still out there and must stay hidden.)
 #
 # The READ side is deliberately untouched, because rows already exist:
 #   * Message.deleted_at stays on the model and in the schema. Dropping it would
@@ -482,8 +542,8 @@ async def toggle_pin(db: AsyncSession, *, message_id: uuid.UUID, actor: User) ->
 #   * enrich.serialize_message keeps emitting is_deleted and blanking content, so
 #     historical tombstones still render as "This message was deleted".
 #   * MessageDeletion rows stay filtered out of every read path — required both
-#     for history hidden before this change and for Clear chat, which still
-#     writes them.
+#     for history hidden before this change and for conversation deletion, which
+#     still writes them.
 #   * edit_message and forward_message keep refusing to operate on a tombstone.
 # The result is that removing the feature changes what users can DO without
 # changing what they SEE.
@@ -556,6 +616,22 @@ async def forward_message(
     if original.deleted_at is not None:
         raise SendError(status_code=400, detail="Cannot forward a deleted message")
 
+    # Forwarding creates attachments with no Upload row at all — it copies
+    # storage_key by reference — so it bypasses the claim-time check entirely.
+    # Without this, "text only" would stop someone sending a photo but not stop
+    # them forwarding one they received. Checked once against the source
+    # message: what is being forwarded cannot change between targets.
+    policy = await access.resolve_send_policy(db, actor)
+    if original.type == MessageType.text and not policy.text:
+        raise SendError(status_code=403, detail="You are not permitted to send text messages")
+    for attachment in original.attachments:
+        ext = os.path.splitext(attachment.filename or "")[1].lower()
+        if not policy.allows_extension(ext):
+            raise SendError(
+                status_code=403,
+                detail=f"You are not permitted to send {ext or 'this type of'} files",
+            )
+
     forwarded_to: list[str] = []
 
     async def _copy_into(conv: Conversation, participants: list[ConversationParticipant]):
@@ -611,18 +687,18 @@ async def forward_message(
         conv = await db.get(Conversation, conv_uuid)
         if conv is None or not conv.is_active:
             continue
-        participants = (
-            (
-                await db.execute(
-                    select(ConversationParticipant).where(ConversationParticipant.conversation_id == conv.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        if not any(p.user_id == actor.id for p in participants):
-            continue
-        if conv.type.value != "cross_org" and conv.org_id != actor.org_id:
+        # Was: hand-rolled membership + org checks, and nothing else. That made
+        # forwarding a way around admin_only_messages — a plain member of an
+        # admin-only group could post into it by forwarding, because only
+        # send_message consulted that flag. Routing through the shared gate
+        # closes it and means every future send rule applies here automatically
+        # instead of having to be remembered twice.
+        #
+        # Skip rather than raise, preserving forward's best-effort semantics:
+        # one unreachable target must not fail the whole fan-out.
+        try:
+            participants = await _require_send_access(db, conv, actor)
+        except SendError:
             continue
         await _copy_into(conv, participants)
 
@@ -636,7 +712,14 @@ async def forward_message(
         contact = await db.get(User, contact_uuid)
         if contact is None or contact.org_id != actor.org_id or not contact.is_active:
             continue
-        conv = await get_or_create_direct(db, actor, contact, notify=True)
+        try:
+            # get_or_create_direct now enforces reachability and raises 403 for a
+            # pair that may not converse. Caught so an unreachable contact is
+            # skipped like any other bad target, rather than failing the fan-out
+            # to everyone else.
+            conv = await get_or_create_direct(db, actor, contact, notify=True)
+        except HTTPException:
+            continue
         participants = (
             (
                 await db.execute(

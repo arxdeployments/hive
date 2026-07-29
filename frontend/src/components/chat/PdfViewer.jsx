@@ -1,7 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { motion } from 'framer-motion';
-import { Download, Loader2, X } from 'lucide-react';
+import { CornerUpLeft, Download, Loader2, X } from 'lucide-react';
+import client from '../../api/client';
 
 /**
  * Full-screen, scrollable, multi-page PDF reader.
@@ -76,11 +77,44 @@ const PdfPage = ({ src, pageNo, onVisible }) => {
   );
 };
 
-export const PdfViewer = ({ mediaUrl, filename, pageCount, onClose }) => {
+/**
+ * @param onJumpTo Optional. Renders a "go to message" control. Supplied by the
+ *                 media gallery, where opening a PDF replaced the tile's old
+ *                 jump-to-message behaviour and that affordance has to survive
+ *                 somewhere. A DocumentBubble never passes it — you are already
+ *                 looking at the message.
+ */
+export const PdfViewer = ({ mediaUrl, filename, pageCount, onClose, onJumpTo }) => {
   const [current, setCurrent] = useState(1);
+  const [fetchedCount, setFetchedCount] = useState(null);
 
-  const total = Math.min(Math.max(Number(pageCount) || 0, 0), MAX_PAGES);
+  const clamp = (n) => Math.min(Math.max(Number(n) || 0, 0), MAX_PAGES);
+  const known = clamp(pageCount);
   const base = resolveUrl(mediaUrl);
+  const total = known || clamp(fetchedCount);
+  // null means "we have not been told and have not asked yet" — distinct from a
+  // real answer of 0, which is the marker for a PDF that could not be rendered.
+  const discovering = known === 0 && fetchedCount === null;
+
+  /**
+   * Ask the server when the caller had no page count to give us.
+   *
+   * A row fetched while its PDF was still unprocessed carries page_count null.
+   * Merely rendering that row's thumbnail makes the server rasterise page 1 and
+   * write the real count — so by the time the reader opens, the caller's copy is
+   * stale and this component would render "No preview available" for a document
+   * whose first page was visibly on screen a moment ago. /meta performs the same
+   * lazy heal and returns the current truth.
+   */
+  useEffect(() => {
+    if (known > 0 || !base) return undefined;
+    let cancelled = false;
+    client
+      .get(`${base}/meta`)
+      .then(({ data }) => { if (!cancelled) setFetchedCount(data?.page_count ?? 0); })
+      .catch(() => { if (!cancelled) setFetchedCount(0); });
+    return () => { cancelled = true; };
+  }, [known, base]);
 
   const pages = useMemo(
     () => Array.from({ length: total }, (_, i) => i + 1),
@@ -113,9 +147,25 @@ export const PdfViewer = ({ mediaUrl, filename, pageCount, onClose }) => {
         <span className="min-w-0 flex-1">
           <span className="block text-sm text-[#F5F5F5] truncate">{filename}</span>
           <span className="block text-xs text-[#A3A3A3]">
-            {total > 0 ? `Page ${Math.min(current, total)} of ${total}` : 'PDF'}
+            {total > 0
+              ? `Page ${Math.min(current, total)} of ${total}`
+              : discovering
+                ? 'Preparing preview…'
+                : 'PDF'}
           </span>
         </span>
+        {onJumpTo && (
+          <button
+            type="button"
+            onClick={onJumpTo}
+            aria-label="Go to message"
+            title="Go to message"
+            data-testid="pdf-jump-to-message"
+            className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-white/10 rounded-[6px] transition-colors"
+          >
+            <CornerUpLeft size={20} />
+          </button>
+        )}
         <a
           href={base}
           download={filename}
@@ -140,12 +190,19 @@ export const PdfViewer = ({ mediaUrl, filename, pageCount, onClose }) => {
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto scrollable-area px-4 pb-8">
-        {total === 0 ? (
+        {discovering ? (
+          // Rendering page 1 of a large scan is not instant, and the server may
+          // be doing it right now because we asked. Saying "no preview" here
+          // would be a lie that resolves itself a second later.
+          <div className="h-full flex flex-col items-center justify-center gap-3" role="status">
+            <Loader2 size={22} className="text-[#10B981] animate-spin" />
+            <p className="text-xs text-[#A3A3A3]">Preparing preview…</p>
+          </div>
+        ) : total === 0 ? (
           <div className="h-full flex flex-col items-center justify-center gap-3 text-center px-6">
             <p className="text-sm text-[#F5F5F5]">No preview available for this PDF</p>
             <p className="text-xs text-[#A3A3A3] max-w-sm">
-              It was sent before previews existed, or the file could not be read.
-              Use Download to open it.
+              This file could not be rendered. Use Download to open it.
             </p>
           </div>
         ) : (

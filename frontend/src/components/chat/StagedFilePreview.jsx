@@ -135,11 +135,18 @@ export const StagedFilePreview = ({ files, index, onIndex, onClose }) => {
 
       {many && (
         <>
+          {/* These arrows gained a resting bg-black/50 pill along with the green
+              glyph. They previously floated bare over the staged file, which was
+              fine for white-at-70% but not for #10B981: a staged photo or a
+              scanned document is frequently white where the arrow sits, and
+              green-on-white fails contrast outright. The lightbox arrows already
+              had this pill, so this also brings the two into line. */}
           <button
             type="button"
             onClick={(e) => { e.stopPropagation(); prev(); }}
             aria-label="Previous file"
-            className="absolute left-2 top-1/2 -translate-y-1/2 p-3 text-white/70 hover:text-white rounded-full hover:bg-white/10 transition-colors"
+            data-testid="staged-preview-prev"
+            className="absolute left-2 top-1/2 -translate-y-1/2 p-3 bg-black/50 hover:bg-black/80 rounded-full text-[#10B981] transition-colors"
           >
             <ChevronLeft size={28} />
           </button>
@@ -147,7 +154,8 @@ export const StagedFilePreview = ({ files, index, onIndex, onClose }) => {
             type="button"
             onClick={(e) => { e.stopPropagation(); next(); }}
             aria-label="Next file"
-            className="absolute right-2 top-1/2 -translate-y-1/2 p-3 text-white/70 hover:text-white rounded-full hover:bg-white/10 transition-colors"
+            data-testid="staged-preview-next"
+            className="absolute right-2 top-1/2 -translate-y-1/2 p-3 bg-black/50 hover:bg-black/80 rounded-full text-[#10B981] transition-colors"
           >
             <ChevronRight size={28} />
           </button>

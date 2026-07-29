@@ -89,6 +89,7 @@ async def security_headers(request: Request, call_next):
 
 
 from app.api import (  # noqa: E402
+    access_admin,
     admin,
     auth,
     calls,
@@ -106,6 +107,9 @@ from app.api import (  # noqa: E402
 
 app.include_router(auth.router)
 app.include_router(admin.router)
+# Registered after admin.router: both live under /api/admin, and this one's
+# paths are all /api/admin/access/*, which cannot collide with admin's.
+app.include_router(access_admin.router)
 app.include_router(validation.router)
 app.include_router(conversations.router)
 app.include_router(messages.router)

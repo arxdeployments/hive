@@ -231,7 +231,12 @@ def serialize_permissions(conv: Conversation) -> dict:
     return doc
 
 
-def _thumb_url(a: MessageAttachment) -> str | None:
+def attachment_thumb_url(a: MessageAttachment) -> str | None:
+    # Public, and called from api/media.py's gallery route as well as from here.
+    # It was private, and conversation_media hand-rolled a stricter rule that
+    # gated on thumbnail_key alone — so a PDF awaiting its lazy first render got
+    # a preview everywhere except the Media/Links/Docs drawer, which also never
+    # triggered the render that would have healed it. One function, one rule.
     """Thumbnail URL, or None when there will never be one.
 
     Emitted for a PDF that has no thumbnail_key YET but has never been processed
@@ -264,7 +269,7 @@ def _attachment_fields(attachments: list[MessageAttachment]) -> dict:
         item = {
             "id": str(a.id),
             "media_url": media_url_for(a.id),
-            "thumbnail_url": _thumb_url(a),
+            "thumbnail_url": attachment_thumb_url(a),
             "filename": a.filename,
             "mime_type": a.mime_type,
             "file_size": a.file_size,
@@ -280,7 +285,7 @@ def _attachment_fields(attachments: list[MessageAttachment]) -> dict:
     if attachments:
         first = attachments[0]
         out["media_url"] = media_url_for(first.id)
-        out["thumbnail_url"] = _thumb_url(first)
+        out["thumbnail_url"] = attachment_thumb_url(first)
         out["file_size"] = first.file_size
         out["filename"] = first.filename
         out["duration"] = first.duration_seconds

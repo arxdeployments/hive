@@ -35,6 +35,12 @@ router = APIRouter()
 MAX_MESSAGE_BYTES = 10 * 1024
 RATE_LIMIT_PER_MINUTE = 120
 HEARTBEAT_TIMEOUT = 65
+# How stale the account state behind an open socket may get. One row read per
+# socket per interval, so this is a cost/latency dial rather than a correctness
+# one: sending is separately re-checked per message against the live row, and
+# HTTP was already refusing the moment the change landed. This bounds how long a
+# revoked session keeps RECEIVING.
+REVALIDATE_SECONDS = 30
 
 
 class LocalRegistry:
@@ -305,30 +311,43 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 await websocket.send_text(json.dumps({"type": "error", "detail": "Invalid frame"}))
                 continue
 
-            if data["type"] == "ping":
-                # Enforce the access-token lifetime on the long-lived socket:
-                # once it expires, force a re-auth (the client refreshes its
-                # cookie and reconnects). Also re-check is_active periodically so
-                # a deactivated user is dropped, not left connected indefinitely.
-                if token_exp and now.timestamp() > token_exp:
-                    await websocket.close(code=4001, reason="Token expired")
+            # REVALIDATION — on every frame, not only on ping.
+            #
+            # These checks used to live inside the `ping` branch below, which was
+            # a real bypass rather than a theoretical one: the 65s receive
+            # timeout resets on ANY frame, so a client that sent `typing_start`
+            # every 30s and never pinged kept its socket open indefinitely and
+            # was never re-checked. A deactivated account, a revoked mobile
+            # grant and an expired access token all survived for as long as the
+            # client cared to keep typing.
+            #
+            # Hoisted here, after the frame has parsed and before it is
+            # dispatched, so no frame can be handled without the account having
+            # been validated within REVALIDATE_SECONDS.
+            #
+            # The wall-clock gate means the cost stays one row read per socket
+            # per interval regardless of how chatty the client is.
+            if token_exp and now.timestamp() > token_exp:
+                await websocket.close(code=4001, reason="Token expired")
+                break
+            if (now - last_active_check).total_seconds() > REVALIDATE_SECONDS:
+                last_active_check = now
+                async with SessionLocal() as db:
+                    fresh = await db.get(User, user.id)
+                if fresh is None or not fresh.is_active:
+                    await websocket.close(code=4001, reason="Account inactive")
                     break
-                if (now - last_active_check).total_seconds() > 60:
-                    last_active_check = now
-                    async with SessionLocal() as db:
-                        fresh = await db.get(User, user.id)
-                    if fresh is None or not fresh.is_active:
-                        await websocket.close(code=4001, reason="Account inactive")
-                        break
-                    # Same re-check for the mobile grant. Without it a phone whose
-                    # access a superadmin just revoked would keep receiving messages
-                    # on this socket until its access token lapsed — up to the full
-                    # token lifetime — even though its HTTP calls were already 401ing.
-                    if client == MOBILE_CLIENT and (
-                        fresh.role == UserRole.superadmin or not fresh.mobile_access
-                    ):
-                        await websocket.close(code=4001, reason="Mobile access revoked")
-                        break
+                # Same re-check for the mobile grant. Without it a phone whose
+                # access a superadmin just revoked would keep receiving messages
+                # on this socket until its access token lapsed — up to the full
+                # token lifetime — even though its HTTP calls were already 401ing.
+                if client == MOBILE_CLIENT and (
+                    fresh.role == UserRole.superadmin or not fresh.mobile_access
+                ):
+                    await websocket.close(code=4001, reason="Mobile access revoked")
+                    break
+
+            if data["type"] == "ping":
                 await presence.refresh(user.id)
                 await websocket.send_text(json.dumps({"type": "pong", "timestamp": iso_z(now_utc())}))
                 continue

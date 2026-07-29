@@ -31,7 +31,12 @@ const POINTS = [
   {
     icon: ServerCog,
     title: 'Stored on RX HIVE servers',
-    body: 'History is retained on the server so you can search it and pick it up on another device. Deleting a message for yourself hides your copy; deleting for everyone removes it for the whole chat.',
+    // Kept in step with what the product can actually do. This previously
+    // described per-message "delete for me" / "delete for everyone", both of
+    // which were removed, and then "Clear chat", also since removed. Deleting a
+    // conversation is now the only action that hides history, and it hides it
+    // for the caller alone.
+    body: 'History is retained on the server so you can search it and pick it up on another device. Deleting a chat hides your copy; everyone else keeps theirs.',
   },
 ];
 

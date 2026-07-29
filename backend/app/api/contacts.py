@@ -19,7 +19,7 @@ from app.db.models import (
     Department,
     User,
 )
-from app.services import enrich, presence
+from app.services import access, enrich, presence
 from app.utils import iso_z, parse_uuid
 
 router = APIRouter(prefix="/api/users", tags=["contacts"])
@@ -34,6 +34,24 @@ def _like_pattern(value: str) -> str:
     """Escape LIKE wildcards so user input is matched literally."""
     escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
+
+
+@router.get("/me/send-policy")
+async def my_send_policy(tenant: TenantContext = Depends(get_tenant)):
+    """What the caller may send, resolved.
+
+    A dedicated endpoint rather than a field on /api/auth/me, for two reasons.
+    AuthContext caches the /me payload in localStorage, and policy is exactly
+    the thing that must not be read from a store the user can edit. And policy
+    changes independently of identity — it needs re-fetching on an
+    access_changed event without cycling the session.
+
+    Purely a rendering hint. The client uses it to grey out an attach option
+    instead of offering a file the server will refuse; `accept` on a file input
+    is advisory anyway, and drag-and-drop and paste ignore it entirely. Every
+    send is still checked server-side at claim time.
+    """
+    return (await access.resolve_send_policy(tenant.db, tenant.user)).as_dict()
 
 
 @router.get("/contacts")
@@ -69,6 +87,18 @@ async def list_contacts(
         )
 
     rows = (await tenant.db.execute(stmt)).all()
+
+    # Filter the roster to people this user may actually reach. Chosen over
+    # showing everyone and failing on click: a directory that lists a colleague
+    # you cannot contact invites the support ticket, and the ward's staff list
+    # is itself information a restriction is often meant to withhold.
+    #
+    # One preloaded set rather than a per-row check — this endpoint has no
+    # pagination and renders in full, so a per-pair query here would N+1 one of
+    # the hottest paths in the app.
+    reachable = await access.reachable_user_ids(tenant.db, user)
+    rows = [(u, d) for u, d in rows if u.id in reachable]
+
     statuses = await presence.get_statuses([u.id for u, _ in rows])
 
     return [

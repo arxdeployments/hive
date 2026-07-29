@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     access_token_minutes: int = 15
     refresh_token_days: int = 30
 
+    # How long after a refresh token is rotated it may still be replayed once, by
+    # a client that never received the rotation response (request timeout, proxy
+    # error, app suspended mid-flight). Wide enough to cover a lost round trip,
+    # short enough that a stolen cookie is out of time; a replay outside it — or
+    # of a successor already spent — is treated as theft and burns the family.
+    refresh_reuse_grace_seconds: int = 60
+
     # None → derive from environment (Secure cookies in production). Set
     # RXHIVE_COOKIE_SECURE explicitly to force a value (e.g. false for local
     # HTTPS-less testing). Read via the `cookies_secure` property.
@@ -48,7 +55,6 @@ class Settings(BaseSettings):
     rate_limit_refresh: int = 30
     rate_limit_password: int = 5
     rate_limit_upload: int = 30
-    rate_limit_export: int = 10
 
     s3_endpoint: str = "http://localhost:9000"
     # Endpoint the *browser* uses for presigned URLs. May be a bare path like "/s3"

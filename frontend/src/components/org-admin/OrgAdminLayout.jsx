@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Users, FolderTree, Settings, ArrowLeft } from 'lucide-react';
+import { Outlet, NavLink } from 'react-router-dom';
+import { LayoutDashboard, Users, FolderTree, Settings } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
+import { WorkspaceSwitcher } from '../shared/WorkspaceSwitcher';
 
 const navItems = [
   { path: '/org-admin', icon: LayoutDashboard, label: 'Overview', exact: true },
@@ -12,7 +13,6 @@ const navItems = [
 
 export const OrgAdminLayout = () => {
   const { user } = useAuth();
-  const navigate = useNavigate();
   const [collapsed, setCollapsed] = useState(false);
 
   return (
@@ -48,24 +48,29 @@ export const OrgAdminLayout = () => {
           })}
         </nav>
 
+        {/* In the ASIDE, not the header.
+            The header sits in the flex-1 content column, and a nowrap flex row
+            there raises the whole layout's min-content width — 260px of fixed
+            aside plus the header's contents — past a phone viewport. With
+            html/body/#root all overflow:hidden and position:fixed there is no
+            scroll to recover it, so on a phone the switcher went off-screen. It
+            replaced "Back to Chat", which used to live right here and was always
+            visible, so that combination left no route back to chat at all.
+            The aside is a fixed width and always on screen, which this is not. */}
         <div className="border-t border-[#1F1F1F] p-3">
-          <button onClick={() => navigate('/chat')}
-            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-[6px] text-sm text-[#A3A3A3] hover:text-[#10B981] hover:bg-[#141414] transition-colors">
-            <ArrowLeft size={18} />
-            {!collapsed && <span>Back to Chat</span>}
-          </button>
+          <WorkspaceSwitcher compact={collapsed} className={collapsed ? '' : 'w-full justify-center'} />
         </div>
       </aside>
 
       {/* Main content */}
       <div className="flex-1 flex flex-col">
         <header className="h-16 bg-[#0A0A0A]/80 backdrop-blur border-b border-[#1F1F1F] flex items-center justify-between px-6">
-          <h2 className="text-lg font-semibold text-[#F5F5F5]">Organization Management</h2>
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-sm font-medium">
+          <h2 className="text-lg font-semibold text-[#F5F5F5] truncate min-w-0">Organization Management</h2>
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="w-8 h-8 shrink-0 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-sm font-medium">
               {user?.name?.charAt(0) || 'A'}
             </div>
-            <span className="text-sm text-[#F5F5F5]">{user?.name}</span>
+            <span className="text-sm text-[#F5F5F5] truncate">{user?.name}</span>
           </div>
         </header>
         <main className="flex-1 p-6 overflow-y-auto">

@@ -17,6 +17,7 @@ const Departments = lazy(() => import('./pages/admin/Departments'));
 const UsersPage = lazy(() => import('./pages/admin/Users'));
 const SettingsPage = lazy(() => import('./pages/admin/Settings'));
 const CrossOrgGroups = lazy(() => import('./pages/admin/CrossOrgGroups'));
+const AccessControl = lazy(() => import('./pages/admin/AccessControl'));
 const OrgAdminDashboard = lazy(() => import('./pages/OrgAdmin/OrgAdminDashboard'));
 const OrgAdminUsers = lazy(() => import('./pages/OrgAdmin/OrgAdminUsers'));
 const OrgAdminDepartments = lazy(() => import('./pages/OrgAdmin/OrgAdminDepartments'));
@@ -45,6 +46,7 @@ import { IncomingCallOverlay } from './components/calls/IncomingCallOverlay';
 import { OutgoingCallScreen } from './components/calls/OutgoingCallScreen';
 import { MinimizedCallBanner } from './components/calls/MinimizedCallBanner';
 import { CallAudioSink } from './components/calls/CallAudioSink';
+import { RealtimeSession } from './components/shared/RealtimeSession';
 import { ActiveCallView } from './components/calls/ActiveCallView';
 
 // Route guards
@@ -157,6 +159,12 @@ function App() {
     <ErrorBoundary>
     <BrowserRouter>
       <AuthProvider>
+        {/* Realtime socket, scoped to the SESSION rather than to /chat. It lived
+            inside the chat page, so navigating anywhere else disconnected it
+            with no path back — see RealtimeSession for the full account. Sits
+            with the call overlays because it has the same requirement: outlive
+            every route. */}
+        <RealtimeSession />
         <OfflineBanner />
         <IncomingCallOverlay />
         <OutgoingCallScreen />
@@ -221,6 +229,7 @@ function App() {
               <Route path="users" element={<UsersPage />} />
               <Route path="settings" element={<SettingsPage />} />
               <Route path="cross-org-groups" element={<CrossOrgGroups />} />
+              <Route path="access" element={<AccessControl />} />
             </Route>
 
             <Route

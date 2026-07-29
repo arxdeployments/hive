@@ -13,6 +13,7 @@ import { FILE_ICONS, formatFileSize } from './DocumentBubble';
 import { AudioRecorderBar } from './AudioRecorderBar';
 import { StagedFilePreview } from './StagedFilePreview';
 import useAudioRecorder from '../../hooks/useAudioRecorder';
+import { useSendPolicy, acceptFor, isBlockedFile } from '../../hooks/useSendPolicy';
 import { canRecordAudio } from '../../utils/audioFormat';
 
 // Client-side size hints (server still enforces its own limits).
@@ -112,6 +113,15 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   // offered and then failing on click.
   const recorder = useAudioRecorder();
   const [micSupported] = useState(() => canRecordAudio());
+
+  // What this user may send. A rendering hint only — the server re-checks every
+  // send at claim time, and it must, because `accept` is advisory and neither
+  // drag-and-drop nor paste honours it.
+  const sendPolicy = useSendPolicy();
+  // A voice note is an audio upload down the identical path, so an audio
+  // restriction has to disable the mic as well — otherwise the user records,
+  // waits for the upload and only then gets a 403.
+  const canRecord = micSupported && sendPolicy.audio;
   const [voiceSending, setVoiceSending] = useState(false);
   // Index of the staged file being previewed full-size, or null. Nothing has been
   // uploaded at this point, so the preview reads the tray's own object URL.
@@ -467,9 +477,21 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     setDragOver(false);
     const files = Array.from(e.dataTransfer.files || []);
     if (files.length === 0) return;
+    // `accept` on the hidden inputs does nothing here — drop bypasses it
+    // entirely — so the policy has to be applied by hand or a restricted user
+    // stages a file that will be refused on send.
+    const permitted = files.filter((f) => !isBlockedFile(sendPolicy, f));
+    if (permitted.length < files.length) {
+      toast.error(
+        permitted.length
+          ? 'Some files are not allowed for your account and were skipped'
+          : 'That file type is not allowed for your account'
+      );
+    }
+    if (permitted.length === 0) return;
     // Everything staged for confirmation — dropping a video no longer sends it
     // before the user has seen it.
-    stageFiles(files);
+    stageFiles(permitted);
   };
 
   // ── Clipboard paste ───────────────────────────────────────────────────────
@@ -480,6 +502,12 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     if (imageItems.length > 0) {
       e.preventDefault();
       const files = imageItems.map(item => item.getAsFile()).filter(Boolean);
+      // Paste ignores `accept` too. A pasted screenshot is an image upload like
+      // any other, so it is subject to the same rule.
+      if (!sendPolicy.image) {
+        toast.error('Photos are not allowed for your account');
+        return;
+      }
       stageFiles(files);
     }
   };
@@ -746,6 +774,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                     exit={{ opacity: 0, y: 10 }}
                     className="absolute bottom-full left-0 mb-2 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[8px] shadow-lg z-30 py-1 w-40"
                   >
+                    {(sendPolicy.image || sendPolicy.video) && (
                     <button
                       onClick={() => fileInputRef.current?.click()}
                       data-testid="attach-image-btn"
@@ -753,6 +782,8 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                     >
                       <Image size={16} className="text-[#10B981]" /> Photos &amp; Videos
                     </button>
+                    )}
+                    {(sendPolicy.video || sendPolicy.audio) && (
                     <button
                       onClick={() => mediaInputRef.current?.click()}
                       data-testid="attach-media-btn"
@@ -760,6 +791,8 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                     >
                       <Film size={16} className="text-[#A855F7]" /> Media
                     </button>
+                    )}
+                    {sendPolicy.document && (
                     <button
                       onClick={() => docInputRef.current?.click()}
                       data-testid="attach-doc-btn"
@@ -767,6 +800,14 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                     >
                       <FileText size={16} className="text-[#3B82F6]" /> Document
                     </button>
+                    )}
+                    {/* Every category blocked. Saying so beats an empty popover,
+                        which reads as a broken menu rather than a policy. */}
+                    {!sendPolicy.image && !sendPolicy.video && !sendPolicy.audio && !sendPolicy.document && (
+                      <p className="px-4 py-2.5 text-xs text-[#A3A3A3]" data-testid="attach-none-allowed">
+                        Attachments are turned off for your account.
+                      </p>
+                    )}
                   </motion.div>
                 </>
               )}
@@ -777,9 +818,9 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
           {/* Photos & videos: one picker for both so a mixed batch is a single
               selection. All three pickers share handleFileSelect, which stages
               every category for confirmation instead of sending anything. */}
-          <input ref={fileInputRef} type="file" accept={`image/*,video/*,${VIDEO_ACCEPT}`} multiple className="hidden" onChange={handleFileSelect} />
-          <input ref={mediaInputRef} type="file" accept={`video/*,audio/*,${VIDEO_ACCEPT},${AUDIO_ACCEPT}`} multiple className="hidden" onChange={handleFileSelect} />
-          <input ref={docInputRef} type="file" accept={`${DOC_ACCEPT},${VIDEO_ACCEPT},${AUDIO_ACCEPT}`} multiple className="hidden" onChange={handleFileSelect} />
+          <input ref={fileInputRef} type="file" accept={sendPolicy.image || sendPolicy.video ? `${sendPolicy.image ? 'image/*,' : ''}${sendPolicy.video ? `video/*,${acceptFor(sendPolicy, 'video', VIDEO_ACCEPT)}` : ''}`.replace(/,$/, '') : ''} multiple className="hidden" onChange={handleFileSelect} />
+          <input ref={mediaInputRef} type="file" accept={[sendPolicy.video && `video/*,${acceptFor(sendPolicy, 'video', VIDEO_ACCEPT)}`, sendPolicy.audio && `audio/*,${acceptFor(sendPolicy, 'audio', AUDIO_ACCEPT)}`].filter(Boolean).join(',')} multiple className="hidden" onChange={handleFileSelect} />
+          <input ref={docInputRef} type="file" accept={acceptFor(sendPolicy, 'document', DOC_ACCEPT)} multiple className="hidden" onChange={handleFileSelect} />
 
           {/* Text input */}
           <textarea
@@ -809,10 +850,10 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
               getUserMedia, or an insecure context) the button falls back to
               send-only rather than offering a control that cannot work. */}
           <button
-            onClick={hasText ? handleSend : (micSupported ? handleMicClick : undefined)}
-            disabled={uploading || (!hasText && !micSupported)}
+            onClick={hasText ? handleSend : (canRecord ? handleMicClick : undefined)}
+            disabled={uploading || (!hasText && !canRecord)}
             aria-label={hasText ? 'Send message' : 'Record voice message'}
-            title={hasText ? 'Send' : (micSupported ? 'Record voice message' : 'Recording is not supported in this browser')}
+            title={hasText ? 'Send' : (canRecord ? 'Record voice message' : (micSupported ? 'Voice messages are turned off for your account' : 'Recording is not supported in this browser'))}
             data-testid={hasText ? 'message-send-btn' : 'voice-record-btn'}
             className={`p-2.5 rounded-full flex-shrink-0 mb-0.5 transition-all duration-150 ${
               uploading

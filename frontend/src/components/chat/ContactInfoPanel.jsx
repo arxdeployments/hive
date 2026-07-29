@@ -26,8 +26,6 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Check,
   Copy,
-  Download,
-  Eraser,
   FolderTree,
   Info,
   Image as ImageIcon,
@@ -36,7 +34,6 @@ import {
   Phone,
   Search,
   Star,
-  Timer,
   Users,
   Video,
 } from 'lucide-react';
@@ -51,9 +48,7 @@ import { MediaLinksDocsSection } from './info/MediaLinksDocsSection';
 import { StarredSection } from './info/StarredSection';
 import { EncryptionSection } from './info/EncryptionSection';
 import {
-  ActionRow,
   Avatar,
-  ConfirmDialog,
   EmptyState,
   LoadingState,
   QuickAction,
@@ -112,7 +107,6 @@ export const ContactInfoPanel = ({
   const myUserId = currentUserId || user?.id;
   const setActiveConversation = useChatStore((s) => s.setActiveConversation);
   const updateConversation = useChatStore((s) => s.updateConversation);
-  const setMessages = useChatStore((s) => s.setMessages);
 
   const [section, setSection] = useState(initialSection);
   const [directory, setDirectory] = useState(null); // roster row: email + department
@@ -122,9 +116,6 @@ export const ContactInfoPanel = ({
   const [muted, setMuted] = useState(false);
   const [mutePending, setMutePending] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [confirm, setConfirm] = useState(null); // 'clear'
-  const [confirmBusy, setConfirmBusy] = useState(false);
-  const [exporting, setExporting] = useState(false);
 
   const convId = conversation?._id;
   const participants = useMemo(() => conversation?.participants || [], [conversation]);
@@ -269,42 +260,6 @@ export const ContactInfoPanel = ({
     }
   };
 
-  const handleExport = async () => {
-    if (!convId) return;
-    setExporting(true);
-    try {
-      const response = await client.get(`/api/conversations/${convId}/export`, { responseType: 'blob' });
-      const blob = new Blob([response.data], { type: 'text/plain;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `rxhive-chat-${convId}.txt`;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(url);
-      toast.success('Chat exported');
-    } catch (err) {
-      toast.error(err.response?.data?.detail || 'Export failed');
-    } finally {
-      setExporting(false);
-    }
-  };
-
-  const handleClearChat = async () => {
-    setConfirmBusy(true);
-    try {
-      await client.post(`/api/conversations/${convId}/clear`);
-      setMessages(convId, []);
-      toast.success('Chat cleared');
-      setConfirm(null);
-    } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to clear chat');
-    } finally {
-      setConfirmBusy(false);
-    }
-  };
-
   const openGroup = (groupId) => {
     onClose?.();
     if (onSelectConversation) onSelectConversation(groupId);
@@ -384,38 +339,6 @@ export const ContactInfoPanel = ({
             busy={mutePending}
             onChange={handleToggleMute}
             testId="contact-info-mute-toggle"
-          />
-          <div className="flex items-center justify-between gap-4 px-4 py-3" data-testid="contact-info-disappearing">
-            <span className="flex items-center gap-3 min-w-0">
-              <Timer size={18} className="text-[#A3A3A3] shrink-0" />
-              <span className="min-w-0">
-                <span className="block text-sm text-[#F5F5F5]">Disappearing messages</span>
-                <span className="block text-xs text-[#A3A3A3] mt-0.5">Not available on RX HIVE yet</span>
-              </span>
-            </span>
-            <span className="text-sm text-[#A3A3A3] shrink-0">Off</span>
-          </div>
-        </div>
-      )}
-
-      {/* Chat actions */}
-      {convId && (
-        <div className="bg-[#141414] border border-[#1F1F1F] rounded-[10px] divide-y divide-[#1F1F1F]">
-          <ActionRow
-            icon={Download}
-            label="Export chat"
-            description="Download this conversation as a text file"
-            onClick={handleExport}
-            disabled={exporting}
-            trailing={exporting ? 'Exporting…' : undefined}
-            testId="contact-info-export"
-          />
-          <ActionRow
-            icon={Eraser}
-            label="Clear chat"
-            description="Remove all messages from your copy of this chat"
-            onClick={() => setConfirm('clear')}
-            testId="contact-info-clear"
           />
         </div>
       )}
@@ -525,17 +448,6 @@ export const ContactInfoPanel = ({
         {section === 'encryption' && <EncryptionSection testIdPrefix="contact-info-encryption" />}
         {section === 'groups' && renderGroups()}
       </InfoPanelShell>
-
-      <ConfirmDialog
-        open={confirm === 'clear'}
-        title="Clear this chat?"
-        body={`Every message will be removed from your copy of this chat. ${person.display_name} keeps theirs.`}
-        confirmLabel="Clear chat"
-        busy={confirmBusy}
-        onConfirm={handleClearChat}
-        onCancel={() => setConfirm(null)}
-        testId="contact-info-clear-confirm"
-      />
     </>
   );
 };

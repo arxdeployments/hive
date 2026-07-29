@@ -28,6 +28,9 @@ import {
 import { toast } from 'sonner';
 import client from '../../../api/client';
 import { ForwardModal } from '../ForwardModal';
+import { FullscreenImageViewer } from '../FullscreenImageViewer';
+import { FullscreenVideoViewer } from '../FullscreenVideoViewer';
+import { PdfViewer } from '../PdfViewer';
 import {
   EmptyState,
   LoadingState,
@@ -51,11 +54,55 @@ const EMPTY_COPY = {
   docs: { icon: FileText, title: 'No documents yet', hint: 'Files shared in this chat will appear here.' },
 };
 
+/**
+ * Trust the server's mime_type first: `filename` is whatever the sender's file
+ * was called, so an extension test alone can be wrong in both directions. The
+ * extension is kept only as a fallback for rows whose message has no attachment
+ * and therefore no mime_type at all.
+ */
+const isPdfItem = (item) =>
+  item?.mime_type === 'application/pdf' || /\.pdf$/i.test(item?.filename || '');
+
 const fetchType = async (conversationId, type) => {
   const { data } = await client.get(`/api/conversations/${conversationId}/media`, {
     params: { type, limit: 100 },
   });
   return (data?.data || []).map((item) => ({ ...item, media_kind: type }));
+};
+
+/**
+ * Leading tile for a Docs row: page 1 for a PDF, the generic icon otherwise.
+ *
+ * The onError fallback is mandatory rather than defensive. enrich._thumb_url
+ * returns a thumbnail URL optimistically for any PDF whose page_count is still
+ * NULL — before page 1 has ever been rendered — and /media/{id}/thumb 404s if
+ * the render then fails on an encrypted or corrupt file. A non-null
+ * thumbnail_url is therefore a maybe, not a promise.
+ *
+ * loading="lazy" is load-bearing too: that same /thumb route rasterises, uploads
+ * and commits on first hit, so eagerly fetching a screenful of legacy PDFs would
+ * fire a render, an S3 put and a DB write for each one.
+ */
+const DocThumb = ({ item }) => {
+  const [broken, setBroken] = useState(false);
+  const src = resolveMediaUrl(item.thumbnail_url);
+  return (
+    <span className="w-10 h-10 shrink-0 rounded-[8px] overflow-hidden flex items-center justify-center bg-[#1A1A1A]">
+      {src && !broken ? (
+        <img
+          src={src}
+          alt=""
+          loading="lazy"
+          onError={() => setBroken(true)}
+          // object-top: a cropped page must show its title, not its middle.
+          className="w-full h-full object-cover object-top bg-white"
+          data-testid="doc-row-thumbnail"
+        />
+      ) : (
+        <FileText size={16} className="text-[#A3A3A3]" />
+      )}
+    </span>
+  );
 };
 
 export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdPrefix = 'info-media' }) => {
@@ -67,6 +114,8 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
   const [selected, setSelected] = useState([]);
   const [forwardTargets, setForwardTargets] = useState(null);
   const [working, setWorking] = useState(false);
+  // { kind: 'image', index } | { kind: 'video' | 'pdf', item }
+  const [viewer, setViewer] = useState(null);
 
   const load = useCallback(async () => {
     if (!conversationId) return;
@@ -107,9 +156,17 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
   useEffect(() => {
     setSelected([]);
     setSelectMode(false);
+    // An open viewer holds an index into the previous tab's list; leaving it up
+    // across a tab change would page through the wrong images.
+    setViewer(null);
   }, [tab, conversationId]);
 
   const grouped = useMemo(() => groupByMonth(items), [items]);
+
+  // The lightbox pages across the WHOLE Media tab, not just the month bucket the
+  // click came from — a photo browser that stops at a month boundary is worse
+  // than no paging. Videos are excluded: they cannot render in an <img>.
+  const imageItems = useMemo(() => items.filter((i) => i.media_kind === 'image'), [items]);
 
   // Links are keyed by url too: one message can hold several distinct links, so
   // message_id alone would collapse them into a single selectable row.
@@ -131,6 +188,26 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
     setSelected([]);
   };
 
+  // Jumping to the message closes the whole drawer (both hosts wrap the callback
+  // as `onClose(); onJumpToMessage(id)`), so the viewer must come down with it.
+  const jumpTo = useCallback(
+    (messageId) => {
+      setViewer(null);
+      onJumpToMessage?.(messageId);
+    },
+    [onJumpToMessage]
+  );
+
+  /**
+   * Every tile used to fall through to jump-to-message, which closed the drawer
+   * and scrolled the thread — so clicking a photo, video or PDF looked like it
+   * did nothing at all. Media now opens in place; jump-to-message survives as a
+   * control inside each viewer rather than being deleted.
+   *
+   * Formats with no renderer (docx, xlsx, zip, audio) keep the old behaviour:
+   * jumping to the message is a genuinely useful thing to do with a file the
+   * browser cannot display, and the Docs row already carries its own download.
+   */
   const handleActivate = (item, key) => {
     if (selectMode) {
       toggleSelect(key);
@@ -141,7 +218,20 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
       if (href) window.open(href, '_blank', 'noopener,noreferrer');
       return;
     }
-    onJumpToMessage?.(item.message_id);
+    if (item.media_kind === 'image') {
+      const index = imageItems.findIndex((i) => i.message_id === item.message_id);
+      setViewer({ kind: 'image', index: index < 0 ? 0 : index });
+      return;
+    }
+    if (item.media_kind === 'video') {
+      setViewer({ kind: 'video', item });
+      return;
+    }
+    if (isPdfItem(item)) {
+      setViewer({ kind: 'pdf', item });
+      return;
+    }
+    jumpTo(item.message_id);
   };
 
   const handleStar = async () => {
@@ -264,7 +354,13 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
                   {bucket.items.map((item) => {
                     const key = keyOf(item, 0);
                     const checked = selected.includes(key);
-                    const thumb = resolveMediaUrl(item.thumbnail_url || item.media_url);
+                    const isVideo = item.media_kind === 'video';
+                    // Videos never get a server-side poster (storage.make_thumbnail
+                    // is image-only), so the old `thumbnail_url || media_url`
+                    // fallback pointed an <img> at an mp4 and rendered a broken
+                    // tile. Fall back to media_url for images only and let video
+                    // show its Film placeholder instead.
+                    const thumb = resolveMediaUrl(item.thumbnail_url || (isVideo ? null : item.media_url));
                     return (
                       <button
                         key={key}
@@ -272,6 +368,11 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
                         onClick={() => handleActivate(item, key)}
                         data-testid={`${testIdPrefix}-item`}
                         aria-pressed={selectMode ? checked : undefined}
+                        // The tile's only content is an alt="" image and
+                        // decorative icons, so without this it announces as a
+                        // bare "button" — and in select mode as "button,
+                        // pressed" with nothing to pin the state to.
+                        aria-label={`${isVideo ? 'Video' : 'Photo'} from ${item.sender_name}, ${formatDateTime(item.created_at)}`}
                         className={`relative aspect-square rounded-[6px] overflow-hidden bg-[#141414] border transition-colors ${
                           checked ? 'border-[#10B981]' : 'border-[#1F1F1F] hover:border-[#2D2D2D]'
                         }`}
@@ -280,10 +381,14 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
                           <img src={thumb} alt="" className="w-full h-full object-cover" loading="lazy" />
                         ) : (
                           <span className="w-full h-full flex items-center justify-center">
-                            <ImageIcon size={18} className="text-[#A3A3A3]" />
+                            {isVideo ? (
+                              <Film size={20} className="text-[#A3A3A3]" />
+                            ) : (
+                              <ImageIcon size={18} className="text-[#A3A3A3]" />
+                            )}
                           </span>
                         )}
-                        {item.media_kind === 'video' && (
+                        {isVideo && (
                           <span className="absolute bottom-1 left-1 p-0.5 rounded bg-black/60">
                             <Film size={12} className="text-white" />
                           </span>
@@ -335,17 +440,13 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
                           data-testid={`${testIdPrefix}-item`}
                           className="flex-1 min-w-0 flex items-center gap-3 text-left"
                         >
-                          <span
-                            className={`w-10 h-10 shrink-0 rounded-[8px] flex items-center justify-center ${
-                              isLink ? 'bg-[#10B981]/10' : 'bg-[#1A1A1A]'
-                            }`}
-                          >
-                            {isLink ? (
+                          {isLink ? (
+                            <span className="w-10 h-10 shrink-0 rounded-[8px] flex items-center justify-center bg-[#10B981]/10">
                               <Link2 size={16} className="text-[#10B981]" />
-                            ) : (
-                              <FileText size={16} className="text-[#A3A3A3]" />
-                            )}
-                          </span>
+                            </span>
+                          ) : (
+                            <DocThumb item={item} />
+                          )}
                           <span className="flex-1 min-w-0">
                             <span className="block text-sm text-[#F5F5F5] truncate">
                               {isLink ? item.title || item.domain : item.filename || 'Document'}
@@ -395,6 +496,46 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
         </Portal>
       )}
 
+      {/* FullscreenImageViewer needs the same <Portal> treatment as ForwardModal
+          above — it is a bare `fixed inset-0` with no portal of its own, so
+          rendered in place it would be pinned to the 720px drawer and clipped by
+          the content pane's overflow-y-auto. That failure looks identical to the
+          bug being fixed here: the click appears to do nothing.
+          PdfViewer and FullscreenVideoViewer portal themselves, so they must NOT
+          be wrapped again. */}
+      {viewer?.kind === 'image' && imageItems.length > 0 && (
+        <Portal>
+          <FullscreenImageViewer
+            images={imageItems.map((i) => i.media_url)}
+            thumbnails={imageItems.map((i) => i.thumbnail_url || i.media_url)}
+            initialIndex={viewer.index}
+            captions={imageItems.map((i) => ({ senderName: i.sender_name, timestamp: i.created_at }))}
+            onJumpTo={(index) => jumpTo(imageItems[index]?.message_id)}
+            onClose={() => setViewer(null)}
+          />
+        </Portal>
+      )}
+
+      {viewer?.kind === 'video' && (
+        <FullscreenVideoViewer
+          src={resolveMediaUrl(viewer.item.media_url)}
+          filename={viewer.item.filename}
+          senderName={viewer.item.sender_name}
+          timestamp={viewer.item.created_at}
+          onJumpTo={() => jumpTo(viewer.item.message_id)}
+          onClose={() => setViewer(null)}
+        />
+      )}
+
+      {viewer?.kind === 'pdf' && (
+        <PdfViewer
+          mediaUrl={viewer.item.media_url}
+          filename={viewer.item.filename || 'Document'}
+          pageCount={viewer.item.page_count}
+          onJumpTo={() => jumpTo(viewer.item.message_id)}
+          onClose={() => setViewer(null)}
+        />
+      )}
     </div>
   );
 };

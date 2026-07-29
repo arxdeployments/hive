@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { MessageSquarePlus, Users, MoreVertical, Search, LogOut, User, Settings, Building2 } from 'lucide-react';
+import { MessageSquarePlus, Users, MoreVertical, Search, LogOut, User, Settings } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -13,6 +13,7 @@ import useChatStore from '../../stores/chatStore';
 import client from '../../api/client';
 
 import { CallsTab } from '../calls/CallsTab';
+import { WorkspaceSwitcher } from '../shared/WorkspaceSwitcher';
 import useCallStore from '../../stores/callStore';
 
 const FILTER_TABS = [
@@ -84,6 +85,23 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
     return () => clearInterval(interval);
   }, [wsConnected, fetchConversations]);
 
+  /**
+   * A super admin changed who this user may talk to.
+   *
+   * The conversation list is reachability-shaped — the server filters what it
+   * returns — so re-fetching is what makes a revocation visible without a
+   * reload. Deliberately a refetch rather than a local mutation: the client has
+   * no copy of the rules and could not compute the new answer if it wanted to.
+   *
+   * The event is best-effort (at-most-once pub/sub), so this shortens the window
+   * in which the list is stale; it is not what enforces anything.
+   */
+  useEffect(() => {
+    const onAccessChanged = () => fetchConversations();
+    window.addEventListener('rxhive:access-changed', onAccessChanged);
+    return () => window.removeEventListener('rxhive:access-changed', onAccessChanged);
+  }, [fetchConversations]);
+
   useEffect(() => {
     const onVisibility = () => {
       if (document.visibilityState === 'visible') fetchConversations();
@@ -123,15 +141,27 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
     <div className="h-full flex flex-col bg-[#0F0F0F] border-r border-[#1F1F1F] overflow-hidden" data-testid="chat-sidebar">
       {/* Header */}
       <div className="h-[60px] flex items-center justify-between px-4 border-b border-[#1F1F1F] flex-shrink-0">
-        <div className="flex items-center gap-3 cursor-pointer" onClick={() => setShowProfile(true)}>
-          <div className="w-9 h-9 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-sm font-medium">
+        <div className="flex items-center gap-3 cursor-pointer min-w-0" onClick={() => setShowProfile(true)}>
+          <div className="w-9 h-9 shrink-0 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-sm font-medium">
             {user?.name?.charAt(0)?.toUpperCase() || 'U'}
           </div>
           {!isMobile && (
-            <span className="text-sm font-medium text-[#F5F5F5]">{user?.name}</span>
+            // truncate + the min-w-0 above: this span had no way to shrink, so
+            // the header's min-content was avatar + full name + every control.
+            // Anything added to the right-hand group then overflowed a sidebar
+            // that is a fixed 300px (or 360px at lg) and overflow-hidden, with
+            // the page itself position:fixed — so it clipped silently instead of
+            // scrolling. The name is the one thing here that can safely give.
+            <span className="text-sm font-medium text-[#F5F5F5] truncate">{user?.name}</span>
           )}
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 shrink-0">
+          {/* Renders only for org admins; returns null for everyone else, so the
+              header is unchanged for ordinary users.
+              ALWAYS compact, not just on mobile: the labelled form is ~154px and
+              the three icon buttons alone already fill a 300px sidebar. Labels
+              live on the admin side, where the header is full width. */}
+          <WorkspaceSwitcher compact className="mr-1" />
           <button
             onClick={() => setShowNewChat(true)}
             data-testid="new-chat-button"
@@ -173,16 +203,10 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
                     <button onClick={() => { setShowMenu(false); navigate('/settings'); }} className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-[#A3A3A3] hover:bg-[#1A1A1A] hover:text-[#F5F5F5] transition-colors">
                       <Settings size={16} /> Settings
                     </button>
-                    {user?.role === 'admin' && (
-                      <>
-                        <div className="border-t border-[#1F1F1F] my-1" />
-                        <button onClick={() => { setShowMenu(false); navigate('/org-admin'); }}
-                          data-testid="manage-org-button"
-                          className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-[#10B981] hover:bg-[#10B981]/10 transition-colors">
-                          <Building2 size={16} /> Manage Organization
-                        </button>
-                      </>
-                    )}
+                    {/* "Manage Organization" used to live here. It is now the
+                        Admin tab in the header above — persistently visible and
+                        symmetric with the Chat tab on the admin side, rather
+                        than buried one click deep in this menu. */}
                     <div className="border-t border-[#1F1F1F] my-1" />
                     <button
                       onClick={handleLogout}
