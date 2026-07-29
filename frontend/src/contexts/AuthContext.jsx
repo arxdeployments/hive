@@ -3,6 +3,19 @@ import client from '../api/client';
 
 const AuthContext = createContext(null);
 
+/**
+ * The localStorage mirror of /api/auth/me. It exists only to survive a boot where
+ * the server could not be reached; the httpOnly cookies, not this, decide whether
+ * the session is real, and every request still proves that against the API.
+ */
+const cachedUser = () => {
+  try {
+    return JSON.parse(localStorage.getItem('user') || 'null');
+  } catch {
+    return null;
+  }
+};
+
 export const useAuth = () => {
   const context = useContext(AuthContext);
   if (!context) throw new Error('useAuth must be used within AuthProvider');
@@ -20,8 +33,19 @@ export const AuthProvider = ({ children }) => {
       setUser(data);
       localStorage.setItem('user', JSON.stringify(data));
     } catch (err) {
-      localStorage.removeItem('user');
-      setUser(null);
+      // Tell "the server says this session is finished" apart from "we could not
+      // ask". Every failure used to clear the cache and drop to the login screen,
+      // so a boot with no network signed out a user whose cookies were still
+      // good. client.js has already tried refresh-and-replay by the time we get
+      // here, so a 401/403 is terminal; anything else is a transport failure and
+      // the cached user stands until a request can actually reach the server.
+      const status = err.response?.status;
+      if (status === 401 || status === 403) {
+        localStorage.removeItem('user');
+        setUser(null);
+      } else {
+        setUser(cachedUser());
+      }
     } finally {
       setLoading(false);
     }

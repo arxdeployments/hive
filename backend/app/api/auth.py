@@ -6,15 +6,25 @@ Changes vs the Mongo build (all deliberate, coordinated with the frontend):
   revoked on logout/deactivation. is_active is re-checked on refresh.
 - Superadmin sessions refresh like everyone else (fixes the 15-min logout bug).
 - The rate limiter is a dependency wired here — not dead code in main.py.
+
+Rotation is now delivery-safe as well as single-use. Revoking the presented token
+commits before its replacement can reach the client, so a lost response used to
+leave a healthy client holding a token the server had already spent, and its next
+refresh signed the user out of a session that was fine. A rotated token may now be
+replayed once, within a short grace window, while the successor it never received
+is still unused. Every other reuse is treated as a stolen cookie and burns that
+client's whole session family — stricter than failing the one token, which is what
+the previous build did.
 """
 
 import datetime as dt
+import logging
 import uuid
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -34,6 +44,8 @@ from app.db.models import RefreshToken, User, UserRole
 from app.db.session import get_db
 from app.services import presence
 from app.utils import iso_z, now_utc
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -118,19 +130,25 @@ async def _issue_session(
     response: Response,
     request: Request,
     client: str = WEB_CLIENT,
+    replaces: RefreshToken | None = None,
 ) -> None:
     settings = get_settings()
     access = create_access_token(user.id, wire_role(user.role), user.org_id, client=client)
     raw_refresh, token_hash = new_refresh_token()
-    db.add(
-        RefreshToken(
-            user_id=user.id,
-            token_hash=token_hash,
-            user_agent=(request.headers.get("user-agent") or "")[:300],
-            client=client,
-            expires_at=now_utc() + dt.timedelta(days=settings.refresh_token_days),
-        )
+    issued = RefreshToken(
+        user_id=user.id,
+        token_hash=token_hash,
+        user_agent=(request.headers.get("user-agent") or "")[:300],
+        client=client,
+        expires_at=now_utc() + dt.timedelta(days=settings.refresh_token_days),
     )
+    db.add(issued)
+    if replaces is not None:
+        # Flushed first so the rotated row can point at a real id in the same
+        # transaction: that link is the only way a later replay of the rotated
+        # token can be recognised as a response this client never received.
+        await db.flush()
+        replaces.replaced_by_id = issued.id
     await db.commit()
     set_auth_cookies(response, access, raw_refresh)
 
@@ -164,6 +182,77 @@ async def login(
     return {"user": _user_payload(user)}
 
 
+def _as_utc(value: dt.datetime) -> dt.datetime:
+    # Rows written before the timezone-aware columns landed can still read naive.
+    return value if value.tzinfo else value.replace(tzinfo=dt.UTC)
+
+
+async def _revoke_session_family(db: AsyncSession, token: RefreshToken) -> None:
+    """Burn every live session the reused token could belong to, and commit.
+
+    Scoped to the user AND the client that opened the reused session. Walking the
+    replaced_by chain would only reach rotations descended from this one row, while
+    whoever holds a stolen cookie plausibly holds others taken with it, so the
+    family is read as that user's live sessions for that client. Wider than the
+    chain on purpose — and still narrow enough that a stolen phone token cannot
+    sign the same person out of the browser they are working in, which is the
+    property refresh_tokens.client exists to protect.
+    """
+    await db.execute(
+        update(RefreshToken)
+        .where(
+            RefreshToken.user_id == token.user_id,
+            RefreshToken.client == (token.client or WEB_CLIENT),
+            RefreshToken.revoked_at.is_(None),
+        )
+        .values(revoked_at=now_utc())
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+
+
+async def _undelivered_successor(db: AsyncSession, token: RefreshToken) -> RefreshToken:
+    """Resolve a replay of an already-rotated token, or raise 401 as theft.
+
+    Rotation commits the revocation of the presented token before its replacement
+    can possibly reach the client, so any response lost in flight — the iOS
+    client's 30s budget expiring, a proxy 502 after the commit, the app being
+    suspended, a reset connection — leaves a perfectly healthy client holding a
+    token the server considers spent. Refusing that is what ended sessions that
+    were fine, so within a bounded window the replay is honoured by rotating from
+    the successor the client never saw. It buys exactly one rotation: that
+    successor is spent by the rotation below, so a second replay lands in the
+    theft branch.
+
+    Every other reuse is a token someone has already spent being presented again,
+    which is what a captured cookie looks like, so the family is burned rather than
+    just this row.
+    """
+    grace = dt.timedelta(seconds=get_settings().refresh_reuse_grace_seconds)
+    successor = await db.get(RefreshToken, token.replaced_by_id) if token.replaced_by_id else None
+    undelivered = (
+        successor is not None
+        and successor.revoked_at is None
+        and _as_utc(successor.expires_at) > now_utc()
+        and now_utc() - _as_utc(token.revoked_at) <= grace
+    )
+    if not undelivered:
+        logger.warning(
+            "Refresh token reuse for user %s (%s session): revoking that client's session family",
+            token.user_id,
+            token.client or WEB_CLIENT,
+        )
+        await _revoke_session_family(db, token)
+        # Same detail as an unknown token: which of the two it was is not the
+        # caller's business, and saying so would help a thief probe the window.
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    logger.info(
+        "Rotation response never reached user %s; replaying onto the undelivered successor",
+        token.user_id,
+    )
+    return successor
+
+
 @router.post("/refresh")
 async def refresh(
     request: Request,
@@ -177,9 +266,14 @@ async def refresh(
     token = (
         await db.execute(select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw)))
     ).scalar_one_or_none()
-    if token is None or token.revoked_at is not None:
+    if token is None:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
-    expires = token.expires_at if token.expires_at.tzinfo else token.expires_at.replace(tzinfo=dt.UTC)
+    if token.revoked_at is not None:
+        # Substituting the successor rather than returning early keeps every check
+        # below — expiry, is_active, the mobile grant — applied in the same order,
+        # to the row that is actually the live session.
+        token = await _undelivered_successor(db, token)
+    expires = _as_utc(token.expires_at)
     if expires < now_utc():
         raise HTTPException(status_code=401, detail="Refresh token expired")
 
@@ -202,7 +296,7 @@ async def refresh(
         raise HTTPException(status_code=403, detail=MOBILE_NOT_APPROVED)
 
     token.revoked_at = now_utc()  # rotation: old token is single-use
-    await _issue_session(db, user, response, request, client=session_client)
+    await _issue_session(db, user, response, request, client=session_client, replaces=token)
     return {"user": _user_payload(user)}
 
 
