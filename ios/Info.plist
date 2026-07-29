@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Kept OUTSIDE ios/RxHive/ on purpose: that folder is a synchronized root group,
+  so anything inside it is picked up as a source or resource automatically. An
+  Info.plist in there would be copied into the bundle twice.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>RxHive</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+
+	<!--
+	  The API origin, read by AppConfig.apiBaseURL. Driven by a build setting so a
+	  TestFlight build is not one edited constant away from talking to a laptop:
+	  Debug resolves to the LAN/localhost value, Release to production.
+	-->
+	<key>RXHIVE_API_URL</key>
+	<string>$(RXHIVE_API_URL)</string>
+
+	<key>UILaunchScreen</key>
+	<dict>
+		<!-- Matches Theme.Color.bg (#0A0A0A) so the launch image hands off to
+		     SplashView with no flash of a different background. -->
+		<key>UIColorName</key>
+		<string>LaunchBackground</string>
+	</dict>
+
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+	</dict>
+
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<!-- iPad gets landscape too; a video call on a tablet in portrait only would
+	     be a strange restriction. -->
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+
+	<!-- Dark-only, matching the web app's single :root theme. -->
+	<key>UIUserInterfaceStyle</key>
+	<string>Dark</string>
+
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<false/>
+	<key>UIStatusBarStyle</key>
+	<string>UIStatusBarStyleLightContent</string>
+
+	<!-- Permission strings. iOS terminates the app on first use of a capability
+	     whose usage description is missing, so all three are required, not optional. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>RxHive needs the microphone for voice messages and for voice and video calls.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>RxHive needs the camera for video calls and for taking photos to send.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>RxHive needs access to your photos so you can send images and videos in chats.</string>
+
+	<key>UIBackgroundModes</key>
+	<array>
+		<!-- Keeps call audio alive when the app leaves the foreground mid-call.
+		     NOTE: this does NOT make incoming calls ring in the background — the ring
+		     arrives over the app's WebSocket, which iOS suspends. Background ringing
+		     needs an APNs VoIP push certificate and a backend that sends PushKit
+		     pushes; the backend's push_subscriptions table currently stores Web Push
+		     subscriptions only and cannot hold an APNs token. -->
+		<string>audio</string>
+		<string>voip</string>
+	</array>
+
+	<!--
+	  App Transport Security: no global exception. Production is HTTPS behind Caddy.
+	  For local development against http://localhost:8000, localhost is already
+	  exempt from ATS on iOS, so nothing is needed here. If you point a device build
+	  at a plain-HTTP LAN address you will need NSExceptionDomains for that host —
+	  add it deliberately rather than disabling ATS outright.
+	-->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+</dict>
+</plist>

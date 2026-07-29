@@ -30,3 +30,9 @@ test-results/
 # Local data
 /data/
 backend/.local-uploads/
+
+# Xcode (ios/). Per-user state and build output, none of which belongs in git.
+xcuserdata/
+DerivedData/
+*.xcuserstate
+*.xcscmblueprint

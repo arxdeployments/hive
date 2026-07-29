@@ -1,0 +1,475 @@
+import Foundation
+import os
+#if canImport(UIKit)
+import UIKit
+#endif
+
+/// The live connection to `/api/ws`.
+///
+/// ## Auth
+/// The handshake is cookie-authenticated: `core/deps.py:get_current_user_ws`
+/// reads `rx_access` from the request cookies and only falls back to a
+/// `?token=` query param **outside production**. `URLSessionWebSocketTask` sends
+/// cookies from the session's storage automatically, so a socket opened after a
+/// successful login is authenticated with no extra work — and there is no
+/// supported way to authenticate it otherwise in production.
+///
+/// ## Heartbeat
+/// The server drops any socket that goes 65 seconds without a frame
+/// (`hub.py:HEARTBEAT_TIMEOUT`). We ping every 25s: frequent enough to survive
+/// one lost ping, cheap enough to ignore. The server answers `pong`.
+///
+/// ## Token expiry is normal, not exceptional
+/// On `ping`, the server compares now against the access token's `exp` and closes
+/// with **4001** when it has passed — which happens every 15 minutes by default.
+/// So 4001 is the expected steady-state closure, and the correct response is to
+/// refresh the cookie and reconnect, not to sign the user out. `AuthStore` owns
+/// that distinction; this class reports the close code and lets it decide.
+@MainActor
+final class RealtimeClient: NSObject, ObservableObject {
+
+    enum State: Equatable {
+        case idle
+        case connecting
+        case connected
+        /// Waiting out backoff before the next attempt.
+        case reconnecting(attempt: Int)
+        /// Given up until something external (foreground, network, sign-in) pokes us.
+        case offline
+    }
+
+    @Published private(set) var state: State = .idle
+
+    /// Live subscriber continuations, keyed so a finished stream can remove its own.
+    ///
+    /// **This is a fan-out, not a single stream, and it has to be.** A lone
+    /// `AsyncStream` has exactly one consumer: two `for await` loops over the same
+    /// stream *split* the elements between them rather than each seeing all of them.
+    /// `ChatStore` and `CallStore` both consume this, so a single stream would deliver
+    /// roughly half of every `call:*` frame to `ChatStore` (which drops them) and half
+    /// of every `new_message` to `CallStore` (likewise) — calls and messages both
+    /// intermittently dead, with nothing in the logs to say why. Every subscriber gets
+    /// its own continuation and every event is yielded to all of them.
+    private var subscribers: [UUID: AsyncStream<RealtimeEvent>.Continuation] = [:]
+
+    /// A stream carrying **every** event, for as long as the returned stream is
+    /// iterated. Cancelling the consuming task unregisters it.
+    ///
+    /// `.bufferingNewest(64)` rather than unbounded: a subscriber that stops draining
+    /// must not let the socket's backlog grow without limit, and for realtime chat the
+    /// newest frames are the ones worth keeping.
+    func subscribe() -> AsyncStream<RealtimeEvent> {
+        let id = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(64)) { continuation in
+            subscribers[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor in self?.subscribers[id] = nil }
+            }
+        }
+    }
+
+    private func broadcast(_ event: RealtimeEvent) {
+        for continuation in subscribers.values {
+            continuation.yield(event)
+        }
+    }
+
+    private var task: URLSessionWebSocketTask?
+    private var session: URLSession!
+    private var pingTimer: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var attempt = 0
+    private var intentionallyClosed = false
+
+    private let decoder: JSONDecoder
+    private let encoder = JSONEncoder()
+    private let log = Logger(subsystem: "ai.rhythmrx.rxhive", category: "ws")
+
+    /// Called when the socket closes because the access token expired (4001).
+    /// Returning true means "a refresh succeeded, reconnect now".
+    var onTokenExpired: (() async -> Bool)?
+    /// Called when the socket is closed for a reason a refresh cannot fix.
+    var onUnauthorized: (() -> Void)?
+
+    private let pingInterval: Duration = .seconds(25)
+    /// Server closes with 4001 for both "invalid token" and "token expired", and
+    /// with 4001 for "account inactive" too — the reason string distinguishes them.
+    private let authCloseCode = 4001
+
+    override init() {
+        decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let text = try decoder.singleValueContainer().decode(String.self)
+            guard let date = RxDate.parse(text) else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: decoder.codingPath, debugDescription: "Bad date \(text)")
+                )
+            }
+            return date
+        }
+        super.init()
+
+        let config = URLSessionConfiguration.default
+        config.httpCookieStorage = .shared
+        config.httpShouldSetCookies = true
+        config.httpCookieAcceptPolicy = .always
+        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }
+
+    // MARK: - Lifecycle
+
+    func connect() {
+        guard state != .connected, state != .connecting else { return }
+        intentionallyClosed = false
+        openSocket()
+    }
+
+    func disconnect() {
+        intentionallyClosed = true
+        reconnectTask?.cancel(); reconnectTask = nil
+        pingTimer?.cancel(); pingTimer = nil
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+        attempt = 0
+        state = .idle
+    }
+
+    private func openSocket() {
+        state = .connecting
+        var request = URLRequest(url: AppConfig.webSocketBaseURL.appendingPathComponent("api/ws"))
+        // Not required by the handshake (which is a GET), but harmless and keeps
+        // every request this app makes uniform.
+        request.setValue(AppConfig.csrfHeader.value, forHTTPHeaderField: AppConfig.csrfHeader.name)
+
+        let socket = session.webSocketTask(with: request)
+        task = socket
+        socket.resume()
+        receiveLoop(on: socket)
+        startPinging()
+    }
+
+    // MARK: - Receiving
+
+    private func receiveLoop(on socket: URLSessionWebSocketTask) {
+        Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    let message = try await socket.receive()
+                    guard let self else { return }
+                    // A different socket took over while this loop was suspended.
+                    guard await self.isCurrent(socket) else { return }
+                    switch message {
+                    case .string(let text):
+                        await self.handle(text: text)
+                    case .data(let data):
+                        if let text = String(data: data, encoding: .utf8) {
+                            await self.handle(text: text)
+                        }
+                    @unknown default:
+                        break
+                    }
+                } catch {
+                    guard let self else { return }
+                    guard await self.isCurrent(socket) else { return }
+                    await self.socketFailed(socket, error: error)
+                    return
+                }
+            }
+        }
+    }
+
+    private func isCurrent(_ socket: URLSessionWebSocketTask) -> Bool {
+        task === socket
+    }
+
+    private func handle(text: String) {
+        guard let frame = InboundFrame(text: text) else {
+            log.error("Unparseable frame: \(text.prefix(200), privacy: .public)")
+            return
+        }
+        if frame.type == "connected" {
+            attempt = 0
+            state = .connected
+        }
+        guard let event = map(frame) else {
+            log.notice("Unhandled event type \(frame.type, privacy: .public)")
+            return
+        }
+        broadcast(event)
+    }
+
+    private func socketFailed(_ socket: URLSessionWebSocketTask, error: Error) {
+        pingTimer?.cancel(); pingTimer = nil
+        guard !intentionallyClosed else { return }
+
+        let code = socket.closeCode
+        log.notice("Socket closed (code \(code.rawValue), \(error.localizedDescription, privacy: .public))")
+
+        if code.rawValue == authCloseCode {
+            // The 15-minute access token lapsed — the common case. Refresh and
+            // reconnect immediately rather than backing off, because the user is
+            // very likely looking at the screen right now.
+            Task { [weak self] in
+                guard let self else { return }
+                let refreshed = await self.onTokenExpired?() ?? false
+                if refreshed {
+                    self.attempt = 0
+                    self.openSocket()
+                } else {
+                    self.state = .offline
+                    self.onUnauthorized?()
+                }
+            }
+            return
+        }
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        reconnectTask?.cancel()
+        attempt += 1
+        state = .reconnecting(attempt: attempt)
+        // Exponential with a 30s ceiling, plus jitter so a server restart doesn't
+        // bring every client back in the same instant.
+        let base = min(pow(2.0, Double(min(attempt, 5))), 30)
+        let delay = base + Double.random(in: 0...1)
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled, !self.intentionallyClosed else { return }
+            self.openSocket()
+        }
+    }
+
+    // MARK: - Sending
+
+    func send(_ frame: OutboundFrame) {
+        guard let task, state == .connected else {
+            // Dropped rather than queued. Every frame this app sends is either
+            // idempotent-on-reconnect (read_receipt, typing) or has a UI-level
+            // retry (message). A queue would replay stale typing indicators and
+            // resend messages the user may have given up on.
+            log.debug("Dropping frame; socket not connected")
+            return
+        }
+        do {
+            let data = try encoder.encode(frame)
+            guard let text = String(data: data, encoding: .utf8) else { return }
+            task.send(.string(text)) { [weak self] error in
+                if let error {
+                    self?.log.error("Send failed: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+        } catch {
+            log.error("Encode failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    private func startPinging() {
+        pingTimer?.cancel()
+        pingTimer = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: self?.pingInterval ?? .seconds(25))
+                guard let self, !Task.isCancelled else { return }
+                // The app-level ping, not the WebSocket protocol ping: the server's
+                // heartbeat check and token-expiry check both hang off receiving a
+                // `{"type":"ping"}` frame, so a protocol-level ping would keep the
+                // socket alive without ever triggering either.
+                self.send(.ping)
+            }
+        }
+    }
+
+    // MARK: - Foreground / background
+
+    /// iOS suspends the process in the background, which silently kills the
+    /// socket; there is no close event to react to. So the connection is torn down
+    /// on the way out and rebuilt on the way in, rather than discovered dead.
+    func applicationDidEnterBackground() {
+        pingTimer?.cancel(); pingTimer = nil
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+        state = .idle
+    }
+
+    func applicationWillEnterForeground() {
+        guard !intentionallyClosed else { return }
+        attempt = 0
+        openSocket()
+    }
+
+    // MARK: - Frame -> event
+
+    private func map(_ frame: InboundFrame) -> RealtimeEvent? {
+        switch frame.type {
+        case "connected":
+            return .connected(userID: frame.string("user_id") ?? "")
+        case "pong":
+            return .pong
+        case "error":
+            return .error(detail: frame.string("detail") ?? "", tempID: frame.string("temp_id"))
+
+        // Messaging
+        case "new_message":
+            // The message rides under `message` in the published payload.
+            guard let message = frame.decode(Message.self, at: "message", using: decoder)
+                    ?? frame.decodeSelf(Message.self, using: decoder) else { return nil }
+            return .newMessage(message)
+        case "message_ack":
+            return .messageAck(
+                tempID: frame.string("temp_id"),
+                messageID: frame.string("message_id") ?? "",
+                createdAt: frame.date("created_at"),
+                status: frame.string("status") ?? "sent"
+            )
+        case "message_status":
+            return .messageStatus(messageID: frame.string("message_id"), status: frame.string("status"))
+        case "messages_read":
+            return .messagesRead(
+                conversationID: frame.string("conversation_id"),
+                userID: frame.string("user_id"),
+                readAt: frame.date("read_at")
+            )
+        case "message_edited":
+            guard let messageID = frame.string("message_id") else { return nil }
+            return .messageEdited(
+                messageID: messageID,
+                conversationID: frame.string("conversation_id"),
+                content: frame.string("content") ?? "",
+                editedAt: frame.date("edited_at")
+            )
+        case "reaction_update":
+            let reactions = frame.decode([Reaction].self, at: "reactions", using: decoder) ?? []
+            return .reactionUpdate(
+                messageID: frame.string("message_id"),
+                conversationID: frame.string("conversation_id"),
+                reactions: reactions
+            )
+        case "message_pin_update":
+            return .messagePinUpdate(
+                messageID: frame.string("message_id"),
+                conversationID: frame.string("conversation_id"),
+                isPinned: frame.bool("is_pinned") ?? false
+            )
+        case "typing":
+            guard let conversationID = frame.string("conversation_id"),
+                  let userID = frame.string("user_id") else { return nil }
+            return .typing(
+                conversationID: conversationID,
+                userID: userID,
+                userName: frame.string("user_name"),
+                isTyping: frame.bool("is_typing") ?? false
+            )
+        case "presence":
+            guard let userID = frame.string("user_id") else { return nil }
+            let status = PresenceStatus(rawValue: frame.string("status") ?? "") ?? .unknown
+            return .presence(userID: userID, status: status, lastSeen: frame.date("last_seen"))
+
+        // Conversations
+        case "conversation_created":
+            return .conversationCreated(frame.decode(Conversation.self, at: "conversation", using: decoder))
+        case "conversation_updated":
+            return .conversationUpdated(conversationID: frame.string("conversation_id"))
+        case "conversation_pin_update":
+            return .conversationPinUpdate(
+                conversationID: frame.string("conversation_id"),
+                isPinned: frame.bool("is_pinned") ?? false,
+                pinOrder: frame.int("pin_order")
+            )
+        case "permissions_updated":
+            return .permissionsUpdated(
+                conversationID: frame.string("conversation_id"),
+                permissions: frame.decode(GroupPermissions.self, at: "permissions", using: decoder)
+            )
+        case "member_added":
+            return .memberAdded(conversationID: frame.string("conversation_id"), userID: frame.string("user_id"))
+        case "member_removed":
+            return .memberRemoved(conversationID: frame.string("conversation_id"), userID: frame.string("user_id"))
+        case "member_left":
+            return .memberLeft(conversationID: frame.string("conversation_id"), userID: frame.string("user_id"))
+        case "role_changed":
+            return .roleChanged(
+                conversationID: frame.string("conversation_id"),
+                userID: frame.string("user_id"),
+                role: ParticipantRole(rawValue: frame.string("role") ?? "")
+            )
+        case "removed_from_conversation":
+            return .removedFromConversation(conversationID: frame.string("conversation_id"))
+        case "profile_updated":
+            return .profileUpdated(userID: frame.string("user_id"))
+        case "cross_org":
+            return .crossOrg
+
+        // Calls
+        case "call:incoming":            return .callIncoming(signal(frame))
+        case "call:accepted":            return .callAccepted(signal(frame))
+        case "call:declined":            return .callDeclined(signal(frame))
+        case "call:cancelled":           return .callCancelled(signal(frame))
+        case "call:ended", "call:end":   return .callEnded(signal(frame))
+        case "call:busy":                return .callBusy(signal(frame))
+        case "call:missed":              return .callMissed(signal(frame))
+        case "call:unavailable":         return .callUnavailable(signal(frame))
+        case "call:full":                return .callFull(signal(frame))
+        case "call:error":               return .callError(detail: frame.string("message") ?? "Call failed")
+        case "call:ringing_started":     return .callRingingStarted(signal(frame))
+        case "call:participant_joined":  return .callParticipantJoined(signal(frame))
+        case "call:participant_left":    return .callParticipantLeft(signal(frame))
+        case "call:group_started":       return .callGroupStarted(signal(frame))
+        case "call:group_ended":         return .callGroupEnded(signal(frame))
+        case "call:group_active":        return .callGroupActive(signal(frame))
+        case "call:group_already_active": return .callGroupAlreadyActive(signal(frame))
+        case "call:group_participants":  return .callGroupParticipants(signal(frame))
+        case "call:media_toggle":
+            return .callMediaToggle(
+                callID: frame.string("call_id"),
+                userID: frame.string("user_id"),
+                mediaType: frame.string("media_type"),
+                enabled: frame.bool("enabled") ?? true
+            )
+
+        default:
+            return .unknown(type: frame.type)
+        }
+    }
+
+    private func signal(_ frame: InboundFrame) -> CallSignal {
+        frame.decodeSelf(CallSignal.self, using: decoder)
+            ?? CallSignal(
+                callID: frame.string("call_id"), callType: nil, caller: nil,
+                conversationID: frame.string("conversation_id"), calleeID: nil,
+                isGroup: nil, groupName: nil, accepterID: nil, duration: nil,
+                reason: nil, message: frame.string("message"), participants: nil,
+                participant: nil, participantID: nil
+            )
+    }
+}
+
+// MARK: - URLSessionWebSocketDelegate
+
+extension RealtimeClient: URLSessionWebSocketDelegate {
+    nonisolated func urlSession(
+        _ session: URLSession,
+        webSocketTask: URLSessionWebSocketTask,
+        didOpenWithProtocol protocol: String?
+    ) {
+        // `state` only becomes `.connected` on the server's `connected` frame — an
+        // open TCP/TLS socket is not yet an authenticated session, and treating it
+        // as one would let frames be sent into a connection about to be closed 4001.
+        Task { @MainActor [weak self] in
+            guard let self, self.task === webSocketTask else { return }
+            if self.state == .connecting { /* awaiting `connected` */ }
+        }
+    }
+
+    nonisolated func urlSession(
+        _ session: URLSession,
+        webSocketTask: URLSessionWebSocketTask,
+        didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
+        reason: Data?
+    ) {
+        // The receive loop's throw is the single path that handles closure, so
+        // there is nothing to do here beyond leaving a trace.
+        let text = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        Logger(subsystem: "ai.rhythmrx.rxhive", category: "ws")
+            .notice("didClose \(closeCode.rawValue) \(text, privacy: .public)")
+    }
+}
