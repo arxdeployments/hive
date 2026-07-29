@@ -231,6 +231,24 @@ def serialize_permissions(conv: Conversation) -> dict:
     return doc
 
 
+def _thumb_url(a: MessageAttachment) -> str | None:
+    """Thumbnail URL, or None when there will never be one.
+
+    Emitted for a PDF that has no thumbnail_key YET but has never been processed
+    (page_count IS NULL): /thumb renders page 1 lazily on first view, so offering
+    the URL is what triggers the backfill for anything the batch job missed.
+
+    Not emitted once page_count is 0, which is the "tried and could not render"
+    marker — otherwise every view would re-parse a file already known to be
+    un-renderable. Non-PDF documents never have a thumbnail at all.
+    """
+    if a.thumbnail_key:
+        return thumb_url_for(a.id)
+    if a.mime_type == "application/pdf" and a.page_count is None:
+        return thumb_url_for(a.id)
+    return None
+
+
 def _attachment_fields(attachments: list[MessageAttachment]) -> dict:
     """Legacy top-level media fields from the first attachment + full list."""
     out: dict = {
@@ -246,7 +264,7 @@ def _attachment_fields(attachments: list[MessageAttachment]) -> dict:
         item = {
             "id": str(a.id),
             "media_url": media_url_for(a.id),
-            "thumbnail_url": thumb_url_for(a.id) if a.thumbnail_key else None,
+            "thumbnail_url": _thumb_url(a),
             "filename": a.filename,
             "mime_type": a.mime_type,
             "file_size": a.file_size,
@@ -262,7 +280,7 @@ def _attachment_fields(attachments: list[MessageAttachment]) -> dict:
     if attachments:
         first = attachments[0]
         out["media_url"] = media_url_for(first.id)
-        out["thumbnail_url"] = thumb_url_for(first.id) if first.thumbnail_key else None
+        out["thumbnail_url"] = _thumb_url(first)
         out["file_size"] = first.file_size
         out["filename"] = first.filename
         out["duration"] = first.duration_seconds

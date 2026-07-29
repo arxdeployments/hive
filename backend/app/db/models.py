@@ -270,8 +270,12 @@ class MessageAttachment(Base):
     height: Mapped[int | None]
     duration_seconds: Mapped[float | None]
     # PDF page count, so a document bubble can say "13 pages" and the viewer
-    # knows how many pages to request. NULL means "not a PDF, or uploaded before
-    # previews existed" — never coerce it to 0.
+    # knows how many pages to request.
+    #   NULL = not a PDF, or a PDF never processed for previews yet. The lazy
+    #          path in /media/{id}/thumb treats NULL as "try rendering it".
+    #   0    = processed and could NOT be rendered (encrypted, corrupt). This is
+    #          what stops an un-renderable file being re-parsed on every view.
+    #   >0   = real page count.
     page_count: Mapped[int | None]
     created_at: Mapped[dt.datetime] = _now()
 

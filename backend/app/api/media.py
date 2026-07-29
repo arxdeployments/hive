@@ -253,6 +253,31 @@ async def serve_attachment_thumb(
     db: AsyncSession = Depends(get_db),
 ):
     attachment = await _member_attachment(db, attachment_id, user)
+
+    # Lazy PDF preview. A PDF uploaded before previews existed — or one that
+    # arrived by any path that skipped thumbnailing — has no thumbnail_key. Render
+    # page 1 on first view and persist it, so the feature is self-healing rather
+    # than depending on a backfill having been run.
+    #
+    # page_count doubles as the "already processed" marker: NULL means never
+    # tried, 0 means tried and the file could not be rendered. Without that, an
+    # un-renderable PDF would be re-parsed on every single view.
+    if (
+        not attachment.thumbnail_key
+        and attachment.mime_type == "application/pdf"
+        and attachment.page_count is None
+    ):
+        data = await storage.get_object(attachment.storage_key)
+        thumb, pages = await storage.make_pdf_preview(data)
+        if thumb is not None:
+            thumb_key = f"{attachment.storage_key}_thumb.jpg"
+            await storage.put_object(thumb_key, thumb, "image/jpeg")
+            attachment.thumbnail_key = thumb_key
+            attachment.page_count = pages
+        else:
+            attachment.page_count = 0
+        await db.commit()
+
     if not attachment.thumbnail_key:
         raise _not_found()
     url = await storage.presign_get(attachment.thumbnail_key, inline=True)
