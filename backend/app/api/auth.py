@@ -10,6 +10,7 @@ Changes vs the Mongo build (all deliberate, coordinated with the frontend):
 
 import datetime as dt
 import uuid
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr
@@ -21,7 +22,9 @@ from app.core.deps import get_current_user
 from app.core.rate_limit import login_limiter, refresh_limiter
 from app.core.security import (
     ACCESS_COOKIE,
+    MOBILE_CLIENT,
     REFRESH_COOKIE,
+    WEB_CLIENT,
     create_access_token,
     hash_refresh_token,
     new_refresh_token,
@@ -38,9 +41,38 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 _DUMMY_HASH = "$2b$12$C6UzMDM.H6dfI/f/IKcEeO0000000000000000000000000000000000"
 
 
+# Distinct from the generic 401 on purpose. A member whose account is fine but
+# who has not been granted mobile access must not be told "invalid password" —
+# they would retype it forever. These are 403s: authentication succeeded, the
+# client is what is refused.
+SUPERADMIN_MOBILE_DENIED = "Super admin accounts can only sign in on the web app"
+MOBILE_NOT_APPROVED = (
+    "Mobile access has not been enabled for this account. "
+    "Ask your super admin to approve mobile sign-in."
+)
+
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+    # Which client is signing in. Absent means web, so the existing frontend and
+    # every API consumer keep working untouched.
+    client: Literal["web", "mobile"] = WEB_CLIENT
+
+
+def _assert_mobile_allowed(user: User) -> None:
+    """Gate a mobile sign-in. Raises 403 unless this account may use mobile.
+
+    Called on login AND on refresh, so a revoked grant ends the session at the
+    next refresh instead of lasting as long as the refresh token would. The
+    superadmin exclusion is unconditional and not overridable by the flag: the
+    admin portal has no mobile UI, and a phone is the wrong place to hold the
+    keys to every tenant.
+    """
+    if user.role == UserRole.superadmin:
+        raise HTTPException(status_code=403, detail=SUPERADMIN_MOBILE_DENIED)
+    if not user.mobile_access:
+        raise HTTPException(status_code=403, detail=MOBILE_NOT_APPROVED)
 
 
 def wire_role(role: UserRole) -> str:
@@ -80,15 +112,22 @@ def clear_auth_cookies(response: Response) -> None:
         response.delete_cookie(name, domain=settings.cookie_domain, path="/")
 
 
-async def _issue_session(db: AsyncSession, user: User, response: Response, request: Request) -> None:
+async def _issue_session(
+    db: AsyncSession,
+    user: User,
+    response: Response,
+    request: Request,
+    client: str = WEB_CLIENT,
+) -> None:
     settings = get_settings()
-    access = create_access_token(user.id, wire_role(user.role), user.org_id)
+    access = create_access_token(user.id, wire_role(user.role), user.org_id, client=client)
     raw_refresh, token_hash = new_refresh_token()
     db.add(
         RefreshToken(
             user_id=user.id,
             token_hash=token_hash,
             user_agent=(request.headers.get("user-agent") or "")[:300],
+            client=client,
             expires_at=now_utc() + dt.timedelta(days=settings.refresh_token_days),
         )
     )
@@ -115,9 +154,13 @@ async def login(
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not user.is_active:
         raise HTTPException(status_code=401, detail="Account is deactivated")
+    # Ordered after the password check so the mobile-approval state of an account
+    # is never disclosed to someone who cannot authenticate as it.
+    if body.client == MOBILE_CLIENT:
+        _assert_mobile_allowed(user)
 
     user.last_seen_at = now_utc()
-    await _issue_session(db, user, response, request)
+    await _issue_session(db, user, response, request, client=body.client)
     return {"user": _user_payload(user)}
 
 
@@ -147,8 +190,19 @@ async def refresh(
         await db.commit()
         raise HTTPException(status_code=401, detail="Account is deactivated")
 
+    # A mobile session outlives the grant that created it unless the grant is
+    # re-checked here — same reasoning as is_active directly above. The session is
+    # burned before raising so a revoked user cannot keep retrying this token.
+    session_client = token.client or WEB_CLIENT
+    if session_client == MOBILE_CLIENT and (
+        user.role == UserRole.superadmin or not user.mobile_access
+    ):
+        token.revoked_at = now_utc()
+        await db.commit()
+        raise HTTPException(status_code=403, detail=MOBILE_NOT_APPROVED)
+
     token.revoked_at = now_utc()  # rotation: old token is single-use
-    await _issue_session(db, user, response, request)
+    await _issue_session(db, user, response, request, client=session_client)
     return {"user": _user_payload(user)}
 
 
@@ -181,6 +235,7 @@ async def me(user: User = Depends(get_current_user), db: AsyncSession = Depends(
         payload["about"] = user.about
         payload["status"] = statuses.get(str(user.id), "offline")
         payload["last_seen"] = iso_z(user.last_seen_at)
+        payload["mobile_access"] = user.mobile_access
     return payload
 
 

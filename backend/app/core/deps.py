@@ -31,6 +31,19 @@ def _token_from_request(request: Request) -> str | None:
     return None
 
 
+def _mobile_grant_revoked(payload: dict, user: User) -> bool:
+    """True if this token was minted for mobile but the account may no longer use it.
+
+    Checked on every request, not just refresh, so a superadmin revoking mobile
+    access ends that user's mobile session now rather than whenever their access
+    token happens to expire. Tokens minted before the claim existed have no
+    "client" and are treated as web, which is what they were.
+    """
+    if payload.get("client") != "mobile":
+        return False
+    return user.role == UserRole.superadmin or not user.mobile_access
+
+
 async def _load_user(token: str | None, db: AsyncSession) -> User:
     if not token:
         raise _credentials_error
@@ -40,6 +53,8 @@ async def _load_user(token: str | None, db: AsyncSession) -> User:
     user = await db.get(User, uuid.UUID(payload["sub"]))
     if not user or not user.is_active:
         raise _credentials_error
+    if _mobile_grant_revoked(payload, user):
+        raise _credentials_error
     return user
 
 
@@ -47,10 +62,13 @@ async def get_current_user(request: Request, db: AsyncSession = Depends(get_db))
     return await _load_user(_token_from_request(request), db)
 
 
-async def get_current_user_ws(websocket: WebSocket, db: AsyncSession) -> tuple[User, int] | None:
-    """Cookie-authenticated WebSocket handshake. Returns (user, token_exp) so the
-    connection can enforce the access-token lifetime and force a re-auth on
-    expiry. The query-param token fallback exists only outside production."""
+async def get_current_user_ws(websocket: WebSocket, db: AsyncSession) -> tuple[User, int, str] | None:
+    """Cookie-authenticated WebSocket handshake.
+
+    Returns (user, token_exp, client) so the connection can enforce the
+    access-token lifetime and force a re-auth on expiry, and so its periodic
+    liveness check knows whether to re-verify the mobile grant. The query-param
+    token fallback exists only outside production."""
     from app.core.config import get_settings
 
     token = websocket.cookies.get(ACCESS_COOKIE)
@@ -67,7 +85,9 @@ async def get_current_user_ws(websocket: WebSocket, db: AsyncSession) -> tuple[U
         return None
     if not user or not user.is_active:
         return None
-    return user, int(payload.get("exp", 0))
+    if _mobile_grant_revoked(payload, user):
+        return None
+    return user, int(payload.get("exp", 0)), str(payload.get("client") or "web")
 
 
 async def require_superadmin(user: User = Depends(get_current_user)) -> User:

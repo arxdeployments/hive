@@ -16,6 +16,12 @@ JWT_ALGORITHM = "HS256"
 ACCESS_COOKIE = "rx_access"
 REFRESH_COOKIE = "rx_refresh"
 
+# Which client a session belongs to. Lives here, in a core module, rather than in
+# api/auth.py so the realtime hub can compare against it without the realtime
+# layer importing the API layer.
+WEB_CLIENT = "web"
+MOBILE_CLIENT = "mobile"
+
 
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
@@ -45,7 +51,12 @@ def enforce_password_policy(password: str) -> None:
         raise PasswordPolicyError("Password must contain both letters and numbers")
 
 
-def create_access_token(user_id: uuid.UUID, role: str, org_id: uuid.UUID | None) -> str:
+def create_access_token(
+    user_id: uuid.UUID,
+    role: str,
+    org_id: uuid.UUID | None,
+    client: str = WEB_CLIENT,
+) -> str:
     settings = get_settings()
     now = dt.datetime.now(dt.UTC)
     payload = {
@@ -53,6 +64,11 @@ def create_access_token(user_id: uuid.UUID, role: str, org_id: uuid.UUID | None)
         "role": role,
         "org_id": str(org_id) if org_id else None,
         "iat": now,
+        # Which client this token was minted for. Signed, so it is trustworthy —
+        # which is what lets every request re-check the mobile grant instead of
+        # only the refresh path, so a revoked grant does not stay usable for the
+        # remaining lifetime of an already-issued access token.
+        "client": client,
         "exp": now + dt.timedelta(minutes=settings.access_token_minutes),
         "type": "access",
     }

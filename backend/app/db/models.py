@@ -124,6 +124,13 @@ class User(Base):
     avatar_url: Mapped[str | None]
     about: Mapped[str | None] = mapped_column(String(200))
     is_active: Mapped[bool] = mapped_column(default=True)
+    # Per-user grant for the native mobile app, issued by a superadmin only.
+    # Defaults to False: mobile is opt-in per account, so an existing user base
+    # does not silently become reachable from a new client. is_active governs
+    # "may this account sign in at all"; this governs "may it sign in on mobile".
+    # Superadmins are excluded from mobile entirely regardless of this flag —
+    # the admin portal is web-only (see api/auth.py:_assert_mobile_allowed).
+    mobile_access: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
     must_change_password: Mapped[bool] = mapped_column(default=False)
     last_seen_at: Mapped[dt.datetime | None]
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
@@ -448,6 +455,11 @@ class RefreshToken(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     token_hash: Mapped[str] = mapped_column(String(64), unique=True)
     user_agent: Mapped[str | None] = mapped_column(String(300))
+    # Which client opened this session: "web" | "mobile". Recorded because the
+    # mobile-access grant is re-checked on refresh, and revoking the grant must
+    # kill that user's MOBILE sessions without touching their web session.
+    # user_agent cannot serve this purpose — it is attacker-controlled text.
+    client: Mapped[str] = mapped_column(String(20), default="web", server_default=text("'web'"))
     expires_at: Mapped[dt.datetime]
     revoked_at: Mapped[dt.datetime | None]
     created_at: Mapped[dt.datetime] = _now()

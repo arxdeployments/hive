@@ -207,6 +207,7 @@ async def make_user(
     dept_id=None,
     password: str = "TestPass1234",
     display_name: str | None = None,
+    mobile_access: bool = False,
 ) -> User:
     async with SessionLocal() as db:
         user = User(
@@ -217,6 +218,7 @@ async def make_user(
             org_id=org_id,
             dept_id=dept_id,
             is_active=True,
+            mobile_access=mobile_access,
         )
         db.add(user)
         await db.commit()

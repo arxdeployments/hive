@@ -2,7 +2,8 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Plus, Search, Pencil, Trash2, Users as UsersIcon, Loader2,
-  ChevronLeft, ChevronRight, ChevronDown, Copy, RefreshCw, X, Check
+  ChevronLeft, ChevronRight, ChevronDown, Copy, RefreshCw, X, Check,
+  Smartphone
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
@@ -23,6 +24,8 @@ export default function UsersPage() {
   const [orgDropdownOpen, setOrgDropdownOpen] = useState(false);
   const [deptDropdownOpen, setDeptDropdownOpen] = useState(false);
   const [statusFilter, setStatusFilter] = useState(null);
+  // null = all, 'granted' | 'denied' — "who can actually use the phone app?"
+  const [mobileFilter, setMobileFilter] = useState(null);
   const [users, setUsers] = useState([]);
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
@@ -49,6 +52,7 @@ export default function UsersPage() {
   const [createName, setCreateName] = useState('');
   const [createPassword, setCreatePassword] = useState('');
   const [createRole, setCreateRole] = useState('member');
+  const [createMobileAccess, setCreateMobileAccess] = useState(false);
   const [autoPassword, setAutoPassword] = useState(true);
   const [emailAvailable, setEmailAvailable] = useState(null);
   const [createSaving, setCreateSaving] = useState(false);
@@ -57,10 +61,15 @@ export default function UsersPage() {
   const [editName, setEditName] = useState('');
   const [editRole, setEditRole] = useState('member');
   const [editActive, setEditActive] = useState(true);
+  const [editMobileAccess, setEditMobileAccess] = useState(false);
   const [editDeptId, setEditDeptId] = useState(null);
   const [editDepts, setEditDepts] = useState([]);
   const [editDeptOpen, setEditDeptOpen] = useState(false);
   const [editSaving, setEditSaving] = useState(false);
+
+  // Ids with an in-flight inline mobile-access toggle, so the row can show a
+  // spinner and refuse a second click without blocking the rest of the table.
+  const [mobilePending, setMobilePending] = useState([]);
 
   // Load orgs
   useEffect(() => {
@@ -91,6 +100,7 @@ export default function UsersPage() {
       if (selectedOrg) params.org_id = selectedOrg._id;
       if (selectedDept) params.dept_id = selectedDept._id;
       if (statusFilter) params.status = statusFilter;
+      if (mobileFilter) params.mobile = mobileFilter;
       const { data } = await client.get('/api/admin/users', { params });
       setUsers(data.data);
       setTotal(data.total);
@@ -99,7 +109,7 @@ export default function UsersPage() {
     } finally {
       setLoading(false);
     }
-  }, [selectedOrg, selectedDept, statusFilter, page, search]);
+  }, [selectedOrg, selectedDept, statusFilter, mobileFilter, page, search]);
 
   useEffect(() => { fetchUsers(); }, [fetchUsers]);
 
@@ -148,6 +158,7 @@ export default function UsersPage() {
     setCreateEmail('');
     setCreateName('');
     setCreateRole('member');
+    setCreateMobileAccess(false);
     setAutoPassword(true);
     setCreatePassword(generatePassword());
     setEmailAvailable(null);
@@ -159,6 +170,7 @@ export default function UsersPage() {
     setEditName(user.display_name);
     setEditRole(user.role);
     setEditActive(user.is_active);
+    setEditMobileAccess(!!user.mobile_access);
     setEditDeptId(user.dept_id);
   };
 
@@ -173,6 +185,7 @@ export default function UsersPage() {
         display_name: createName,
         password: createPassword,
         role: createRole,
+        mobile_access: createMobileAccess,
       });
       setCreatedPw(createPassword);
       toast.success('User created successfully', {
@@ -200,6 +213,7 @@ export default function UsersPage() {
         display_name: editName,
         role: editRole,
         is_active: editActive,
+        mobile_access: editMobileAccess,
       };
       if (editDeptId !== editUser.dept_id) payload.dept_id = editDeptId;
       await client.put(`/api/admin/users/${editUser._id}`, payload);
@@ -228,6 +242,37 @@ export default function UsersPage() {
       });
     } catch (err) {
       toast.error('Failed to reset password');
+    }
+  };
+
+  /**
+   * Grant/revoke one user's mobile sign-in straight from the table row.
+   *
+   * Approving a rollout means walking a list and saying yes to most of it, so the
+   * decision lives one click from the row rather than three clicks deep in the
+   * edit drawer. Optimistic: the pill flips immediately and is put back if the
+   * request fails, because the round trip is long enough that an un-flipped
+   * toggle reads as a dead button and invites a second click.
+   */
+  const toggleMobileAccess = async (user) => {
+    if (mobilePending.includes(user._id)) return;
+    const next = !user.mobile_access;
+    setMobilePending(prev => [...prev, user._id]);
+    setUsers(prev => prev.map(u => (u._id === user._id ? { ...u, mobile_access: next } : u)));
+    try {
+      await client.put(`/api/admin/users/${user._id}`, { mobile_access: next });
+      toast.success(
+        next
+          ? `Mobile access granted to ${user.display_name}`
+          : `Mobile access revoked for ${user.display_name}`
+      );
+      // Keep the edit drawer in sync if it happens to be open on this user.
+      if (editUser?._id === user._id) setEditMobileAccess(next);
+    } catch (err) {
+      setUsers(prev => prev.map(u => (u._id === user._id ? { ...u, mobile_access: !next } : u)));
+      toast.error(err.response?.data?.detail || 'Failed to update mobile access');
+    } finally {
+      setMobilePending(prev => prev.filter(id => id !== user._id));
     }
   };
 
@@ -365,6 +410,25 @@ export default function UsersPage() {
             </div>
           </div>
 
+          {/* Mobile-access filter */}
+          <div>
+            <label className="text-xs text-[#A3A3A3] mb-1.5 block">Mobile App</label>
+            <div className="flex gap-1">
+              {[
+                { value: null, label: 'All' },
+                { value: 'granted', label: 'Approved' },
+                { value: 'denied', label: 'Not approved' },
+              ].map(opt => (
+                <button key={opt.value || 'all'}
+                  onClick={() => { setMobileFilter(opt.value); setPage(1); }}
+                  data-testid={`users-mobile-filter-${opt.value || 'all'}`}
+                  className={`px-3 h-10 rounded-[6px] text-xs font-medium transition-colors whitespace-nowrap ${mobileFilter === opt.value ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30' : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] hover:text-[#F5F5F5]'}`}>
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
           <div className="ml-auto">
             <button onClick={openCreate} data-testid="users-create-button"
               className="flex items-center gap-2 px-4 py-2.5 rounded-[6px] text-sm font-medium border border-[#10B981] text-[#10B981] hover:bg-[#10B981] hover:text-[#0A0A0A] transition-all duration-200 active:scale-[0.98]">
@@ -389,6 +453,17 @@ export default function UsersPage() {
               <button onClick={() => handleBulkAction('activate')}
                 className="px-3 py-1.5 rounded-[6px] text-xs font-medium bg-[#10B981]/10 text-[#10B981] hover:bg-[#10B981]/20 transition-colors">
                 Activate Selected
+              </button>
+              <div className="w-px h-5 bg-[#2D2D2D]" />
+              <button onClick={() => handleBulkAction('grant_mobile')}
+                data-testid="users-bulk-grant-mobile"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] text-xs font-medium bg-[#10B981]/10 text-[#10B981] hover:bg-[#10B981]/20 transition-colors">
+                <Smartphone size={12} /> Grant Mobile Access
+              </button>
+              <button onClick={() => handleBulkAction('revoke_mobile')}
+                data-testid="users-bulk-revoke-mobile"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-[6px] text-xs font-medium bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] hover:text-[#F5F5F5] transition-colors">
+                <Smartphone size={12} /> Revoke Mobile Access
               </button>
               <button onClick={() => setSelectedIds([])}
                 className="ml-auto p-1.5 text-[#A3A3A3] hover:text-[#F5F5F5] transition-colors">
@@ -415,6 +490,7 @@ export default function UsersPage() {
                   <th className="px-4 py-3 text-left">Department</th>
                   <th className="px-4 py-3 text-left">Role</th>
                   <th className="px-4 py-3 text-left">Status</th>
+                  <th className="px-4 py-3 text-left">Mobile App</th>
                   <th className="px-4 py-3 text-right">Actions</th>
                 </tr>
               </thead>
@@ -422,7 +498,7 @@ export default function UsersPage() {
                 {loading ? (
                   [...Array(5)].map((_, i) => (
                     <tr key={i} className="border-t border-[#1F1F1F]">
-                      {[...Array(8)].map((_, j) => (
+                      {[...Array(9)].map((_, j) => (
                         <td key={j} className="px-4 py-4">
                           <div className="h-4 bg-[#1A1A1A] rounded animate-pulse" style={{ width: `${40 + Math.random() * 50}%` }} />
                         </td>
@@ -431,7 +507,7 @@ export default function UsersPage() {
                   ))
                 ) : users.length === 0 ? (
                   <tr>
-                    <td colSpan={8} className="px-4 py-16 text-center">
+                    <td colSpan={9} className="px-4 py-16 text-center">
                       <UsersIcon size={40} className="text-[#A3A3A3]/30 mx-auto mb-3" />
                       <p className="text-[#A3A3A3] mb-4">No users found</p>
                     </td>
@@ -479,6 +555,26 @@ export default function UsersPage() {
                             <span className={`w-1.5 h-1.5 rounded-full ${user.is_active ? 'bg-[#10B981]' : 'bg-[#EF4444]'}`} />
                             {user.is_active ? 'Active' : 'Inactive'}
                           </span>
+                        </td>
+                        <td className="px-4 py-4">
+                          <button
+                            onClick={() => toggleMobileAccess(user)}
+                            disabled={mobilePending.includes(user._id)}
+                            data-testid="users-mobile-access-toggle"
+                            title={user.mobile_access
+                              ? 'Approved for the mobile app — click to revoke'
+                              : 'Not approved for the mobile app — click to grant'}
+                            className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium border transition-colors disabled:opacity-50 disabled:cursor-wait ${
+                              user.mobile_access
+                                ? 'bg-[#10B981]/10 text-[#10B981] border-[#10B981]/30 hover:bg-[#10B981]/20'
+                                : 'bg-[#1A1A1A] text-[#A3A3A3] border-[#2D2D2D] hover:text-[#F5F5F5] hover:border-[#10B981]/30'
+                            }`}
+                          >
+                            {mobilePending.includes(user._id)
+                              ? <Loader2 size={12} className="animate-spin" />
+                              : <Smartphone size={12} />}
+                            {user.mobile_access ? 'Approved' : 'Not approved'}
+                          </button>
                         </td>
                         <td className="px-4 py-4">
                           <button onClick={() => openEdit(user)} data-testid="users-edit-open-button"
@@ -652,6 +748,28 @@ export default function UsersPage() {
                         ))}
                       </div>
                     </div>
+
+                    {/* Mobile app access */}
+                    <div>
+                      <label className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</label>
+                      <button onClick={() => setCreateMobileAccess(!createMobileAccess)}
+                        data-testid="users-create-mobile-access-toggle"
+                        className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D] hover:border-[#10B981]/20 transition-colors text-left">
+                        <div className={`w-10 h-5 rounded-full transition-colors flex-shrink-0 ${createMobileAccess ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
+                          <div className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all"
+                            style={{ left: createMobileAccess ? '22px' : '2px' }} />
+                        </div>
+                        <div className="min-w-0">
+                          <span className={`text-sm flex items-center gap-1.5 ${createMobileAccess ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}>
+                            <Smartphone size={13} />
+                            {createMobileAccess ? 'Allow mobile sign-in' : 'Web only'}
+                          </span>
+                          <p className="text-xs text-[#A3A3A3] mt-0.5">
+                            Mobile access is off by default and can be changed at any time.
+                          </p>
+                        </div>
+                      </button>
+                    </div>
                   </div>
                 </div>
                 <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-[#1F1F1F]">
@@ -768,6 +886,37 @@ export default function UsersPage() {
                           {editActive ? 'Active' : 'Inactive'}
                         </span>
                       </button>
+                    </div>
+
+                    {/* Mobile app access — the super-admin-only grant. Spelled out
+                        rather than labelled with a bare toggle, because "off" here
+                        is the reason a user's app says it cannot sign them in. */}
+                    <div>
+                      <label className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</label>
+                      <button onClick={() => setEditMobileAccess(!editMobileAccess)}
+                        data-testid="users-edit-mobile-access-toggle"
+                        className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D] hover:border-[#10B981]/20 transition-colors text-left">
+                        <div className={`w-10 h-5 rounded-full transition-colors flex-shrink-0 ${editMobileAccess ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
+                          <div className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all"
+                            style={{ left: editMobileAccess ? '22px' : '2px' }} />
+                        </div>
+                        <div className="min-w-0">
+                          <span className={`text-sm flex items-center gap-1.5 ${editMobileAccess ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}>
+                            <Smartphone size={13} />
+                            {editMobileAccess ? 'Approved for mobile' : 'Web only'}
+                          </span>
+                          <p className="text-xs text-[#A3A3A3] mt-0.5">
+                            {editMobileAccess
+                              ? 'This user can sign in to the RxHive iOS app.'
+                              : 'This user cannot sign in to the RxHive iOS app.'}
+                          </p>
+                        </div>
+                      </button>
+                      {editUser.mobile_access && !editMobileAccess && (
+                        <p className="mt-2 text-xs text-[#F59E0B]">
+                          Saving will sign this user out of the mobile app. Their web session is unaffected.
+                        </p>
+                      )}
                     </div>
 
                     {/* Reset Password */}

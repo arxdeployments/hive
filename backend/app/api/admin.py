@@ -76,6 +76,8 @@ class CreateUser(BaseModel):
     display_name: str = Field(min_length=2, max_length=100)
     password: str = Field(min_length=6)
     role: Literal["admin", "member"] = "member"
+    # Mobile is opt-in at creation too, so the default here matches the column's.
+    mobile_access: bool = False
 
 
 class UpdateUser(BaseModel):
@@ -83,6 +85,11 @@ class UpdateUser(BaseModel):
     dept_id: str | None = None
     role: Literal["admin", "member"] | None = None
     is_active: bool | None = None
+    # Granting/revoking native-app sign-in for one account. Superadmin-only by
+    # virtue of this router's require_superadmin dependency — the org-admin
+    # portal's OrgUpdateUser deliberately has no equivalent field, so an org
+    # admin can see the state but cannot change it.
+    mobile_access: bool | None = None
 
 
 class BulkAction(BaseModel):
@@ -155,6 +162,7 @@ def _user_row(
         "created_by": str(user.created_by) if user.created_by else None,
         "created_at": iso_z(user.created_at),
         "is_active": user.is_active,
+        "mobile_access": user.mobile_access,
         "org_name": org_names.get(user.org_id, "Unknown"),
         "dept_name": dept_names.get(user.dept_id, "Unknown"),
     }
@@ -204,15 +212,24 @@ async def _org_counts(
     return dept_counts, dict(rows.all())
 
 
-async def _revoke_refresh_tokens(db: AsyncSession, user_ids: list[uuid.UUID]) -> None:
+async def _revoke_refresh_tokens(
+    db: AsyncSession, user_ids: list[uuid.UUID], *, client: str | None = None
+) -> None:
+    """Revoke live refresh sessions for these users.
+
+    `client` narrows the revocation to sessions opened by one client. Revoking a
+    mobile grant must sign the user out of the phone without signing them out of
+    the browser they may be using right now, so that path passes client="mobile";
+    deactivation passes nothing and kills everything.
+    """
     if not user_ids:
         return
-    await db.execute(
-        update(RefreshToken)
-        .where(RefreshToken.user_id.in_(user_ids), RefreshToken.revoked_at.is_(None))
-        .values(revoked_at=now_utc())
-        .execution_options(synchronize_session=False)
+    stmt = update(RefreshToken).where(
+        RefreshToken.user_id.in_(user_ids), RefreshToken.revoked_at.is_(None)
     )
+    if client is not None:
+        stmt = stmt.where(RefreshToken.client == client)
+    await db.execute(stmt.values(revoked_at=now_utc()).execution_options(synchronize_session=False))
 
 
 async def _deactivate_org_users(db: AsyncSession, org_id: uuid.UUID) -> int:
@@ -697,6 +714,9 @@ async def list_users(
     dept_id: str | None = None,
     search: str = "",
     status: str = "",
+    # "granted" | "denied" — lets the portal answer "who can actually use the app?"
+    # without paging through everyone. Empty means no filter.
+    mobile: str = "",
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=100),
     sort: str = "created_at",
@@ -718,6 +738,10 @@ async def list_users(
         filters.append(User.is_active.is_(True))
     elif status == "inactive":
         filters.append(User.is_active.is_(False))
+    if mobile == "granted":
+        filters.append(User.mobile_access.is_(True))
+    elif mobile == "denied":
+        filters.append(User.mobile_access.is_(False))
 
     sort_col = {
         "display_name": User.display_name,
@@ -778,6 +802,7 @@ async def create_user(
         password_hash=hash_password(body.password),
         role=_db_role(body.role),
         is_active=True,
+        mobile_access=body.mobile_access,
         must_change_password=False,
         created_by=actor.id,
         created_at=now_utc(),
@@ -794,7 +819,7 @@ async def create_user(
         actor_type="superadmin",
         action="create_user",
         target=str(user.id),
-        details={"email": user.email, "role": body.role},
+        details={"email": user.email, "role": body.role, "mobile_access": body.mobile_access},
         org_id=oid,
     )
     await db.commit()
@@ -833,6 +858,30 @@ async def bulk_user_action(
                 await _revoke_refresh_tokens(db, ids)
         count = len(ids)
         message = f"{count} users {body.action}d"
+    elif body.action in ("grant_mobile", "revoke_mobile"):
+        # Approving a department's worth of people one modal at a time is the kind
+        # of chore that ends in nobody being approved, so the grant is bulk-able.
+        granting = body.action == "grant_mobile"
+        ids = list(
+            (
+                await db.execute(
+                    select(User.id).where(User.id.in_(valid_ids), User.role != UserRole.superadmin)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if ids:
+            await db.execute(
+                update(User)
+                .where(User.id.in_(ids))
+                .values(mobile_access=granting)
+                .execution_options(synchronize_session=False)
+            )
+            if not granting:
+                await _revoke_refresh_tokens(db, ids, client="mobile")
+        count = len(ids)
+        message = f"Mobile access {'granted for' if granting else 'revoked for'} {count} users"
     elif body.action == "change_dept":
         if not body.dept_id:
             raise HTTPException(status_code=400, detail="dept_id required for change_dept")
@@ -904,6 +953,12 @@ async def update_user(
         user.dept_id = did
     if "role" in update_data:
         user.role = _db_role(update_data["role"])
+    if "mobile_access" in update_data:
+        user.mobile_access = update_data["mobile_access"]
+        if update_data["mobile_access"] is False:
+            # Revoking the grant ends the phone's session immediately; the web
+            # session is untouched (see _revoke_refresh_tokens).
+            await _revoke_refresh_tokens(db, [user.id], client="mobile")
     if "is_active" in update_data:
         user.is_active = update_data["is_active"]
         if update_data["is_active"] is False:

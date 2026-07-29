@@ -71,6 +71,10 @@ def _serialize_user(user: User, dept_name: str, status: str) -> dict:
         "created_by": str(user.created_by) if user.created_by else None,
         "created_at": iso_z(user.created_at),
         "is_active": user.is_active,
+        # Read-only here. Only a superadmin grants mobile access (OrgUpdateUser has
+        # no such field), but an org admin fielding "the app won't let me in" needs
+        # to be able to see whether the account was ever approved.
+        "mobile_access": user.mobile_access,
         "dept_name": dept_name,
     }
 
