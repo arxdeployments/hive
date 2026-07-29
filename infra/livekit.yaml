@@ -10,5 +10,32 @@ rtc:
   use_external_ip: true
 redis:
   address: redis:6379
+
+# Server-to-server event delivery to the API. Mounting the endpoint is only half
+# the fix — without this block the SFU never calls it, so the API learns nothing
+# about what actually happened in a room.
+#
+# What it buys: room_finished lets the API mark a call answered and publish
+# call:ended with a real duration, which is what stops a client that was killed
+# mid-call from leaving the row "connected" forever. participant_joined /
+# participant_left keep the roster honest when a browser tab dies without sending
+# call:leave.
+webhook:
+  # MUST be one of the keys in LIVEKIT_KEYS (docker-compose.yml sets that from
+  # LIVEKIT_API_KEY, default rxhive-api) AND must match the API's
+  # RXHIVE_LIVEKIT_API_KEY. This file is in git and cannot read the .env, so if
+  # you change LIVEKIT_API_KEY you must change it here too.
+  #
+  # Symptom of a mismatch: calls work, but the API logs
+  # "Rejected LiveKit webhook: verification failed" on every room event — the
+  # SFU signs with a key the API does not recognise as its issuer.
+  api_key: rxhive-api
+  urls:
+    # The compose service name, on the internal network — deliberately not the
+    # public Caddy hostname. This traffic never needs to leave the bridge, and
+    # keeping it internal means the endpoint is not a public attack surface
+    # (it verifies its JWT regardless, but there is no reason to expose it).
+    - http://api:8000/api/livekit/webhook
+
 logging:
   level: info

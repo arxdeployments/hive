@@ -116,6 +116,16 @@ app.include_router(search.router)
 app.include_router(cross_org.router)
 app.include_router(org_admin.router)
 app.include_router(calls.router)
+# The LiveKit webhook lives on its own router because it is the one route in the
+# app that is NOT under /api/calls and NOT user-authenticated: the SFU calls it
+# server-to-server and proves itself with a signed JWT instead of a session
+# cookie. Registering it was missed when the router was split out, which left
+# every SFU-driven reconciliation path dead — room_finished never marked a call
+# answered, so a client that was killed mid-call left the row "connected"
+# forever, and the webhook's participant_joined/left fan-out never fired.
+# It must also be listed in CSRF_EXEMPT_PATHS above (it is): the SFU is not a
+# browser and cannot send X-Requested-With.
+app.include_router(calls.webhook_router)
 app.include_router(notifications.router)
 app.include_router(hub.router)
 

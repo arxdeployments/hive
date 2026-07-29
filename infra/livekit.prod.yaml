@@ -27,5 +27,23 @@ redis:
   # inside this container, whereas a loopback address would point at LiveKit's
   # own network namespace and silently fail.
   address: redis:6379
+
+# Server-to-server event delivery to the API. See livekit.yaml for the full
+# rationale; the short version is that without this the API never finds out a room
+# ended, so a call whose client died stays "connected" in call_history forever and
+# the participant roster drifts from reality.
+webhook:
+  # MUST match LIVEKIT_API_KEY (which docker-compose.prod.yml feeds into
+  # LIVEKIT_KEYS) and the API's RXHIVE_LIVEKIT_API_SECRET pairing. This file is in
+  # git and cannot read the .env, so changing the key means changing it here too.
+  # A mismatch is not silent: the API logs "Rejected LiveKit webhook:
+  # verification failed" for every room event while calls otherwise work.
+  api_key: rxhive-api
+  urls:
+    # Internal compose address, not the public domain: this is east-west traffic
+    # and routing it out through Caddy and back would add a public dependency to
+    # something that never needs one.
+    - http://api:8000/api/livekit/webhook
+
 logging:
   level: info

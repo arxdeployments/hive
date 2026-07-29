@@ -14,13 +14,38 @@ auth with revocable refresh tokens.
 rxhive/
 ├─ backend/    FastAPI (Python 3.12) — runs independently
 ├─ frontend/   React 19 + Vite — runs independently
+├─ ios/        SwiftUI iOS app (Xcode 16+) — same backend, no mobile API
 ├─ infra/      docker-compose, Caddy, LiveKit config
 └─ docs/       handoff spec + API reference
 ```
 
-`backend/` and `frontend/` are fully self-contained: they share no code and talk
-only over the documented HTTP/WebSocket API, so either can be built, tested, and
-deployed on its own.
+`backend/`, `frontend/` and `ios/` are fully self-contained: they share no code
+and talk only over the documented HTTP/WebSocket API, so each can be built,
+tested, and deployed on its own.
+
+## Clients, and who may use which
+
+| | Web (`frontend/`) | iOS (`ios/`) |
+|---|---|---|
+| Super admin | **yes** — the only place the admin portal exists | **never** |
+| Org admin (`admin`) | yes | only if granted |
+| Member | yes | only if granted |
+
+Mobile access is a **per-user grant issued by a super admin**, not a role. A
+member or org admin cannot sign in to the iOS app until someone approves their
+account individually, at **Admin → Users** in the web portal (inline per-row
+toggle, edit-drawer control, a field on user creation, bulk grant/revoke, and an
+Approved / Not-approved filter).
+
+Enforced in `backend/app/api/auth.py:_assert_mobile_allowed`, re-checked on every
+request via a signed `client` claim and again on refresh — so revoking access ends
+the phone's session immediately. Revoking does **not** end that user's web session:
+`refresh_tokens.client` records which client opened each session, and only mobile
+ones are revoked. Both refusals are `403` with a user-facing sentence, never `401`,
+so "not approved yet" can never be mistaken for "wrong password".
+
+Covered by [`backend/tests/test_mobile_access.py`](backend/tests/test_mobile_access.py).
+See [`ios/README.md`](ios/README.md) for the app itself.
 
 ## One-command local stack
 

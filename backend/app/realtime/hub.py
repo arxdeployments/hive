@@ -21,7 +21,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
 from app.core.deps import get_current_user_ws
-from app.db.models import ConversationParticipant, User
+from app.core.security import MOBILE_CLIENT
+from app.db.models import ConversationParticipant, User, UserRole
 from app.db.session import SessionLocal
 from app.realtime.redis_bus import get_redis, publish_to_users, user_channel
 from app.services import presence
@@ -256,7 +257,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
         await websocket.close(code=4001, reason="Invalid token")
         return
-    user, token_exp = auth
+    user, token_exp, client = auth
 
     await websocket.accept()
     last_active_check = now_utc()
@@ -318,6 +319,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         fresh = await db.get(User, user.id)
                     if fresh is None or not fresh.is_active:
                         await websocket.close(code=4001, reason="Account inactive")
+                        break
+                    # Same re-check for the mobile grant. Without it a phone whose
+                    # access a superadmin just revoked would keep receiving messages
+                    # on this socket until its access token lapsed — up to the full
+                    # token lifetime — even though its HTTP calls were already 401ing.
+                    if client == MOBILE_CLIENT and (
+                        fresh.role == UserRole.superadmin or not fresh.mobile_access
+                    ):
+                        await websocket.close(code=4001, reason="Mobile access revoked")
                         break
                 await presence.refresh(user.id)
                 await websocket.send_text(json.dumps({"type": "pong", "timestamp": iso_z(now_utc())}))
