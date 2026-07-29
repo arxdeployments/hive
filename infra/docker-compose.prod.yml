@@ -32,7 +32,14 @@ services:
   livekit:
     image: livekit/livekit-server:latest
     restart: unless-stopped
-    command: --config /etc/livekit.yaml
+    # See docker-compose.yml for why the config is templated rather than mounted
+    # as-is: webhook.api_key must equal LIVEKIT_API_KEY, and livekit-server does not
+    # expand env vars in its config file, so a hardcoded key crash-loops the SFU.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sed 's|__LIVEKIT_API_KEY__|${LIVEKIT_API_KEY:-rxhive-api}|' /etc/livekit.yaml > /tmp/livekit.yaml
+        exec /livekit-server --config /tmp/livekit.yaml
     volumes:
       - ./livekit.prod.yaml:/etc/livekit.yaml:ro
     environment:

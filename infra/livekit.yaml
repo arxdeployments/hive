@@ -21,15 +21,18 @@ redis:
 # participant_left keep the roster honest when a browser tab dies without sending
 # call:leave.
 webhook:
-  # MUST be one of the keys in LIVEKIT_KEYS (docker-compose.yml sets that from
-  # LIVEKIT_API_KEY, default rxhive-api) AND must match the API's
-  # RXHIVE_LIVEKIT_API_KEY. This file is in git and cannot read the .env, so if
-  # you change LIVEKIT_API_KEY you must change it here too.
+  # Substituted at container start-up from LIVEKIT_API_KEY — see the livekit
+  # service's entrypoint in docker-compose.yml. NOT a literal.
   #
-  # Symptom of a mismatch: calls work, but the API logs
-  # "Rejected LiveKit webhook: verification failed" on every room event — the
-  # SFU signs with a key the API does not recognise as its issuer.
-  api_key: rxhive-api
+  # It has to be a placeholder rather than a hardcoded key: LiveKit requires
+  # webhook.api_key to be one of the keys in LIVEKIT_KEYS, that comes from the
+  # .env, and livekit-server does **not** expand env vars inside its config file
+  # (verified — it reads `${VAR}` literally). A hardcoded key that does not match
+  # the deployment's LIVEKIT_API_KEY makes livekit-server refuse to start with
+  # "api_key is required to use webhooks", and it crash-loops: calls break
+  # entirely, and the API starts reporting "livekit":"unreachable" because the
+  # container is never up long enough to resolve.
+  api_key: __LIVEKIT_API_KEY__
   urls:
     # The compose service name, on the internal network — deliberately not the
     # public Caddy hostname. This traffic never needs to leave the bridge, and

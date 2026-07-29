@@ -49,7 +49,19 @@ services:
   livekit:
     image: livekit/livekit-server:latest
     restart: unless-stopped
-    command: --config /etc/livekit.yaml
+    # The config is templated at start-up, not passed straight through, because
+    # `webhook.api_key` has to equal LIVEKIT_API_KEY and livekit-server does not
+    # expand env vars inside its config file. The mounted YAML carries a
+    # __LIVEKIT_API_KEY__ placeholder and sed fills it in here, so the key lives in
+    # exactly one place (.env) instead of also being hardcoded in a file that is in
+    # git. Getting that wrong does not degrade gracefully — the SFU exits with
+    # "api_key is required to use webhooks" and restart:unless-stopped turns it
+    # into a crash loop.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        sed 's|__LIVEKIT_API_KEY__|${LIVEKIT_API_KEY:-rxhive-api}|' /etc/livekit.yaml > /tmp/livekit.yaml
+        exec /livekit-server --config /tmp/livekit.yaml
     volumes:
       - ./livekit.yaml:/etc/livekit.yaml:ro
     environment:

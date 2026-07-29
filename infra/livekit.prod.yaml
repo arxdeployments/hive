@@ -33,12 +33,10 @@ redis:
 # ended, so a call whose client died stays "connected" in call_history forever and
 # the participant roster drifts from reality.
 webhook:
-  # MUST match LIVEKIT_API_KEY (which docker-compose.prod.yml feeds into
-  # LIVEKIT_KEYS) and the API's RXHIVE_LIVEKIT_API_SECRET pairing. This file is in
-  # git and cannot read the .env, so changing the key means changing it here too.
-  # A mismatch is not silent: the API logs "Rejected LiveKit webhook:
-  # verification failed" for every room event while calls otherwise work.
-  api_key: rxhive-api
+  # Substituted at container start-up from LIVEKIT_API_KEY by the livekit service's
+  # entrypoint in docker-compose.prod.yml. NOT a literal — see livekit.yaml for why
+  # a hardcoded key here crash-loops the SFU.
+  api_key: __LIVEKIT_API_KEY__
   urls:
     # Internal compose address, not the public domain: this is east-west traffic
     # and routing it out through Caddy and back would add a public dependency to
