@@ -29,11 +29,47 @@ const extractError = (err, fallback) => {
   return fallback;
 };
 
-const Toggle = ({ checked, onChange }) => (
-  <button onClick={() => onChange(!checked)}
-    className={`w-10 h-5 rounded-full transition-colors ${checked ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
-    <div className="absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform"
-      style={{ left: checked ? '22px' : '2px' }} />
+// Track 36x20 with a 16px knob and a 2px inset — the standard compact switch,
+// and the same geometry as InfoPanelPrimitives' Switch so the app has one
+// answer for what a toggle looks like.
+//
+// Sized in PIXELS, not rem. It was `w-10 h-5` (2.5rem x 1.25rem) with the knob
+// offset by a hard-coded `left: 22px`, so the track scaled with the root
+// font-size — which this very page changes, via the Appearance setting — while
+// the knob's travel did not. The two drifted apart: at Small the knob pushed
+// past the track's right edge, and the whole control grew out of proportion with
+// the rows around it. A switch is chrome, not body text; it should not resize
+// with the message font at all.
+const TRACK_W = 36;
+const TRACK_H = 20;
+const KNOB = 16;
+const INSET = (TRACK_H - KNOB) / 2;
+
+const Toggle = ({ checked, onChange, label }) => (
+  <button
+    type="button"
+    role="switch"
+    aria-checked={!!checked}
+    aria-label={label}
+    onClick={() => onChange(!checked)}
+    style={{ width: TRACK_W, height: TRACK_H }}
+    className={`relative shrink-0 rounded-full transition-colors outline-none focus-visible:ring-2 focus-visible:ring-[#10B981]/40 ${
+      checked ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'
+    }`}
+  >
+    <span
+      aria-hidden="true"
+      style={{
+        width: KNOB,
+        height: KNOB,
+        top: INSET,
+        left: INSET,
+        // Travel is derived, so the knob can never overshoot the track however
+        // the constants above are tuned.
+        transform: `translateX(${checked ? TRACK_W - KNOB - INSET * 2 : 0}px)`,
+      }}
+      className="absolute rounded-full bg-white shadow-sm transition-transform duration-200"
+    />
   </button>
 );
 
@@ -158,7 +194,7 @@ export default function SettingsPage() {
                     <div><p className="text-sm text-[#F5F5F5]">Notification Sound</p>
                       <p className="text-xs text-[#525252]">Play a sound for new messages</p></div>
                   </div>
-                  <Toggle checked={notifSound} onChange={setNotifSound} />
+                  <Toggle checked={notifSound} onChange={setNotifSound} label="Notification sound" />
                 </div>
                 <div className="flex items-center justify-between p-4">
                   <div className="flex items-center gap-3">
@@ -166,7 +202,7 @@ export default function SettingsPage() {
                     <div><p className="text-sm text-[#F5F5F5]">Desktop Notifications</p>
                       <p className="text-xs text-[#525252]">Show browser notifications</p></div>
                   </div>
-                  <Toggle checked={desktopNotif} onChange={handleDesktopNotif} disabled={notifBusy} />
+                  <Toggle checked={desktopNotif} onChange={handleDesktopNotif} label="Desktop notifications" />
                 </div>
               </div>
             </section>
@@ -181,7 +217,7 @@ export default function SettingsPage() {
                     <div><p className="text-sm text-[#F5F5F5]">Enter Key Sends Message</p>
                       <p className="text-xs text-[#525252]">{enterSends ? 'Enter sends, Shift+Enter for new line' : 'Enter for new line, Ctrl+Enter sends'}</p></div>
                   </div>
-                  <Toggle checked={enterSends} onChange={setEnterSends} />
+                  <Toggle checked={enterSends} onChange={setEnterSends} label="Enter key sends message" />
                 </div>
               </div>
             </section>
