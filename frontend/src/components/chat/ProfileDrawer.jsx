@@ -1,14 +1,31 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, Pencil, Camera, Mail, Building2, FolderTree } from 'lucide-react';
+import { X, Pencil, Camera, Mail, Building2, FolderTree, LogOut } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
+import { useNavigate } from 'react-router-dom';
 import client from '../../api/client';
 import { toast } from 'sonner';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 
 export const ProfileDrawer = ({ isOpen, onClose }) => {
-  const { user, checkAuth } = useAuth();
+  const { user, checkAuth, logout } = useAuth();
+  const navigate = useNavigate();
+  const [signingOut, setSigningOut] = useState(false);
+
+  const handleSignOut = async () => {
+    if (signingOut) return;
+    setSigningOut(true);
+    try {
+      await logout();
+      toast.success('Signed out');
+      navigate('/login');
+    } finally {
+      // Not reset on success — the route change unmounts this — but a failed
+      // logout still clears local state, so the button must not stay stuck.
+      setSigningOut(false);
+    }
+  };
   const [profile, setProfile] = useState(null);
   const [editingName, setEditingName] = useState(false);
   const [editingAbout, setEditingAbout] = useState(false);
@@ -159,6 +176,25 @@ export const ProfileDrawer = ({ isOpen, onClose }) => {
                   <p className="text-sm text-[#F5F5F5]">{profile?.dept_name || 'N/A'}</p>
                 </div>
               </div>
+            </div>
+
+            {/* Sign out.
+                Also on the Settings page. Deliberate duplication rather than an
+                oversight: this drawer is the account surface — it is where your
+                name, photo and organization live — and signing out is an account
+                action, so people look for it here first. The two share no state;
+                each owns its own in-flight flag. */}
+            <div className="pt-4 mt-4 border-t border-[#1F1F1F]">
+              <button
+                type="button"
+                onClick={handleSignOut}
+                disabled={signingOut}
+                data-testid="profile-logout-button"
+                className="w-full flex items-center justify-center gap-2 h-10 rounded-[6px] border border-[#EF4444]/40 text-[#EF4444] hover:bg-[#EF4444]/10 disabled:opacity-50 text-sm font-medium transition-colors"
+              >
+                <LogOut size={16} />
+                {signingOut ? 'Signing out…' : 'Sign out'}
+              </button>
             </div>
           </div>
         </motion.div>

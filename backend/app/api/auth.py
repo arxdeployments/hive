@@ -40,7 +40,7 @@ from app.core.security import (
     new_refresh_token,
     verify_password,
 )
-from app.db.models import RefreshToken, User, UserRole
+from app.db.models import Department, Organization, RefreshToken, User, UserRole
 from app.db.session import get_db
 from app.services import presence
 from app.utils import iso_z, now_utc
@@ -330,6 +330,16 @@ async def me(user: User = Depends(get_current_user), db: AsyncSession = Depends(
         payload["status"] = statuses.get(str(user.id), "offline")
         payload["last_seen"] = iso_z(user.last_seen_at)
         payload["mobile_access"] = user.mobile_access
+        # Resolved NAMES, not just the ids _user_payload already carries. The
+        # profile drawer renders org_name and dept_name, which this endpoint
+        # never returned — so those two rows read "N/A" for every user, always,
+        # regardless of their actual organization and department.
+        payload["org_name"] = (
+            (await db.get(Organization, user.org_id)).name if user.org_id else None
+        )
+        payload["dept_name"] = (
+            (await db.get(Department, user.dept_id)).name if user.dept_id else None
+        )
     return payload
 
 
