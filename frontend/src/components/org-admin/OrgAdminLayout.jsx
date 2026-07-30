@@ -19,16 +19,29 @@ export const OrgAdminLayout = () => {
     <div className="min-h-screen bg-[#0A0A0A] flex">
       {/* Sidebar */}
       <aside className={`h-screen bg-[#0F0F0F] border-r border-[#1F1F1F] flex flex-col ${collapsed ? 'w-[72px]' : 'w-[260px]'} transition-all duration-300 flex-shrink-0`}>
+        {/* The switcher lives HERE — top of the sidebar, right-aligned — because
+            that is exactly where it sits on the chat side. It previously sat at
+            the foot of this sidebar, so flipping to admin moved the control from
+            the top of the screen to the bottom and you had to hunt for it to get
+            back.
+            Still inside the aside rather than the content header: that header is
+            in the flex-1 column, and a nowrap row there raises the whole
+            layout's min-content width past a phone viewport, with nothing to
+            scroll because the page is position:fixed. The aside is a fixed width
+            and always on screen. */}
         <div className="h-16 flex items-center px-4 border-b border-[#1F1F1F] gap-3">
           {!collapsed && (
             <>
-              <div className="w-8 h-8 rounded-[6px] bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-sm font-bold">O</div>
+              <div className="w-8 h-8 shrink-0 rounded-[6px] bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-sm font-bold">O</div>
               <div className="flex-1 min-w-0">
                 <span className="text-sm font-bold text-[#F5F5F5] truncate block">Org Admin</span>
-                <span className="text-[10px] text-[#10B981]">Organization Panel</span>
+                <span className="text-[10px] text-[#10B981] truncate block">Organization Panel</span>
               </div>
             </>
           )}
+          {/* Compact in both shells, so the control is visually identical
+              whichever side you are on. */}
+          <WorkspaceSwitcher compact className={collapsed ? 'mx-auto' : 'shrink-0'} />
         </div>
 
         <nav className="flex-1 py-4 px-3 space-y-1">
@@ -48,18 +61,6 @@ export const OrgAdminLayout = () => {
           })}
         </nav>
 
-        {/* In the ASIDE, not the header.
-            The header sits in the flex-1 content column, and a nowrap flex row
-            there raises the whole layout's min-content width — 260px of fixed
-            aside plus the header's contents — past a phone viewport. With
-            html/body/#root all overflow:hidden and position:fixed there is no
-            scroll to recover it, so on a phone the switcher went off-screen. It
-            replaced "Back to Chat", which used to live right here and was always
-            visible, so that combination left no route back to chat at all.
-            The aside is a fixed width and always on screen, which this is not. */}
-        <div className="border-t border-[#1F1F1F] p-3">
-          <WorkspaceSwitcher compact={collapsed} className={collapsed ? '' : 'w-full justify-center'} />
-        </div>
       </aside>
 
       {/* Main content */}
