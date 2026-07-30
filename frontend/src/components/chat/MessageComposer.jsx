@@ -817,33 +817,33 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: 10 }}
-                    className="absolute bottom-full left-0 mb-2 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[8px] shadow-lg z-30 py-1 w-40"
+                    className="absolute bottom-full left-0 mb-2 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[8px] shadow-lg z-30 py-1 w-48"
                   >
                     {(sendPolicy.image || sendPolicy.video) && (
                     <button
                       onClick={() => fileInputRef.current?.click()}
                       data-testid="attach-image-btn"
-                      className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-[#F5F5F5] hover:bg-[#2D2D2D] transition-colors"
+                      className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-left text-[#F5F5F5] hover:bg-[#2D2D2D] transition-colors"
                     >
-                      <Image size={16} className="text-[#10B981]" /> Photos &amp; Videos
+                      <Image size={16} className="text-[#10B981] shrink-0" /> Photos &amp; Videos
                     </button>
                     )}
                     {(sendPolicy.video || sendPolicy.audio) && (
                     <button
                       onClick={() => mediaInputRef.current?.click()}
                       data-testid="attach-media-btn"
-                      className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-[#F5F5F5] hover:bg-[#2D2D2D] transition-colors"
+                      className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-left text-[#F5F5F5] hover:bg-[#2D2D2D] transition-colors"
                     >
-                      <Film size={16} className="text-[#A855F7]" /> Media
+                      <Film size={16} className="text-[#A855F7] shrink-0" /> Media
                     </button>
                     )}
                     {sendPolicy.document && (
                     <button
                       onClick={() => docInputRef.current?.click()}
                       data-testid="attach-doc-btn"
-                      className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-[#F5F5F5] hover:bg-[#2D2D2D] transition-colors"
+                      className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-left text-[#F5F5F5] hover:bg-[#2D2D2D] transition-colors"
                     >
-                      <FileText size={16} className="text-[#3B82F6]" /> Document
+                      <FileText size={16} className="text-[#3B82F6] shrink-0" /> Document
                     </button>
                     )}
                     {/* Every category blocked. Saying so beats an empty popover,
