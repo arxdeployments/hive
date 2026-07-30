@@ -159,7 +159,25 @@ export default function SettingsPage() {
           <ArrowLeft size={16} /> Back to Chat
         </button>
 
-        <h1 className="text-2xl font-bold text-[#F5F5F5] mb-8">Settings</h1>
+        {/* Sign out lives in the header, not at the foot of the page.
+            It was originally a section after Security, which put it below a
+            three-field password form and off the bottom of the viewport — the
+            one action people come to this page looking for was the hardest thing
+            on it to find. Up here it is visible the moment the page opens, with
+            no scrolling, on any height. */}
+        <div className="flex items-center justify-between gap-4 mb-8">
+          <h1 className="text-2xl font-bold text-[#F5F5F5]">Settings</h1>
+          <button
+            type="button"
+            onClick={handleSignOut}
+            disabled={signingOut}
+            data-testid="settings-logout-button"
+            className="flex items-center gap-2 px-3 py-2 rounded-[6px] border border-[#EF4444]/40 text-[#EF4444] hover:bg-[#EF4444]/10 disabled:opacity-50 text-sm font-medium transition-colors flex-shrink-0"
+          >
+            <LogOut size={16} />
+            {signingOut ? 'Signing out…' : 'Sign out'}
+          </button>
+        </div>
 
         <PageTransition>
           <div className="space-y-8">
@@ -286,25 +304,6 @@ export default function SettingsPage() {
                   {changingPassword ? 'Updating…' : 'Update Password'}
                 </button>
               </form>
-            </section>
-
-            {/* Account.
-                Sign out moved here from the chat sidebar's three-dot menu, which
-                was removed. It sits under Security rather than at the top: it is
-                the one irreversible action on the page, and the previous home
-                put it a single hover away from "New group". */}
-            <section>
-              <h2 className="text-sm font-medium text-[#A3A3A3] uppercase tracking-wider mb-4">Account</h2>
-              <button
-                type="button"
-                onClick={handleSignOut}
-                disabled={signingOut}
-                data-testid="settings-logout-button"
-                className="w-full flex items-center justify-center gap-2 h-10 rounded-[6px] border border-[#EF4444]/40 text-[#EF4444] hover:bg-[#EF4444]/10 disabled:opacity-50 text-sm font-medium transition-colors"
-              >
-                <LogOut size={16} />
-                {signingOut ? 'Signing out…' : 'Sign out'}
-              </button>
             </section>
 
             {/* About */}
