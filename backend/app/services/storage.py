@@ -15,13 +15,27 @@ import anyio
 import pypdfium2 as pdfium
 from minio import Minio
 from minio.credentials import IamAwsProvider
-from PIL import Image
+from PIL import Image, ImageFile
 
 from app.core.config import get_settings
 
 # Decompression-bomb guard: cap decoded pixels well below a memory-exhaustion
 # threshold. A crafted small file can otherwise claim huge dimensions.
 Image.MAX_IMAGE_PIXELS = 40_000_000  # ~40 MP
+
+# Required by the `optimize=True` JPEG saves below.
+#
+# With optimize (or progressive) Pillow encodes the whole scan into ONE buffer
+# rather than streaming tiles, and raises "broken data stream when writing image
+# file" if that buffer exceeds MAXBLOCK — 64 KB by default. A 720px 4:4:4
+# thumbnail is several times that, so raising the thumbnail size turned this into
+# a real failure: two of nineteen local images produced no thumbnail at all, and
+# the exception was swallowed by make_thumbnail's except-return-None. Pillow's own
+# documentation prescribes exactly this for the case.
+#
+# 32 MB comfortably covers both a THUMB_PX thumbnail and a PDF_PAGE_PX page, and
+# is a buffer ceiling rather than a steady allocation.
+ImageFile.MAXBLOCK = 32 * 1024 * 1024
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".m4v"}
@@ -151,8 +165,31 @@ async def put_object(key: str, data: bytes, content_type: str) -> None:
     await anyio.to_thread.run_sync(_put)
 
 
+# Long edge for the in-bubble image preview.
+#
+# Sized from what it is DRAWN into, not picked round: ImageBubble renders a
+# single image at up to 330x300 CSS px, which is 660x600 device px on a 2x
+# display. The old 200px thumbnail was upscaled more than threefold there, which
+# is why photos and any text inside them looked soft. 720 covers the 2x case with
+# headroom and still costs a fraction of the original.
+#
+# Image.thumbnail() only ever shrinks, so a smaller original is left at its own
+# size rather than being blown up.
+THUMB_PX = 720
+# 85 over 80, with DEFAULT (4:2:0) chroma.
+#
+# 4:4:4 was measured against 4:2:0 on real attachments before choosing: on a
+# 3024x2268 camera photo it cost 449 KB against 244 KB, and on a screenshot 36 KB
+# against 33 KB. Photographic content gains nothing perceptually from full chroma,
+# so that is a doubling for nothing on exactly the largest files. Text-heavy
+# images — screenshots — are small either way, and their sharpness comes from the
+# resolution increase rather than the chroma. The PDF path keeps 4:4:4, where the
+# content is entirely type and the cost is demonstrably low.
+THUMB_QUALITY = 85
+
+
 async def make_thumbnail(data: bytes) -> bytes | None:
-    """200px JPEG thumbnail, transparent pixels flattened onto the app bg."""
+    """Bubble-sized JPEG thumbnail, transparent pixels flattened onto the app bg."""
 
     def _thumb() -> bytes | None:
         try:
@@ -160,7 +197,9 @@ async def make_thumbnail(data: bytes) -> bytes | None:
             # Reject decompression bombs by declared dimensions before decoding.
             if img.size[0] * img.size[1] > Image.MAX_IMAGE_PIXELS:
                 return None
-            img.thumbnail((200, 200))
+            # LANCZOS explicitly: Pillow's default for thumbnail() is BICUBIC,
+            # which is visibly softer on the fine detail this is meant to keep.
+            img.thumbnail((THUMB_PX, THUMB_PX), Image.LANCZOS)
             if img.mode in ("RGBA", "P", "LA"):
                 background = Image.new("RGB", img.size, (26, 26, 26))
                 img = img.convert("RGBA")
@@ -169,7 +208,7 @@ async def make_thumbnail(data: bytes) -> bytes | None:
             elif img.mode != "RGB":
                 img = img.convert("RGB")
             buf = io.BytesIO()
-            img.save(buf, "JPEG", quality=80)
+            img.save(buf, "JPEG", quality=THUMB_QUALITY, optimize=True)
             return buf.getvalue()
         except Exception:
             return None
@@ -184,8 +223,16 @@ async def make_thumbnail(data: bytes) -> bytes | None:
 # rejected: a virtualised scrollback of ten 20MB PDFs would download 200MB just
 # to draw ten thumbnails.
 
-PDF_THUMB_PX = 400    # page-1 preview inside the bubble
+# Page-1 preview inside the bubble. DocumentBubble draws it at 280x150 CSS px —
+# 560x300 device px at 2x — and crops with object-cover, so the old 400px long
+# edge (about 283px wide for portrait A4) was being upscaled roughly twofold.
+# 1000 puts a portrait page at ~707px wide, which covers the 2x case.
+PDF_THUMB_PX = 1000
 PDF_PAGE_PX = 1600    # long edge for full-viewer pages
+# Higher than the photo path and with 4:4:4 chroma. A PDF is text by definition,
+# and subsampled chroma is what makes small type look smeared rather than merely
+# small.
+PDF_QUALITY = 88
 # Hard clamp. The page count comes out of a parser fed untrusted input, so a
 # hostile file reporting a huge count would otherwise turn the count itself into
 # an attack on both the DOM and the per-page endpoint.
@@ -210,7 +257,7 @@ def _render_pdf_page(page, long_px: int) -> bytes:
     bitmap = page.render(scale=scale, draw_annots=False, may_draw_forms=False)
     img = bitmap.to_pil().convert("RGB")
     buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=80)
+    img.save(buf, "JPEG", quality=PDF_QUALITY, optimize=True, subsampling=0)
     return buf.getvalue()
 
 
