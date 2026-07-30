@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { MessageSquarePlus, Users, MoreVertical, Search, LogOut, User, Settings } from 'lucide-react';
+import { motion } from 'framer-motion';
+import { MessageSquarePlus, Users, Search, Settings } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -23,7 +23,7 @@ const FILTER_TABS = [
 ];
 
 export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
-  const { user, logout } = useAuth();
+  const { user } = useAuth();
   const navigate = useNavigate();
   // Narrow selectors: `useChatStore()` subscribed the whole sidebar (and every
   // row in it) to every store write, including message traffic in threads that
@@ -41,7 +41,6 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
   const [activeTab, setActiveTab] = useState('chats');
   const [showNewChat, setShowNewChat] = useState(false);
   const [showCreateGroup, setShowCreateGroup] = useState(false);
-  const [showMenu, setShowMenu] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
   const [showGlobalSearch, setShowGlobalSearch] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -124,12 +123,6 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
     }
   };
 
-  const handleLogout = async () => {
-    await logout();
-    toast.success('Logged out successfully');
-    navigate('/login');
-  };
-
   const handleConversationClick = useCallback((conv) => {
     onSelectConversation(conv._id);
     // Clear the badge immediately; ChatPanel issues the PUT /read for every open
@@ -178,48 +171,22 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
           >
             <Users size={20} />
           </button>
-          <div className="relative">
-            <button
-              onClick={() => setShowMenu(!showMenu)}
-              data-testid="sidebar-menu-button"
-              className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors"
-            >
-              <MoreVertical size={20} />
-            </button>
-            <AnimatePresence>
-              {showMenu && (
-                <>
-                  <div className="fixed inset-0 z-40" onClick={() => setShowMenu(false)} />
-                  <motion.div
-                    initial={{ opacity: 0, scale: 0.95, y: -4 }}
-                    animate={{ opacity: 1, scale: 1, y: 0 }}
-                    exit={{ opacity: 0, scale: 0.95, y: -4 }}
-                    transition={{ duration: 0.15 }}
-                    className="absolute right-0 top-full mt-1 w-48 bg-[#141414] border border-[#1F1F1F] rounded-[8px] shadow-lg z-50 py-1"
-                  >
-                    <button onClick={() => { setShowProfile(true); setShowMenu(false); }} className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-[#A3A3A3] hover:bg-[#1A1A1A] hover:text-[#F5F5F5] transition-colors">
-                      <User size={16} /> Profile
-                    </button>
-                    <button onClick={() => { setShowMenu(false); navigate('/settings'); }} className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-[#A3A3A3] hover:bg-[#1A1A1A] hover:text-[#F5F5F5] transition-colors">
-                      <Settings size={16} /> Settings
-                    </button>
-                    {/* "Manage Organization" used to live here. It is now the
-                        Admin tab in the header above — persistently visible and
-                        symmetric with the Chat tab on the admin side, rather
-                        than buried one click deep in this menu. */}
-                    <div className="border-t border-[#1F1F1F] my-1" />
-                    <button
-                      onClick={handleLogout}
-                      data-testid="chat-logout-button"
-                      className="w-full flex items-center gap-3 px-4 py-2.5 text-sm text-[#EF4444] hover:bg-[#EF4444]/10 transition-colors"
-                    >
-                      <LogOut size={16} /> Logout
-                    </button>
-                  </motion.div>
-                </>
-              )}
-            </AnimatePresence>
-          </div>
+          {/* Settings, opened directly.
+              This replaces a three-dot menu whose only contents were Profile,
+              Settings and Logout. Profile was already reachable by tapping the
+              avatar to the left, so the menu mostly existed to hide two links
+              behind an extra click. Logout now lives on the Settings page, which
+              is where a destructive account action belongs — next to the account
+              it acts on, rather than one hover away from "New group". */}
+          <button
+            onClick={() => navigate('/settings')}
+            data-testid="sidebar-settings-button"
+            aria-label="Settings"
+            title="Settings"
+            className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors"
+          >
+            <Settings size={20} />
+          </button>
         </div>
       </div>
 

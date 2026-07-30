@@ -4,8 +4,23 @@ import { micErrorMessage, pickAudioFormat } from '../utils/audioFormat';
 /**
  * Voice-note recorder.
  *
- * States: 'idle' -> 'recording' -> 'preview' (a finished blob awaiting send).
- * cancel() from either non-idle state discards the blob and releases the mic.
+ * States: 'idle' -> 'recording' <-> 'paused' -> 'preview'.
+ *
+ * PAUSED is the review stage. MediaRecorder.pause()/resume() keeps ONE recorder
+ * and one chunk array alive, so resuming appends to the same take rather than
+ * producing a second file that would then have to be concatenated — which is not
+ * generally possible for webm/mp4 without a remux. The user can therefore listen
+ * back mid-recording and carry on, and Send still uploads a single continuous
+ * file.
+ *
+ * The paused preview is built from the chunks captured SO FAR, after a
+ * requestData() flush. Chunk 0 carries the container header, so the partial blob
+ * is normally playable. It is best-effort: Safari records audio/mp4, whose moov
+ * atom is only written on stop, so a partial preview there may refuse to play.
+ * That degrades to "cannot preview yet" and never affects the sent file, which
+ * is always assembled from a completed stop().
+ *
+ * cancel() from any non-idle state discards the blob and releases the mic.
  *
  * Elapsed time is measured by WALL CLOCK, not by reading the recorded file.
  * MediaRecorder writes streaming containers with no duration in the header, so
@@ -26,12 +41,26 @@ export function useAudioRecorder() {
   const recorderRef = useRef(null);
   const streamRef = useRef(null);
   const chunksRef = useRef([]);
-  const startedAtRef = useRef(0);
+  // Elapsed excludes paused time: `accumulated` is the total of finished
+  // segments, `segmentStart` the wall clock of the live one.
+  const accumulatedRef = useRef(0);
+  const segmentStartRef = useRef(0);
   const tickRef = useRef(null);
   const formatRef = useRef(null);
   // Set when the user cancels, so the recorder's onstop knows to throw the audio
   // away instead of promoting it to a preview.
   const discardRef = useRef(false);
+
+  /** Total recorded milliseconds, excluding time spent paused. */
+  const elapsedNow = useCallback(
+    () => accumulatedRef.current + (segmentStartRef.current ? Date.now() - segmentStartRef.current : 0),
+    []
+  );
+
+  const startTick = useCallback(
+    () => setInterval(() => setElapsed(elapsedNow() / 1000), 200),
+    [elapsedNow]
+  );
 
   const releaseStream = useCallback(() => {
     if (tickRef.current) {
@@ -92,7 +121,7 @@ export function useAudioRecorder() {
       };
 
       recorder.onstop = () => {
-        const seconds = (Date.now() - startedAtRef.current) / 1000;
+        const seconds = elapsedNow() / 1000;
         const chunks = chunksRef.current;
         chunksRef.current = [];
         releaseStream();
@@ -121,15 +150,14 @@ export function useAudioRecorder() {
 
       recorderRef.current = recorder;
       streamRef.current = stream;
-      startedAtRef.current = Date.now();
+      accumulatedRef.current = 0;
+      segmentStartRef.current = Date.now();
       setElapsed(0);
       // 1s timeslices so a long recording is not one giant final chunk, which
       // also means a crash mid-recording loses only the last second.
       recorder.start(1000);
       setState('recording');
-      tickRef.current = setInterval(() => {
-        setElapsed((Date.now() - startedAtRef.current) / 1000);
-      }, 200);
+      tickRef.current = startTick();
       return { ok: true, error: null };
     } catch (err) {
       // MediaRecorder construction can still fail even after isTypeSupported.
@@ -138,11 +166,83 @@ export function useAudioRecorder() {
     }
   }, [state, releaseStream]);
 
-  /** Finish recording and move to preview. */
+  /**
+   * Pause and build a preview of what has been captured so far.
+   *
+   * requestData() first: without it the current timeslice is still buffered
+   * inside the recorder and the preview would be up to a second short of what
+   * the user just said. ondataavailable is synchronous enough in practice, but
+   * the blob is assembled on the next tick so the flushed chunk has landed.
+   */
+  const pause = useCallback(() => {
+    const rec = recorderRef.current;
+    if (!rec || rec.state !== 'recording') return;
+
+    accumulatedRef.current = elapsedNow();
+    segmentStartRef.current = 0;
+    if (tickRef.current) {
+      clearInterval(tickRef.current);
+      tickRef.current = null;
+    }
+    try {
+      rec.requestData();
+    } catch {
+      // Not all implementations allow requestData while recording; the preview
+      // is then simply one timeslice behind.
+    }
+    rec.pause();
+
+    setTimeout(() => {
+      const format = formatRef.current;
+      if (!format) return;
+      const blob = new Blob(chunksRef.current, { type: format.mimeType });
+      setResult((prev) => {
+        if (prev?.url) URL.revokeObjectURL(prev.url);
+        return blob.size === 0
+          ? null
+          : {
+              blob,
+              url: URL.createObjectURL(blob),
+              mimeType: format.mimeType,
+              extension: format.extension,
+              duration: accumulatedRef.current / 1000,
+              // Flags a preview assembled mid-recording. The sent file is always
+              // built from a completed stop(), never from this.
+              partial: true,
+            };
+      });
+      setElapsed(accumulatedRef.current / 1000);
+      setState('paused');
+    }, 0);
+  }, [elapsedNow]);
+
+  /** Carry on recording into the SAME take. */
+  const resume = useCallback(() => {
+    const rec = recorderRef.current;
+    if (!rec || rec.state !== 'paused') return;
+    // The preview URL is dropped here rather than on the next pause: leaving it
+    // alive would let the bar keep showing a player for audio that is now stale.
+    setResult((prev) => {
+      if (prev?.url) URL.revokeObjectURL(prev.url);
+      return null;
+    });
+    segmentStartRef.current = Date.now();
+    rec.resume();
+    setState('recording');
+    tickRef.current = startTick();
+  }, [startTick]);
+
+  /** Finish recording and move to the final preview. */
   const stop = useCallback(() => {
     const rec = recorderRef.current;
     if (!rec || rec.state === 'inactive') return;
     discardRef.current = false;
+    // A paused recorder must be resumed before stop(), or Chrome fires onstop
+    // without flushing the final buffered chunk.
+    if (rec.state === 'paused') {
+      segmentStartRef.current = Date.now();
+      rec.resume();
+    }
     rec.stop();
   }, []);
 
@@ -151,6 +251,9 @@ export function useAudioRecorder() {
     const rec = recorderRef.current;
     if (rec && rec.state !== 'inactive') {
       discardRef.current = true;
+      // Same reason as stop(): a paused recorder has to be resumed before it
+      // will fire onstop reliably.
+      if (rec.state === 'paused') rec.resume();
       rec.stop();
       return;
     }
@@ -159,6 +262,8 @@ export function useAudioRecorder() {
       if (prev?.url) URL.revokeObjectURL(prev.url);
       return null;
     });
+    accumulatedRef.current = 0;
+    segmentStartRef.current = 0;
     setState('idle');
     setElapsed(0);
   }, [releaseStream]);
@@ -169,11 +274,13 @@ export function useAudioRecorder() {
       if (prev?.url) URL.revokeObjectURL(prev.url);
       return null;
     });
+    accumulatedRef.current = 0;
+    segmentStartRef.current = 0;
     setState('idle');
     setElapsed(0);
   }, []);
 
-  return { state, elapsed, result, start, stop, cancel, reset };
+  return { state, elapsed, result, start, pause, resume, stop, cancel, reset };
 }
 
 export default useAudioRecorder;

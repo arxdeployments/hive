@@ -107,6 +107,9 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   const sendingFilesRef = useRef(false);
   const sendingTextRef = useRef(false);
   const sendingVoiceRef = useRef(false);
+  // Set when Send was pressed while paused, so the finalised recording is
+  // uploaded as soon as the recorder promotes it to 'preview'.
+  const sendAfterStopRef = useRef(false);
 
   // Voice notes. `micSupported` is computed once: without MediaRecorder, without
   // getUserMedia, or outside a secure context the button is hidden rather than
@@ -385,8 +388,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     if (!ok && error) toast.error(error);
   };
 
-  const handleSendVoice = async () => {
-    const rec = recorder.result;
+  const uploadVoice = useCallback(async (rec) => {
     if (!rec || !conversationId) return;
     // Same reentrancy guard as text and files: the button is disabled while
     // sending, but a double-click can land before React re-renders.
@@ -410,6 +412,46 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
       setVoiceSending(false);
       sendingVoiceRef.current = false;
     }
+  }, [conversationId, replyTo, recorder, sendMediaFile]);
+
+  /**
+   * Completes a send that was requested while paused.
+   *
+   * handleSendVoice cannot simply await recorder.stop(): finalising is driven by
+   * MediaRecorder's onstop callback, so the completed blob only exists a tick
+   * later, once the hook has promoted the state to 'preview'. This picks it up
+   * then. The flag is cleared first so a failed upload does not re-fire.
+   */
+  useEffect(() => {
+    if (!sendAfterStopRef.current) return;
+    if (recorder.state !== 'preview' || !recorder.result) return;
+    sendAfterStopRef.current = false;
+    uploadVoice(recorder.result);
+  }, [recorder.state, recorder.result, uploadVoice]);
+
+  /**
+   * Send from either review stage.
+   *
+   * From `paused`, the blob currently on screen is a PARTIAL preview assembled
+   * mid-recording — it may be missing a trailing container atom and, on Safari,
+   * may not even play. It must never be what gets uploaded. So a paused send
+   * finalises the recording first and lets the effect above pick up the
+   * completed result. Sending is what the user asked for either way; the stop is
+   * invisible to them.
+   *
+   * Declared after uploadVoice deliberately: no-use-before-define is enabled in
+   * this project because a dependency array that referenced a later `const`
+   * once crashed the whole chat pane at mount.
+   */
+  const handleSendVoice = async () => {
+    if (recorder.state === 'paused') {
+      if (sendingVoiceRef.current) return;
+      setVoiceSending(true);
+      sendAfterStopRef.current = true;
+      recorder.stop();
+      return;
+    }
+    await uploadVoice(recorder.result);
   };
 
   // ── Confirm Send ──────────────────────────────────────────────────────────
@@ -736,7 +778,9 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
           stage={recorder.state}
           elapsed={recorder.elapsed}
           result={recorder.result}
-          onCancel={recorder.cancel}
+          onCancel={() => { sendAfterStopRef.current = false; recorder.cancel(); }}
+          onPause={recorder.pause}
+          onResume={recorder.resume}
           onStop={recorder.stop}
           onSend={handleSendVoice}
           sending={voiceSending}

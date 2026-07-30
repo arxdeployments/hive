@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { ArrowLeft, Bell, BellOff, Keyboard, Type, Lock, Eye, EyeOff } from 'lucide-react';
+import { ArrowLeft, Bell, BellOff, Keyboard, Type, Lock, Eye, EyeOff, LogOut } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
 import { PageTransition } from '../components/common/PageTransition';
 import client from '../api/client';
 import { enablePushNotifications, disablePushNotifications } from '../lib/pwa';
+import { useAuth } from '../contexts/AuthContext';
 
 const FONT_PX = { small: '14px', medium: '16px', large: '18px' };
 const FONT_SCALE = { small: 0.9, medium: 1, large: 1.12 };
@@ -38,6 +39,8 @@ const Toggle = ({ checked, onChange }) => (
 );
 
 export default function SettingsPage() {
+  const { logout } = useAuth();
+  const [signingOut, setSigningOut] = useState(false);
   const navigate = useNavigate();
   const [notifSound, setNotifSound] = useState(() => localStorage.getItem('rxhive_notif_sound') !== 'false');
   const [desktopNotif, setDesktopNotif] = useState(() => localStorage.getItem('rxhive_desktop_notif') !== 'false');
@@ -132,6 +135,20 @@ export default function SettingsPage() {
 
   const pwInputClass =
     'w-full h-10 pl-10 pr-10 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#525252] focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all';
+
+  const handleSignOut = async () => {
+    if (signingOut) return;
+    setSigningOut(true);
+    try {
+      await logout();
+      toast.success('Signed out');
+      navigate('/login');
+    } finally {
+      // Not reset on success — the route change unmounts this — but a failed
+      // logout still clears local state, so the button must not stay stuck.
+      setSigningOut(false);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-[#0A0A0A]">
@@ -269,6 +286,25 @@ export default function SettingsPage() {
                   {changingPassword ? 'Updating…' : 'Update Password'}
                 </button>
               </form>
+            </section>
+
+            {/* Account.
+                Sign out moved here from the chat sidebar's three-dot menu, which
+                was removed. It sits under Security rather than at the top: it is
+                the one irreversible action on the page, and the previous home
+                put it a single hover away from "New group". */}
+            <section>
+              <h2 className="text-sm font-medium text-[#A3A3A3] uppercase tracking-wider mb-4">Account</h2>
+              <button
+                type="button"
+                onClick={handleSignOut}
+                disabled={signingOut}
+                data-testid="settings-logout-button"
+                className="w-full flex items-center justify-center gap-2 h-10 rounded-[6px] border border-[#EF4444]/40 text-[#EF4444] hover:bg-[#EF4444]/10 disabled:opacity-50 text-sm font-medium transition-colors"
+              >
+                <LogOut size={16} />
+                {signingOut ? 'Signing out…' : 'Sign out'}
+              </button>
             </section>
 
             {/* About */}

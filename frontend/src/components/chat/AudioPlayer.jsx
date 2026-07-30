@@ -18,7 +18,15 @@ import { formatDuration } from '../../utils/audioFormat';
  * Only one player sounds at a time: starting one pauses every other, via a
  * module-level registry rather than a context, so a bubble deep in a virtualised
  * list needs no provider above it.
+ *
+ * Playback rate cycles 1x -> 1.5x -> 2x -> 1x on one button. A cycling control
+ * rather than a menu because there are only three values and the common gesture
+ * is "faster, faster, back" — a dropdown would cost two interactions per step.
+ * preservesPitch keeps a sped-up voice intelligible rather than chipmunked,
+ * which matters when the content is clinical.
  */
+
+const RATES = [1, 1.5, 2];
 
 const playing = new Set();
 
@@ -33,6 +41,7 @@ export const AudioPlayer = ({ src, fallbackDuration = null, tone = 'dark', class
   const [isPlaying, setIsPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const [intrinsic, setIntrinsic] = useState(null);
+  const [rate, setRate] = useState(1);
 
   const total = (() => {
     if (Number.isFinite(fallbackDuration) && fallbackDuration > 0) return fallbackDuration;
@@ -70,6 +79,23 @@ export const AudioPlayer = ({ src, fallbackDuration = null, tone = 'dark', class
       playing.delete(el);
     };
   }, [src]);
+
+  // Re-applied on src change too: a new <audio> src resets playbackRate to 1,
+  // so without this the badge would say 2x while the audio played at normal
+  // speed — the recorder swaps src every time the preview is rebuilt.
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    el.playbackRate = rate;
+    // Vendor-prefixed on Safari. Without it a 2x voice note is comically
+    // high-pitched and much harder to understand.
+    if ('preservesPitch' in el) el.preservesPitch = true;
+    if ('webkitPreservesPitch' in el) el.webkitPreservesPitch = true;
+  }, [rate, src]);
+
+  const cycleRate = useCallback(() => {
+    setRate((prev) => RATES[(RATES.indexOf(prev) + 1) % RATES.length]);
+  }, []);
 
   const toggle = useCallback(() => {
     const el = audioRef.current;
@@ -124,6 +150,22 @@ export const AudioPlayer = ({ src, fallbackDuration = null, tone = 'dark', class
         disabled={!total}
         className={`flex-1 h-1 min-w-0 cursor-pointer ${track} disabled:cursor-default`}
       />
+      <button
+        type="button"
+        onClick={cycleRate}
+        aria-label={`Playback speed ${rate}x, tap to change`}
+        title={`Playback speed: ${rate}x`}
+        data-testid="audio-speed-toggle"
+        className={`px-1.5 py-0.5 rounded-[4px] text-[10px] font-medium tabular-nums flex-shrink-0 transition-colors ${
+          rate === 1
+            ? `${label} hover:bg-white/10`
+            : own
+              ? 'bg-white/25 text-white'
+              : 'bg-[#10B981]/20 text-[#10B981]'
+        }`}
+      >
+        {rate}x
+      </button>
       <span className={`text-[11px] tabular-nums flex-shrink-0 ${label}`} data-testid="audio-duration">
         {formatDuration(shown)}
       </span>
