@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 /**
  * Waveforms for the voice-note UI.
@@ -22,7 +22,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
  * telling.
  */
 
-const BAR_W = 3;
+const BAR_W = 2;
 const GAP = 2;
 
 /** Nearest even split of a Uint8 time-domain buffer into an RMS level 0..1. */
@@ -186,19 +186,85 @@ export const PeaksWaveform = ({
     return () => { cancelled = true; };
   }, [src, barCount]);
 
-  const bars = useMemo(
-    () => peaks || Array.from({ length: barCount }, () => 0.35),
-    [peaks, barCount]
-  );
+  const canvasRef = useRef(null);
 
-  const own = tone === 'own';
-  const playedColor = own ? 'bg-white' : 'bg-[#10B981]';
-  const restColor = own ? 'bg-white/35' : 'bg-[#A3A3A3]/40';
+  /**
+   * Canvas, not a row of flex divs.
+   *
+   * The DOM version gave every bar a 2px min-width, so 56 bars plus their gaps
+   * floored the component's min-content at ~222px. Inside a 260px bubble — which
+   * after the mic badge, play button, speed badge and duration leaves roughly
+   * 92px — flex could not shrink below that floor, so the waveform drew straight
+   * through the duration and out past the bubble's right edge.
+   *
+   * A canvas cannot do that: it paints inside its own box, and its box is
+   * whatever CSS gives it. Overflow becomes structurally impossible rather than
+   * something to keep tuning. Bar COUNT is then derived from the measured width,
+   * so the same component is dense in a wide preview and sparse in a narrow
+   * bubble without either overflowing or leaving a gap.
+   */
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const wrap = wrapRef.current;
+    if (!canvas || !wrap) return undefined;
+
+    const own = tone === 'own';
+    const played = own ? '#FFFFFF' : '#10B981';
+    const rest = own ? 'rgba(255,255,255,0.38)' : 'rgba(163,163,163,0.45)';
+
+    const draw = () => {
+      const cssW = canvas.clientWidth;
+      const cssH = canvas.clientHeight;
+      if (cssW <= 0 || cssH <= 0) return;
+      const dpr = window.devicePixelRatio || 1;
+      if (canvas.width !== cssW * dpr || canvas.height !== cssH * dpr) {
+        canvas.width = cssW * dpr;
+        canvas.height = cssH * dpr;
+      }
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssW, cssH);
+
+      const count = Math.max(1, Math.floor(cssW / (BAR_W + GAP)));
+      // Centre the row in whatever space is left over, so the bars never touch
+      // the elements either side of them.
+      const used = count * BAR_W + (count - 1) * GAP;
+      const originX = Math.max(0, (cssW - used) / 2);
+      const mid = cssH / 2;
+      const rounded = typeof ctx.roundRect === 'function';
+
+      for (let i = 0; i < count; i += 1) {
+        // Resample whatever peak data we have onto the bars that actually fit.
+        const level = peaks && peaks.length
+          ? peaks[Math.floor((i / count) * peaks.length)] ?? 0.35
+          : 0.35;
+        const h = Math.max(2, Math.min(cssH - 2, level * (cssH - 4)));
+        const x = originX + i * (BAR_W + GAP);
+        ctx.fillStyle = (i + 0.5) / count <= progress ? played : rest;
+        if (rounded) {
+          ctx.beginPath();
+          ctx.roundRect(x, mid - h / 2, BAR_W, h, BAR_W / 2);
+          ctx.fill();
+        } else {
+          ctx.fillRect(x, mid - h / 2, BAR_W, h);
+        }
+      }
+    };
+
+    draw();
+    // Redraw on resize: the bubble is a fixed width today, but the pre-send
+    // preview stretches with the composer and the bar count is width-derived.
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(draw) : null;
+    ro?.observe(wrap);
+    return () => ro?.disconnect();
+  }, [peaks, progress, tone]);
 
   const seekTo = (clientX) => {
     const el = wrapRef.current;
     if (!el || !onSeek) return;
     const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return;
     onSeek(Math.min(1, Math.max(0, (clientX - rect.left) / rect.width)));
   };
 
@@ -217,17 +283,11 @@ export const PeaksWaveform = ({
         if (e.key === 'ArrowLeft') onSeek?.(Math.max(0, progress - 0.05));
       }}
       data-testid="peaks-waveform"
-      className={`flex items-center gap-[2px] h-8 cursor-pointer select-none outline-none ${className}`}
+      // min-w-0 lets flex shrink this below its content, and overflow-hidden is
+      // the belt to the canvas's braces.
+      className={`relative h-8 min-w-0 overflow-hidden cursor-pointer select-none outline-none ${className}`}
     >
-      {bars.map((level, i) => (
-        <span
-          key={i}
-          className={`flex-1 rounded-full transition-colors ${
-            i / bars.length <= progress ? playedColor : restColor
-          }`}
-          style={{ height: `${Math.max(3, level * 28)}px`, minWidth: 2 }}
-        />
-      ))}
+      <canvas ref={canvasRef} className="block w-full h-full" aria-hidden="true" />
     </div>
   );
 };
