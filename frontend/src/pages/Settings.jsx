@@ -1,11 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { ArrowLeft, Bell, BellOff, Keyboard, Type, Lock, Eye, EyeOff, LogOut } from 'lucide-react';
+import { ArrowLeft, Bell, BellOff, Keyboard, Type, Lock, Eye, EyeOff } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
 import { PageTransition } from '../components/common/PageTransition';
 import client from '../api/client';
 import { enablePushNotifications, disablePushNotifications } from '../lib/pwa';
-import { useAuth } from '../contexts/AuthContext';
 
 const FONT_PX = { small: '14px', medium: '16px', large: '18px' };
 const FONT_SCALE = { small: 0.9, medium: 1, large: 1.12 };
@@ -39,8 +38,6 @@ const Toggle = ({ checked, onChange }) => (
 );
 
 export default function SettingsPage() {
-  const { logout } = useAuth();
-  const [signingOut, setSigningOut] = useState(false);
   const navigate = useNavigate();
   const [notifSound, setNotifSound] = useState(() => localStorage.getItem('rxhive_notif_sound') !== 'false');
   const [desktopNotif, setDesktopNotif] = useState(() => localStorage.getItem('rxhive_desktop_notif') !== 'false');
@@ -136,20 +133,6 @@ export default function SettingsPage() {
   const pwInputClass =
     'w-full h-10 pl-10 pr-10 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#525252] focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all';
 
-  const handleSignOut = async () => {
-    if (signingOut) return;
-    setSigningOut(true);
-    try {
-      await logout();
-      toast.success('Signed out');
-      navigate('/login');
-    } finally {
-      // Not reset on success — the route change unmounts this — but a failed
-      // logout still clears local state, so the button must not stay stuck.
-      setSigningOut(false);
-    }
-  };
-
   return (
     <div className="min-h-screen bg-[#0A0A0A]">
       <div className="max-w-[500px] mx-auto p-6">
@@ -159,25 +142,9 @@ export default function SettingsPage() {
           <ArrowLeft size={16} /> Back to Chat
         </button>
 
-        {/* Sign out lives in the header, not at the foot of the page.
-            It was originally a section after Security, which put it below a
-            three-field password form and off the bottom of the viewport — the
-            one action people come to this page looking for was the hardest thing
-            on it to find. Up here it is visible the moment the page opens, with
-            no scrolling, on any height. */}
-        <div className="flex items-center justify-between gap-4 mb-8">
-          <h1 className="text-2xl font-bold text-[#F5F5F5]">Settings</h1>
-          <button
-            type="button"
-            onClick={handleSignOut}
-            disabled={signingOut}
-            data-testid="settings-logout-button"
-            className="flex items-center gap-2 px-3 py-2 rounded-[6px] border border-[#EF4444]/40 text-[#EF4444] hover:bg-[#EF4444]/10 disabled:opacity-50 text-sm font-medium transition-colors flex-shrink-0"
-          >
-            <LogOut size={16} />
-            {signingOut ? 'Signing out…' : 'Sign out'}
-          </button>
-        </div>
+        {/* Sign out is NOT here. It lives in the profile drawer, which is the
+            account surface — one home for it, not two. */}
+        <h1 className="text-2xl font-bold text-[#F5F5F5] mb-8">Settings</h1>
 
         <PageTransition>
           <div className="space-y-8">
