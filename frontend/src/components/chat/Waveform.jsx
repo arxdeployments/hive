@@ -22,8 +22,14 @@ import React, { useEffect, useRef, useState } from 'react';
  * telling.
  */
 
-const BAR_W = 2;
-const GAP = 2;
+// Bar geometry, in CSS pixels. The pitch (BAR_W + GAP) is what sets density:
+// at 2.5px a 98px bubble waveform draws ~39 bars where a 4px pitch drew 24.
+// Fractional widths are fine because both canvases scale by devicePixelRatio —
+// 1.5 CSS px is a crisp 3 device px on a retina screen, and softens slightly on
+// a 1x display, which is the right trade for matching the reference's density.
+// These are the two numbers to change if the look needs tuning.
+const BAR_W = 1.5;
+const GAP = 1;
 
 /** Nearest even split of a Uint8 time-domain buffer into an RMS level 0..1. */
 const rmsOf = (buf) => {
@@ -80,7 +86,12 @@ export const LiveWaveform = ({ stream, paused = false, className = '' }) => {
 
       // Push a new bar on a fixed cadence rather than every frame, so the
       // waveform scrolls at the same speed regardless of refresh rate.
-      if (!paused && now - lastPush > 55) {
+      //
+      // 38ms, tightened from 55ms when the bars got narrower: the cadence sets
+      // scroll speed in pixels per second, so a 2.5px pitch at the old rate
+      // crawled compared with the 4px pitch it replaced. It also samples the
+      // microphone more finely, which is what thinner bars are for.
+      if (!paused && now - lastPush > 38) {
         lastPush = now;
         analyser.getByteTimeDomainData(buf);
         // Gain then clamp: speech RMS sits low (~0.05-0.25), so the raw value
