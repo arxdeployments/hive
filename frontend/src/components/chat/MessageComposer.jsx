@@ -778,6 +778,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
           stage={recorder.state}
           elapsed={recorder.elapsed}
           result={recorder.result}
+          stream={recorder.stream}
           onCancel={() => { sendAfterStopRef.current = false; recorder.cancel(); }}
           onPause={recorder.pause}
           onResume={recorder.resume}

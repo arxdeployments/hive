@@ -37,6 +37,9 @@ export function useAudioRecorder() {
   const [state, setState] = useState('idle');
   const [elapsed, setElapsed] = useState(0);
   const [result, setResult] = useState(null); // { blob, url, mimeType, extension, duration }
+  // Exposed as STATE, not just the ref below: the live waveform needs to mount
+  // an AnalyserNode when the stream appears, which means a render.
+  const [stream, setStream] = useState(null);
 
   const recorderRef = useRef(null);
   const streamRef = useRef(null);
@@ -71,6 +74,7 @@ export function useAudioRecorder() {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     }
+    setStream(null);
     recorderRef.current = null;
   }, []);
 
@@ -150,6 +154,7 @@ export function useAudioRecorder() {
 
       recorderRef.current = recorder;
       streamRef.current = stream;
+      setStream(stream);
       accumulatedRef.current = 0;
       segmentStartRef.current = Date.now();
       setElapsed(0);
@@ -280,7 +285,7 @@ export function useAudioRecorder() {
     setElapsed(0);
   }, []);
 
-  return { state, elapsed, result, start, pause, resume, stop, cancel, reset };
+  return { state, elapsed, result, stream, start, pause, resume, stop, cancel, reset };
 }
 
 export default useAudioRecorder;

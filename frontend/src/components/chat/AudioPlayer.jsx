@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Play, Pause } from 'lucide-react';
 import { formatDuration } from '../../utils/audioFormat';
+import { PeaksWaveform } from './Waveform';
 
 /**
  * Play/pause + scrubbable progress + length, shared by the pre-send preview and
@@ -108,23 +109,21 @@ export const AudioPlayer = ({ src, fallbackDuration = null, tone = 'dark', class
     }
   }, []);
 
-  const seek = useCallback((e) => {
+  const seek = useCallback((fraction) => {
     const el = audioRef.current;
     if (!el || !total) return;
-    const next = (Number(e.target.value) / 1000) * total;
+    const next = Math.min(total, Math.max(0, fraction * total));
     el.currentTime = next;
     setPosition(next);
   }, [total]);
 
   const own = tone === 'own';
   const accent = own ? 'text-white' : 'text-[#10B981]';
-  const track = own ? 'accent-white' : 'accent-[#10B981]';
   const label = own ? 'text-white/70' : 'text-[#A3A3A3]';
 
   // Remaining while playing, total while idle — the WhatsApp behaviour, and it
   // means the bubble always shows a length even before playback starts.
   const shown = isPlaying || position > 0 ? Math.max(0, total - position) : total;
-  const sliderValue = total > 0 ? Math.min(1000, (position / total) * 1000) : 0;
 
   return (
     <div className={`flex items-center gap-2 ${className}`} data-testid="audio-player">
@@ -140,15 +139,17 @@ export const AudioPlayer = ({ src, fallbackDuration = null, tone = 'dark', class
       >
         {isPlaying ? <Pause size={14} /> : <Play size={14} />}
       </button>
-      <input
-        type="range"
-        min={0}
-        max={1000}
-        value={sliderValue}
-        onChange={seek}
-        aria-label="Seek"
-        disabled={!total}
-        className={`flex-1 h-1 min-w-0 cursor-pointer ${track} disabled:cursor-default`}
+      {/* Bars, not a range input. The flat line read as a loading bar rather
+          than audio, and gave no sense of where the speech actually is. For the
+          local pre-send preview these are the clip's real peaks; a sent note
+          shows an even row, because decoding every clip in a thread to draw it
+          is not worth the bandwidth — see Waveform.jsx. */}
+      <PeaksWaveform
+        src={src}
+        progress={total > 0 ? Math.min(1, position / total) : 0}
+        onSeek={seek}
+        tone={tone}
+        className="flex-1 min-w-0"
       />
       <button
         type="button"

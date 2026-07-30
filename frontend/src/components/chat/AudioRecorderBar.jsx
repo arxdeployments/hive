@@ -1,6 +1,7 @@
 import React from 'react';
 import { Check, Mic, Pause, Send, Trash2, Loader2 } from 'lucide-react';
 import { AudioPlayer } from './AudioPlayer';
+import { LiveWaveform } from './Waveform';
 import { formatDuration } from '../../utils/audioFormat';
 
 /**
@@ -25,6 +26,7 @@ export const AudioRecorderBar = ({
   stage,
   elapsed,
   result,
+  stream,
   onCancel,
   onPause,
   onResume,
@@ -61,13 +63,17 @@ export const AudioRecorderBar = ({
           />
           <Mic size={16} className="text-[#EF4444] flex-shrink-0" />
           <span
-            className="text-sm text-[#F5F5F5] tabular-nums"
+            className="text-sm text-[#F5F5F5] tabular-nums flex-shrink-0"
             data-testid="audio-elapsed"
             aria-live="polite"
           >
             {formatDuration(elapsed)}
           </span>
-          <span className="text-xs text-[#525252] truncate">Recording…</span>
+          {/* Replaces a static "Recording…" label. Reading your own voice back
+              as moving bars is the only feedback that the microphone is
+              actually picking you up — a timer ticking up looks identical
+              whether the input is live or muted. */}
+          <LiveWaveform stream={stream} className="flex-1 min-w-0" />
         </div>
       ) : (
         <AudioPlayer
