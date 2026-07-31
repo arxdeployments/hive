@@ -3,9 +3,18 @@ import { motion } from 'framer-motion';
 import { Plus, Pencil, Trash2, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
+import { useAuth } from '../../contexts/AuthContext';
 import client from '../../api/client';
 
 export default function OrgAdminDepartments() {
+  const { user: me } = useAuth();
+  // Empty means organization-wide, matching org_admin.managed_dept_ids. A
+  // department-scoped admin cannot add departments: the new one would fall
+  // outside their scope the moment it existed, so it would vanish from this very
+  // table and they could neither staff it nor rename it.
+  const managed = me?.managed_departments || [];
+  const scoped = managed.length > 0;
+
   const [depts, setDepts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
@@ -48,12 +57,21 @@ export default function OrgAdminDepartments() {
   return (
     <PageTransition>
       <div className="max-w-[1200px]">
-        <div className="flex items-center justify-between mb-6">
+        {/* gap-4 and the flex-wrap matter: justify-between with a long text node
+            instead of a button leaves the two children touching as soon as they
+            fill the row, which reads as one run-on sentence. */}
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 mb-6">
           <h2 className="text-lg font-semibold text-[#F5F5F5]">Departments</h2>
-          <button onClick={openCreate}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-[6px] text-sm font-medium border border-[#10B981] text-[#10B981] hover:bg-[#10B981] hover:text-[#0A0A0A] transition-all">
-            <Plus size={16} /> Create Department
-          </button>
+          {scoped ? (
+            <span className="text-xs text-[#A3A3A3] sm:text-right">
+              You manage {managed.length === 1 ? 'this department' : 'these departments'}. Ask a super admin to add more.
+            </span>
+          ) : (
+            <button onClick={openCreate}
+              className="flex items-center gap-2 px-4 py-2.5 rounded-[6px] text-sm font-medium border border-[#10B981] text-[#10B981] hover:bg-[#10B981] hover:text-[#0A0A0A] transition-all">
+              <Plus size={16} /> Create Department
+            </button>
+          )}
         </div>
 
         <div className="bg-[#141414] border border-[#1F1F1F] rounded-[8px] overflow-hidden">
