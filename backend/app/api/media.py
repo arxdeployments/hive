@@ -8,6 +8,8 @@ redirecting to a short-lived presigned URL.
 
 import os
 import re
+
+import anyio
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -34,14 +36,7 @@ from app.utils import iso_z, parse_uuid, sanitize_text
 
 router = APIRouter(prefix="/api", tags=["media"])
 
-_CHUNK_SIZE = 1024 * 1024
-
-_TOO_LARGE_MESSAGES = {
-    "image": "Image too large (max 16MB)",
-    "video": "File too large (max 200MB)",
-    "audio": "File too large (max 200MB)",
-    "document": "File too large (max 100MB)",
-}
+_TOO_LARGE_MESSAGE = "File too large (max 2GB)"
 
 _MEDIA_LIST_TYPES = {"image", "video", "audio", "file"}
 
@@ -107,37 +102,55 @@ async def upload_file(
         raise HTTPException(status_code=400, detail="No file provided")
 
     ext = os.path.splitext(file.filename or "")[1].lower()
+    # Every extension is accepted. classify only decides which bubble renders it.
     file_type = storage.classify(ext)
-    if file_type is None:
-        raise HTTPException(status_code=400, detail="File type not supported")
 
-    limit = storage.size_limit_for(file_type)
-    data = bytearray()
-    while True:
-        chunk = await file.read(_CHUNK_SIZE)
-        if not chunk:
-            break
-        data.extend(chunk)
-        if len(data) > limit:
-            raise HTTPException(status_code=400, detail=_TOO_LARGE_MESSAGES[file_type])
-    payload = bytes(data)
+    # Size from the spooled file rather than by counting bytes as we read them.
+    # Starlette has already streamed the whole request body to a
+    # SpooledTemporaryFile — on disk past 1 MB — so it is complete by the time
+    # this handler runs and seek/tell is exact. The old loop accumulated it into
+    # a bytearray as well, which meant a second full copy in memory; at the
+    # 2 GB ceiling that is the difference between working and killing the
+    # process for every other user on the box.
+    size = file.size
+    if size is None:
+        file.file.seek(0, os.SEEK_END)
+        size = file.file.tell()
+    if size > storage.MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail=_TOO_LARGE_MESSAGE)
+    if size == 0:
+        raise HTTPException(status_code=400, detail="File is empty")
 
-    # Content type from the extension map — the client's Content-Type is never trusted.
+    # Content type from the extension map — the client's Content-Type is never
+    # trusted, and unknown extensions stay application/octet-stream on purpose.
+    #
+    # Load-bearing now that any format is accepted. Media is served from a
+    # SAME-ORIGIN path (see storage.rewrite_to_public) with
+    # Content-Disposition: inline, so a stored type the browser renders is a
+    # stored-XSS primitive on the app's own origin — an uploaded .html or .svg
+    # would execute as us. octet-stream makes the browser download it instead.
+    # Do not "improve" this into mimetypes.guess_type.
     content_type = storage.MIME_BY_EXT.get(ext, "application/octet-stream")
 
     key = storage.new_storage_key(user.org_id, ext)
-    await storage.put_object(key, payload, content_type)
+    await storage.put_stream(key, file.file, size, content_type)
 
-    # Branch on CONTENT TYPE, not file_type: ".pdf" classifies as "document", and
-    # file_type is a key into size_limit_for / _TOO_LARGE_MESSAGES, so inventing a
-    # "pdf" file_type would KeyError there.
+    # Previews need the bytes in memory, so they are the one thing still bounded
+    # by size. Past the bound the upload succeeds without a preview rather than
+    # the request failing — see storage.THUMBNAIL_SOURCE_LIMIT.
     thumbnail_key = None
     page_count = None
     thumb = None
-    if file_type == "image":
-        thumb = await storage.make_thumbnail(payload)
-    elif content_type == "application/pdf":
-        thumb, page_count = await storage.make_pdf_preview(payload)
+    if size <= storage.THUMBNAIL_SOURCE_LIMIT and (
+        file_type == "image" or content_type == "application/pdf"
+    ):
+        file.file.seek(0)
+        payload = await anyio.to_thread.run_sync(file.file.read)
+        if file_type == "image":
+            thumb = await storage.make_thumbnail(payload)
+        else:
+            thumb, page_count = await storage.make_pdf_preview(payload)
+        del payload
     if thumb is not None:
         thumbnail_key = f"{key}_thumb.jpg"
         await storage.put_object(thumbnail_key, thumb, "image/jpeg")
@@ -150,7 +163,7 @@ async def upload_file(
         filename=_safe_filename(file.filename),
         mime_type=content_type,
         file_type=file_type,
-        file_size=len(payload),
+        file_size=size,
         page_count=page_count,
     )
     db.add(upload)

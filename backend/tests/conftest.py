@@ -22,7 +22,7 @@ from urllib.parse import urlparse, urlunparse  # noqa: E402
 
 import pytest  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
-from sqlalchemy import event, select, text  # noqa: E402
+from sqlalchemy import event, text  # noqa: E402
 from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
 
@@ -208,22 +208,14 @@ async def make_user(
     password: str = "TestPass1234",
     display_name: str | None = None,
     mobile_access: bool = False,
-    link_peers: bool = True,
 ) -> User:
-    """Create a user and, by default, make them reachable by their org-mates.
+    """Create a user.
 
-    `link_peers` exists because chat reachability is DENY BY DEFAULT: with no
-    ChatAccessRule a pair cannot hold a conversation at all, so without this
-    every test that sends a message would fail with 403 and would have to grow
-    access-control setup it is not about.
-
-    Granting explicit user-pair rules mirrors what the production migration does
-    for existing relationships, so tests still exercise the real enforcement
-    path rather than a bypass — the rules are genuinely evaluated, they just say
-    yes. Tests ABOUT access control pass link_peers=False and build their own.
-
-    Rules are only created between users of the SAME org, so cross-tenant tests
-    keep failing closed exactly as they should.
+    `link_peers` used to live here, granting each new user explicit
+    ChatAccessRule rows against their org-mates, because reachability was DENY
+    BY DEFAULT and otherwise every messaging test 403'd. Access control is gone:
+    anyone in an organisation may message anyone else in it, so there is nothing
+    left to grant and the parameter would only be a no-op callers had to pass.
     """
     async with SessionLocal() as db:
         user = User(
@@ -239,36 +231,6 @@ async def make_user(
         db.add(user)
         await db.commit()
         await db.refresh(user)
-
-        if link_peers and org_id is not None and role != UserRole.superadmin:
-            from app.db.models import AccessPartyType, ChatAccessRule
-            from app.services.access import canonical_pair
-
-            peers = (
-                (
-                    await db.execute(
-                        select(User.id).where(
-                            User.org_id == org_id,
-                            User.id != user.id,
-                            User.role != UserRole.superadmin,
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            # Only the NEW user is paired with each existing one, so this cannot
-            # collide with the canonical-pair unique constraint.
-            for peer_id in peers:
-                (a_type, a_id), (b_type, b_id) = canonical_pair(
-                    (AccessPartyType.user, user.id), (AccessPartyType.user, peer_id)
-                )
-                db.add(
-                    ChatAccessRule(
-                        org_id=org_id, a_type=a_type, a_id=a_id, b_type=b_type, b_id=b_id, allow=True
-                    )
-                )
-            await db.commit()
         return user
 
 

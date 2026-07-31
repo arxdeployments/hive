@@ -84,23 +84,6 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
     return () => clearInterval(interval);
   }, [wsConnected, fetchConversations]);
 
-  /**
-   * A super admin changed who this user may talk to.
-   *
-   * The conversation list is reachability-shaped — the server filters what it
-   * returns — so re-fetching is what makes a revocation visible without a
-   * reload. Deliberately a refetch rather than a local mutation: the client has
-   * no copy of the rules and could not compute the new answer if it wanted to.
-   *
-   * The event is best-effort (at-most-once pub/sub), so this shortens the window
-   * in which the list is stale; it is not what enforces anything.
-   */
-  useEffect(() => {
-    const onAccessChanged = () => fetchConversations();
-    window.addEventListener('rxhive:access-changed', onAccessChanged);
-    return () => window.removeEventListener('rxhive:access-changed', onAccessChanged);
-  }, [fetchConversations]);
-
   useEffect(() => {
     const onVisibility = () => {
       if (document.visibilityState === 'visible') fetchConversations();
