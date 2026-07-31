@@ -1,8 +1,9 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { motion } from 'framer-motion';
-import { Plus, Search, Pencil, Loader2, RefreshCw, Copy, X, ChevronDown } from 'lucide-react';
+import { Plus, Search, Pencil, Loader2, RefreshCw, Copy, X, ChevronDown, Info } from 'lucide-react';
 import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
+import { useAuth } from '../../contexts/AuthContext';
 import client from '../../api/client';
 
 function genPassword(len=12) {
@@ -11,6 +12,14 @@ function genPassword(len=12) {
 }
 
 export default function OrgAdminUsers() {
+  const { user: me } = useAuth();
+  // An empty array means organization-wide, matching the API (see
+  // org_admin.managed_dept_ids). Absent for anyone who is not an org admin, and
+  // this page is admin-only, but default it so a stale cached /me cannot crash
+  // the render.
+  const managed = me?.managed_departments || [];
+  const scoped = managed.length > 0;
+
   const [users, setUsers] = useState([]);
   const [depts, setDepts] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -25,7 +34,6 @@ export default function OrgAdminUsers() {
   const [formEmail, setFormEmail] = useState('');
   const [formName, setFormName] = useState('');
   const [formDept, setFormDept] = useState('');
-  const [formRole, setFormRole] = useState('member');
   const [formPassword, setFormPassword] = useState('');
   const [autoPassword, setAutoPassword] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -54,15 +62,17 @@ export default function OrgAdminUsers() {
   useEffect(() => { fetchUsers(); }, [fetchUsers]);
 
   const openCreate = () => {
-    setFormEmail(''); setFormName(''); setFormDept(depts[0]?._id || ''); setFormRole('member');
+    setFormEmail(''); setFormName(''); setFormDept(depts[0]?._id || '');
     setAutoPassword(true); setFormPassword(genPassword()); setShowCreate(true);
   };
 
   const handleCreate = async () => {
     setSaving(true);
     try {
+      // Always 'member'. The API rejects anything else from an org admin, so
+      // there is no role to choose and no state to hold one in.
       await client.post('/api/org-admin/users', {
-        dept_id: formDept, email: formEmail, display_name: formName, password: formPassword, role: formRole
+        dept_id: formDept, email: formEmail, display_name: formName, password: formPassword, role: 'member'
       });
       toast.success('User created', {
         description: `Password: ${formPassword}`, duration: 10000,
@@ -100,6 +110,19 @@ export default function OrgAdminUsers() {
   return (
     <PageTransition>
       <div className="max-w-[1200px]">
+        {/* Without this a scoped admin sees a short list with no explanation and
+            reasonably concludes people are missing. Names the departments rather
+            than saying "restricted", so the boundary is checkable at a glance. */}
+        {scoped && (
+          <div className="flex items-start gap-2 mb-4 p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D]">
+            <Info size={14} className="text-[#10B981] mt-0.5 flex-shrink-0" />
+            <p className="text-xs text-[#A3A3A3] leading-relaxed">
+              You manage{' '}
+              <span className="text-[#F5F5F5]">{managed.map(d => d.name).join(', ')}</span>.
+              You can view and create members in {managed.length > 1 ? 'these departments' : 'this department'} only.
+            </p>
+          </div>
+        )}
         <div className="flex flex-wrap items-end gap-4 mb-6">
           <div className="relative flex-1 max-w-xs">
             <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#A3A3A3]" />
@@ -212,17 +235,17 @@ export default function OrgAdminUsers() {
                       className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none" />
                   )}
                 </div>
-                <div>
-                  <label className="text-sm text-[#A3A3A3] mb-2 block">Role</label>
-                  <div className="flex gap-3">
-                    {['member', 'admin'].map(r => (
-                      <label key={r} className={`flex-1 p-3 rounded-[6px] border cursor-pointer text-center text-sm capitalize transition-colors ${
-                        formRole === r ? 'bg-[#10B981]/10 border-[#10B981]/30 text-[#F5F5F5]' : 'bg-[#1A1A1A] border-[#2D2D2D] text-[#A3A3A3]'}`}>
-                        <input type="radio" name="role" value={r} checked={formRole === r} onChange={() => setFormRole(r)} className="hidden" />
-                        {r}
-                      </label>
-                    ))}
-                  </div>
+                {/* No role picker: an admin creates members only, and the API
+                    refuses anything else with a 403. Offering a choice that
+                    always fails would be worse than offering none. Stated
+                    rather than left implicit, so nobody hunts for the missing
+                    control. */}
+                <div className="flex items-start gap-2 p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D]">
+                  <Info size={14} className="text-[#A3A3A3] mt-0.5 flex-shrink-0" />
+                  <p className="text-xs text-[#A3A3A3] leading-relaxed">
+                    New accounts are created as <span className="text-[#F5F5F5]">members</span>.
+                    Only a super admin can grant admin access.
+                  </p>
                 </div>
               </div>
               <div className="flex justify-end gap-3 mt-6">
@@ -260,12 +283,29 @@ export default function OrgAdminUsers() {
                   </select></div>
                 <div><label className="text-sm text-[#A3A3A3] mb-2 block">Role</label>
                   <div className="flex gap-2">
-                    {['member', 'admin'].map(r => (
-                      <button key={r} onClick={() => setEditRole(r)}
-                        className={`flex-1 h-10 rounded-[6px] text-sm font-medium capitalize transition-colors ${
-                          editRole === r ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30' : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3]'}`}>{r}</button>
-                    ))}
-                  </div></div>
+                    {['member', 'admin'].map(r => {
+                      // Promotion is the same grant the create form refuses,
+                      // reached through a member who already exists, so the
+                      // API blocks it too. Demotion stays available — taking
+                      // reach away is not escalation — which is why this
+                      // disables the button rather than dropping it: an
+                      // existing admin still needs a selected state to
+                      // demote FROM.
+                      const blocked = r === 'admin' && editUser.role !== 'admin';
+                      return (
+                        <button key={r} onClick={() => !blocked && setEditRole(r)}
+                          disabled={blocked}
+                          title={blocked ? 'Only a super admin can grant admin access' : undefined}
+                          className={`flex-1 h-10 rounded-[6px] text-sm font-medium capitalize transition-colors ${
+                            blocked ? 'bg-[#1A1A1A] border border-[#1F1F1F] text-[#5A5A5A] cursor-not-allowed'
+                            : editRole === r ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30'
+                            : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3]'}`}>{r}</button>
+                      );
+                    })}
+                  </div>
+                  {editUser.role !== 'admin' && (
+                    <p className="text-xs text-[#5A5A5A] mt-1.5">Only a super admin can grant admin access.</p>
+                  )}</div>
                 <div><label className="text-sm text-[#A3A3A3] mb-2 block">Status</label>
                   <button onClick={() => setEditActive(!editActive)}
                     className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D]">
