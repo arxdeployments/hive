@@ -22,7 +22,6 @@ from app.core.deps import get_current_user
 from app.core.rate_limit import password_limiter
 from app.core.security import PasswordPolicyError, enforce_password_policy, hash_password
 from app.db.models import (
-    AdminDepartment,
     AuditLog,
     Conversation,
     Department,
@@ -102,43 +101,18 @@ def _serialize_org(org: Organization) -> dict:
     }
 
 
-async def managed_dept_ids(db: AsyncSession, admin: User) -> set[uuid.UUID] | None:
-    """Departments this admin administers, or None for organization-wide.
+async def _org_department_or_404(db: AsyncSession, admin: User, dept_id_raw: str) -> Department:
+    """Resolve a department in the admin's organisation, or 404.
 
-    None and the empty set mean opposite things, so both callers below have to
-    branch rather than treating "no departments" as "no reach". An admin with no
-    AdminDepartment rows is org-wide — that is what every existing org_admin was
-    migrated to, since the migration cannot guess which departments each of them
-    should own and silently stripping them would be worse.
-    """
-    rows = (
-        (await db.execute(select(AdminDepartment.dept_id).where(AdminDepartment.user_id == admin.id)))
-        .scalars()
-        .all()
-    )
-    return set(rows) or None
-
-
-async def _writable_department(db: AsyncSession, admin: User, dept_id_raw: str) -> Department:
-    """Resolve a department this admin is allowed to place a person INTO.
-
-    Both create-user and change-department route through here, because they are
-    the same grant reached two ways. Scoping only the create would leave the
-    two-step: create in a department I manage, then move the account to one I do
-    not. The second step is the one that actually plants a user outside the
-    admin's reach, and it is also the point of no return — once moved, the target
-    fails _load_org_user, so the admin cannot undo their own edit.
-
-    Out of scope reads as not-found rather than forbidden, matching how the rest
-    of this module treats another tenant's objects: an admin should not be able
-    to enumerate departments they do not manage by watching which ids answer 403.
+    Replaces the department-scoping helper. Delegation is gone: an org admin
+    manages their whole organisation again, so the only question left is whether
+    the department is theirs to touch at all, which means "is it in my org".
     """
     dept_uuid = parse_uuid(dept_id_raw)
     if dept_uuid is None:
         raise HTTPException(status_code=400, detail="Invalid department ID")
     dept = await _org_department(db, admin.org_id, dept_uuid)
-    scope = await managed_dept_ids(db, admin)
-    if dept is None or (scope is not None and dept.id not in scope):
+    if dept is None:
         raise HTTPException(status_code=404, detail="Department not found in your organization")
     return dept
 
@@ -152,17 +126,27 @@ async def _load_org_user(db: AsyncSession, admin: User, user_id_raw: str) -> Use
     ).scalar_one_or_none()
     if target is None:
         raise HTTPException(status_code=404, detail="User not found")
-    # Department scoping, applied at the LOAD helper rather than at each route:
-    # every single-user mutation in this module (activate, deactivate, reset
+    # Peer admins are off limits, applied at the LOAD helper rather than at each
+    # route: every single-user mutation in this module (deactivate, reset
     # password, change department, change role) resolves its target through
     # here, so enforcing once covers them all and a new route inherits it.
     #
-    # 404 rather than 403, matching how this module already treats a user from
-    # another organization — an admin should not be able to probe for the
-    # existence of people outside their scope.
-    scope = await managed_dept_ids(db, admin)
-    if scope is not None and target.dept_id not in scope:
-        raise HTTPException(status_code=404, detail="User not found")
+    # Without this, "admins cannot create admins" is decorative. An admin who
+    # cannot MINT an admin account can simply TAKE one: reset-password returns
+    # the new password in its own response body, so one call against a peer
+    # hands over a working login for an account the actor does not own. Blocking
+    # creation while leaving seizure open would protect nothing.
+    #
+    # Demotion is still reachable, because update_user resolves a peer through
+    # this helper too — so it is blocked as well. That is the deliberate
+    # trade: removing another admin is a superadmin action, which is where role
+    # grants already live. An admin managing their own account is unaffected;
+    # self-service lives in /api/auth, not here.
+    if target.role is not UserRole.member and target.id != admin.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only a superadmin can manage another admin's account",
+        )
     return target
 
 
@@ -205,33 +189,19 @@ async def org_stats(
     db: AsyncSession = Depends(get_db),
 ):
     org_id = admin.org_id
-    # Scoped to the same departments the Users and Departments pages now list.
-    # Without this the dashboard would report "8 departments" beside a listing
-    # showing two, which reads as a bug in the listing rather than as scope.
-    scope = await managed_dept_ids(db, admin)
-    in_scope = [User.dept_id.in_(scope)] if scope is not None else []
-
     total_users = (
-        await db.execute(select(func.count()).select_from(User).where(User.org_id == org_id, *in_scope))
+        await db.execute(select(func.count()).select_from(User).where(User.org_id == org_id))
     ).scalar_one()
     active_ids = (
-        (
-            await db.execute(
-                select(User.id).where(User.org_id == org_id, User.is_active.is_(True), *in_scope)
-            )
-        )
+        (await db.execute(select(User.id).where(User.org_id == org_id, User.is_active.is_(True))))
         .scalars()
         .all()
     )
     statuses = await presence.get_statuses(list(active_ids))
     active_today = sum(1 for s in statuses.values() if s == "online")
-    dept_count = select(func.count()).select_from(Department).where(Department.org_id == org_id)
-    if scope is not None:
-        dept_count = dept_count.where(Department.id.in_(scope))
-    total_departments = (await db.execute(dept_count)).scalar_one()
-    # Left organization-wide on purpose: a conversation has participants, not a
-    # department, so there is no honest per-department number to show. A count of
-    # threads touching my departments would double-count cross-department ones.
+    total_departments = (
+        await db.execute(select(func.count()).select_from(Department).where(Department.org_id == org_id))
+    ).scalar_one()
     total_conversations = (
         await db.execute(
             select(func.count())
@@ -252,21 +222,17 @@ async def org_activity(
     admin: User = Depends(_require_org_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    stmt = select(AuditLog).where(AuditLog.org_id == admin.org_id)
-    # An audit row's `target` is the affected person's EMAIL, so an unfiltered
-    # feed hands a department-scoped admin the addresses of people their own user
-    # list is hiding from them. Filtering on the ACTOR is the filter available —
-    # audit_logs records who acted but not which user was acted upon as an id, so
-    # a target-based filter would mean matching on a display string.
-    #
-    # Own rows are always included: an admin must be able to see what they
-    # themselves did, including edits to a user who has since moved out of scope.
-    scope = await managed_dept_ids(db, admin)
-    if scope is not None:
-        visible_actors = select(User.id).where(User.org_id == admin.org_id, User.dept_id.in_(scope))
-        stmt = stmt.where(or_(AuditLog.actor_id == admin.id, AuditLog.actor_id.in_(visible_actors)))
     logs = (
-        (await db.execute(stmt.order_by(AuditLog.created_at.desc()).limit(10))).scalars().all()
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(AuditLog.org_id == admin.org_id)
+                .order_by(AuditLog.created_at.desc())
+                .limit(10)
+            )
+        )
+        .scalars()
+        .all()
     )
     return [serialize_audit(log) for log in logs]
 
@@ -287,12 +253,6 @@ async def list_users(
     db: AsyncSession = Depends(get_db),
 ):
     stmt = select(User).where(User.org_id == admin.org_id)
-    # A department-scoped admin sees only their own departments' people. Applied
-    # before the caller's own dept filter, so narrowing further is allowed but
-    # widening is not.
-    scope = await managed_dept_ids(db, admin)
-    if scope is not None:
-        stmt = stmt.where(User.dept_id.in_(scope))
     dept_uuid = parse_uuid(dept_id)
     if dept_uuid is not None:  # malformed dept_id is silently ignored (reference behavior)
         stmt = stmt.where(User.dept_id == dept_uuid)
@@ -338,7 +298,7 @@ async def create_user(
     admin: User = Depends(_require_org_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    dept = await _writable_department(db, admin, body.dept_id)
+    dept = await _org_department_or_404(db, admin, body.dept_id)
 
     email = body.email.strip().lower()
     taken = (
@@ -349,13 +309,11 @@ async def create_user(
 
     # An admin creates members, never other admins.
     #
-    # Not merely a policy preference: an admin who can mint admins can mint one
-    # with no admin_departments rows, which _require_org_admin and
-    # managed_dept_ids both read as ORGANIZATION-WIDE. A single-department admin
-    # could therefore create an account with reach over the entire org and log in
-    # as it, since they choose its password. Department scoping would be
-    # decorative. Granting the admin role stays a superadmin action (admin.py),
-    # where the actor is already org-wide by definition.
+    # The actor picks the new account's password, so minting an admin is the same
+    # thing as handing yourself a second admin login — one that survives your own
+    # account being deactivated or demoted. Granting the admin role stays a
+    # superadmin action (admin.py). _load_org_user closes the other half of this:
+    # you cannot take over an admin that already exists either.
     if body.role != "member":
         raise HTTPException(
             status_code=403,
@@ -427,7 +385,7 @@ async def update_user(
             target.display_name = cleaned
             changes["display_name"] = cleaned
     if body.dept_id is not None:
-        dept = await _writable_department(db, admin, body.dept_id)
+        dept = await _org_department_or_404(db, admin, body.dept_id)
         target.dept_id = dept.id
         changes["dept_id"] = str(dept.id)
     if body.role is not None and body.role in _ROLE_MAP:
@@ -437,10 +395,10 @@ async def update_user(
         # /users refuses, routed through a member who already exists. Blocking
         # only the create would have been a one-line detour.
         #
-        # Demotion is deliberately still allowed: taking reach away is not
-        # escalation, and an admin who has lost their post needs to be
-        # demotable by whoever is on shift. Re-granting the role afterwards
-        # requires a superadmin, which is the intended asymmetry.
+        # The target here is always a member: _load_org_user refuses a peer
+        # admin outright. So this is specifically "member -> admin", and the
+        # is-it-a-change half of the condition is what keeps a no-op save of an
+        # unchanged role from 403ing.
         if new_role is UserRole.org_admin and target.role is not UserRole.org_admin:
             raise HTTPException(
                 status_code=403,
@@ -512,12 +470,6 @@ async def list_departments(
         .group_by(Department.id)
         .order_by(Department.name.asc())
     )
-    # This response IS the department picker in the create-user and edit-user
-    # forms, so scoping it is what makes the restriction visible rather than a
-    # 404 the admin runs into after filling the form in.
-    scope = await managed_dept_ids(db, admin)
-    if scope is not None:
-        stmt = stmt.where(Department.id.in_(scope))
     rows = (await db.execute(stmt)).all()
     return [{**_serialize_department(dept), "member_count": count} for dept, count in rows]
 
@@ -533,18 +485,6 @@ async def create_department(
     admin: User = Depends(_require_org_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    # A department-scoped admin cannot add departments. Not a security boundary
-    # so much as a coherence one: the new department would fall outside their
-    # scope the instant it existed, so it would vanish from their own listing and
-    # they could neither staff it nor rename it. Auto-granting themselves the new
-    # department would be worse — self-service scope expansion. Org-wide admins,
-    # which is every admin today, are unaffected.
-    if await managed_dept_ids(db, admin) is not None:
-        raise HTTPException(
-            status_code=403,
-            detail="You manage specific departments and cannot create new ones. Ask a superadmin.",
-        )
-
     name = sanitize_text(body.name).strip()
     if len(name) < 2:
         raise HTTPException(status_code=400, detail="Department name must be at least 2 characters")
@@ -585,7 +525,7 @@ async def update_department(
     admin: User = Depends(_require_org_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    dept = await _writable_department(db, admin, dept_id)
+    dept = await _org_department_or_404(db, admin, dept_id)
 
     changes: dict = {}
     if body.name is not None:
@@ -630,7 +570,7 @@ async def delete_department(
     admin: User = Depends(_require_org_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    dept = await _writable_department(db, admin, dept_id)
+    dept = await _org_department_or_404(db, admin, dept_id)
 
     active_users = (
         await db.execute(

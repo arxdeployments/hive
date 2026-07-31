@@ -17,7 +17,6 @@ const Departments = lazy(() => import('./pages/admin/Departments'));
 const UsersPage = lazy(() => import('./pages/admin/Users'));
 const SettingsPage = lazy(() => import('./pages/admin/Settings'));
 const CrossOrgGroups = lazy(() => import('./pages/admin/CrossOrgGroups'));
-const AccessControl = lazy(() => import('./pages/admin/AccessControl'));
 const OrgAdminDashboard = lazy(() => import('./pages/OrgAdmin/OrgAdminDashboard'));
 const OrgAdminUsers = lazy(() => import('./pages/OrgAdmin/OrgAdminUsers'));
 const OrgAdminDepartments = lazy(() => import('./pages/OrgAdmin/OrgAdminDepartments'));
@@ -229,7 +228,6 @@ function App() {
               <Route path="users" element={<UsersPage />} />
               <Route path="settings" element={<SettingsPage />} />
               <Route path="cross-org-groups" element={<CrossOrgGroups />} />
-              <Route path="access" element={<AccessControl />} />
             </Route>
 
             <Route

@@ -6,7 +6,6 @@ the Mongo build: HTTP sends were stored but never broadcast).
 """
 
 import datetime as dt
-import os
 import re
 import uuid
 
@@ -17,7 +16,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import (
     Conversation,
     ConversationParticipant,
-    ConversationType,
     Message,
     MessageAttachment,
     MessagePin,
@@ -29,7 +27,7 @@ from app.db.models import (
     User,
 )
 from app.realtime.redis_bus import publish_to_users
-from app.services import access, enrich, presence
+from app.services import enrich, presence
 from app.utils import now_utc, sanitize_text
 
 _MEDIA_TYPES = {"image", "video", "audio", "file"}
@@ -87,24 +85,8 @@ async def _require_send_access(
     if conv.type.value != "cross_org" and conv.org_id != sender.org_id:
         raise SendError(status_code=403, detail="Access denied")
 
-    # Reachability, re-checked per send rather than only at creation. A pair
-    # whose permission is revoked keeps its existing thread — the conversation
-    # stays visible and its history readable — but the composer stops working.
-    # That is the only degradation pattern with precedent here
-    # (admin_only_messages does the same), and it beats making a clinical
-    # conversation silently disappear from someone's sidebar.
-    #
-    # Direct conversations only. A group's membership is its own access list,
-    # and applying a pair rule inside one would mean a single blocked pair
-    # silencing a whole ward round.
-    if conv.type == ConversationType.direct:
-        other_id = next((p.user_id for p in participants if p.user_id != sender.id), None)
-        if other_id is not None:
-            other = await db.get(User, other_id)
-            if other is not None and not await access.can_converse(db, sender, other):
-                raise SendError(
-                    status_code=403, detail="You are not permitted to message this person"
-                )
+    # No per-pair reachability check any more: membership of the conversation
+    # IS the permission, and the org check above is what keeps tenants apart.
     if (
         conv.admin_only_messages
         and conv.type.value in ("group", "cross_org")
@@ -178,37 +160,9 @@ async def send_message(
     db.add(msg)
     await db.flush()
 
-    # Send policy. Resolved once per message, then applied to every attachment.
-    #
-    # Enforced HERE, at claim time, and not at /api/upload: that endpoint is
-    # shared with the profile- and group-avatar flows, so a "no images" rule
-    # applied there would stop a restricted user changing their own avatar. The
-    # claim is also the point that cannot be bypassed — it is the only place an
-    # Upload becomes a MessageAttachment, and _claim_upload deliberately does
-    # not check upload.claimed (retry re-claims), so the check has to be inside
-    # this loop rather than a one-shot flag flip earlier.
-    #
-    # The honest cost of claiming late: disallowed bytes are already in object
-    # storage by the time we refuse, and a PDF has already been rasterised. They
-    # are left as unclaimed uploads, which the existing orphan cleanup covers.
-    policy = await access.resolve_send_policy(db, sender)
-    if msg_type == "text" and content and not policy.text:
-        raise SendError(status_code=403, detail="You are not permitted to send text messages")
-
     seen_keys: set[str] = set()
     for url in urls:
         upload = await _claim_upload(db, url, sender)
-        # Keyed off the UPLOAD, never off msg_type. The declared type is not
-        # evidence of anything: unknown values are silently coerced to "text"
-        # above and this loop runs regardless of type, so `{type: "text",
-        # media_url: "...pdf"}` produces a real PDF attachment on a row the
-        # database records as text. upload.filename is what was actually stored.
-        ext = os.path.splitext(upload.filename or "")[1].lower()
-        if not policy.allows_extension(ext):
-            raise SendError(
-                status_code=403,
-                detail=f"You are not permitted to send {ext or 'this type of'} files",
-            )
         if upload.storage_key in seen_keys:
             continue
         seen_keys.add(upload.storage_key)
@@ -615,22 +569,6 @@ async def forward_message(
         raise SendError(status_code=404, detail="Message not found")
     if original.deleted_at is not None:
         raise SendError(status_code=400, detail="Cannot forward a deleted message")
-
-    # Forwarding creates attachments with no Upload row at all — it copies
-    # storage_key by reference — so it bypasses the claim-time check entirely.
-    # Without this, "text only" would stop someone sending a photo but not stop
-    # them forwarding one they received. Checked once against the source
-    # message: what is being forwarded cannot change between targets.
-    policy = await access.resolve_send_policy(db, actor)
-    if original.type == MessageType.text and not policy.text:
-        raise SendError(status_code=403, detail="You are not permitted to send text messages")
-    for attachment in original.attachments:
-        ext = os.path.splitext(attachment.filename or "")[1].lower()
-        if not policy.allows_extension(ext):
-            raise SendError(
-                status_code=403,
-                detail=f"You are not permitted to send {ext or 'this type of'} files",
-            )
 
     forwarded_to: list[str] = []
 

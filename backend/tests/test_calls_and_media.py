@@ -140,11 +140,50 @@ async def test_media_upload_and_authenticated_serving(client, two_orgs_with_user
         assert resp.status_code == 401
 
 
-async def test_upload_rejects_unsupported_type(client, two_orgs_with_users):
+async def test_upload_accepts_any_extension(client, two_orgs_with_users):
+    """There is no allow-list any more: every format uploads.
+
+    Inverted from what it asserted before, which was that `.exe` 400s. Kept
+    rather than deleted because the replacement contract is worth pinning: an
+    unrecognised extension is a DOCUMENT, not a rejection, and that is what puts
+    it in the generic file card instead of nowhere.
+    """
     async with _client_for("alice@a.com") as alice:
-        files = {"file": ("evil.exe", io.BytesIO(b"MZ..."), "application/octet-stream")}
-        resp = await alice.post("/api/upload", files=files)
-        assert resp.status_code == 400
+        for name in ("tool.exe", "design.psd", "plan.dwg", "archive.rar", "scan.dcm"):
+            resp = await alice.post("/api/upload", files={"file": (name, io.BytesIO(b"x" * 32))})
+            assert resp.status_code == 200, f"{name}: {resp.text}"
+            assert resp.json()["file_type"] == "document", name
+
+
+async def test_unknown_types_are_stored_as_octet_stream(client, two_orgs_with_users):
+    """The safety property that replaced the allow-list.
+
+    Media is served from a SAME-ORIGIN path with Content-Disposition: inline, so
+    a stored content type the browser renders is stored XSS on the app's own
+    origin — an uploaded .html or .svg would execute as us. Everything outside
+    MIME_BY_EXT must stay application/octet-stream so the browser downloads it.
+
+    This is the test that fails if someone "improves" the content-type lookup
+    into mimetypes.guess_type, which maps .html to text/html.
+    """
+    async with _client_for("alice@a.com") as alice:
+        for name in ("page.html", "vector.svg", "script.js"):
+            resp = await alice.post("/api/upload", files={"file": (name, io.BytesIO(b"<h1>hi</h1>"))})
+            assert resp.status_code == 200, f"{name}: {resp.text}"
+            assert resp.json()["mime_type"] == "application/octet-stream", name
+
+
+async def test_upload_still_refuses_past_the_ceiling(client, two_orgs_with_users):
+    """One limit for every type now, but there is still a limit.
+
+    Asserted against the constant rather than by uploading 2 GB, which no test
+    should do. The route reads UploadFile.size, so this checks the branch is
+    wired to the right number rather than exercising the byte count.
+    """
+    from app.services import storage
+
+    assert storage.MAX_UPLOAD_BYTES == 2 * 1024 * 1024 * 1024
+    assert storage.THUMBNAIL_SOURCE_LIMIT < storage.MAX_UPLOAD_BYTES
 
 
 async def test_voice_note_duration_round_trip(client, two_orgs_with_users):

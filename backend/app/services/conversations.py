@@ -15,8 +15,9 @@ from app.db.models import (
     ParticipantRole,
     User,
 )
+from app.db.models import UserRole
 from app.realtime.redis_bus import publish_to_users
-from app.services import access, enrich
+from app.services import enrich
 from app.utils import now_utc
 
 
@@ -39,16 +40,26 @@ async def find_direct(db: AsyncSession, user_a: uuid.UUID, user_b: uuid.UUID) ->
 async def get_or_create_direct(
     db: AsyncSession, me: User, other: User, *, notify: bool = False
 ) -> Conversation:
-    # THE reachability choke point. Three separate paths manufacture a direct
+    # THE tenant choke point. Three separate paths manufacture a direct
     # conversation — POST /conversations/direct, forward-to-contacts, and call
     # initiation — and all three land here. Guarding any one endpoint instead
-    # would leave the other two as ways to reach someone you may not reach.
+    # would leave the other two as ways to reach someone in another tenant.
     #
-    # Checked before the find, not only before the create: a pair whose
-    # permission was revoked must not be able to keep using the conversation
-    # they already had. The send path re-checks too, so an existing thread goes
-    # read-only rather than vanishing.
-    if not await access.can_converse(db, me, other):
+    # Anyone may message anyone inside their own organisation; this is the only
+    # thing left standing between them. It used to be the first clause of
+    # access.can_converse, which is gone, so it is restated here rather than
+    # inherited — deleting the rules engine must not quietly open direct
+    # conversations BETWEEN organisations, which is a different feature
+    # (cross-org groups) with its own membership model.
+    #
+    # Superadmins are exempt, as they were before: org_id is NULL for them and
+    # they drive cross-org group machinery. They have no chat surface of their
+    # own, so this is not a way in.
+    if (
+        me.role != UserRole.superadmin
+        and other.role != UserRole.superadmin
+        and (me.org_id is None or other.org_id is None or me.org_id != other.org_id)
+    ):
         raise HTTPException(status_code=403, detail="You are not permitted to message this person")
 
     existing = await find_direct(db, me.id, other.id)

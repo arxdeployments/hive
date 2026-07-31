@@ -38,7 +38,7 @@ from app.db.models import (
     User,
 )
 from app.realtime.redis_bus import publish_to_users
-from app.services import access, presence
+from app.services import presence
 from app.utils import iso_z, sanitize_text
 
 router = APIRouter(prefix="/api", tags=["search"])
@@ -174,13 +174,7 @@ async def global_search(
             .order_by(User.display_name.asc())
             .limit(_BUCKET_LIMIT)
         )
-        # Same reachability filter the contact list applies. Search would
-        # otherwise be the way round a filtered directory: type a colleague's
-        # name and there they are, with a tile that 403s on click.
-        reachable = await access.reachable_user_ids(db, user)
         for contact, dept_name in (await db.execute(stmt)).all():
-            if contact.id not in reachable:
-                continue
             results["contacts"].append(
                 {
                     "id": str(contact.id),

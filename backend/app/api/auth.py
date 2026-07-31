@@ -40,7 +40,7 @@ from app.core.security import (
     new_refresh_token,
     verify_password,
 )
-from app.db.models import AdminDepartment, Department, Organization, RefreshToken, User, UserRole
+from app.db.models import Department, Organization, RefreshToken, User, UserRole
 from app.db.session import get_db
 from app.services import presence
 from app.utils import iso_z, now_utc
@@ -103,35 +103,6 @@ def _user_payload(user: User) -> dict:
         payload["org_id"] = str(user.org_id) if user.org_id else None
         payload["dept_id"] = str(user.dept_id) if user.dept_id else None
     return payload
-
-
-async def _attach_managed_departments(db: AsyncSession, user: User, payload: dict) -> None:
-    """Add `managed_departments` for org admins, so the console can hide what
-    the API would refuse rather than let an admin fill in a form and collect a
-    404 on submit.
-
-    An EMPTY list means organization-wide, matching org_admin.managed_dept_ids —
-    every admin in production is in that state today, since the delegation
-    migration could not guess who should own what. The key is absent entirely for
-    members and superadmins, which is what stops a client reading "no
-    departments" as "manages nothing" for someone the concept does not apply to.
-
-    Attached on login as well as /me. AuthContext calls /me on boot but sets the
-    user straight from the login response, so a scoped admin who signed in and
-    went to the console would otherwise be shown org-wide controls until their
-    next page load.
-    """
-    if user.role != UserRole.org_admin:
-        return
-    rows = (
-        await db.execute(
-            select(AdminDepartment.dept_id, Department.name)
-            .join(Department, Department.id == AdminDepartment.dept_id)
-            .where(AdminDepartment.user_id == user.id)
-            .order_by(Department.name)
-        )
-    ).all()
-    payload["managed_departments"] = [{"_id": str(d), "name": n} for d, n in rows]
 
 
 def set_auth_cookies(response: Response, access: str, refresh: str) -> None:
@@ -208,9 +179,7 @@ async def login(
 
     user.last_seen_at = now_utc()
     await _issue_session(db, user, response, request, client=body.client)
-    payload = _user_payload(user)
-    await _attach_managed_departments(db, user, payload)
-    return {"user": payload}
+    return {"user": _user_payload(user)}
 
 
 def _as_utc(value: dt.datetime) -> dt.datetime:
@@ -371,9 +340,6 @@ async def me(user: User = Depends(get_current_user), db: AsyncSession = Depends(
         payload["dept_name"] = (
             (await db.get(Department, user.dept_id)).name if user.dept_id else None
         )
-    # Queried only for org admins: /me runs on every app load, and members and
-    # superadmins have no use for it.
-    await _attach_managed_departments(db, user, payload)
     return payload
 
 

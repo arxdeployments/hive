@@ -7,7 +7,6 @@ import {
   FolderTree,
   Users,
   Globe,
-  ShieldCheck,
   Settings,
   LogOut,
   ChevronLeft,
@@ -26,7 +25,6 @@ const navItems = [
   // Its own entry rather than folded into Settings: this is the screen that
   // decides who can talk to whom, and burying it under a placeholder page would
   // make the product's central policy the hardest thing to find.
-  { path: '/admin/access', icon: ShieldCheck, label: 'Access Control' },
   { path: '/admin/settings', icon: Settings, label: 'Settings' },
 ];
 

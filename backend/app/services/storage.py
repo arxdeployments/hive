@@ -61,9 +61,24 @@ DOC_EXTS = {
     ".rtf",
 }
 
-MAX_IMAGE_BYTES = 16 * 1024 * 1024
-MAX_MEDIA_BYTES = 200 * 1024 * 1024
-MAX_DOC_BYTES = 100 * 1024 * 1024
+# One ceiling for every kind of file. There is no per-category limit any more and
+# no allow-list of extensions: any format may be sent.
+#
+# 2 GB is not arbitrary. Starlette spools a multipart upload to a temp file once
+# it passes 1 MB, and media.py hands that file object straight to S3, so the API
+# never holds the payload in memory — but it does hold it on the instance's DISK
+# for the length of the request. Two or three concurrent uploads at this size are
+# what the box can absorb, not twenty.
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+
+# Above this we skip preview generation rather than attempt it.
+#
+# Thumbnailing is the one step that genuinely needs the bytes in memory: Pillow
+# and pypdfium both take a buffer. Without a bound, someone uploading a 2 GB TIFF
+# named .jpg would have the API read all of it into RAM to make a 720px preview
+# and take the process down. Past the bound the file still uploads and still
+# sends; it just arrives without a preview image.
+THUMBNAIL_SOURCE_LIMIT = 64 * 1024 * 1024
 
 MIME_BY_EXT = {
     ".jpg": "image/jpeg",
@@ -98,7 +113,17 @@ MIME_BY_EXT = {
 }
 
 
-def classify(ext: str) -> str | None:
+def classify(ext: str) -> str:
+    """Which bubble renders this file. Never rejects — every extension maps.
+
+    The four sets are no longer an allow-list, only a rendering hint: they decide
+    whether something arrives as a photo, a video player, a voice note or a
+    document card. Anything unrecognised is a document, which is the generic
+    file card, so a .psd or a .dwg sends fine and simply shows as a file.
+
+    Returning a str rather than str | None is the whole change. Callers used to
+    treat None as "reject this upload"; there is nothing left to reject.
+    """
     ext = ext.lower()
     if ext in IMAGE_EXTS:
         return "image"
@@ -106,18 +131,7 @@ def classify(ext: str) -> str | None:
         return "video"
     if ext in AUDIO_EXTS:
         return "audio"
-    if ext in DOC_EXTS:
-        return "document"
-    return None
-
-
-def size_limit_for(file_type: str) -> int:
-    return {
-        "image": MAX_IMAGE_BYTES,
-        "video": MAX_MEDIA_BYTES,
-        "audio": MAX_MEDIA_BYTES,
-        "document": MAX_DOC_BYTES,
-    }[file_type]
+    return "document"
 
 
 def _endpoint_parts(url: str) -> tuple[str, bool]:
@@ -161,6 +175,35 @@ async def put_object(key: str, data: bytes, content_type: str) -> None:
 
     def _put() -> None:
         _client().put_object(settings.s3_bucket, key, io.BytesIO(data), len(data), content_type=content_type)
+
+    await anyio.to_thread.run_sync(_put)
+
+
+async def put_stream(key: str, fileobj, length: int, content_type: str) -> None:
+    """Upload from a file object without reading it into memory.
+
+    put_object above takes `bytes`, which is fine for a thumbnail and fatal for a
+    2 GB video: it would mean the whole file resident in the API process. This
+    takes the SpooledTemporaryFile that Starlette already streamed the request
+    body into, so the bytes go disk -> socket and the process holds only
+    part_size at a time.
+
+    part_size is the multipart chunk minio buffers per part. 64 MB over the 5 MB
+    minimum keeps the part count for a 2 GB file at 32 rather than 400, which
+    matters because each part is a separate round trip.
+    """
+    settings = get_settings()
+
+    def _put() -> None:
+        fileobj.seek(0)
+        _client().put_object(
+            settings.s3_bucket,
+            key,
+            fileobj,
+            length,
+            content_type=content_type,
+            part_size=64 * 1024 * 1024,
+        )
 
     await anyio.to_thread.run_sync(_put)
 

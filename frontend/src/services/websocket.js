@@ -307,10 +307,6 @@ class RxHiveWebSocket {
       // longer permitted goes read-only on its next send rather than
       // disappearing mid-sentence. Losing this event costs a stale UI until the
       // next fetch, never a lifted restriction: the server re-checks every send.
-      case 'access_changed': {
-        window.dispatchEvent(new CustomEvent('rxhive:access-changed'));
-        break;
-      }
 
       case 'member_added': {
         const { conversation_id, conversation: updatedConv } = data;
