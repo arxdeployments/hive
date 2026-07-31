@@ -744,10 +744,18 @@ private struct OrgUserSheet: View {
                     // server ignores anything else, and `superadmin` is not grantable
                     // from an org-admin account at all.
                     ForEach(["member", "admin"], id: \.self) { value in
+                        // Promoting is refused by the server: an admin creates and
+                        // promotes members only, because an admin with no
+                        // admin_departments rows is organisation-wide, so minting one
+                        // would hand out reach the actor may not have. Demoting an
+                        // existing admin is still allowed, which is why this disables
+                        // the button rather than dropping it — the current role still
+                        // needs a selected state to demote FROM.
+                        let blocked = value == "admin" && user.role != .admin
                         SegmentButton(
                             title: value.capitalized,
                             isSelected: user.role.rawValue == value,
-                            isDisabled: isSelf || busy != nil
+                            isDisabled: isSelf || blocked || busy != nil
                         ) {
                             guard user.role.rawValue != value else { return }
                             apply(.role) { try await store.update(userID: user.id, role: value) }
@@ -757,7 +765,11 @@ private struct OrgUserSheet: View {
                         ProgressView().tint(Theme.Color.textMuted).scaleEffect(0.7)
                     }
                 }
-                Text("Admins can see this screen and manage everyone in the organisation.")
+                // Was "manage everyone in the organisation", which stopped being true
+                // once a super admin could scope an admin to named departments.
+                Text(user.role == .admin
+                     ? "Admins can see this screen and manage the departments they are assigned to."
+                     : "Only a super admin can grant admin access.")
                     .font(Theme.Typography.caption)
                     .foregroundStyle(Theme.Color.textMuted)
                     .frame(maxWidth: .infinity, alignment: .leading)
