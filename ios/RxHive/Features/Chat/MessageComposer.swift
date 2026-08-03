@@ -5,13 +5,14 @@ import UniformTypeIdentifiers
 
 /// The message composer: text, attachments and voice notes.
 ///
-/// Ported from `frontend/src/components/chat/MessageComposer.jsx`, with one
-/// deliberate divergence. The web app stages every pick in a confirmation tray with
-/// a caption field, because a desktop file dialog is easy to mis-click. On a phone the
-/// system pickers are already a confirmation step (you tap a photo, then tap Add), so
-/// a second tray would be a third tap for nothing. Instead a pick uploads straight
-/// away and the *composer's own text* becomes the caption, which is where the user's
-/// fingers already are.
+/// Ported from `frontend/src/components/chat/MessageComposer.jsx`.
+///
+/// Photos and video go through `MediaSendSheet` before they are uploaded, which is
+/// where the caption is written and where the Standard/HD choice is made. Documents
+/// and voice notes do not: a document has no quality tier and nothing to preview that
+/// the picker has not already shown, and a voice note has just been reviewed in the
+/// recorder bar. Both upload straight from the pick, with the composer's own text as
+/// the caption.
 struct MessageComposer: View {
 
     let conversationID: String
@@ -46,6 +47,14 @@ struct MessageComposer: View {
     @State private var photoSelection: [PhotosPickerItem] = []
     @State private var showCamera = false
     @State private var showFileImporter = false
+
+    /// Persisted across launches and shared by every chat, like the reference's own
+    /// upload-quality setting: this is a statement about the user's data plan, not
+    /// about one conversation.
+    @AppStorage(MediaQuality.storageKey) private var mediaQuality: MediaQuality = .standard
+
+    /// Picked or captured media awaiting confirmation. Non-empty presents the send sheet.
+    @State private var pendingMedia: [PendingMedia] = []
 
     @State private var uploads: [UploadJob] = []
     @State private var replyDismissed = false
@@ -163,7 +172,7 @@ struct MessageComposer: View {
             isPresented: $showPhotoPicker,
             selection: $photoSelection,
             maxSelectionCount: 10,
-            matching: .any(of: [.images, .videos])
+            matching: photoPickerFilter
         )
         .onChange(of: photoSelection) { _, items in
             guard !items.isEmpty else { return }
@@ -172,16 +181,49 @@ struct MessageComposer: View {
             Task { @MainActor in await stage(pickerItems: picked) }
         }
         .fullScreenCover(isPresented: $showCamera) {
-            CameraCapture { data, filename in
+            // The capture UI is narrowed too: an unusable Video tab in the shutter
+            // bar is a worse answer than not showing it.
+            CameraCapture(
+                allowsPhotos: true,
+                allowsVideos: true,
+                // Capture at the tier the user chose. Recording 4K to then throw most
+                // of it away in a re-encode wastes both the wait and the disk.
+                videoQuality: mediaQuality == .hd ? .typeHigh : .typeMedium
+            ) { data, filename in
                 showCamera = false
                 guard let data, let filename else { return }
-                stage(data: data, filename: filename)
+                // A capture goes to the same confirm step as a pick: it is the one that
+                // most needs reviewing, since nobody has seen the frame yet.
+                Task { @MainActor in
+                    let isVideo = MediaFormatting.fileExtension(of: filename) != "jpg"
+                    if let media = await makePending(data: data, filename: filename, isVideo: isVideo) {
+                        pendingMedia = [media]
+                    }
+                }
             }
             .ignoresSafeArea()
         }
+        // `fullScreenCover`, not `sheet`: the point of this screen is to look at the
+        // media, and a sheet leaves the chat showing through above it.
+        .fullScreenCover(isPresented: Binding(
+            get: { !pendingMedia.isEmpty },
+            set: { if !$0 { pendingMedia = [] } }
+        )) {
+            MediaSendSheet(
+                items: pendingMedia,
+                caption: trimmedText,
+                onSend: { items, caption, quality in
+                    pendingMedia = []
+                    send(media: items, caption: caption, quality: quality)
+                },
+                onCancel: { pendingMedia = [] }
+            )
+        }
         .fileImporter(
             isPresented: $showFileImporter,
-            allowedContentTypes: Self.documentContentTypes,
+            // `.data` is every file. Any format may be sent, so the picker must
+            // not narrow: a .psd or a .dwg has to be reachable.
+            allowedContentTypes: [.data],
             allowsMultipleSelection: true
         ) { result in
             handleFileImport(result)
@@ -227,15 +269,21 @@ struct MessageComposer: View {
                     .animation(Theme.Motion.ease, value: isFocused)
             }
 
-            sendOrMicButton
-                // The lock column floats above the mic, anchored to the button rather
-                // than to the bar, so "slide up" points at something.
-                .overlay(alignment: .bottom) {
-                    if micHeld && !isLocked {
-                        VoiceRecorderBar.lockAffordance(dragY: slideUp)
-                            .transition(.opacity)
+            // Hidden outright when there is nothing for it to do. With the box empty
+            // and audio blocked it would be a mic that cannot record, and iOS has
+            // nowhere to put the tooltip the web uses to explain that. Typing brings
+            // it straight back as the send button.
+            if true {
+                sendOrMicButton
+                    // The lock column floats above the mic, anchored to the button
+                    // rather than to the bar, so "slide up" points at something.
+                    .overlay(alignment: .bottom) {
+                        if micHeld && !isLocked {
+                            VoiceRecorderBar.lockAffordance(dragY: slideUp)
+                                .transition(.opacity)
+                        }
                     }
-                }
+            }
         }
         .padding(.horizontal, Theme.Layout.spacing3)
         .padding(.vertical, Theme.Layout.spacing2)
@@ -243,18 +291,20 @@ struct MessageComposer: View {
 
     private var attachmentMenu: some View {
         Menu {
-            Button {
-                showPhotoPicker = true
-            } label: {
-                Label("Photo Library", systemImage: "photo.on.rectangle")
+            if true {
+                Button {
+                    showPhotoPicker = true
+                } label: {
+                    Label("Photo Library", systemImage: "photo.on.rectangle")
+                }
+                Button {
+                    showCamera = true
+                } label: {
+                    Label("Camera", systemImage: "camera")
+                }
             }
             Button {
-                showCamera = true
-            } label: {
-                Label("Camera", systemImage: "camera")
-            }
-            Button {
-                showFileImporter = true
+                    showFileImporter = true
             } label: {
                 Label("Document", systemImage: "doc")
             }
@@ -498,6 +548,7 @@ struct MessageComposer: View {
     /// Photos and videos from the system picker.
     @MainActor
     private func stage(pickerItems: [PhotosPickerItem]) async {
+        var staged: [PendingMedia] = []
         for item in pickerItems {
             // Loaded as `Data` because `APIClient.upload` builds an in-memory multipart
             // body — there is no streaming upload path to hand a file URL to, so
@@ -511,7 +562,61 @@ struct MessageComposer: View {
             let isVideo = type?.conforms(to: .movie) == true
             let stamp = Int(Date().timeIntervalSince1970)
             let name = "\(isVideo ? "VID" : "IMG")-\(stamp)-\(UUID().uuidString.prefix(4)).\(ext)"
-            stage(data: data, filename: name)
+            if let media = await makePending(data: data, filename: name, isVideo: isVideo) {
+                staged.append(media)
+            }
+        }
+        guard !staged.isEmpty else { return }
+        pendingMedia = staged
+    }
+
+    /// Build the preview the send sheet shows.
+    ///
+    /// The poster frame and the playable temp file are produced here rather than in the
+    /// sheet so the sheet stays synchronous — a `View` that has to await its own content
+    /// flashes empty on first appear, and this screen's whole job is to show the media.
+    private func makePending(data: Data, filename: String, isVideo: Bool) async -> PendingMedia? {
+        guard let kind = mediaKind(data: data, filename: filename) else {
+            toasts.error("\(filename) isn't a file type this chat accepts.")
+            return nil
+        }
+
+        if isVideo || kind == .video {
+            let url = MediaTranscoder.stagePreviewFile(data: data, filename: filename)
+            let (poster, duration) = await MediaTranscoder.videoPoster(url: url)
+            return PendingMedia(
+                data: data, filename: filename, isVideo: true,
+                preview: poster, playbackURL: url, duration: duration
+            )
+        }
+        // Downscaled for display only — the bytes sent are still the originals, and the
+        // tier is applied at send time from whatever the sheet ends up choosing.
+        let poster = MediaTranscoder.thumbnail(data: data, maxEdge: 1400)
+        return PendingMedia(
+            data: data, filename: filename, isVideo: false,
+            preview: poster, playbackURL: nil, duration: nil
+        )
+    }
+
+    /// Confirmed in the send sheet: transcode each item to the chosen tier and upload.
+    private func send(media: [PendingMedia], caption: String, quality: MediaQuality) {
+        guard !media.isEmpty else { return }
+        if !caption.isEmpty || !trimmedText.isEmpty {
+            text = ""
+            chat.stopTyping(in: conversationID)
+        }
+        for (offset, item) in media.enumerated() {
+            MediaTranscoder.discardPreviewFile(item.playbackURL)
+            enqueueMedia(
+                data: item.data,
+                filename: item.filename,
+                kind: item.isVideo ? .video : .image,
+                quality: quality,
+                // The caption rides on the first item only, as it does on the web — five
+                // bubbles repeating the same sentence reads as a bug.
+                caption: offset == 0 ? caption : "",
+                replyID: offset == 0 ? consumeReplyID() : nil
+            )
         }
     }
 
@@ -536,6 +641,8 @@ struct MessageComposer: View {
 
     /// Validate, then queue an upload. The caption is whatever is in the box, which is
     /// then cleared — a picked photo with text already typed reads as one message.
+    /// Documents and voice notes only. Photos and video come through `send(media:…)`
+    /// after the send sheet, because they need the chosen tier applied first.
     private func stage(data: Data, filename: String) {
         guard let candidate = validate(data: data, filename: filename) else { return }
         let caption = trimmedText
@@ -553,23 +660,46 @@ struct MessageComposer: View {
         )
     }
 
+    /// `.image` or `.video` when this file is one, else nil.
+    ///
+    /// Falls back to decoding the bytes because the extension is not always enough:
+    /// an iPhone photo arrives as HEIC, which classifies as a document now that
+    /// nothing is rejected. It is still an image, and treating it as one is what
+    /// gets it a preview instead of a file card.
+    private func mediaKind(data: Data, filename: String) -> AttachmentKind? {
+        let ext = MediaFormatting.fileExtension(of: filename)
+        let kind = AttachmentKind(fileExtension: ext)
+        if kind == .image || kind == .video { return kind }
+        return UIImage(data: data) != nil ? .image : nil
+    }
+
     /// Enforce the server's own limits before spending the user's data allowance.
     ///
-    /// Returns possibly-rewritten bytes: an iPhone photo is usually HEIC, which is not
-    /// in the server's allowed image set, so it is transcoded to JPEG here rather than
-    /// uploaded and rejected. The filename is rewritten to match, because the server
-    /// derives the MIME type from the extension and ignores what we claim.
+    /// Returns possibly-rewritten bytes: an iPhone photo is usually HEIC, which the
+    /// server has no thumbnailer for, so it is transcoded to JPEG here. The filename
+    /// is rewritten to match, because the server derives the MIME type from the
+    /// extension and ignores what we claim.
+    ///
+    /// Still the single place the size limit is applied to a file. The pickers no
+    /// longer narrow anything — every format is accepted — but the camera returns
+    /// whatever it captured and a HEIC arrives here as something else entirely, so
+    /// every path except a voice note passes through this function.
     private func validate(data: Data, filename: String) -> (data: Data, filename: String, kind: AttachmentKind)? {
         let ext = MediaFormatting.fileExtension(of: filename)
 
-        guard let kind = AttachmentKind(fileExtension: ext) else {
-            if let image = UIImage(data: data), let jpeg = image.jpegData(compressionQuality: 0.9) {
-                let base = (filename as NSString).deletingPathExtension
-                return validate(data: jpeg, filename: "\((base.isEmpty ? "IMG" : base)).jpg")
-            }
-            toasts.error("\(filename) isn't a file type this chat accepts.")
-            return nil
+        // HEIC has no server-side thumbnailer, so it is still rewritten to JPEG —
+        // not because it would be rejected, but because it would arrive as a file
+        // card with no preview on every other device.
+        if ext == "heic" || ext == "heif",
+           let image = UIImage(data: data),
+           let jpeg = image.jpegData(compressionQuality: 0.9) {
+            let base = (filename as NSString).deletingPathExtension
+            return validate(data: jpeg, filename: "\((base.isEmpty ? "IMG" : base)).jpg")
         }
+
+        // Never nil now: an unrecognised extension is a document, matching
+        // `storage.classify`.
+        let kind = AttachmentKind(fileExtension: ext)
 
         if data.count > kind.maxBytes {
             // Name the actual limit: "too large" without a number leaves the user
@@ -591,8 +721,13 @@ struct MessageComposer: View {
     /// that matters on a slow connection.
     fileprivate struct UploadJob: Identifiable {
         let id = UUID()
-        let filename: String
+        /// Mutable because a transcode renames the file — a HEIC becomes a JPEG, a
+        /// `.mov` becomes an `.mp4` — and the row should say what is actually going.
+        var filename: String
         let kind: AttachmentKind
+        /// "Compressing…" then "Sending…". A 4K clip at HD can take tens of seconds to
+        /// export, and a bar that says nothing during it reads as a hang.
+        var status: String
         var task: Task<Void, Never>?
     }
 
@@ -604,7 +739,7 @@ struct MessageComposer: View {
         duration: Double?,
         replyID: String?
     ) {
-        let job = UploadJob(filename: filename, kind: kind)
+        let job = UploadJob(filename: filename, kind: kind, status: "Sending…")
         uploads.append(job)
 
         let task = Task { @MainActor in
@@ -612,6 +747,61 @@ struct MessageComposer: View {
                 data: data, filename: filename, kind: kind,
                 caption: caption, duration: duration, replyID: replyID
             )
+            uploads.removeAll { $0.id == job.id }
+        }
+        if let index = uploads.firstIndex(where: { $0.id == job.id }) {
+            uploads[index].task = task
+        }
+    }
+
+    /// Photos and video: re-encode to the chosen tier, *then* validate, then upload.
+    ///
+    /// The order matters and is the opposite of every other attachment. `validate`
+    /// enforces the server's size ceiling, and a 4K clip straight off the camera is
+    /// routinely past it — rejecting that before compressing would refuse a file the
+    /// app is perfectly able to send. So the row appears first (the export is the slow
+    /// part and needs to be visible), the bytes are rewritten, and only the bytes that
+    /// will actually be uploaded are measured.
+    private func enqueueMedia(
+        data: Data,
+        filename: String,
+        kind: AttachmentKind,
+        quality: MediaQuality,
+        caption: String,
+        replyID: String?
+    ) {
+        let job = UploadJob(
+            filename: filename,
+            kind: kind,
+            status: kind == .video ? "Compressing…" : "Preparing…"
+        )
+        uploads.append(job)
+
+        let task = Task { @MainActor in
+            let output: MediaTranscoder.Output
+            switch kind {
+            case .video:
+                output = await MediaTranscoder.video(data: data, filename: filename, quality: quality)
+            default:
+                output = MediaTranscoder.image(data: data, filename: filename, quality: quality)
+            }
+
+            guard !Task.isCancelled else {
+                uploads.removeAll { $0.id == job.id }
+                return
+            }
+
+            if let index = uploads.firstIndex(where: { $0.id == job.id }) {
+                uploads[index].filename = output.filename
+                uploads[index].status = "Sending…"
+            }
+
+            if let candidate = validate(data: output.data, filename: output.filename) {
+                await perform(
+                    data: candidate.data, filename: candidate.filename, kind: candidate.kind,
+                    caption: caption, duration: nil, replyID: replyID
+                )
+            }
             uploads.removeAll { $0.id == job.id }
         }
         if let index = uploads.firstIndex(where: { $0.id == job.id }) {
@@ -666,16 +856,16 @@ struct MessageComposer: View {
         uploads.removeAll { $0.id == job.id }
     }
 
-    // MARK: - Static configuration
+    // MARK: - Picker configuration
 
-    /// What the document picker will offer. Derived from the server's allow-list so
-    /// the picker cannot surface a type the upload would reject.
-    private static let documentContentTypes: [UTType] = {
-        let types = AttachmentKind.documentExtensions
-            .sorted()
-            .compactMap { UTType(filenameExtension: $0) }
-        return types.isEmpty ? [.data] : types
-    }()
+    /// What the photo library will offer.
+    ///
+    /// `PHPickerFilter`, not `accept`: this one really does constrain the picker, so
+    /// a video-blocked user is shown a library with no videos in it rather than a
+    /// grid where half the taps fail.
+    private var photoPickerFilter: PHPickerFilter {
+        .any(of: [.images, .videos])
+    }
 }
 
 // MARK: - Attachment classification
@@ -685,6 +875,17 @@ struct MessageComposer: View {
 /// Limits and extension sets come from `app/services/storage.py` (via the product
 /// contract), and they are enforced client-side purely so a 200 MB video fails in
 /// under a second instead of after a long upload.
+///
+/// ## These sets classify; they no longer restrict
+/// Which bubble renders a file — photo, video player, voice note or file card —
+/// is `storage.classify`'s job and is the same for everybody. Anything not listed
+/// is a document, exactly as the server treats it, so an unrecognised extension
+/// sends fine and simply arrives as a file card.
+///
+/// Which means this list is the third of four copies that have to stay in lockstep:
+/// `services/storage.py`, the web composer, here, and
+/// `frontend/src/utils/audioFormat.js` — the last of which depends on ".weba"
+/// classifying as audio and ".webm" as video, so do not "tidy" those two together.
 private enum AttachmentKind {
     case image, video, audio, document
 
@@ -696,30 +897,20 @@ private enum AttachmentKind {
         "doc", "docx", "xls", "xlsx", "ppt", "pptx", "rtf",
     ]
 
-    init?(fileExtension ext: String) {
+    /// Non-failable: every extension maps. Unrecognised means document, matching
+    /// `storage.classify`, which no longer rejects anything either.
+    init(fileExtension ext: String) {
         let lowered = ext.lowercased()
         if Self.imageExtensions.contains(lowered) { self = .image }
         else if Self.videoExtensions.contains(lowered) { self = .video }
         else if Self.audioExtensions.contains(lowered) { self = .audio }
-        else if Self.documentExtensions.contains(lowered) { self = .document }
-        else { return nil }
+        else { self = .document }
     }
 
-    var maxBytes: Int {
-        switch self {
-        case .image: return 16 * 1024 * 1024
-        case .video, .audio: return 200 * 1024 * 1024
-        case .document: return 100 * 1024 * 1024
-        }
-    }
+    /// One ceiling for everything, matching `storage.MAX_UPLOAD_BYTES`.
+    var maxBytes: Int { 2 * 1024 * 1024 * 1024 }
 
-    var limitLabel: String {
-        switch self {
-        case .image: return "16 MB"
-        case .video, .audio: return "200 MB"
-        case .document: return "100 MB"
-        }
-    }
+    var limitLabel: String { "2 GB" }
 
     /// The message `type` the API and the bubbles expect. Note "document" maps to
     /// "file" — the upload service and the message contract disagree on the word.
@@ -822,11 +1013,17 @@ private struct UploadRow: View {
                 .frame(width: 20)
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(job.filename)
-                    .font(Theme.Typography.caption)
-                    .foregroundStyle(Theme.Color.text)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                HStack(spacing: Theme.Layout.spacing2) {
+                    Text(job.filename)
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.Color.text)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(job.status)
+                        .font(Theme.Typography.micro)
+                        .foregroundStyle(Theme.Color.textMuted)
+                        .fixedSize()
+                }
                 IndeterminateBar()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -844,7 +1041,7 @@ private struct UploadRow: View {
         .padding(.vertical, Theme.Layout.spacing2)
         .background(Theme.Color.surface)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Sending \(job.filename)")
+        .accessibilityLabel("\(job.status) \(job.filename)")
     }
 }
 
@@ -902,6 +1099,12 @@ private struct RecordingWaveform: View {
 /// would mean building a capture UI to replace one iOS already ships. Photos come back
 /// as JPEG and movies as the recorder's `.mov`, both of which the server accepts.
 private struct CameraCapture: UIViewControllerRepresentable {
+    /// Which of the shutter bar's two modes to offer. Both, always — kept as
+    /// parameters rather than hard-coded so the capture UI stays reusable.
+    let allowsPhotos: Bool
+    let allowsVideos: Bool
+    /// Recording quality, from the composer's Standard/HD setting.
+    let videoQuality: UIImagePickerController.QualityType
     /// nil data means the user cancelled.
     let onCapture: (Data?, String?) -> Void
 
@@ -910,8 +1113,14 @@ private struct CameraCapture: UIViewControllerRepresentable {
         // Guard against the simulator and any device without a camera: without this
         // the controller presents an empty black sheet.
         picker.sourceType = UIImagePickerController.isSourceTypeAvailable(.camera) ? .camera : .photoLibrary
-        picker.mediaTypes = [UTType.image.identifier, UTType.movie.identifier]
-        picker.videoQuality = .typeHigh
+        var mediaTypes: [String] = []
+        if allowsPhotos { mediaTypes.append(UTType.image.identifier) }
+        if allowsVideos { mediaTypes.append(UTType.movie.identifier) }
+        // `UIImagePickerController` shows every available type when handed an empty
+        // array, so a caller that permits neither must not reach here — the menu
+        // entry is hidden in that case.
+        picker.mediaTypes = mediaTypes.isEmpty ? [UTType.image.identifier] : mediaTypes
+        picker.videoQuality = videoQuality
         picker.delegate = context.coordinator
         return picker
     }
@@ -936,7 +1145,11 @@ private struct CameraCapture: UIViewControllerRepresentable {
                 onCapture(data, "VID-\(stamp).\(movieURL.pathExtension.isEmpty ? "mov" : movieURL.pathExtension)")
                 return
             }
-            if let image = info[.originalImage] as? UIImage, let data = image.jpegData(compressionQuality: 0.9) {
+            // Encoded at 1.0 deliberately: `MediaTranscoder` does the real encode a
+            // moment later, and compressing twice would stack a second generation of
+            // JPEG loss on top of the tier the user actually asked for. These bytes
+            // only ever live in memory on the way to it.
+            if let image = info[.originalImage] as? UIImage, let data = image.jpegData(compressionQuality: 1.0) {
                 onCapture(data, "IMG-\(stamp).jpg")
                 return
             }

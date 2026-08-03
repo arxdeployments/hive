@@ -93,12 +93,27 @@
 	</array>
 
 	<!--
-	  App Transport Security: no global exception. Production is HTTPS behind Caddy.
-	  For local development against http://localhost:8000, localhost is already
-	  exempt from ATS on iOS, so nothing is needed here. If you point a device build
-	  at a plain-HTTP LAN address you will need NSExceptionDomains for that host —
-	  add it deliberately rather than disabling ATS outright.
+	  App Transport Security. Production is HTTPS behind Caddy and stays fully
+	  protected: this is NOT NSAllowsArbitraryLoads, which would permit plain HTTP to
+	  anywhere. NSAllowsLocalNetworking relaxes ATS for local-network destinations
+	  only — RFC1918 addresses and .local names — which is what a device build talking
+	  to the dev stack on the Mac needs.
+	  Loopback is already exempt, which is why the simulator worked against
+	  http://localhost with no exception at all; a phone reaching the Mac at
+	  192.168.x.y is not loopback and is refused outright without this.
 	-->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+
+	<!-- iOS 14+ asks before an app may talk to devices on the local network, and
+	     terminates it if this string is missing when the prompt is needed. Only
+	     reached by a build pointed at a LAN address. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>RxHive connects to the RX HIVE server running on your local network.</string>
+
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 </dict>

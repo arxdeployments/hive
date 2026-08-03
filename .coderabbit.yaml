@@ -1,0 +1,133 @@
+# CodeRabbit configuration — https://docs.coderabbit.ai/reference/configuration
+# Schema: https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# For a one-time deep audit, set `profile: assertive` below, open a PR, then set
+# it back to `chill` so day-to-day reviews stay signal-heavy.
+
+language: en-US
+
+reviews:
+  profile: chill
+  high_level_summary: true
+  sequence_diagrams: true
+  estimate_code_review_effort: true
+  changed_files_summary: true
+  related_prs: true
+  poem: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    base_branches:
+      - main
+
+  # Generated output and lockfiles carry no review signal and burn context.
+  path_filters:
+    - "!**/package-lock.json"
+    - "!ios/RxHive.xcodeproj/project.pbxproj"
+    - "!ios/build/**"
+    - "!**/dist/**"
+    - "!**/node_modules/**"
+    - "!frontend/test-results/**"
+    - "!frontend/playwright-report/**"
+
+  path_instructions:
+    - path: "frontend/src/**/*.{js,jsx}"
+      instructions: |
+        React 19 + Vite SPA. State is Zustand, HTTP is axios, routing is
+        react-router-dom v7, long lists use react-virtuoso, toasts use sonner.
+        Flag: missing cleanup in useEffect (especially WebSocket and LiveKit
+        subscriptions), stale closures over store state, keys derived from array
+        index in chat/message lists, unbounded re-renders in message components,
+        and any user-supplied string rendered without escaping.
+        Auth tokens must never land in localStorage-readable paths if a safer
+        store is already used elsewhere in the file — call out inconsistency.
+
+    - path: "backend/app/**/*.py"
+      instructions: |
+        FastAPI on Python 3.12 with async SQLAlchemy and Alembic. Ruff config is
+        line-length 110, rules E,F,W,I,UP,B,ASYNC.
+        Flag: sync I/O inside async handlers, missing `await`, N+1 queries from
+        lazy relationship loads, endpoints that read a resource without checking
+        the caller's org/department scope, mass-assignment from Pydantic models
+        into ORM objects, and unparameterized SQL.
+        Authorization is the highest-risk area in this codebase — for any route
+        touching messages, files, or members, state explicitly which tenancy
+        check applies and whether it is present.
+
+    - path: "backend/alembic/versions/*.py"
+      instructions: |
+        Migrations must be reversible and safe against a live table. Flag missing
+        or wrong `downgrade()`, non-nullable columns added without a server
+        default or backfill, and index creation that would lock a large table.
+
+    - path: "backend/tests/**/*.py"
+      instructions: |
+        pytest with asyncio_mode=auto. Flag tests that assert on a mock instead
+        of on behavior, and shared mutable fixtures that leak state across tests.
+
+    - path: "ios/RxHive/**/*.swift"
+      instructions: |
+        SwiftUI app that mirrors the web client's features. Flag: force unwraps
+        and `try!`, UI mutation off the main actor, retain cycles in closures
+        capturing self, unstructured Task usage that outlives its view, and
+        `URLSession` calls without error handling.
+        This app must stay behaviorally aligned with frontend/ — see
+        docs/IOS_TO_WEB_PARITY.md. If a change alters shared behavior on only
+        one platform, say so.
+
+    - path: "infra/terraform/**/*.tf"
+      instructions: |
+        Flag hardcoded secrets, security groups open to 0.0.0.0/0, unencrypted
+        storage or volumes, over-broad IAM policy statements, and resources
+        missing lifecycle protection where data loss is possible.
+
+    - path: "infra/**/docker-compose*.yml"
+      instructions: |
+        Flag plaintext credentials, host ports bound to 0.0.0.0 for internal-only
+        services, missing healthchecks, and `latest` image tags in prod files.
+
+    - path: ".github/workflows/*.yml"
+      instructions: |
+        Flag unpinned third-party actions, `pull_request_target` combined with
+        checkout of untrusted refs, and secrets exposed to fork-triggered runs.
+
+  tools:
+    eslint:
+      enabled: true
+    ruff:
+      enabled: true
+    swiftlint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    semgrep:
+      enabled: true
+    checkov:
+      enabled: true
+    tflint:
+      enabled: true
+    hadolint:
+      enabled: true
+    actionlint:
+      enabled: true
+    shellcheck:
+      enabled: true
+    yamllint:
+      enabled: true
+    markdownlint:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  learnings:
+    scope: auto
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/CLAUDE.md"
+      - "README.md"
+      - "docs/**/*.md"

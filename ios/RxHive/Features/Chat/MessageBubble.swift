@@ -158,18 +158,22 @@ struct MessageBubble: View {
 
     /// The bubble hugs its content.
     ///
-    /// Two footer placements, because one does not fit both kinds of message:
+    /// Three footer placements, because no single one fits every message:
     ///
-    ///  - **Photo/video:** the footer is *overlaid* on the media's bottom-right with a
-    ///    scrim, as in the reference. The media is the bubble, so anything below it
-    ///    would add a band of empty colour.
-    ///  - **Everything else:** the footer sits to the bottom-right of the content in an
-    ///    `HStack(alignment: .bottom)`, which is what keeps a short "hi" from
-    ///    stretching to the full column while still letting long text wrap.
+    ///  - **Photo/video:** *overlaid* on the media's bottom-right with a scrim, as in
+    ///    the reference. The media is the bubble, so anything below it would add a band
+    ///    of empty colour.
+    ///  - **Audio/document:** composed *into* the card, on a line that already has room
+    ///    to spare. Both cards are a fixed width — wide enough for a waveform, or for a
+    ///    page preview — so a footer placed beside one makes the bubble wider than the
+    ///    card it contains and opens a block of bubble colour that nothing ever fills.
+    ///  - **Everything else:** *beside* the content, bottom-aligned, which is what keeps
+    ///    a short "hi" from stretching to the full column while still letting long text
+    ///    wrap.
     private var bubble: some View {
         HStack(alignment: .bottom, spacing: Theme.Layout.spacing2) {
             bubbleContent
-            if !isOverlaidFooter { footer }
+            if footerPlacement == .beside { footer }
         }
         .padding(.horizontal, isRichMedia ? Theme.Layout.spacing1 : Theme.Layout.spacing3)
         .padding(.vertical, isRichMedia ? Theme.Layout.spacing1 : Theme.Layout.spacing2)
@@ -196,10 +200,17 @@ struct MessageBubble: View {
         }
     }
 
-    /// Photo and video only. A document card and an audio player both carry their own
-    /// text, which a timestamp sitting on top of would collide with.
-    private var isOverlaidFooter: Bool {
-        message.type == .image || message.type == .video
+    enum FooterPlacement { case beside, overlaid, insideCard }
+
+    /// A document card and an audio player both carry their own text, so the footer
+    /// cannot sit *on* them as it does on a photo — but it can sit *in* them, on the
+    /// metadata line each one already has.
+    private var footerPlacement: FooterPlacement {
+        switch message.type {
+        case .image, .video: return .overlaid
+        case .audio, .file: return message.renderableAttachments.isEmpty ? .beside : .insideCard
+        case .text, .system, .unknown: return .beside
+        }
     }
 
     private var bubbleContent: some View {
@@ -234,7 +245,7 @@ struct MessageBubble: View {
 
             typeBody
                 .overlay(alignment: .bottomTrailing) {
-                    if isOverlaidFooter {
+                    if footerPlacement == .overlaid {
                         footer
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
@@ -300,7 +311,10 @@ struct MessageBubble: View {
                 AudioAttachmentView(
                     attachment: attachment,
                     senderName: message.senderName,
-                    senderAvatarPath: message.senderAvatar
+                    senderAvatarPath: message.senderAvatar,
+                    // Sits at the trailing end of the duration line, which was empty
+                    // across most of the card's width.
+                    trailingMeta: AnyView(footer)
                 )
             } else {
                 // The message says audio but carries no media — a half-written row.
@@ -310,7 +324,7 @@ struct MessageBubble: View {
 
         case .file:
             if let attachment = message.renderableAttachments.first {
-                DocumentAttachmentView(attachment: attachment)
+                DocumentAttachmentView(attachment: attachment, trailingMeta: AnyView(footer))
             } else {
                 unavailableMedia("File unavailable")
             }

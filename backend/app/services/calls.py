@@ -110,8 +110,18 @@ async def _finalize(
     await _clear_in_call(ids, call.id)
     if call.conversation_id:
         await get_redis().delete(_conv_key(call.conversation_id))
+    # Never cancel the task we are running on.
+    #
+    # `_ring_timeout` calls this function, and the task it pops here IS that task.
+    # `task.cancel()` therefore cancelled the caller, and because
+    # `contextlib.suppress(Exception)` below does NOT catch `CancelledError` (a
+    # BaseException since 3.8), the timeout died at its next await — inside
+    # `send_system_message` — before publishing either `call:missed`. The row was
+    # already committed as missed, so the call was dead while both clients rang on
+    # forever, and a later Accept hit the `status != ringing` guard and returned
+    # silently. asyncio logs nothing for a cancelled task, so it was invisible.
     task = _ring_timers.pop(str(call.id), None)
-    if task:
+    if task and task is not asyncio.current_task():
         task.cancel()
     if system_note and call.conversation_id:
         from app.services.messaging import send_system_message
@@ -342,23 +352,65 @@ async def initiate_group_call(user: User, conversation_id: uuid.UUID, call_type:
 async def _accept(user: User, call_id: uuid.UUID) -> None:
     async with SessionLocal() as db:
         call = await _load_call(db, call_id)
+        # Every rejection path answers the accepter.
+        #
+        # These were bare `return`s, which is why "the call never connects" had no
+        # error anywhere: a client that pressed Accept on a call the server had
+        # already finalised — rung out, cancelled, or ended — got no frame at all
+        # and sat on "Connecting" indefinitely. It could not tell a dead call from
+        # a dropped frame. `call:error` gives the client something to act on.
         if call is None:
+            await publish_to_users(
+                [user.id],
+                {"type": "call:error", "call_id": str(call_id), "reason": "not_found"},
+            )
             return
         member = await db.get(CallParticipant, (call_id, user.id))
         if member is None or user.id == call.initiated_by:
+            await publish_to_users(
+                [user.id],
+                {"type": "call:error", "call_id": str(call_id), "reason": "not_a_participant"},
+            )
             return
         if call.status != CallStatus.ringing:
+            logger.info(
+                "call.accept.stale call_id=%s user_id=%s status=%s",
+                call_id, user.id, call.status.value,
+            )
+            await publish_to_users(
+                [user.id],
+                {
+                    "type": "call:error",
+                    "call_id": str(call_id),
+                    "reason": "no_longer_ringing",
+                    "status": call.status.value,
+                },
+            )
             return
         call.status = CallStatus.connected
         call.answered_at = now_utc()
         await db.commit()
         task = _ring_timers.pop(str(call_id), None)
-        if task:
+        if task and task is not asyncio.current_task():
             task.cancel()
+        logger.info(
+            "call.accepted call_id=%s accepter_id=%s caller_id=%s",
+            call_id, user.id, call.initiated_by,
+        )
         # Both sides get this: the caller needs to know who answered, and the
         # accepter needs the server's confirmation that the call really moved to
         # connected before joining the SFU room. Sending it only to the caller
         # left the callee never joining — a connected-looking but silent call.
+        #
+        # It reaches every SOCKET of both users, because the bus is keyed per user
+        # (redis_bus.publish_to_users -> hub fan-out). That is deliberate — the
+        # accepter's other devices must stop ringing — but it means a device cannot
+        # tell from this frame alone whether it should JOIN the room or merely
+        # dismiss its ringer. `accepter_id` answers "which user", not "which
+        # device", and every device of one user shares a LiveKit identity
+        # (`mint_token`), so a second device joining EVICTS the first. Clients must
+        # therefore join only if they are the device that sent `call:accept`, or the
+        # caller; see the guards in websocket.js and CallStore.swift.
         await publish_to_users(
             [call.initiated_by, user.id],
             {"type": "call:accepted", "call_id": str(call_id), "accepter_id": str(user.id)},
