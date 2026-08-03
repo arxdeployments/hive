@@ -33,7 +33,7 @@ export const formatFileSize = (bytes) => {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 };
 
-export const DocumentBubble = ({ message, isOwn }) => {
+export const DocumentBubble = ({ message, isOwn, trailingMeta = null }) => {
   // Fall back to a file attachment when the message doesn't carry the fields inline.
   const attachment = Array.isArray(message.attachments)
     ? (message.attachments.find(a => !a.type || a.type === 'file' || a.type === 'document') || message.attachments[0])
@@ -104,7 +104,12 @@ export const DocumentBubble = ({ message, isOwn }) => {
         data-testid="document-bubble"
       >
         {meta}
-        <Download size={16} className={subColor} />
+        {/* The bubble's timestamp and ticks stack UNDER the download arrow
+            rather than on a full-width row beneath this fixed-width card. */}
+        <div className="flex flex-col items-end gap-1 flex-shrink-0">
+          <Download size={16} className={subColor} />
+          {trailingMeta}
+        </div>
       </a>
     );
   }
@@ -150,6 +155,9 @@ export const DocumentBubble = ({ message, isOwn }) => {
             <Download size={16} />
           </a>
         </div>
+        {trailingMeta && (
+          <div className="flex justify-end px-1.5 pb-0.5 -mt-1">{trailingMeta}</div>
+        )}
       </div>
 
       <AnimatePresence>

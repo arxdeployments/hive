@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Play, Pause } from 'lucide-react';
+import { Play, Pause, Mic } from 'lucide-react';
 import { formatDuration } from '../../utils/audioFormat';
 import { PeaksWaveform } from './Waveform';
 
@@ -37,9 +37,25 @@ const pauseOthers = (self) => {
   });
 };
 
-export const AudioPlayer = ({ src, fallbackDuration = null, tone = 'dark', className = '' }) => {
+export const AudioPlayer = ({
+  src,
+  fallbackDuration = null,
+  tone = 'dark',
+  className = '',
+  /* Leading slot: shown with a mic badge until the note is played, then
+     replaced by the speed control. Omit for previews, which have no sender. */
+  senderInitial = null,
+  senderColor = null,
+  /* The owning bubble's timestamp / ticks, composed onto the duration row. */
+  trailingMeta = null,
+}) => {
   const audioRef = useRef(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  // Latched on first play, deliberately NOT derived from position > 0: reaching
+  // the end rewinds to zero, which would flip a fully-listened note back to
+  // looking unplayed.
+  const [hasPlayed, setHasPlayed] = useState(false);
+
   const [position, setPosition] = useState(0);
   const [intrinsic, setIntrinsic] = useState(null);
   const [rate, setRate] = useState(1);
@@ -60,7 +76,7 @@ export const AudioPlayer = ({ src, fallbackDuration = null, tone = 'dark', class
       // Guard the Infinity/NaN case explicitly rather than letting it reach the UI.
       setIntrinsic(Number.isFinite(el.duration) ? el.duration : null);
     };
-    const onPlay = () => { pauseOthers(el); setIsPlaying(true); };
+    const onPlay = () => { pauseOthers(el); setIsPlaying(true); setHasPlayed(true); };
     const onPause = () => setIsPlaying(false);
     const onEnded = () => { setIsPlaying(false); setPosition(0); };
 
@@ -125,9 +141,61 @@ export const AudioPlayer = ({ src, fallbackDuration = null, tone = 'dark', class
   // means the bubble always shows a length even before playback starts.
   const shown = isPlaying || position > 0 ? Math.max(0, total - position) : total;
 
+  // The leading slot swaps once the note has been heard.
+  //
+  // Before first play it identifies WHO the note is from and that you have not
+  // heard it — on a thread of voice notes every bubble otherwise looks
+  // identical and equally listened-to. After that the identity has done its job
+  // and the space is better spent on the speed control, which is a decision the
+  // listener can only sensibly make once they have started listening.
+  //
+  // Only rendered when the caller supplies an initial: the pre-send preview and
+  // the staged-file preview have no sender and keep the speed pill throughout.
+  const showsUnplayedBadge = Boolean(senderInitial) && !hasPlayed;
+
+  const speedButton = (
+    <button
+      type="button"
+      onClick={cycleRate}
+      aria-label={`Playback speed ${rate}x, tap to change`}
+      title={`Playback speed: ${rate}x`}
+      data-testid="audio-speed-toggle"
+      className={`px-1.5 py-0.5 rounded-[4px] text-[10px] font-medium tabular-nums flex-shrink-0 transition-colors ${
+        rate === 1
+          ? `${label} hover:bg-white/10`
+          : own
+            ? 'bg-white/25 text-white'
+            : 'bg-[#10B981]/20 text-[#10B981]'
+      }`}
+    >
+      {rate}x
+    </button>
+  );
+
   return (
     <div className={`flex items-center gap-2 ${className}`} data-testid="audio-player">
       <audio ref={audioRef} src={src} preload="metadata" className="hidden" />
+      {showsUnplayedBadge && (
+        <div
+          className="relative w-9 h-9 flex-shrink-0"
+          data-testid="audio-unplayed-avatar"
+          aria-label="Not played yet"
+        >
+          <div
+            className={`w-9 h-9 rounded-full flex items-center justify-center text-xs font-medium ${
+              own ? 'bg-white/15 text-white' : 'bg-[#10B981]/15'
+            }`}
+            style={own ? undefined : { color: senderColor || '#10B981' }}
+          >
+            {senderInitial}
+          </div>
+          <span className={`absolute -bottom-0.5 -right-0.5 w-4 h-4 rounded-full flex items-center justify-center ${
+            own ? 'bg-[#10B981]' : 'bg-[#10B981]'
+          }`}>
+            <Mic size={9} className="text-white" />
+          </span>
+        </div>
+      )}
       <button
         type="button"
         onClick={toggle}
@@ -151,25 +219,14 @@ export const AudioPlayer = ({ src, fallbackDuration = null, tone = 'dark', class
         tone={tone}
         className="flex-1 min-w-0"
       />
-      <button
-        type="button"
-        onClick={cycleRate}
-        aria-label={`Playback speed ${rate}x, tap to change`}
-        title={`Playback speed: ${rate}x`}
-        data-testid="audio-speed-toggle"
-        className={`px-1.5 py-0.5 rounded-[4px] text-[10px] font-medium tabular-nums flex-shrink-0 transition-colors ${
-          rate === 1
-            ? `${label} hover:bg-white/10`
-            : own
-              ? 'bg-white/25 text-white'
-              : 'bg-[#10B981]/20 text-[#10B981]'
-        }`}
-      >
-        {rate}x
-      </button>
+      {!showsUnplayedBadge && speedButton}
       <span className={`text-[11px] tabular-nums flex-shrink-0 ${label}`} data-testid="audio-duration">
         {formatDuration(shown)}
       </span>
+      {/* The bubble's own timestamp and ticks, rendered on THIS row rather than
+          on a full-width strip beneath a fixed-width card. This row already had
+          the horizontal room going spare. */}
+      {trailingMeta}
     </div>
   );
 };

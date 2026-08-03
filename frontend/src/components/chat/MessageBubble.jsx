@@ -1,8 +1,11 @@
 import React, { memo, useCallback, useEffect, useRef } from 'react';
-import { Check, CheckCheck, Clock, Ban, Mic, ChevronDown, Star, Pin } from 'lucide-react';
+import { AlertTriangle, Ban, ChevronDown, Mic } from 'lucide-react';
 import { ImageBubble } from './ImageBubble';
 import { DocumentBubble } from './DocumentBubble';
 import { AudioPlayer } from './AudioPlayer';
+import { MessageFooter } from './MessageFooter';
+import { FullscreenVideoViewer } from './FullscreenVideoViewer';
+import { VideoBubble } from './VideoBubble';
 
 const LONG_PRESS_MS = 500;
 
@@ -25,45 +28,6 @@ const getSenderColor = (userId) => {
     hash = userId.charCodeAt(i) + ((hash << 5) - hash);
   }
   return SENDER_COLORS[Math.abs(hash) % SENDER_COLORS.length];
-};
-
-const formatTime = (dateStr) => {
-  if (!dateStr) return '';
-  const d = new Date(dateStr);
-  return d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
-};
-
-// WhatsApp tick semantics. These only ever render on your own bubble, which is
-// bg-[#10B981] green, so every tick colour below is judged against THAT
-// background rather than against the page.
-//
-// The double tick is white. Read is pure white; delivered stays the dimmer
-// white/70 it already was, because the two states share one icon (CheckCheck)
-// and would otherwise be indistinguishable — the brightness step is the only
-// thing left carrying the difference once the colour is common.
-//
-// Measured contrast against #10B981 (WCAG relative luminance):
-//   old read  #53BDEB  1.19:1   <- barely visible; blue on green is near-tonal
-//   new read  #FFFFFF  2.56:1   <- more than twice the contrast
-//   delivered white/70 1.92:1
-// So going white is a legibility win here, not just a restyle.
-//
-// The app ships one fixed dark palette — tailwind.config.js declares
-// darkMode: ['class'] but no `dark:` variant is used anywhere in src/ and there
-// is no theme toggle — so there is no light-theme case for these to fail on.
-// They are always white-on-green.
-const StatusIcon = ({ status }) => {
-  switch (status) {
-    case 'sending':
-      return <Clock size={12} className="text-white/50" data-testid="message-status" data-status="sending" aria-label="Sending" />;
-    case 'delivered':
-      return <CheckCheck size={12} className="text-white/70" data-testid="message-status" data-status="delivered" aria-label="Delivered" />;
-    case 'read':
-      return <CheckCheck size={12} className="text-white" data-testid="message-status" data-status="read" aria-label="Read" />;
-    case 'sent':
-    default:
-      return <Check size={12} className="text-white/70" data-testid="message-status" data-status="sent" aria-label="Sent" />;
-  }
 };
 
 // Aggregate reactions for display
@@ -211,6 +175,18 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
   const isFile = message.type === 'file';
   const richBubble = isImage || isVideo || isAudio || isFile;
 
+  // Whether the media this message CLAIMS to carry is actually there. A
+  // half-written row from the backend used to render as an empty card, a dead
+  // download link or a player pointed at the empty string; each type now says
+  // what happened instead. Mirrors iOS renderableAttachments / unavailableMedia.
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  const hasMediaUrl = Boolean(
+    message.media_url ||
+    (Array.isArray(message.media_urls) && message.media_urls.length > 0) ||
+    attachments.some((a) => a.media_url || a.url)
+  );
+  const mediaMissing = richBubble && !hasMediaUrl;
+
   const reactions = aggregateReactions(message.reactions);
   const replyMsg = message.reply_to_message;
 
@@ -219,6 +195,22 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
   const audioName = message.filename ||
     (isAudio && message.content && !message.content.startsWith('/api/') ? message.content : '') ||
     'Voice message';
+
+  const imageCaption = message.caption ||
+    (isImage && message.content && !message.content.startsWith('/api/') ? message.content : '');
+  const hasCaption = Boolean(isVideo ? videoCaption : imageCaption);
+
+  // Built once and handed to whichever slot this message type uses. `overlaid`
+  // only when it will actually sit on a picture — with a caption the footer
+  // drops below the text, where a scrim would be wrong.
+  const footer = (
+    <MessageFooter
+      message={message}
+      isOwn={isOwn}
+      onRetry={onRetry}
+      variant={(isImage || isVideo) && !hasCaption && !mediaMissing ? 'overlaid' : 'inline'}
+    />
+  );
 
   const canEdit = isOwn && message.type === 'text' && !message.is_deleted;
 
@@ -238,7 +230,14 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
        search hit) so the user can see which message they landed on. A ring plus
        a tint rather than a background swap, so it reads on both the green own
        bubble and the dark received one. */
-    <div className={`flex ${isOwn ? 'justify-end' : 'justify-start'} mb-1 px-3 sm:px-8 md:px-16 transition-colors duration-500 ${
+    /* Vertical rhythm carries the run grouping, matching iOS's 8pt-vs-1pt top
+       padding. showSenderName IS the run boundary — it is already computed in
+       ChatPanel and already drives the avatar and the name — it just never
+       reached the spacing. Applied for DMs too, where the avatar and name are
+       suppressed entirely and spacing is the only grouping signal there is. */
+    <div className={`flex ${isOwn ? 'justify-end' : 'justify-start'} ${
+      showSenderName ? 'mt-2' : 'mt-px'
+    } mb-px px-3 sm:px-8 md:px-16 transition-colors duration-500 ${
       highlighted ? 'bg-[#10B981]/15 rounded-[6px]' : ''
     }`}
       data-highlighted={highlighted || undefined}
@@ -306,23 +305,31 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
             </div>
           )}
 
-          {/* Content by type */}
-          {isImage ? (
-            <ImageBubble message={message} isOwn={isOwn} />
-          ) : isVideo ? (
-            <div data-testid="video-bubble" className="max-w-[330px]">
-              <video
-                controls
-                playsInline
-                preload="metadata"
-                src={resolveUrl(message.media_url)}
-                poster={message.thumbnail_url ? resolveUrl(message.thumbnail_url) : undefined}
-                className="w-full rounded-[6px] max-h-[320px] bg-black"
-              />
-              {videoCaption && (
-                <p className={`text-sm mt-1 px-1 ${isOwn ? 'text-white' : 'text-[#F5F5F5]'}`}>{videoCaption}</p>
-              )}
+          {/* Content by type.
+
+              FOOTER PLACEMENT is decided per type, which is the whole of items
+              17-20 in the parity brief. Previously one shared block sat below
+              every kind of content, which cost a full row of empty bubble under
+              a photo, under a fixed-width audio card and under a document card,
+              and made every one-word text message two rows tall. */}
+          {mediaMissing ? (
+            /* A message typed as media whose media is not there. Previously:
+               ImageBubble returned null leaving a bubble with only a timestamp,
+               audio got <AudioPlayer src="">, video got <video src="">, and the
+               document card rendered a dead download link named "Document". */
+            <div className="flex items-center gap-2 px-2 py-1.5" data-testid="media-unavailable">
+              <AlertTriangle size={14} className={isOwn ? 'text-white/70' : 'text-[#A3A3A3]'} />
+              <span className={`text-sm ${isOwn ? 'text-white/80' : 'text-[#A3A3A3]'}`}>
+                {isImage ? 'Photo unavailable'
+                  : isVideo ? 'Video unavailable'
+                  : isAudio ? 'Voice message unavailable'
+                  : 'File unavailable'}
+              </span>
             </div>
+          ) : isImage ? (
+            <ImageBubble message={message} isOwn={isOwn} footer={footer} />
+          ) : isVideo ? (
+            <VideoBubble message={message} isOwn={isOwn} footer={footer} caption={videoCaption} />
           ) : isAudio ? (
             /* Was a bare `<audio controls>` at 32px inside a 260px bubble: no
                scrub, no length before the file loaded, and completely different
@@ -330,9 +337,6 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
                the pre-send preview uses, so what the sender heard is what the
                recipient sees, and only one clip can sound at a time. */
             <div data-testid="audio-bubble" className="w-[260px] flex items-center gap-2.5 p-1.5">
-              <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 ${isOwn ? 'bg-white/15' : 'bg-[#10B981]/15'}`}>
-                <Mic size={18} className={isOwn ? 'text-white' : 'text-[#10B981]'} />
-              </div>
               <div className="flex-1 min-w-0">
                 {/* pr-6 keeps the filename clear of the chevron's corner */}
                 <p className={`text-xs truncate pr-6 ${isOwn ? 'text-white/90' : 'text-[#F5F5F5]'}`}>{audioName}</p>
@@ -343,64 +347,39 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
                   fallbackDuration={message.duration ?? message.attachments?.[0]?.duration ?? null}
                   tone={isOwn ? 'own' : 'dark'}
                   className="mt-1"
+                  /* The leading slot: the sender's initial with a mic badge until
+                     the note has been played, then the speed control. Offering
+                     "2x" on a note nobody has heard is a control for a decision
+                     the listener has not had the chance to make. */
+                  senderInitial={message.sender_name?.charAt(0)?.toUpperCase() || null}
+                  senderColor={getSenderColor(message.sender_id)}
+                  /* The bubble footer, rendered on the player's own duration row
+                     rather than on a full-width strip beneath a 260px card. */
+                  trailingMeta={footer}
                 />
               </div>
             </div>
           ) : isFile ? (
-            <DocumentBubble message={message} isOwn={isOwn} />
+            <DocumentBubble message={message} isOwn={isOwn} trailingMeta={footer} />
           ) : (
-            <p className={`text-sm whitespace-pre-wrap break-words ${isOwn ? 'text-white' : 'text-[#F5F5F5]'}`}>
-              {message.content}
-            </p>
+            /* Beside, not below: a short message is "hi  10:24 AM ✓" on one line.
+               items-end bottom-aligns the footer with the last line of wrapped
+               text. The footer is deliberately not flex-1 — trailing alignment
+               already comes from the row's justify-end, and stretching it is
+               what pushed every bubble to the full column width on iOS. */
+            <div className="flex items-end gap-2">
+              <p className={`text-sm whitespace-pre-wrap break-words min-w-0 ${isOwn ? 'text-white' : 'text-[#F5F5F5]'}`}>
+                {message.content}
+              </p>
+              {footer}
+            </div>
           )}
 
-          {/* Time + status. The negative right margin gives back the space the
-              chevron reserved above, so the timestamp still sits flush right. */}
-          <div className={`flex items-center gap-1 mt-1 ${richBubble ? 'px-2 pb-1' : '-mr-5'} justify-end`}>
-            {message.is_pinned && (
-              <Pin
-                size={11}
-                className={isOwn ? 'text-white/70' : 'text-[#A3A3A3]'}
-                data-testid="message-pinned-indicator"
-                aria-label="Pinned"
-              />
-            )}
-            {message.is_starred && (
-              <Star
-                size={11}
-                fill="currentColor"
-                className={isOwn ? 'text-white/70' : 'text-[#A3A3A3]'}
-                data-testid="message-starred-indicator"
-                aria-label="Starred"
-              />
-            )}
-            <span className={`text-[11px] ${isOwn ? 'text-white/70' : 'text-[#A3A3A3]'}`}>
-              {formatTime(message.created_at)}
-            </span>
-            {message.edited_at && (
-              <span
-                className={`text-[11px] ${isOwn ? 'text-white/70' : 'text-[#A3A3A3]'}`}
-                data-testid="edited-indicator"
-              >
-                · edited
-              </span>
-            )}
-            {isOwn && (
-              message.status === 'failed' ? (
-                <button
-                  type="button"
-                  onClick={(e) => { e.stopPropagation(); onRetry && onRetry(message); }}
-                  title="Failed to send. Tap to retry."
-                  data-testid="message-retry"
-                  className="flex items-center justify-center w-4 h-4 rounded-full bg-[#EF4444] text-white text-[10px] font-bold leading-none hover:bg-[#DC2626] transition-colors"
-                >
-                  !
-                </button>
-              ) : (
-                <StatusIcon status={message.status || 'sent'} />
-              )
-            )}
-          </div>
+          {/* Back to its own row only where there is nothing to sit beside or
+              on top of: a captioned photo/video, and the unavailable case. */}
+          {(mediaMissing || ((isImage || isVideo) && hasCaption)) && (
+            <div className={`flex ${richBubble ? 'px-2 pb-1' : ''} justify-end`}>{footer}</div>
+          )}
         </div>
 
         {/* Reaction badges */}
