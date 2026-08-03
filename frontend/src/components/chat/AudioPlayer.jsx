@@ -48,6 +48,10 @@ export const AudioPlayer = ({
   senderColor = null,
   /* The owning bubble's timestamp / ticks, composed onto the duration row. */
   trailingMeta = null,
+  /* Called when the element cannot load this source at all. The mid-recording
+     preview needs it: a paused MP4 has no finalised moov atom, so the browser
+     refuses it and the player would otherwise sit there doing nothing. */
+  onUnplayable = null,
 }) => {
   const audioRef = useRef(null);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -77,6 +81,12 @@ export const AudioPlayer = ({
       setIntrinsic(Number.isFinite(el.duration) ? el.duration : null);
     };
     const onPlay = () => { pauseOthers(el); setIsPlaying(true); setHasPlayed(true); };
+    // There was NO error handling here at all, which is why the documented
+    // "degrades to cannot-preview" behaviour never actually happened: the user
+    // tapped play on a paused preview, the waveform was flat, and nothing
+    // occurred. Reported upward rather than rendered here, because only the
+    // caller knows whether an unplayable source is expected.
+    const onError = () => { setIsPlaying(false); onUnplayable?.(); };
     const onPause = () => setIsPlaying(false);
     const onEnded = () => { setIsPlaying(false); setPosition(0); };
 
@@ -84,6 +94,7 @@ export const AudioPlayer = ({
     el.addEventListener('loadedmetadata', onMeta);
     el.addEventListener('durationchange', onMeta);
     el.addEventListener('play', onPlay);
+    el.addEventListener('error', onError);
     el.addEventListener('pause', onPause);
     el.addEventListener('ended', onEnded);
     return () => {
@@ -91,11 +102,12 @@ export const AudioPlayer = ({
       el.removeEventListener('loadedmetadata', onMeta);
       el.removeEventListener('durationchange', onMeta);
       el.removeEventListener('play', onPlay);
+      el.removeEventListener('error', onError);
       el.removeEventListener('pause', onPause);
       el.removeEventListener('ended', onEnded);
       playing.delete(el);
     };
-  }, [src]);
+  }, [src, onUnplayable]);
 
   // Re-applied on src change too: a new <audio> src resets playbackRate to 1,
   // so without this the badge would say 2x while the audio played at normal
@@ -208,15 +220,20 @@ export const AudioPlayer = ({
         {isPlaying ? <Pause size={14} /> : <Play size={14} />}
       </button>
       {/* Bars, not a range input. The flat line read as a loading bar rather
-          than audio, and gave no sense of where the speech actually is. For the
-          local pre-send preview these are the clip's real peaks; a sent note
-          shows an even row, because decoding every clip in a thread to draw it
-          is not worth the bandwidth — see Waveform.jsx. */}
+          than audio, and gave no sense of where the speech actually is.
+          These are the clip's REAL peaks — decoded from the audio, never
+          fabricated — which is what makes the seek surface aimable.
+
+          Decoding is deferred until the note is first played (or is a local
+          blob, where the bytes are already in memory). A thread scrolled past
+          fifty voice notes therefore fetches none of them, and by the time this
+          does fetch, the player is downloading the same file anyway. */}
       <PeaksWaveform
         src={src}
         progress={total > 0 ? Math.min(1, position / total) : 0}
         onSeek={seek}
         tone={tone}
+        decode={hasPlayed || Boolean(src && src.startsWith('blob:'))}
         className="flex-1 min-w-0"
       />
       {!showsUnplayedBadge && speedButton}

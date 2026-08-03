@@ -1,6 +1,15 @@
 import React, { useState, useRef, useEffect, useCallback, memo } from 'react';
 import { Send, Smile, Paperclip, Mic, Image, FileText, Film, X, Loader2, Upload } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
+import {
+  formatBytes,
+  loadQualityTier,
+  measureBatchSize,
+  saveQualityTier,
+  transcodeImage,
+} from '../../utils/mediaQuality';
+import { extractVideoPoster } from '../../utils/videoPoster';
+import { useHoldToTalk } from '../../hooks/useHoldToTalk';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
 import EmojiPicker from 'emoji-picker-react';
@@ -100,6 +109,12 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   //   { id, file, url, name, category, size }
   const [stagedFiles, setStagedFiles] = useState([]);
   const [previewCaption, setPreviewCaption] = useState('');
+  // Standard vs HD, persisted the way the other preferences in Settings are.
+  const [qualityTier, setQualityTier] = useState(loadQualityTier);
+  // The MEASURED cost of this batch at the current tier, from running the real
+  // transcode rather than estimating. A number beside the send button that is
+  // not the number that arrives is worse than no number.
+  const [batchSize, setBatchSize] = useState(null);
   const textareaRef = useRef(null);
   const fileInputRef = useRef(null);
   const mediaInputRef = useRef(null);
@@ -260,6 +275,18 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   };
 
   // ── Upload + media send ───────────────────────────────────────────────────
+  useEffect(() => {
+    if (stagedFiles.length === 0) { setBatchSize(null); return undefined; }
+    let cancelled = false;
+    // Keyed on tier + batch, and re-run on either change, so flipping HD
+    // updates the figure. Cancelled rather than raced: a slow measurement of an
+    // older batch must not land on top of a newer one.
+    measureBatchSize(stagedFiles, qualityTier).then((res) => {
+      if (!cancelled) setBatchSize(res);
+    });
+    return () => { cancelled = true; };
+  }, [stagedFiles, qualityTier]);
+
   const uploadFile = async (file, onProgress, signal) => {
     const formData = new FormData();
     formData.append('file', file);
@@ -411,7 +438,45 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     if (disabled || !conversationId) return;
     const { ok, error } = await recorder.start();
     if (!ok && error) toast.error(error);
+    return { ok };
   };
+
+  /**
+   * Hold-to-talk, on touch only.
+   *
+   * The click toggle above is KEPT for a mouse rather than replaced: a
+   * mouse-hold is a poor primary interaction, and on desktop the click flow
+   * already behaves like iOS's locked state. On a phone the whole point is that
+   * record, review and send are one continuous gesture instead of three taps.
+   */
+  const hold = useHoldToTalk({
+    enabled: canRecord && !disabled && Boolean(conversationId),
+    onStart: handleMicClick,
+    onLock: () => { /* recording simply continues; the bar reflects hold.locked */ },
+    onSend: () => { sendAfterStopRef.current = true; recorder.stop(); },
+    onCancel: (info) => {
+      recorder.cancel();
+      sendAfterStopRef.current = false;
+      if (info?.tooShort) toast.error('Hold to record, release to send');
+    },
+  });
+
+  /**
+   * Say why a recording produced nothing.
+   *
+   * Three paths in the hook used to drop a take and return to idle in silence,
+   * so the recorder bar simply vanished with no explanation — the user is left
+   * to guess whether the mic failed, the app broke, or they mis-clicked.
+   */
+  useEffect(() => {
+    if (!recorder.lastError) return;
+    toast.error({
+      too_short: 'That recording was too short to send',
+      empty: 'Nothing was recorded — check your microphone',
+      device_lost: 'Your microphone became unavailable, so recording paused',
+    }[recorder.lastError] || 'Recording failed');
+    recorder.clearLastError();
+  }, [recorder.lastError, recorder.clearLastError, recorder]);
 
   const uploadVoice = useCallback(async (rec) => {
     if (!rec || !conversationId) return;
@@ -531,11 +596,26 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
         if (!controller) { URL.revokeObjectURL(item.url); continue; }
 
         try {
+          // Re-encoded HERE rather than at stage time, so the tier can still be
+          // changed in the tray and so a cancelled batch costs no CPU. Returns
+          // the original untouched for anything that is not a re-encodable
+          // image, so this is safe for every category.
+          const outgoing = await transcodeImage(item.file, qualityTier);
+          // Measure a video's length before sending it. duration is
+          // CLIENT-supplied on message create — the server never probes the file
+          // — and the web only ever passed it for voice notes, so every video
+          // ever sent from the web has duration null forever and the bubble's
+          // duration badge can never render. Best-effort: a failure sends null,
+          // which is what happened unconditionally before.
+          let mediaDuration = null;
+          if (item.category === 'video') {
+            mediaDuration = (await extractVideoPoster(outgoing)).duration;
+          }
           await sendMediaFile(
-            item.file,
+            outgoing,
             i === 0 ? replyId : null,
             i === 0 ? caption : '',
-            null,
+            mediaDuration,
             (pct) => setProgress(item.id, pct),
             controller.signal
           );
@@ -712,6 +792,38 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                 {describeStaged(stagedFiles)}
                 <span className="ml-2 text-[11px] font-normal text-[#525252]">tap to preview</span>
               </span>
+              <div className="flex items-center gap-2">
+                {stagedFiles.some((f) => f.category === 'image') && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = qualityTier === 'hd' ? 'standard' : 'hd';
+                      setQualityTier(next);
+                      saveQualityTier(next);
+                    }}
+                    title={qualityTier === 'hd'
+                      ? 'HD: clearer, slower to send, can be several times larger'
+                      : 'Standard: faster to send, smaller file size'}
+                    aria-pressed={qualityTier === 'hd'}
+                    data-testid="media-quality-toggle"
+                    className={`px-2 py-1 rounded-[4px] text-[11px] font-medium transition-colors ${
+                      qualityTier === 'hd'
+                        ? 'bg-[#10B981]/20 text-[#10B981] border border-[#10B981]/40'
+                        : 'bg-[#1A1A1A] text-[#A3A3A3] border border-[#2D2D2D] hover:text-[#F5F5F5]'
+                    }`}
+                  >
+                    HD
+                  </button>
+                )}
+                {batchSize && (
+                  <span
+                    className="text-[11px] text-[#A3A3A3] tabular-nums"
+                    data-testid="media-measured-size"
+                  >
+                    {formatBytes(batchSize.total)}{batchSize.anyOriginal ? ' original' : ''}
+                  </span>
+                )}
+              </div>
               <button
                 onClick={clearStaged}
                 disabled={uploading}
@@ -868,6 +980,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
           onStop={recorder.stop}
           onSend={handleSendVoice}
           sending={voiceSending}
+          hold={hold}
         />
       ) : (
       /* Main composer bar */
@@ -970,7 +1083,13 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
               getUserMedia, or an insecure context) the button falls back to
               send-only rather than offering a control that cannot work. */}
           <button
-            onClick={hasText ? handleSend : (canRecord ? handleMicClick : undefined)}
+            // On a coarse pointer the gesture owns the button and the click
+            // handler is suppressed, or a tap would both start a hold AND fire
+            // the toggle, leaving two recorders racing.
+            onClick={hasText ? handleSend : (canRecord && !hold.active ? handleMicClick : undefined)}
+            {...(hasText ? {} : hold.handlers)}
+            style={hasText ? undefined : { touchAction: 'none', WebkitTouchCallout: 'none' }}
+            data-hold-active={hold.active || undefined}
             disabled={!hasText && !canRecord}
             aria-label={hasText ? 'Send message' : 'Record voice message'}
             title={hasText ? 'Send' : (canRecord ? 'Record voice message' : (micSupported ? 'Voice messages are turned off for your account' : 'Recording is not supported in this browser'))}

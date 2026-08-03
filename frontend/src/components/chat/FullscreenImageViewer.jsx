@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Download, ChevronLeft, ChevronRight, CornerUpLeft } from 'lucide-react';
+import { useZoomPan } from '../../hooks/useZoomPan';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 
@@ -29,6 +30,8 @@ export const FullscreenImageViewer = ({
   onJumpTo,
 }) => {
   const [currentIndex, setCurrentIndex] = useState(initialIndex);
+  // resetKey: paging must not land the user on a photo that is still zoomed in.
+  const zoom = useZoomPan({ resetKey: currentIndex });
 
   // Capture-phase on window, matching PdfViewer and FullscreenVideoViewer.
   //
@@ -151,19 +154,52 @@ export const FullscreenImageViewer = ({
           </div>
         </div>
 
-        {/* Image */}
-        <div className="flex-1 flex items-center justify-center px-16 py-4" onClick={(e) => e.stopPropagation()}>
+        {/* Image.
+
+            touch-action: none is required, not optional: without it the
+            browser's own page pinch claims the gesture before any pointer event
+            is delivered, and the two-finger zoom below never fires. overflow
+            hidden keeps a panned image inside the viewer rather than spilling
+            over the header. */}
+        <div
+          ref={zoom.containerRef}
+          className="flex-1 flex items-center justify-center px-16 py-4 overflow-hidden touch-none select-none"
+          style={{ cursor: zoom.isZoomed ? 'grab' : 'default' }}
+          onClick={(e) => e.stopPropagation()}
+          {...zoom.handlers}
+        >
           <motion.img
             key={currentIndex}
-            initial={{ opacity: 0, scale: 0.9 }}
-            animate={{ opacity: 1, scale: 1 }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
             transition={{ duration: 0.2 }}
             src={imageUrl}
             alt=""
+            draggable={false}
+            data-testid="viewer-image"
+            data-zoom={zoom.scale.toFixed(2)}
             className="max-w-[90vw] max-h-[85vh] object-contain rounded-lg"
+            style={{
+              transform: `translate(${zoom.offset.x}px, ${zoom.offset.y}px) scale(${zoom.scale})`,
+              // No transition while zooming: a CSS transition on a wheel or
+              // pinch stream lags a frame behind the fingers and reads as jank.
+              transformOrigin: 'center center',
+              willChange: 'transform',
+            }}
             onClick={(e) => e.stopPropagation()}
           />
         </div>
+
+        {zoom.isZoomed && (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); zoom.reset(); }}
+            data-testid="image-zoom-reset"
+            className="absolute bottom-24 left-1/2 -translate-x-1/2 z-20 px-3 py-1.5 rounded-full bg-black/60 text-xs text-white hover:bg-black/80 transition-colors"
+          >
+            {Math.round(zoom.scale * 100)}% · reset
+          </button>
+        )}
 
         {/* Navigation arrows */}
         {images.length > 1 && (

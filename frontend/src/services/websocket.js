@@ -2,7 +2,7 @@ import { toast } from 'sonner';
 import useChatStore from '../stores/chatStore';
 import useCallStore from '../stores/callStore';
 import livekitClient from './livekitClient';
-import { refreshSession, sessionRejected } from '../api/client';
+import { refreshSession, sessionRejected, setSignOutReason } from '../api/client';
 import { withDerivedStatus, applyReadReceipt } from '../utils/messageStatus';
 import { handleCallJoinError, notifyCameraUnavailable } from '../utils/callErrors';
 
@@ -122,7 +122,10 @@ class RxHiveWebSocket {
         // Anything else backs off and retries like a normal disconnect.
         if (sessionRejected(err)) {
           localStorage.removeItem('user');
-          window.location.href = '/login';
+          setSignOutReason('expired');
+          // Guarded, matching client.js: already being on /login is not a reason
+          // to navigate again, and a reload there would clear the form.
+          if (window.location.pathname !== '/login') window.location.href = '/login';
           return;
         }
         this._scheduleReconnect();
@@ -593,8 +596,24 @@ class RxHiveWebSocket {
   send(data) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this._rawSend(data);
-    } else {
-      this.messageQueue.push(data);
+      return;
+    }
+    // Frames sent while the socket is down are DROPPED, not queued.
+    //
+    // A queue survives an entire offline period and then flushes at once on
+    // reconnect, which replays intent that has expired: a `typing_start` from a
+    // keystroke minutes ago shows the peer a phantom "typing…", a read_receipt
+    // fires for a conversation the user has since left, and — the one that
+    // actually hurts — a queued `call:initiate` RINGS the callee for a call
+    // that was abandoned before the connection dropped.
+    //
+    // Nothing here needs replay. Chat messages already refuse to queue (see
+    // sendMessage) because the HTTP fallback owns them and a replayed frame
+    // would double-send; typing and receipts are self-correcting (the receiver
+    // clears typing after 4s, receipts are idempotent); call signalling is
+    // driven by the UI, which is still there to retry.
+    if (import.meta.env.DEV) {
+      console.debug('[WS] dropped while disconnected:', data?.type);
     }
   }
 
@@ -690,9 +709,18 @@ class RxHiveWebSocket {
   _scheduleReconnect(immediate = false) {
     if (this._intentionalClose || !this._active) return;
 
+    // Jittered, not bare exponential. Every tab that was connected when the API
+    // restarted wakes on the SAME schedule otherwise — 1s, 2s, 4s in lockstep —
+    // and the herd hits a server that is still coming up. The web is the client
+    // with the most concurrent sessions per user, since each tab holds its own
+    // socket, so it needs this more than iOS does.
+    //
+    // The attempt counter needs no clamp: Math.pow overflows to Infinity and
+    // Math.min caps it at maxReconnectDelay, so the ceiling already holds.
     const delay = immediate
       ? 100
-      : Math.min(1000 * Math.pow(2, this.reconnectAttempts), this.maxReconnectDelay);
+      : Math.min(1000 * Math.pow(2, this.reconnectAttempts), this.maxReconnectDelay)
+        + Math.random() * 1000;
     this.reconnectAttempts++;
 
     useChatStore.getState().setWsConnecting(true);
