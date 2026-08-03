@@ -112,7 +112,7 @@ const ImageGrid = ({ items, onImageClick }) => {
   );
 };
 
-export const ImageBubble = ({ message, isOwn }) => {
+export const ImageBubble = ({ message, isOwn, footer = null }) => {
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerIndex, setViewerIndex] = useState(0);
 
@@ -129,7 +129,18 @@ export const ImageBubble = ({ message, isOwn }) => {
   return (
     <>
       <div data-testid="image-bubble">
-        <ImageGrid items={items} onImageClick={handleImageClick} />
+        {/* relative so the footer can be absolutely positioned over the picture
+            rather than adding a row of bubble colour beneath it. With a caption
+            the caller passes no footer and puts it under the text instead.
+
+            min-h is load-bearing, not cosmetic: an overlaid footer is positioned
+            against THIS box, so a picture that renders with no height — a 404,
+            a decode failure, a degenerate 1x1 — would let the scrim escape the
+            bubble and land on top of whatever is below it in the thread. */}
+        <div className="relative min-h-[34px]">
+          <ImageGrid items={items} onImageClick={handleImageClick} />
+          {!caption && footer}
+        </div>
         {caption && (
           <p className={`text-sm mt-1 ${isOwn ? 'text-white' : 'text-[#F5F5F5]'}`}>{caption}</p>
         )}
