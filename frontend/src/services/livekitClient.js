@@ -66,6 +66,13 @@ class LiveKitClient {
     this.room = null;
     this.callId = null;
     this._screenSharePublication = null;
+    /**
+     * Called when the SFU drops us without being asked — an eviction, a server
+     * restart, a network partition. Set by the signalling layer, which is the only
+     * part that can tell the server the call is over; wiring it the other way round
+     * would make this module import websocket.js and close an import cycle.
+     */
+    this.onUnexpectedDisconnect = null;
   }
 
   /**
@@ -216,8 +223,26 @@ class LiveKitClient {
           useCallStore.setState({ networkQuality: map[quality] || 'good' });
         }
       })
-      .on(RoomEvent.Disconnected, () => {
+      .on(RoomEvent.Disconnected, (reason) => {
         useCallStore.setState({ localStream: null, activeSpeakerIds: [] });
+
+        // An unexpected disconnect has to reach call state, not just clear media.
+        //
+        // This handler used to stop at the two setState fields, so when the SFU
+        // dropped us the UI carried on showing "Connecting" — or a running duration
+        // timer over dead audio — with no error and no way out. That is precisely how
+        // the web-accepted call presented as "never connects": a second device of the
+        // same user joined with the same LiveKit identity and the server evicted this
+        // one as DUPLICATE_IDENTITY, silently.
+        //
+        // `leave()` nulls `this.room` before it calls `room.disconnect()`, so a
+        // disconnect we asked for arrives here with no room and is ignored. Only a
+        // drop we did not initiate gets through.
+        if (!this.room) return;
+        console.warn('[call] SFU disconnected unexpectedly', { reason, callId: this.callId });
+        const lostCallId = this.callId;
+        this.leave();
+        this.onUnexpectedDisconnect?.(lostCallId, reason);
       })
       .on(RoomEvent.LocalTrackPublished, () => {
         useCallStore.setState({ localStream: this._localStream() });

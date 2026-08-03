@@ -419,14 +419,24 @@ struct AudioAttachmentView: View {
     /// context, can still render the player.
     var senderName: String?
     var senderAvatarPath: String?
+    /// The bubble's timestamp and ticks, placed on the duration line. Passed in rather
+    /// than sitting beside the card, which made the bubble wider than the card and left
+    /// dead colour in the gap. Nil in a gallery row, which has no bubble around it.
+    var trailingMeta: AnyView?
 
     @EnvironmentObject private var toasts: ToastCenter
     @StateObject private var playback = AudioAttachmentPlayback()
 
-    init(attachment: Attachment, senderName: String? = nil, senderAvatarPath: String? = nil) {
+    init(
+        attachment: Attachment,
+        senderName: String? = nil,
+        senderAvatarPath: String? = nil,
+        trailingMeta: AnyView? = nil
+    ) {
         self.attachment = attachment
         self.senderName = senderName
         self.senderAvatarPath = senderAvatarPath
+        self.trailingMeta = trailingMeta
     }
 
     private var total: TimeInterval {
@@ -493,12 +503,20 @@ struct AudioAttachmentView: View {
             }
 
             // Elapsed sits under the waveform rather than beside it, as in the
-            // reference — inline it competes with the bubble's own timestamp.
-            Text(MediaFormatting.clockLabel(shownTime))
-                .font(Theme.Typography.micro)
-                .monospacedDigit()
-                .foregroundStyle(Theme.Color.textMuted)
-                .padding(.leading, 74)
+            // reference. The timestamp shares the line: it is the one row in the card
+            // with space going spare, and putting it here is what lets the bubble hug
+            // the card instead of standing a footer's width proud of it.
+            HStack(alignment: .bottom, spacing: Theme.Layout.spacing2) {
+                Text(MediaFormatting.clockLabel(shownTime))
+                    .font(Theme.Typography.micro)
+                    .monospacedDigit()
+                    .foregroundStyle(Theme.Color.textMuted)
+                    .padding(.leading, 74)
+                if let trailingMeta {
+                    Spacer(minLength: Theme.Layout.spacing3)
+                    trailingMeta
+                }
+            }
         }
         .padding(.horizontal, Theme.Layout.spacing3)
         .padding(.vertical, Theme.Layout.spacing2)
@@ -792,8 +810,26 @@ struct DocumentAttachmentView: View {
     /// back to the icon row is better than a permanently empty preview plate.
     @State private var previewFailed = false
 
-    init(attachment: Attachment) {
+    /// The bubble's timestamp and ticks, stacked under the download control. Beside the
+    /// card it forced the bubble a footer's width wider than the card and left a block
+    /// of empty bubble colour; here it uses the vertical room the two-line filename
+    /// already claims. Nil outside a bubble.
+    var trailingMeta: AnyView?
+
+    /// Card width, and the page preview inside it.
+    ///
+    /// 290 rather than the original 262: the timestamp moved into the card, and a
+    /// timestamp is wider than the download arrow it sits under, so the metadata column
+    /// lost about 24pt and started eliding "• pdf" off the end of
+    /// "26 pages • 43.1 MB • pdf". Widening by that much keeps the line whole and buys
+    /// a larger page preview, and the bubble is still far narrower than it was when the
+    /// footer hung off the side of the card.
+    private static let cardWidth: CGFloat = 290
+    private static let previewSize = CGSize(width: 278, height: 167)
+
+    init(attachment: Attachment, trailingMeta: AnyView? = nil) {
         self.attachment = attachment
+        self.trailingMeta = trailingMeta
     }
 
     private var glyph: (systemImage: String, tint: Color) {
@@ -842,7 +878,7 @@ struct DocumentAttachmentView: View {
             // A white plate under the page: a rasterised page is white-on-white at
             // the margins, and without this it bleeds into the bubble.
             .background(Color.white)
-            .frame(width: 250, height: 150)
+            .frame(width: Self.previewSize.width, height: Self.previewSize.height)
             // `.top` alignment matters — a cropped portrait page must show the TOP of
             // page 1, where the title is, not its middle.
             .clipped()
@@ -851,7 +887,7 @@ struct DocumentAttachmentView: View {
             metaRow
         }
         .padding(5)
-        .frame(width: 262)
+        .frame(width: Self.cardWidth)
         .background(
             RoundedRectangle(cornerRadius: Theme.Layout.radiusInput)
                 .fill(Theme.Color.surface2)
@@ -893,10 +929,24 @@ struct DocumentAttachmentView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            downloadControl
+            trailingColumn { downloadControl }
         }
         .padding(.horizontal, 5)
         .padding(.bottom, 3)
+    }
+
+    /// The trailing control with the bubble's timestamp beneath it, so the footer costs
+    /// no extra row and no extra bubble width.
+    @ViewBuilder
+    private func trailingColumn<Control: View>(@ViewBuilder _ control: () -> Control) -> some View {
+        if let trailingMeta {
+            VStack(alignment: .trailing, spacing: Theme.Layout.spacing1) {
+                control()
+                trailingMeta
+            }
+        } else {
+            control()
+        }
     }
 
     // MARK: - Everything else: the plain icon row
@@ -920,16 +970,18 @@ struct DocumentAttachmentView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                if isFetching {
-                    ProgressView().tint(Theme.Color.textMuted).scaleEffect(0.7)
-                } else {
-                    Image(systemName: "arrow.down.circle")
-                        .font(.system(size: 16))
-                        .foregroundStyle(Theme.Color.textMuted)
+                trailingColumn {
+                    if isFetching {
+                        ProgressView().tint(Theme.Color.textMuted).scaleEffect(0.7)
+                    } else {
+                        Image(systemName: "arrow.down.circle")
+                            .font(.system(size: 16))
+                            .foregroundStyle(Theme.Color.textMuted)
+                    }
                 }
             }
             .padding(Theme.Layout.spacing3)
-            .frame(width: 262)
+            .frame(width: Self.cardWidth)
             .background(
                 RoundedRectangle(cornerRadius: Theme.Layout.radiusInput)
                     .fill(Theme.Color.surface2)

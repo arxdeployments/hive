@@ -71,6 +71,10 @@ final class CallStore: ObservableObject {
     private var signalledMedia: [String: (muted: Bool?, cameraOff: Bool?)] = [:]
     /// Set while we are the initiator and the server has not yet told us the call id.
     private var awaitingCallID = false
+    /// The call answered on *this* device. Only that device may join the SFU room,
+    /// because every device of one user shares a single LiveKit identity and a second
+    /// join evicts the first. Cleared on teardown.
+    private var acceptedLocallyCallID: String?
     private var startedAt: Date?
 
     private let log = Logger(subsystem: "ai.rhythmrx.rxhive", category: "calls")
@@ -364,6 +368,9 @@ final class CallStore: ObservableObject {
     func accept() {
         guard case .incoming(let signal) = phase, let auth, let callID = signal.callID else { return }
         isConnecting = true
+        // This device is the one answering, so this device is the one that may enter
+        // the SFU room — see `callAccepted` for why only one device per user can.
+        acceptedLocallyCallID = callID
         // Group calls are joined, direct calls accepted. Either way the LiveKit join
         // waits for the server's confirmation (`call:accepted` /
         // `call:group_participants`) — joining the room before the call row moves to
@@ -506,8 +513,25 @@ final class CallStore: ObservableObject {
             // Published to *both* sides: the caller learns who answered, the
             // accepter gets confirmation the row moved to connected. Both join here.
             guard hasLiveCall else { return }
-            let callID = currentCallID ?? signal.callID
+            let callID = signal.callID ?? currentCallID
             guard let callID else { return }
+
+            // Answered on one of this user's OTHER devices: stop ringing, do not join.
+            //
+            // The frame goes to every socket the accepting user holds, and every device
+            // of a user shares one LiveKit identity (`mint_token`), so a second device
+            // entering the room evicts the first. `hasLiveCall` is true while merely
+            // `.incoming`, so this phone used to join a call it had not answered and
+            // silently knocked the answering client — reliably the browser, which
+            // connects before taking the microphone while this app takes it first — out
+            // of the room with no error shown anywhere.
+            if let accepterID = signal.accepterID,
+               accepterID == auth?.currentUser?.id,
+               acceptedLocallyCallID != callID {
+                log.notice("Call answered on another device; dismissing the ringer")
+                await teardown(to: .idle)
+                return
+            }
             if let accepterID = signal.accepterID,
                accepterID != auth?.currentUser?.id,
                let brief = brief(forUserID: accepterID, in: conversationID) {
@@ -818,6 +842,7 @@ final class CallStore: ObservableObject {
         networkQuality = .unknown
         startedAt = nil
         awaitingCallID = false
+        acceptedLocallyCallID = nil
         activeConversationID = nil
 
         if case .ended = terminal, wasLive {

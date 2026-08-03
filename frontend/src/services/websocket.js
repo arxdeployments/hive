@@ -35,6 +35,20 @@ class RxHiveWebSocket {
     this.pongTimeout = null;
     this._intentionalClose = false;
     this._active = false;
+    /// The call this client answered, so only the answering device joins the SFU.
+    this._acceptedCallId = null;
+
+    // An SFU drop we did not ask for ends the call here, and tells the server.
+    // Without this the room could vanish underneath a "connected" UI and nothing
+    // in the app would notice — the exact shape of the web-accept failure.
+    livekitClient.onUnexpectedDisconnect = (callId, reason) => {
+      const cs = useCallStore.getState();
+      if (cs.callState === 'idle' || cs.callState === 'ended') return;
+      console.warn('[call] ending call after an unexpected SFU disconnect', { callId, reason });
+      toast.error('Call disconnected');
+      cs.endCall();
+      if (callId) this.send({ type: 'call:end', call_id: callId });
+    };
   }
 
   connect() {
@@ -486,11 +500,38 @@ class RxHiveWebSocket {
       }
       case 'call:accepted': {
         const cs = callStore.getState();
+        // The server's authoritative id, not our local one. `cs.callId ||` preferred
+        // stale state and could join the wrong room after a previous call.
+        const joinId = data.call_id || cs.callId;
+
+        // Only ONE device per user may enter the room.
+        //
+        // This frame reaches every socket both users hold, because the bus is keyed
+        // per user. Every device of a user also shares a single LiveKit identity
+        // (backend mint_token), so if two of them connect, livekit-server evicts the
+        // first as a duplicate identity. That was the whole bug: the callee's phone
+        // was still ringing, it joined on this frame too, and because the browser
+        // connects to the room BEFORE asking for the microphone while iOS asks first,
+        // the browser always arrived earlier and was always the one evicted — with no
+        // error, because RoomEvent.Disconnected did not touch call state.
+        //
+        // So: the device that actually pressed Accept joins. The accepter's OTHER
+        // devices just stop ringing. The caller joins.
+        const iAmTheAccepter = data.accepter_id && data.accepter_id === this._currentUserId();
+        if (iAmTheAccepter && !this._acceptedCallId) {
+          console.info('[call] accepted on another device, dismissing ringer', joinId);
+          callStore.getState().resetCall();
+          break;
+        }
+        // A frame for a call this tab has nothing to do with — a stale or duplicate
+        // tab. Joining would evict whichever device is really on the call.
+        if (!iAmTheAccepter && cs.callId !== joinId) {
+          console.info('[call] ignoring call:accepted for a call this client is not in', joinId);
+          break;
+        }
+
+        console.info('[call] joining SFU after accept', { callId: joinId, accepter: data.accepter_id });
         cs.acceptCall();
-        // Both sides connect to the SFU room here: the caller because the
-        // callee just answered, the callee because this is the server's
-        // confirmation that the call really moved to connected.
-        const joinId = cs.callId || data.call_id;
         joinLiveKit(joinId, 'accepted', () => {
           callStore.getState().endCall();
           this.send({ type: 'call:end', call_id: joinId });
@@ -559,7 +600,18 @@ class RxHiveWebSocket {
         break;
       }
       case 'call:error': {
-        toast.error(data.message || 'Call failed');
+        // `reason` is the accept/decline refusal path added on the server: the call
+        // had already rung out, been cancelled or ended. It used to return silently,
+        // which left the UI sitting on "Connecting" with nothing to act on.
+        console.warn('[call] server refused a call action', data);
+        if (data.reason === 'no_longer_ringing') {
+          toast.info(data.status === 'missed' ? 'Call already ended' : 'Call is no longer available');
+        } else if (data.reason) {
+          toast.error('That call is no longer available');
+        } else {
+          toast.error(data.message || 'Call failed');
+        }
+        livekitClient.leave();
         callStore.getState().resetCall();
         break;
       }
@@ -594,35 +646,78 @@ class RxHiveWebSocket {
   }
 
   send(data) {
+    // Remember that THIS client is the one answering.
+    //
+    // `call:accepted` comes back to every device the accepting user has, and only
+    // the device that actually answered may join the SFU — a second device sharing
+    // the same LiveKit identity evicts the first. Recorded here rather than in the
+    // overlay so no future caller of `send` can forget it. Cleared on any terminal
+    // frame so a later call cannot inherit a stale claim.
+    if (data?.type === 'call:accept' || data?.type === 'call:join') {
+      this._acceptedCallId = data.call_id || null;
+    } else if (data?.type === 'call:end' || data?.type === 'call:decline' || data?.type === 'call:cancel') {
+      this._acceptedCallId = null;
+    }
+
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this._rawSend(data);
-      return;
+      return true;
     }
+
     // Frames sent while the socket is down are DROPPED, not queued.
     //
     // A queue survives an entire offline period and then flushes at once on
     // reconnect, which replays intent that has expired: a `typing_start` from a
     // keystroke minutes ago shows the peer a phantom "typing…", a read_receipt
-    // fires for a conversation the user has since left, and — the one that
-    // actually hurts — a queued `call:initiate` RINGS the callee for a call
-    // that was abandoned before the connection dropped.
+    // fires for a conversation the user has since left, and a queued
+    // `call:initiate` RINGS the callee for a call abandoned before the
+    // connection dropped. Typing and receipts are self-correcting (the receiver
+    // clears typing after 4s, receipts are idempotent) and chat already refuses
+    // to queue because the HTTP fallback owns it.
     //
-    // Nothing here needs replay. Chat messages already refuse to queue (see
-    // sendMessage) because the HTTP fallback owns them and a replayed frame
-    // would double-send; typing and receipts are self-correcting (the receiver
-    // clears typing after 4s, receipts are idempotent); call signalling is
-    // driven by the UI, which is still there to retry.
+    // But a DROPPED CALL FRAME IS NOT SELF-CORRECTING, and silence is the worst
+    // possible answer for one. `call:accept` is a user pressing Answer: if it
+    // never reaches the server the call stays `ringing`, the caller keeps
+    // hearing ringback, and the answerer sits on "Connecting…" until the ring
+    // timeout — which is indistinguishable from every other reason a call fails
+    // to establish. Same for `call:end`, where the peer is left in a call alone.
+    //
+    // So call frames report failure instead of vanishing. The return value is
+    // the contract: callers that care check it. Logged at warn level always, not
+    // only in DEV, because this is exactly the line someone reads when a user
+    // says "it says connecting and nothing happens".
+    const isCallFrame = typeof data?.type === 'string' && data.type.startsWith('call:');
+    if (isCallFrame) {
+      console.warn('[call] SIGNAL NOT SENT — socket is not open', {
+        frame: data.type,
+        callId: data.call_id || null,
+        readyState: this.ws ? this.ws.readyState : 'no socket',
+      });
+      return false;
+    }
     if (import.meta.env.DEV) {
       console.debug('[WS] dropped while disconnected:', data?.type);
     }
+    return false;
   }
 
   _rawSend(data) {
     try {
       this.ws.send(JSON.stringify(data));
+      if (typeof data?.type === 'string' && data.type.startsWith('call:')) {
+        // Every outbound signal, logged with its call id. Pairs with the inbound
+        // log in _handleMessage so a whole call can be reconstructed from one
+        // console: who sent what, in what order, and what came back.
+        console.info('[call] -> sent', data.type, data.call_id || '');
+      }
     } catch (err) {
       console.error('[WS] Send failed:', err);
-      this.messageQueue.push(data);
+      // NOT queued. This throws when the socket has closed under us, so the
+      // frame is as stale as anything in the drop path above, and a queued
+      // call frame replayed minutes later is worse than one that failed loudly.
+      if (typeof data?.type === 'string' && data.type.startsWith('call:')) {
+        console.warn('[call] SIGNAL FAILED mid-send', data.type, data.call_id || '');
+      }
     }
   }
 
