@@ -83,8 +83,17 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   const [text, setText] = useState('');
   const [showAttachMenu, setShowAttachMenu] = useState(false);
   const [showEmoji, setShowEmoji] = useState(false);
+  // One row per file in flight, replacing a single `uploading` boolean and one
+  // shared percentage. With the scalar, a batch reset the bar to 0 for each file
+  // and nothing said WHICH file was going; worse, the whole composer was
+  // disabled for the duration, so a large upload on a slow connection wedged the
+  // chat with no way out but a page reload.
+  //
+  // Shape: { id, name, kind, status: 'sending'|'failed', progress, controller }
+  const [uploadJobs, setUploadJobs] = useState([]);
+  // Still guards the TRAY's send button against a double-click. It no longer
+  // disables the composer — that is the point of the change.
   const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
   const [dragOver, setDragOver] = useState(false);
   // Files chosen but NOT yet uploaded. Every category stages here now — nothing
   // reaches the network until the user confirms. Shape:
@@ -104,6 +113,11 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   // spinner and the disabled attribute; these refs are what actually make a
   // double send impossible.
   const sendingFilesRef = useRef(false);
+  // AbortControllers live in a ref, not in the job objects, because the send
+  // loop has to READ one synchronously between files. A state updater does not
+  // run at call time — React invokes it during the render pass — so reading
+  // through setUploadJobs would have handed the loop `undefined` every time.
+  const uploadControllers = useRef(new Map());
   const sendingTextRef = useRef(false);
   const sendingVoiceRef = useRef(false);
   // Set when Send was pressed while paused, so the finalised recording is
@@ -246,11 +260,14 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   };
 
   // ── Upload + media send ───────────────────────────────────────────────────
-  const uploadFile = async (file, onProgress) => {
+  const uploadFile = async (file, onProgress, signal) => {
     const formData = new FormData();
     formData.append('file', file);
     // Cookie + CSRF auth via the shared axios client (no Bearer token, no raw fetch).
     const { data } = await client.post('/api/upload', formData, {
+      // axios forwards this to the underlying XHR, so cancelling really aborts
+      // the request rather than only hiding the row.
+      signal,
       onUploadProgress: (evt) => {
         if (onProgress && evt.total) {
           onProgress(Math.round((evt.loaded / evt.total) * 100));
@@ -273,8 +290,8 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
 
   // Upload a single file, then create the message carrying media_url (the fix).
   // `caption` overrides the derived content (the image preview strip's caption).
-  const sendMediaFile = async (file, replyId, caption = '', duration = null) => {
-    const uploadResult = await uploadFile(file, setUploadProgress);
+  const sendMediaFile = async (file, replyId, caption = '', duration = null, onProgress = null, signal = undefined) => {
+    const uploadResult = await uploadFile(file, onProgress, signal);
     const msgType = mapMessageType(uploadResult.file_type);
     const content = caption || (msgType === 'file' ? (uploadResult.filename || '') : '');
     const tempId = uuidv4();
@@ -320,6 +337,16 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   const stageFiles = (files) => {
     const sized = files.filter(validateSize);
     if (sized.length === 0) return;
+    // Whatever is already typed becomes the caption, and the box is cleared.
+    // Typing a sentence and then attaching a file used to strand the sentence:
+    // the user either lost it or sent it as a second message. Only seeded when
+    // the caption is still empty, so a second batch cannot clobber a caption
+    // the user has already written in the tray.
+    setText((current) => {
+      const trimmed = current.trim();
+      if (trimmed) setPreviewCaption((cap) => (cap ? cap : trimmed));
+      return trimmed ? '' : current;
+    });
     setStagedFiles(prev => {
       const room = MAX_STAGED_FILES - prev.length;
       if (room <= 0) {
@@ -460,51 +487,86 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   // Failures are caught per file: a single bad file used to abort the loop, so
   // the remaining files were never sent AND the tray was never cleared. Only the
   // files that actually failed stay staged, so the user can retry just those.
+  const cancelUpload = (jobId) => {
+    // Really abort the request. Merely dropping the row would leave the bytes
+    // going out over a connection the user has told us to stop using.
+    uploadControllers.current.get(jobId)?.abort();
+    uploadControllers.current.delete(jobId);
+    setUploadJobs((prev) => prev.filter((j) => j.id !== jobId));
+  };
+
   const handleConfirmSend = async () => {
     if (stagedFiles.length === 0) return;
-    // Reentrancy guard — see sendingTextRef. The button is also disabled while
-    // uploading, but a rapid double-click or an Enter in the caption field can
-    // both land before React re-renders with the disabled attribute applied.
+    // Reentrancy guard — see sendingTextRef. A rapid double-click or an Enter in
+    // the caption field can both land before React re-renders.
     if (sendingFilesRef.current) return;
     sendingFilesRef.current = true;
 
     const batch = stagedFiles;
-    setUploading(true);
     const replyId = replyTo?._id || null;
     const caption = previewCaption.trim();
+
+    // The tray closes NOW and the batch becomes rows above a live composer. This
+    // is the whole point: the user keeps typing and can send more messages while
+    // these upload, instead of watching a frozen composer.
+    setStagedFiles([]);
+    setPreviewCaption('');
+    setUploading(true);
+    batch.forEach((f) => uploadControllers.current.set(f.id, new AbortController()));
+    setUploadJobs((prev) => [
+      ...prev,
+      ...batch.map((f) => ({ id: f.id, name: f.name, kind: f.category, progress: 0 })),
+    ]);
+
+    const setProgress = (id, progress) =>
+      setUploadJobs((prev) => prev.map((j) => (j.id === id ? { ...j, progress } : j)));
+
     const stillFailed = [];
     try {
-      for (let i = 0; i < batch.length; i++) {
+      for (let i = 0; i < batch.length; i += 1) {
+        const item = batch[i];
+        const controller = uploadControllers.current.get(item.id);
+        // Cancelled while an earlier file was still going: its controller was
+        // deleted with its row, so skip it silently.
+        if (!controller) { URL.revokeObjectURL(item.url); continue; }
+
         try {
-          // Shared with every other send path so the optimistic bubble is
-          // reconciled with the created message in exactly one place.
           await sendMediaFile(
-            batch[i].file,
+            item.file,
             i === 0 ? replyId : null,
-            i === 0 ? caption : ''
+            i === 0 ? caption : '',
+            null,
+            (pct) => setProgress(item.id, pct),
+            controller.signal
           );
-          // Sent — release this preview's object URL.
-          URL.revokeObjectURL(batch[i].url);
+          URL.revokeObjectURL(item.url);
         } catch (err) {
-          stillFailed.push(batch[i]);
+          // A cancel is not a failure — the user asked for it, and re-staging
+          // the file or toasting about it would both be wrong.
+          const aborted = err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED'
+            || controller.signal.aborted;
+          if (aborted) { URL.revokeObjectURL(item.url); continue; }
+          stillFailed.push(item);
           toast.error(
-            `${batch[i].name || 'File'}: ${err?.response?.data?.detail || err.message || 'Upload failed'}`
+            `${item.name || 'File'}: ${err?.response?.data?.detail || err.message || 'Upload failed'}`
           );
+        } finally {
+          uploadControllers.current.delete(item.id);
+          setUploadJobs((prev) => prev.filter((j) => j.id !== item.id));
         }
       }
     } finally {
       setUploading(false);
-      setUploadProgress(0);
       sendingFilesRef.current = false;
     }
 
     const sent = batch.length - stillFailed.length;
-    setStagedFiles(stillFailed);
-    if (stillFailed.length === 0) {
-      setPreviewCaption('');
+    if (stillFailed.length > 0) {
+      // Back into the tray so they can be retried — the existing recovery path.
+      setStagedFiles((prev) => [...prev, ...stillFailed]);
+      if (sent > 0) toast.error(`${stillFailed.length} of ${batch.length} failed — still attached`);
+    } else {
       toast.success(sent > 1 ? `${sent} files sent` : 'File sent');
-    } else if (sent > 0) {
-      toast.error(`${stillFailed.length} of ${batch.length} failed — still attached`);
     }
   };
 
@@ -576,6 +638,60 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
             </div>
           </motion.div>
         )}
+      </AnimatePresence>
+
+      {/* Files in flight. ABOVE the composer, not inside the tray, because the
+          composer stays usable while they upload — that is the point. One row
+          per file, so a stuck upload in a batch of five can be identified and
+          cancelled instead of wedging the whole chat. */}
+      <AnimatePresence initial={false}>
+        {uploadJobs.map((job) => (
+          <motion.div
+            key={job.id}
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.15 }}
+            data-testid="upload-row"
+            data-upload-name={job.name}
+            className="overflow-hidden border-t border-[#1F1F1F] bg-[#141414]"
+          >
+            <div className="flex items-center gap-3 px-3 py-2">
+              <span className="flex-shrink-0 text-[#10B981]">
+                {job.kind === 'image' ? <Image size={15} />
+                  : job.kind === 'video' ? <Film size={15} />
+                  : job.kind === 'audio' ? <Mic size={15} />
+                  : <FileText size={15} />}
+              </span>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs text-[#F5F5F5] truncate">{job.name}</p>
+                <div className="mt-1 h-1 bg-[#1A1A1A] rounded-full overflow-hidden">
+                  {/* Determinate, which is better than the iOS row's
+                      indeterminate bar — axios gives real byte progress and
+                      APIClient.upload does not. Do not regress it. */}
+                  <div
+                    className="h-full bg-[#10B981] transition-all"
+                    style={{ width: `${job.progress}%` }}
+                    data-testid="upload-row-progress"
+                  />
+                </div>
+              </div>
+              <span className="text-[11px] text-[#A3A3A3] tabular-nums flex-shrink-0 w-9 text-right">
+                {job.progress}%
+              </span>
+              <button
+                type="button"
+                onClick={() => cancelUpload(job.id)}
+                aria-label={`Cancel upload of ${job.name}`}
+                title="Cancel"
+                data-testid="upload-row-cancel"
+                className="p-1 rounded text-[#A3A3A3] hover:text-[#EF4444] hover:bg-[#EF4444]/10 transition-colors flex-shrink-0"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </motion.div>
+        ))}
       </AnimatePresence>
 
       {/* Attachment confirmation tray — every category lands here BEFORE any
@@ -697,19 +813,6 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
               </button>
             </div>
 
-            {/* Sending state: determinate bar plus an explicit count, so a
-                multi-file batch shows progress THROUGH the batch and not just
-                within the current file. */}
-            {uploading && (
-              <>
-                <div className="mt-2 h-1 bg-[#1A1A1A] rounded-full overflow-hidden">
-                  <div className="h-full bg-[#10B981] transition-all" style={{ width: `${uploadProgress}%` }} />
-                </div>
-                <p className="mt-1.5 text-[11px] text-[#A3A3A3]" data-testid="attachment-sending-status">
-                  Sending {stagedFiles.length} {stagedFiles.length === 1 ? 'file' : 'files'}…
-                </p>
-              </>
-            )}
           </motion.div>
         )}
       </AnimatePresence>
@@ -852,7 +955,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
             }}
             placeholder="Type a message"
             rows={1}
-            disabled={disabled || uploading}
+            disabled={disabled}
             data-testid="message-input"
             className="flex-1 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[8px] px-4 py-2.5 text-sm text-[#F5F5F5] placeholder:text-[#525252] resize-none focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all overflow-y-auto"
             style={{ maxHeight: 120, minHeight: 40 }}
@@ -868,7 +971,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
               send-only rather than offering a control that cannot work. */}
           <button
             onClick={hasText ? handleSend : (canRecord ? handleMicClick : undefined)}
-            disabled={uploading || (!hasText && !canRecord)}
+            disabled={!hasText && !canRecord}
             aria-label={hasText ? 'Send message' : 'Record voice message'}
             title={hasText ? 'Send' : (canRecord ? 'Record voice message' : (micSupported ? 'Voice messages are turned off for your account' : 'Recording is not supported in this browser'))}
             data-testid={hasText ? 'message-send-btn' : 'voice-record-btn'}
