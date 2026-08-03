@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import client from '../api/client';
+import client, { setSignOutReason } from '../api/client';
 
 const AuthContext = createContext(null);
 
@@ -42,6 +42,12 @@ export const AuthProvider = ({ children }) => {
       const status = err.response?.status;
       if (status === 401 || status === 403) {
         localStorage.removeItem('user');
+        // This path is a SOFT sign-out — the route guards render
+        // <Navigate to="/login">, a React transition rather than a document
+        // navigation — so unlike client.js the message could have lived in
+        // state. It uses the same channel anyway so there is one way to say
+        // this, and so Login needs only one reader.
+        setSignOutReason('expired');
         setUser(null);
       } else {
         setUser(cachedUser());

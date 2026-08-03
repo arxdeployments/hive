@@ -13,13 +13,28 @@ import React, { useEffect, useRef, useState } from 'react';
  *   PeaksWaveform  — a finished clip. Decodes the audio ONCE and draws its real
  *                    envelope, with the played portion filled.
  *
- * PeaksWaveform decodes only same-origin blob: URLs — i.e. the local pre-send
- * preview, where the bytes are already in memory. A sent voice note in a bubble
- * would mean fetching and decoding every clip in the thread just to draw it, so
- * those fall back to a flat bar row. That row is a progress indicator wearing
- * the same clothes, deliberately NOT a fabricated envelope: showing invented
- * amplitude for a clinical recording would be a lie the UI has no business
- * telling.
+ * PeaksWaveform draws a clip's REAL envelope, decoded from the audio itself —
+ * for the local pre-send preview and for a sent note in a bubble alike.
+ *
+ * It used to refuse anything that was not a blob: URL, on two grounds. One was
+ * sound and still holds: a FABRICATED envelope would be a lie, and showing
+ * invented amplitude for a clinical recording invites a listener to scrub to a
+ * peak that is not there. Decoding the actual file is the opposite of that — it
+ * is the honest version, and it is what makes the seek surface usable, since a
+ * flat row is scrubbable but gives nothing to aim at.
+ *
+ * The other ground was cost, and that one is answered rather than ignored:
+ *   - decoding is deferred to first PLAY, not done on mount, so a thread
+ *     scrolled past fifty notes decodes none of them;
+ *   - results are cached by URL, so scrolling back is free;
+ *   - one in-flight decode per URL, so two bubbles of the same clip cost one;
+ *   - the bytes are already being fetched to play the note, so on the play path
+ *     this is a cache hit at the HTTP layer rather than a second download.
+ *
+ * Failure still lands on the flat row, which matters: the .ogg/.weba fallbacks
+ * from pickAudioFormat do not decode in every browser, and a partial recording
+ * (Safari and Chrome both write MP4, whose moov atom is only finalised on stop)
+ * cannot be decoded at all.
  */
 
 // Bar geometry, in CSS pixels. The pitch (BAR_W + GAP) is what sets density:
@@ -147,55 +162,90 @@ export const LiveWaveform = ({ stream, paused = false, className = '' }) => {
  * A finished clip: real envelope for local blobs, flat bars otherwise.
  * Click or drag anywhere on it to seek.
  */
+/** Decoded envelopes, keyed by source URL. */
+const peaksCache = new Map();
+const peaksInflight = new Map();
+
+/**
+ * Decode a clip into `barCount` peaks, once per URL.
+ *
+ * NORMALISED to the clip's own loudest bar rather than scaled by a fixed gain.
+ * A fixed 1.6x renders a quietly-recorded note as a near-flat line, which is
+ * exactly the uninformative row this replaces — and quiet is common, because a
+ * phone held at arm's length in a noisy ward records low. iOS normalises for the
+ * same reason (Waveform.swift). The floor keeps a genuinely silent clip from
+ * dividing by ~0 and exploding into full-height noise.
+ */
+async function decodePeaks(src, barCount) {
+  const key = `${src}#${barCount}`;
+  if (peaksCache.has(key)) return peaksCache.get(key);
+  if (peaksInflight.has(key)) return peaksInflight.get(key);
+
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+
+  const run = (async () => {
+    let audioCtx = null;
+    try {
+      // credentials: same-origin so /api/media/{id} authenticates. Its redirect
+      // to storage is deliberately kept same-origin, so this does not leak.
+      const buf = await (await fetch(src, { credentials: 'same-origin' })).arrayBuffer();
+      audioCtx = new Ctx();
+      const decoded = await audioCtx.decodeAudioData(buf);
+      const data = decoded.getChannelData(0);
+      const per = Math.floor(data.length / barCount) || 1;
+      const raw = [];
+      let loudest = 0;
+      for (let i = 0; i < barCount; i += 1) {
+        let peak = 0;
+        for (let j = 0; j < per; j += 1) {
+          const v = Math.abs(data[i * per + j] || 0);
+          if (v > peak) peak = v;
+        }
+        raw.push(peak);
+        if (peak > loudest) loudest = peak;
+      }
+      const scale = loudest > 0.01 ? 1 / loudest : 0;
+      const out = raw.map((v) => Math.min(1, v * scale));
+      peaksCache.set(key, out);
+      return out;
+    } catch {
+      // Undecodable: an .ogg/.weba fallback in a browser that cannot read it, or
+      // a partial recording whose container was never finalised. Cache the null
+      // so a bubble does not retry the same doomed decode on every play.
+      peaksCache.set(key, null);
+      return null;
+    } finally {
+      audioCtx?.close().catch(() => {});
+      peaksInflight.delete(key);
+    }
+  })();
+
+  peaksInflight.set(key, run);
+  return run;
+}
+
 export const PeaksWaveform = ({
   src,
   progress = 0,
   onSeek,
   tone = 'dark',
   barCount = 56,
+  /* Gate for the decode. A bubble passes false until the note is first played,
+     so a thread of fifty voice notes fetches none of them; the pre-send preview
+     passes true, because its bytes are already in memory. */
+  decode = true,
   className = '',
 }) => {
   const [peaks, setPeaks] = useState(null);
   const wrapRef = useRef(null);
 
   useEffect(() => {
-    // Only the in-memory preview. See the module docstring for why a remote
-    // clip is not fetched and decoded just to be drawn.
-    if (!src || !src.startsWith('blob:')) {
-      setPeaks(null);
-      return undefined;
-    }
+    if (!src || !decode) return undefined;
     let cancelled = false;
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return undefined;
-
-    (async () => {
-      try {
-        const buf = await (await fetch(src)).arrayBuffer();
-        const audioCtx = new Ctx();
-        const decoded = await audioCtx.decodeAudioData(buf);
-        audioCtx.close().catch(() => {});
-        if (cancelled) return;
-        const data = decoded.getChannelData(0);
-        const per = Math.floor(data.length / barCount) || 1;
-        const out = [];
-        for (let i = 0; i < barCount; i += 1) {
-          let peak = 0;
-          for (let j = 0; j < per; j += 1) {
-            const v = Math.abs(data[i * per + j] || 0);
-            if (v > peak) peak = v;
-          }
-          out.push(Math.min(1, peak * 1.6));
-        }
-        setPeaks(out);
-      } catch {
-        // A partial recording (see useAudioRecorder: Safari writes its moov
-        // atom only on stop) cannot be decoded. Fall back to flat bars.
-        if (!cancelled) setPeaks(null);
-      }
-    })();
+    decodePeaks(src, barCount).then((p) => { if (!cancelled) setPeaks(p); });
     return () => { cancelled = true; };
-  }, [src, barCount]);
+  }, [src, barCount, decode]);
 
   const canvasRef = useRef(null);
 

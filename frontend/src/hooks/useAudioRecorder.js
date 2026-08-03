@@ -33,6 +33,13 @@ import { micErrorMessage, pickAudioFormat } from '../utils/audioFormat';
  * recording indicator lit and holds the device against other apps, so leaking one
  * is immediately visible to the user.
  */
+
+/**
+ * Below this a press reads as a mis-tap on the mic rather than as a message.
+ * Matches iOS AudioRecorder.minimumDuration.
+ */
+export const MIN_DURATION_SECONDS = 0.6;
+
 export function useAudioRecorder() {
   const [state, setState] = useState('idle');
   const [elapsed, setElapsed] = useState(0);
@@ -53,6 +60,15 @@ export function useAudioRecorder() {
   // Set when the user cancels, so the recorder's onstop knows to throw the audio
   // away instead of promoting it to a preview.
   const discardRef = useRef(false);
+  // Why the last recording ended with nothing, so the composer can SAY so. The
+  // hook used to return silently to idle on three separate paths and the bar
+  // just vanished with no explanation.
+  const [lastError, setLastError] = useState(null);
+  const trackWatcherRef = useRef(null);
+  // pause() is defined below but the track watcher is installed above it, so the
+  // watcher reaches it through a ref rather than forcing a reorder that would
+  // put the pause logic before the state it reads.
+  const pauseRef = useRef(null);
 
   /** Total recorded milliseconds, excluding time spent paused. */
   const elapsedNow = useCallback(
@@ -70,6 +86,10 @@ export function useAudioRecorder() {
       clearInterval(tickRef.current);
       tickRef.current = null;
     }
+    if (trackWatcherRef.current) {
+      trackWatcherRef.current();
+      trackWatcherRef.current = null;
+    }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
@@ -86,6 +106,31 @@ export function useAudioRecorder() {
     releaseStream();
     if (resultRef.current?.url) URL.revokeObjectURL(resultRef.current.url);
   }, [releaseStream]);
+
+  /**
+   * The microphone going away underneath a live recording.
+   *
+   * A browser has no phone-call interruption to listen for, but it has the two
+   * events that actually matter: `ended` when the device is unplugged or the
+   * permission is revoked, and `mute`/`unmute` when another application seizes
+   * the input. Without handling them the wall-clock tick keeps counting against
+   * a recorder that has stopped capturing, and the user sends silence — the
+   * failure is invisible until after it has been sent.
+   *
+   * PAUSES rather than cancels, deliberately: throwing away a half-finished
+   * message without asking is worse than handing it back paused.
+   */
+  const watchTrack = useCallback((mediaStream, onLost) => {
+    const track = mediaStream.getAudioTracks()[0];
+    if (!track) return () => {};
+    const lost = () => onLost();
+    track.addEventListener('ended', lost);
+    track.addEventListener('mute', lost);
+    return () => {
+      track.removeEventListener('ended', lost);
+      track.removeEventListener('mute', lost);
+    };
+  }, []);
 
   const start = useCallback(async () => {
     if (state !== 'idle') return { ok: false, error: null };
@@ -119,6 +164,16 @@ export function useAudioRecorder() {
       chunksRef.current = [];
       discardRef.current = false;
       formatRef.current = format;
+      setLastError(null);
+
+      // The device going away mid-take pauses the recording rather than letting
+      // the timer run on against an input that has stopped capturing.
+      trackWatcherRef.current = watchTrack(stream, () => {
+        if (recorderRef.current?.state === 'recording') {
+          setLastError('device_lost');
+          pauseRef.current?.();
+        }
+      });
 
       recorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
@@ -140,6 +195,17 @@ export function useAudioRecorder() {
           // Nothing captured — a muted device, or stopped before the first chunk.
           setState('idle');
           setElapsed(0);
+          setLastError('empty');
+          return;
+        }
+        // Below this a press reads as a mis-tap on the mic rather than as a
+        // message. Matters more once hold-to-talk exists, where a stray tap
+        // would otherwise send a 200ms note — but it is worth having now, since
+        // click-mic-then-immediately-click-finish produces the same thing.
+        if (seconds < MIN_DURATION_SECONDS) {
+          setState('idle');
+          setElapsed(0);
+          setLastError('too_short');
           return;
         }
         setResult({
@@ -203,6 +269,9 @@ export function useAudioRecorder() {
       const blob = new Blob(chunksRef.current, { type: format.mimeType });
       setResult((prev) => {
         if (prev?.url) URL.revokeObjectURL(prev.url);
+        // A pause before the first chunk landed. Previously this set null and
+        // left the bar in `paused` rendering an AudioPlayer with src=undefined
+        // beside a live Send button — an empty player you could send.
         return blob.size === 0
           ? null
           : {
@@ -285,7 +354,14 @@ export function useAudioRecorder() {
     setElapsed(0);
   }, []);
 
-  return { state, elapsed, result, stream, start, pause, resume, stop, cancel, reset };
+  pauseRef.current = pause;
+
+  return {
+    state, elapsed, result, stream, start, pause, resume, stop, cancel, reset,
+    /** 'too_short' | 'empty' | 'device_lost' | null — for the composer's toast. */
+    lastError,
+    clearLastError: useCallback(() => setLastError(null), []),
+  };
 }
 
 export default useAudioRecorder;

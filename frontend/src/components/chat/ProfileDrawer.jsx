@@ -4,6 +4,7 @@ import { X, Pencil, Camera, Mail, Building2, FolderTree, LogOut } from 'lucide-r
 import { useAuth } from '../../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';
 import client from '../../api/client';
+import { transcodeImage } from '../../utils/mediaQuality';
 import { toast } from 'sonner';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
@@ -62,8 +63,14 @@ export const ProfileDrawer = ({ isOpen, onClose }) => {
     const file = e.target.files?.[0];
     if (!file) return;
     try {
+      // The SECOND raw upload path, and the worse of the two: it had no size
+      // check at all, so a 40 MB photo was pushed at the server and only bounced
+      // by the backend limit. Routed through the same transcode the composer
+      // uses, at Standard — an avatar is displayed at 96px and there is nothing
+      // an HD original buys here.
+      const outgoing = await transcodeImage(file, 'standard');
       const formData = new FormData();
-      formData.append('file', file);
+      formData.append('file', outgoing);
       // Cookie-authenticated upload via the shared client (no Bearer token exists).
       const { data: uploadData } = await client.post('/api/upload', formData);
       if (uploadData.file_url) {

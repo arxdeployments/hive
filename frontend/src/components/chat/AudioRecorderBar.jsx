@@ -1,5 +1,5 @@
-import React from 'react';
-import { Check, Mic, Pause, Send, Trash2, Loader2 } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { AlertTriangle, Check, ChevronLeft, Lock, LockOpen, Mic, Pause, Send, Trash2, Loader2 } from 'lucide-react';
 import { AudioPlayer } from './AudioPlayer';
 import { LiveWaveform } from './Waveform';
 import { formatDuration } from '../../utils/audioFormat';
@@ -33,9 +33,30 @@ export const AudioRecorderBar = ({
   onStop,
   onSend,
   sending = false,
+  /* Live gesture state, present only on touch. `hold` means a finger is down on
+     the mic and the recording is following it. */
+  hold = null,
 }) => {
   const recording = stage === 'recording';
   const paused = stage === 'paused';
+
+  /**
+   * Whether the mid-recording preview can actually be played.
+   *
+   * Not a Safari-only problem, despite how it is usually described.
+   * pickAudioFormat puts audio/mp4 FIRST because the backend classifies .webm
+   * as video and AAC-in-MP4 is the only universally playable output — and an
+   * MP4's moov atom is written on STOP. Current Chrome supports recording MP4
+   * too, so both browsers hand back a partial blob no player can open. Only
+   * Firefox, which falls through to Ogg/Opus, reliably previews mid-recording.
+   *
+   * So the control is made honest rather than left dead: the player is replaced
+   * by a line saying the review is only available once the recording is
+   * finished. Resume and Send both still work — only the review is unavailable.
+   */
+  const [previewBroken, setPreviewBroken] = useState(false);
+  // A new take, or a resumed one, deserves a fresh attempt.
+  useEffect(() => { setPreviewBroken(false); }, [result?.url]);
 
   return (
     <div
@@ -55,7 +76,39 @@ export const AudioRecorderBar = ({
         <Trash2 size={18} />
       </button>
 
-      {recording ? (
+      {recording && hold?.held && !hold.locked ? (
+        /* Finger down. The strip fades toward the cancel threshold rather than
+           flipping at it, so the gesture is legible before it commits, and the
+           "slide to cancel" label trails the thumb at half rate. */
+        <div
+          className="flex-1 flex items-center gap-2 min-w-0"
+          data-testid="hold-to-talk-strip"
+          data-cancel-armed={hold.cancelArmed || undefined}
+          style={{ opacity: hold.cancelArmed ? 0.35 : 1 - Math.min(0.6, -hold.drag.x / 200) }}
+        >
+          <span aria-hidden="true" className="w-2 h-2 rounded-full bg-[#EF4444] animate-pulse flex-shrink-0" />
+          <span className="text-sm text-[#F5F5F5] tabular-nums flex-shrink-0" aria-live="polite">
+            {formatDuration(elapsed)}
+          </span>
+          <div className="flex-1 min-w-0 flex items-center justify-center">
+            <span
+              className="flex items-center gap-1 text-xs text-[#A3A3A3] whitespace-nowrap"
+              style={{ transform: `translateX(${Math.max(-60, hold.drag.x * 0.5)}px)` }}
+            >
+              <ChevronLeft size={12} /> slide to cancel
+            </span>
+          </div>
+          {/* Lock affordance, riding upward with the drag. Fills in at 75% of
+              the threshold so the user knows it is about to take. */}
+          <span
+            className="flex-shrink-0 text-[#10B981]"
+            style={{ transform: `translateY(${Math.max(-40, hold.drag.y * 0.6)}px)`, opacity: 0.4 + hold.lockProgress * 0.6 }}
+            data-testid="hold-lock-affordance"
+          >
+            {hold.lockProgress > 0.75 ? <Lock size={16} /> : <LockOpen size={16} />}
+          </span>
+        </div>
+      ) : recording ? (
         <div className="flex-1 flex items-center gap-2 min-w-0">
           <span
             aria-hidden="true"
@@ -76,15 +129,28 @@ export const AudioRecorderBar = ({
           <LiveWaveform stream={stream} className="flex-1 min-w-0" />
         </div>
       ) : (
-        <AudioPlayer
-          // Keyed on the object URL so pausing again after resuming mounts a
-          // fresh element. Reusing one across a src swap leaves the old buffered
-          // audio playing and the scrubber pointing at the previous take.
-          key={result?.url || 'empty'}
-          src={result?.url}
-          fallbackDuration={result?.duration}
-          className="flex-1 min-w-0"
-        />
+        previewBroken || (paused && !result) ? (
+          <div
+            className="flex-1 min-w-0 flex items-center gap-2 px-1"
+            data-testid="audio-preview-unavailable"
+          >
+            <AlertTriangle size={14} className="text-[#F59E0B] flex-shrink-0" />
+            <span className="text-xs text-[#A3A3A3] leading-tight">
+              Review is available once you finish recording.
+            </span>
+          </div>
+        ) : (
+          <AudioPlayer
+            // Keyed on the object URL so pausing again after resuming mounts a
+            // fresh element. Reusing one across a src swap leaves the old buffered
+            // audio playing and the scrubber pointing at the previous take.
+            key={result?.url || 'empty'}
+            src={result?.url}
+            fallbackDuration={result?.duration}
+            onUnplayable={() => setPreviewBroken(true)}
+            className="flex-1 min-w-0"
+          />
+        )
       )}
 
       {recording && (

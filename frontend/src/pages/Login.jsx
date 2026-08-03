@@ -1,17 +1,34 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAuth } from '../contexts/AuthContext';
 import { FloatingInput } from '../components/common/FloatingInput';
+import { takeSignOutReason } from '../api/client';
+
+/**
+ * Why the previous session ended, if it ended rather than being left.
+ *
+ * Landing on a blank login form with no explanation is the whole complaint this
+ * answers: the user cannot tell whether they were signed out, timed out, or the
+ * app broke. Read once and cleared, so a later deliberate visit to /login is
+ * not haunted by a stale notice.
+ */
+const SIGNOUT_COPY = {
+  expired: 'Your session expired. Please sign in again.',
+  inactive: 'Your account is no longer active. Contact your administrator.',
+};
 
 export default function Login() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [signedOutReason, setSignedOutReason] = useState(null);
   const { login } = useAuth();
+
+  useEffect(() => { setSignedOutReason(takeSignOutReason()); }, []);
   const navigate = useNavigate();
 
   const handleSubmit = async (e) => {
@@ -35,7 +52,10 @@ export default function Login() {
         toast.error('Too many attempts. Try again in 60 seconds.');
         setError('rate_limited');
       } else if (status === 401) {
-        toast.error('Invalid email or password');
+        // The server's own wording when it gives one — a 401 from /login can
+        // also mean "Account is deactivated", which is not a typo the user can
+        // fix by retyping their password.
+        toast.error(detail || 'Invalid email or password');
         setError('invalid');
       } else {
         toast.error('Something went wrong. Please try again.');
@@ -89,6 +109,15 @@ export default function Login() {
             </h1>
             <p className="text-[#A3A3A3] text-sm mt-2">Enterprise Messaging</p>
           </div>
+
+          {signedOutReason && (
+            <div
+              data-testid="signout-notice"
+              className="mb-5 px-4 py-3 rounded-[6px] bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-[13px] text-[#F59E0B]"
+            >
+              {SIGNOUT_COPY[signedOutReason] || SIGNOUT_COPY.expired}
+            </div>
+          )}
 
           {/* Form */}
           <form onSubmit={handleSubmit} className="space-y-5">

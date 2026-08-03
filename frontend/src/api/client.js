@@ -99,12 +99,58 @@ export const sessionRejected = (refreshError) => {
   return status === 401 || status === 403;
 };
 
+// Bumped on every successful refresh. A request that was already ON THE WIRE
+// when someone else refreshed comes back 401 against the cookie it was sent
+// with — nothing is wrong with the session, it simply predates the rotation. The
+// single-flight below only covers requests that 401 while isRefreshing is still
+// true; one dispatched before the refresh and answered after it would see the
+// flag already cleared and start a whole second rotation.
+//
+// That matters because the backend rotates refresh tokens single-use: every
+// avoidable rotation is another chance to trip the reuse detection, which burns
+// the entire session family. iOS calls this refreshGeneration (APIClient.swift).
+let refreshGeneration = 0;
+
+// Why the session ended, carried across the hard navigation to /login.
+//
+// The teardown below is `window.location.href = '/login'`, a full document
+// navigation that destroys every in-memory value and any toast already on
+// screen — so a React state message cannot survive it and sessionStorage is the
+// only channel that can. Without this the user lands on a blank form with no
+// idea whether they were signed out, timed out, or the app broke.
+export const SIGNOUT_REASON_KEY = 'rxhive_signout_reason';
+
+export const setSignOutReason = (reason) => {
+  try { sessionStorage.setItem(SIGNOUT_REASON_KEY, reason); } catch { /* private mode */ }
+};
+
+/** Read once and clear, so a later manual visit to /login is not haunted by it. */
+export const takeSignOutReason = () => {
+  try {
+    const v = sessionStorage.getItem(SIGNOUT_REASON_KEY);
+    if (v) sessionStorage.removeItem(SIGNOUT_REASON_KEY);
+    return v;
+  } catch {
+    return null;
+  }
+};
+
 export const refreshSession = () =>
   axios.post(
     `${API_BASE}/api/auth/refresh`,
     {},
     { withCredentials: true, headers: { 'X-Requested-With': 'XMLHttpRequest' } }
   );
+
+// Stamp the generation onto every outgoing request so a 401 can be compared
+// against the generation in force when the response arrives.
+client.interceptors.request.use((config) => {
+  config._generation = refreshGeneration;
+  return config;
+});
+
+/** Replay a request, marked so its own 401 cannot start another refresh. */
+const replay = (config) => client({ ...config, _retry: true });
 
 client.interceptors.response.use(
   (response) => response,
@@ -113,10 +159,21 @@ client.interceptors.response.use(
     const skipRefresh = CREDENTIAL_401_PATHS.has(pathnameOf(originalRequest?.url));
 
     if (error.response?.status === 401 && !originalRequest._retry && !skipRefresh) {
+      // Somebody else refreshed while this was in flight, so the 401 is an
+      // artefact of the old cookie rather than evidence about the session.
+      // Replay it against the new one instead of rotating again.
+      if (originalRequest._generation !== undefined && originalRequest._generation < refreshGeneration) {
+        return replay(originalRequest);
+      }
+
       if (isRefreshing) {
         return new Promise((resolve, reject) => {
           failedQueue.push({ resolve, reject });
-        }).then(() => client(originalRequest));
+          // Followers replay through `replay`, which sets _retry. Previously
+          // they called client(originalRequest) with the marker unset, so a
+          // follower whose replay 401d again re-entered here as a WINNER and
+          // fired a second refresh — a redundant rotation racing the first.
+        }).then(() => replay(originalRequest));
       }
 
       originalRequest._retry = true;
@@ -124,8 +181,9 @@ client.interceptors.response.use(
 
       try {
         await refreshSession();
+        refreshGeneration += 1;
         processQueue(null);
-        return client(originalRequest);
+        return replay(originalRequest);
       } catch (refreshError) {
         // Drained before either branch: the queue is the only thing holding the
         // waiters' promises, and one left unsettled hangs the screen that made
@@ -133,6 +191,7 @@ client.interceptors.response.use(
         processQueue(refreshError);
         if (sessionRejected(refreshError)) {
           localStorage.removeItem('user');
+          setSignOutReason('expired');
           if (window.location.pathname !== '/login') {
             window.location.href = '/login';
           }
