@@ -217,13 +217,17 @@ async def list_messages(
         newer_budget = limit - older_budget
 
         older_rows = (
-            await db.execute(
-                base()
-                .where(key <= anchor_key)
-                .order_by(Message.created_at.desc(), Message.id.desc())
-                .limit(older_budget + 1)
+            (
+                await db.execute(
+                    base()
+                    .where(key <= anchor_key)
+                    .order_by(Message.created_at.desc(), Message.id.desc())
+                    .limit(older_budget + 1)
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         has_more = len(older_rows) > older_budget
         older = list(older_rows[:older_budget])
         older.reverse()
@@ -232,22 +236,24 @@ async def list_messages(
         has_newer = False
         if newer_budget > 0:
             newer_rows = (
-                await db.execute(
-                    base()
-                    .where(key > anchor_key)
-                    .order_by(Message.created_at.asc(), Message.id.asc())
-                    .limit(newer_budget + 1)
+                (
+                    await db.execute(
+                        base()
+                        .where(key > anchor_key)
+                        .order_by(Message.created_at.asc(), Message.id.asc())
+                        .limit(newer_budget + 1)
+                    )
                 )
-            ).scalars().all()
+                .scalars()
+                .all()
+            )
             has_newer = len(newer_rows) > newer_budget
             newer = list(newer_rows[:newer_budget])
         else:
             # limit=1 leaves no newer budget; report truthfully whether any exist.
             has_newer = (
                 await db.scalar(
-                    select(Message.id)
-                    .where(Message.conversation_id == conv_uuid, key > anchor_key)
-                    .limit(1)
+                    select(Message.id).where(Message.conversation_id == conv_uuid, key > anchor_key).limit(1)
                 )
             ) is not None
 

@@ -224,9 +224,7 @@ async def _revoke_refresh_tokens(
     """
     if not user_ids:
         return
-    stmt = update(RefreshToken).where(
-        RefreshToken.user_id.in_(user_ids), RefreshToken.revoked_at.is_(None)
-    )
+    stmt = update(RefreshToken).where(RefreshToken.user_id.in_(user_ids), RefreshToken.revoked_at.is_(None))
     if client is not None:
         stmt = stmt.where(RefreshToken.client == client)
     await db.execute(stmt.values(revoked_at=now_utc()).execution_options(synchronize_session=False))

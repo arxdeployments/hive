@@ -51,9 +51,7 @@ async def test_refresh_rotates_and_old_token_is_single_use(client):
     # test_refresh_rotation.py. Once the successor has been used the client
     # demonstrably received it, so replaying its predecessor is reuse and fails.
     assert (await client.post("/api/auth/refresh")).status_code == 200
-    resp = await client.post(
-        "/api/auth/refresh", headers={"Cookie": f"{REFRESH_COOKIE}={old_refresh}"}
-    )
+    resp = await client.post("/api/auth/refresh", headers={"Cookie": f"{REFRESH_COOKIE}={old_refresh}"})
     assert resp.status_code == 401
 
 

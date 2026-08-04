@@ -59,8 +59,7 @@ _DUMMY_HASH = "$2b$12$C6UzMDM.H6dfI/f/IKcEeO0000000000000000000000000000000000"
 # client is what is refused.
 SUPERADMIN_MOBILE_DENIED = "Super admin accounts can only sign in on the web app"
 MOBILE_NOT_APPROVED = (
-    "Mobile access has not been enabled for this account. "
-    "Ask your super admin to approve mobile sign-in."
+    "Mobile access has not been enabled for this account. Ask your super admin to approve mobile sign-in."
 )
 
 
@@ -288,9 +287,7 @@ async def refresh(
     # re-checked here — same reasoning as is_active directly above. The session is
     # burned before raising so a revoked user cannot keep retrying this token.
     session_client = token.client or WEB_CLIENT
-    if session_client == MOBILE_CLIENT and (
-        user.role == UserRole.superadmin or not user.mobile_access
-    ):
+    if session_client == MOBILE_CLIENT and (user.role == UserRole.superadmin or not user.mobile_access):
         token.revoked_at = now_utc()
         await db.commit()
         raise HTTPException(status_code=403, detail=MOBILE_NOT_APPROVED)
@@ -334,12 +331,8 @@ async def me(user: User = Depends(get_current_user), db: AsyncSession = Depends(
         # profile drawer renders org_name and dept_name, which this endpoint
         # never returned — so those two rows read "N/A" for every user, always,
         # regardless of their actual organization and department.
-        payload["org_name"] = (
-            (await db.get(Organization, user.org_id)).name if user.org_id else None
-        )
-        payload["dept_name"] = (
-            (await db.get(Department, user.dept_id)).name if user.dept_id else None
-        )
+        payload["org_name"] = (await db.get(Organization, user.org_id)).name if user.org_id else None
+        payload["dept_name"] = (await db.get(Department, user.dept_id)).name if user.dept_id else None
     return payload
 
 

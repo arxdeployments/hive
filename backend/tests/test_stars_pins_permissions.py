@@ -390,6 +390,7 @@ async def test_mute_suppresses_push_dispatch(client, two_orgs_with_users, monkey
 
     # push is imported lazily inside send_message, so patch it on its own module.
     import app.services.push as push_mod
+
     monkeypatch.setattr(push_mod, "dispatch_push_to_users", fake_dispatch)
 
     # Bob must look OFFLINE or he is never a push candidate in the first place.
