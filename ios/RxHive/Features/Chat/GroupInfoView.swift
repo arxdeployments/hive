@@ -134,8 +134,8 @@ struct GroupInfoView: View {
         .sheet(isPresented: $showAddMembers) {
             GroupMemberPickerView(
                 excludedUserIDs: Set(participants.map(\.userId))
-            ) { ids in
-                await addMembers(ids)
+            ) { picked in
+                await addMembers(picked.map(\.id))
             }
         }
         .confirmationDialog(leaveTitle, isPresented: $confirmLeave, titleVisibility: .visible) {
@@ -901,9 +901,20 @@ private struct GroupEditSheet: View {
 /// organization and excludes me — the only extra filtering needed is the people
 /// already in the group, because the server skips those silently and the user would
 /// otherwise get a success toast for having added nobody.
+/// Pick people out of the organisation's directory.
+///
+/// Shared by "add members to this group" and "add people to this call" — the two differ
+/// only in wording and in what the confirmation does, so the copy is injected rather
+/// than the whole screen being written twice. `onAdd` receives the full contacts, not
+/// just their ids, because the caller has to be able to name them in its result messages
+/// ("Priya is already on the call" beats a bare failure).
 struct GroupMemberPickerView: View {
     let excludedUserIDs: Set<String>
-    let onAdd: ([String]) async -> Void
+    var title: String = "Add members"
+    var everyoneExcludedTitle: String = "Everyone is already here"
+    var everyoneExcludedMessage: String =
+        "Every active person in your organization is already a member of this group."
+    let onAdd: ([Contact]) async -> Void
 
     @Environment(\.dismiss) private var dismiss
 
@@ -943,9 +954,9 @@ struct GroupMemberPickerView: View {
                 case .loaded where candidates.isEmpty:
                     EmptyStateView(
                         systemImage: "person.2",
-                        title: query.trimmed.isEmpty ? "Everyone is already here" : "No matches",
+                        title: query.trimmed.isEmpty ? everyoneExcludedTitle : "No matches",
                         message: query.trimmed.isEmpty
-                            ? "Every active person in your organization is already a member of this group."
+                            ? everyoneExcludedMessage
                             : "Nobody in your organization matches \"\(query.trimmed)\"."
                     )
 
@@ -971,7 +982,7 @@ struct GroupMemberPickerView: View {
             }
             .padding(.top, Theme.Layout.spacing3)
             .background(Theme.Color.bg.ignoresSafeArea())
-            .navigationTitle("Add members")
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -982,7 +993,7 @@ struct GroupMemberPickerView: View {
                     Button {
                         Task {
                             isAdding = true
-                            await onAdd(Array(selected))
+                            await onAdd(candidates.filter { selected.contains($0.id) })
                             isAdding = false
                             dismiss()
                         }

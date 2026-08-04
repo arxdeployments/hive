@@ -10,7 +10,7 @@ from app.core.config import get_settings
 from app.db.models import Call, CallParticipant, CallStatus, CallType
 from app.db.session import SessionLocal
 from app.main import app
-from app.services.calls import room_name_for
+from app.services.calls import room_name_for, user_id_from_identity
 from app.utils import now_utc
 from tests.conftest import CSRF, login
 
@@ -78,12 +78,102 @@ async def test_call_token_is_scoped_and_only_for_participants(client, two_orgs_w
         # token grants join to exactly this room
         assert claims["video"]["room"] == f"call_{call_id}"
         assert claims["video"]["roomJoin"] is True
-        assert claims["sub"] == str(users["alice"].id)
+        # The identity is `{user_id}#{device}`, not the bare user id: a LiveKit
+        # identity must be unique per connection or the SFU evicts the earlier
+        # client as a duplicate. It still resolves back to the user.
+        assert user_id_from_identity(claims["sub"]) == str(users["alice"].id)
+        assert claims["sub"] == body["identity"]
 
     # a foreign-org user cannot mint a token for someone else's call
     async with _client_for("carol@b.com") as carol:
         resp = await carol.post(f"/api/calls/{call_id}/token")
         assert resp.status_code == 404
+
+
+async def test_two_devices_of_one_user_get_distinct_room_identities(client, two_orgs_with_users):
+    """The regression that made "the call connects then goes silent" reproducible.
+
+    Both devices of a user used to be issued the bare user id as their LiveKit
+    identity, so whichever connected second evicted the first as a duplicate — with
+    no error surfaced anywhere. Distinct identities make a second client additive.
+    """
+    users = two_orgs_with_users
+    call_id = await _seed_connected_call(users)
+
+    async with _client_for("alice@a.com") as alice:
+        phone = await alice.post(f"/api/calls/{call_id}/token", json={"device_id": "phone"})
+        laptop = await alice.post(f"/api/calls/{call_id}/token", json={"device_id": "laptop"})
+
+    assert phone.status_code == 200 and laptop.status_code == 200
+    a, b = phone.json()["identity"], laptop.json()["identity"]
+    assert a != b
+    assert user_id_from_identity(a) == user_id_from_identity(b) == str(users["alice"].id)
+
+
+async def test_ringing_call_is_not_joinable_by_the_callee_before_accepting(
+    client, two_orgs_with_users
+):
+    """A token while merely ringing would publish the callee into the room without
+    them ever answering — the caller would hear a call they believed was ringing."""
+    users = two_orgs_with_users
+    async with SessionLocal() as db:
+        call = Call(
+            org_id=users["org_a"].id,
+            initiated_by=users["alice"].id,
+            type=CallType.voice,
+            status=CallStatus.ringing,
+            room_name="",
+        )
+        db.add(call)
+        await db.flush()
+        call.room_name = room_name_for(call.id)
+        db.add_all(
+            [
+                CallParticipant(call_id=call.id, user_id=users["alice"].id),
+                CallParticipant(call_id=call.id, user_id=users["bob"].id),
+            ]
+        )
+        await db.commit()
+        call_id = str(call.id)
+
+    async with _client_for("bob@a.com") as bob:
+        assert (await bob.post(f"/api/calls/{call_id}/token")).status_code == 400
+    # The caller may pre-join their own ringing call, so ringback and the first
+    # audio packet do not wait on a second round trip after the answer.
+    async with _client_for("alice@a.com") as alice:
+        assert (await alice.post(f"/api/calls/{call_id}/token")).status_code == 200
+
+
+async def test_active_call_lets_a_reconnecting_client_recover_its_call(
+    client, two_orgs_with_users
+):
+    """The recovery path for every frame lost while a socket was down."""
+    users = two_orgs_with_users
+    call_id = await _seed_connected_call(users)
+
+    async with _client_for("bob@a.com") as bob:
+        body = (await bob.get("/api/calls/active")).json()
+        assert body["call"]["call_id"] == call_id
+        assert body["call"]["status"] == "connected"
+        assert body["call"]["is_initiator"] is False
+        # Not joined yet, so a resuming client puts itself back on the ringer /
+        # join affordance rather than straight into a live room.
+        assert body["call"]["self_joined"] is False
+
+    # Someone with no live call gets an explicit null, not a 404.
+    async with _client_for("carol@b.com") as carol:
+        assert (await carol.get("/api/calls/active")).json() == {"call": None}
+
+
+async def test_active_call_reports_self_joined_after_taking_a_token(client, two_orgs_with_users):
+    users = two_orgs_with_users
+    call_id = await _seed_connected_call(users)
+
+    async with _client_for("bob@a.com") as bob:
+        await bob.post(f"/api/calls/{call_id}/token", json={"device_id": "phone"})
+        call = (await bob.get("/api/calls/active")).json()["call"]
+        assert call["self_joined"] is True
+        assert str(users["bob"].id) in call["joined"]
 
 
 async def test_call_history_only_shows_own_calls(client, two_orgs_with_users):

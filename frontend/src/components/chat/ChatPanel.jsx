@@ -14,6 +14,7 @@ import { GroupInfoPanel } from './GroupInfoPanel';
 import { MessageContextMenu } from './MessageContextMenu';
 import { ChatHeaderMenu } from './ChatHeaderMenu';
 import { CallButtonDropdown } from './CallButtonDropdown';
+import { OngoingGroupCallBar } from '../calls/OngoingGroupCallBar';
 import { ReplyPreview } from './ReplyPreview';
 import { ReactionPicker } from './ReactionPicker';
 import { ForwardModal } from './ForwardModal';
@@ -1204,6 +1205,12 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
           </>
         )}
       </div>
+
+      {/* "A call is happening in here — join it." Directly under the header so it
+          reads as belonging to this conversation, which is what makes the names in it
+          meaningful. Renders nothing unless there is a live group call here and this
+          client is not already in a call. */}
+      <OngoingGroupCallBar conversationId={conversationId} />
 
       {/* In-conversation search */}
       <ConversationSearch

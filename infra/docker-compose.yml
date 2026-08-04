@@ -57,10 +57,24 @@ services:
     # git. Getting that wrong does not degrade gracefully — the SFU exits with
     # "api_key is required to use webhooks" and restart:unless-stopped turns it
     # into a crash loop.
+    #
+    # LIVEKIT_NODE_IP gets the same treatment, for the same reason: see the note on
+    # rtc.node_ip in livekit.yaml. Empty (the default) means "deployed server" —
+    # node_ip is dropped from the config entirely and use_external_ip stays true.
+    # Set it to the host's LAN address in infra/.env to test against a phone.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        sed 's|__LIVEKIT_API_KEY__|${LIVEKIT_API_KEY:-rxhive-api}|' /etc/livekit.yaml > /tmp/livekit.yaml
+        NODE_IP='${LIVEKIT_NODE_IP:-}'
+        if [ -n "$$NODE_IP" ]; then EXT=false; else EXT=true; fi
+        sed -e 's|__LIVEKIT_API_KEY__|${LIVEKIT_API_KEY:-rxhive-api}|' \
+            -e "s|__LIVEKIT_USE_EXTERNAL_IP__|$$EXT|" \
+            -e "s|__LIVEKIT_NODE_IP__|$$NODE_IP|" \
+            /etc/livekit.yaml > /tmp/livekit.yaml
+        # An empty node_ip is not the same as an absent one — livekit-server rejects
+        # `node_ip: ""`. Drop the line rather than leave it blank.
+        [ -n "$$NODE_IP" ] || sed -i '/^  node_ip: *$$/d' /tmp/livekit.yaml
+        echo "livekit: use_external_ip=$$EXT node_ip=$${NODE_IP:-<none>}"
         exec /livekit-server --config /tmp/livekit.yaml
     volumes:
       - ./livekit.yaml:/etc/livekit.yaml:ro

@@ -40,6 +40,11 @@ export default async function globalSetup() {
       `Start the stack first:\n` +
       `  docker compose -f infra/docker-compose.yml up -d\n` +
       `or run the backend directly (needs Postgres, Redis, MinIO):\n` +
-      `  cd backend && .venv/bin/uvicorn app.main:app`
+      `  cd backend && RXHIVE_RATE_LIMIT_LOGIN=0 .venv/bin/uvicorn app.main:app\n` +
+      `\n` +
+      `RXHIVE_RATE_LIMIT_LOGIN=0 is not optional for a full run: the sign-in limiter is\n` +
+      `10 per minute PER IP, and every browser context here shares 127.0.0.1, so a suite\n` +
+      `with more than ten logins in a minute starts 429ing partway through and the\n` +
+      `failures surface as "conversation-search never appeared" on a login page.`
   );
 }

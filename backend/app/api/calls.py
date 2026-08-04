@@ -263,9 +263,72 @@ async def call_ended(body: CallEndedBeacon, user: User = Depends(get_current_use
     return {"message": "OK"}
 
 
+@router.get("/active")
+async def active_call(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """The call this client should currently be showing, if any.
+
+    Every `call:*` frame is a fire-and-forget publish, so anything sent while a
+    socket was reconnecting is gone. This is how a client recovers from that:
+    fetched on connect, on reconnect, and on returning to the foreground. Without
+    it a ring delivered during a two-second Wi-Fi handover was simply never seen,
+    even though the server rang on for another forty seconds.
+
+    `{"call": null}` is the normal, common answer — not an error.
+    """
+    return {"call": await calls_service.active_call_state(db, user.id)}
+
+
+class CallInviteRequest(BaseModel):
+    # Capped well below GROUP_CALL_CAP: this is one tap of a picker, not a bulk import,
+    # and an unbounded list would let one request ring an entire org.
+    user_ids: list[uuid.UUID] = Field(min_length=1, max_length=32)
+
+
+@router.post("/{call_id}/invite")
+async def invite_to_call(
+    call_id: uuid.UUID,
+    body: CallInviteRequest,
+    user: User = Depends(get_current_user),
+):
+    """Add people to a group call that is already running.
+
+    REST rather than a `call:*` socket frame, because the caller needs the ANSWER: a
+    per-invitee outcome, so the UI can say "Priya is in another call" instead of
+    reporting a flat success for a partial result. Every other call action is
+    fire-and-forget and belongs on the socket; this one is a request.
+
+    Authorisation is entirely in `services/calls.invite_to_call` — only someone already
+    in the call may invite, group calls only, and each invitee is org-checked against
+    the inviter.
+    """
+    result = await calls_service.invite_to_call(user, call_id, body.user_ids)
+    if error := result.get("error"):
+        raise HTTPException(
+            status_code=403 if error == "not_a_participant" else 400,
+            detail={
+                "not_joinable": "That call is no longer active",
+                "not_a_group_call": "People can only be added to a group call",
+                "not_a_participant": "You are not in this call",
+            }.get(error, "This call cannot be added to"),
+        )
+    return result
+
+
+class CallTokenRequest(BaseModel):
+    # Stable per install/tab. Makes the LiveKit identity unique per client so a
+    # second device of the same user is additive rather than evicting the first;
+    # see services/calls.identity_for. Optional so an older client still works —
+    # it just gets a random suffix per join instead of a stable one.
+    device_id: str | None = Field(default=None, max_length=64)
+
+
 @router.post("/{call_id}/token")
 async def call_token(
     call_id: uuid.UUID,
+    body: CallTokenRequest | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -275,13 +338,44 @@ async def call_token(
         raise HTTPException(status_code=404, detail="Call not found")
     if call.status not in _ACTIVE_STATUSES:
         raise HTTPException(status_code=400, detail="Call is not active")
+    # A ringing call is joinable only by the person who placed it. Without this a
+    # callee could POST here while their phone was still ringing and be published
+    # into the room without ever accepting — the caller would hear a room they
+    # believed was still ringing. All three clients only ask for a token after
+    # `call:accepted` / `call:group_participants`, so this closes a hole rather
+    # than changing any real flow.
+    if call.status == CallStatus.ringing and call.initiated_by != user.id:
+        raise HTTPException(status_code=400, detail="Call has not been answered yet")
     if member.joined_at is None:
         member.joined_at = now_utc()
-        await db.commit()
+    # A rejoin after a drop has to clear `left_at`, or the participant stays
+    # "gone" for every subsequent roster query — including the last-one-out check
+    # that ends a group call, which would then tear the room down under someone
+    # who had just come back.
+    member.left_at = None
+    await db.commit()
+    device_id = body.device_id if body else None
+    identity = calls_service.identity_for(user.id, device_id)
+    # One person, one audio leg. A second client of the same user joining would put
+    # two microphones and two speakers into the call, which the other side hears as
+    # echo and their own voice repeating with a delay. Newest join wins; the older
+    # leg is removed here rather than left for the SFU to kill silently.
+    await calls_service.evict_other_devices(call, user.id, identity)
     with contextlib.suppress(Exception):
         await calls_service._set_in_call([user.id], call.id)
+        # Taking a token is proof of life: cancel any grace window opened by an
+        # earlier socket drop, so a client that reconnects and rejoins is never
+        # resolved out of its own call a moment later.
+        await calls_service.handle_user_link_up(user.id)
     settings = get_settings()
-    return {"token": mint_token(call, user), "url": settings.livekit_url, "room": call.room_name}
+    return {
+        "token": mint_token(call, user, identity=identity),
+        "url": settings.livekit_url,
+        "room": call.room_name,
+        "identity": identity,
+        # Echoed so a client never has to hardcode the server's grace policy.
+        "reconnect_grace_seconds": calls_service.RECONNECT_GRACE_SECONDS,
+    }
 
 
 async def _handle_webhook_event(db: AsyncSession, event) -> None:
@@ -297,12 +391,23 @@ async def _handle_webhook_event(db: AsyncSession, event) -> None:
 
     name = event.event
     if name in ("participant_joined", "participant_left"):
-        member_id = parse_uuid(event.participant.identity or "")
+        # Identities are `{user_id}#{device_id}` so one user may hold more than one
+        # connection without the SFU evicting them as a duplicate
+        # (services/calls.identity_for). `user_id_from_identity` also accepts a bare
+        # user id, so a webhook queued by an older build still resolves.
+        member_id = parse_uuid(calls_service.user_id_from_identity(event.participant.identity))
         if member_id is None:
             return
         member = await db.get(CallParticipant, (call.id, member_id))
         if member is None:
             return
+        # Note: one user holding two room connections produces two joins and two
+        # leaves, so a leave here can name someone still present on another device.
+        # Deliberately not guarded against — both clients treat the ROOM, not this
+        # frame, as the authority on the roster (see LiveKitSession.syncFromRoom and
+        # livekitClient._syncParticipant), so a premature `participant_left` is
+        # corrected on the next room sync, and `POST /{id}/token` clears `left_at`
+        # on any rejoin.
         others = [u for u in await calls_service._call_participant_ids(db, call.id) if u != member_id]
         if name == "participant_joined":
             if member.joined_at is None:

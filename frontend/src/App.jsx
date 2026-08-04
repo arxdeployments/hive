@@ -45,6 +45,7 @@ import { IncomingCallOverlay } from './components/calls/IncomingCallOverlay';
 import { OutgoingCallScreen } from './components/calls/OutgoingCallScreen';
 import { MinimizedCallBanner } from './components/calls/MinimizedCallBanner';
 import { CallAudioSink } from './components/calls/CallAudioSink';
+import { CallConnectivityWatcher } from './components/calls/CallConnectivityWatcher';
 import { RealtimeSession } from './components/shared/RealtimeSession';
 import { ActiveCallView } from './components/calls/ActiveCallView';
 
@@ -174,6 +175,11 @@ function App() {
             ActiveCallView — which returns null when the call is minimised, so
             minimising silenced the other party while LiveKit kept streaming. */}
         <CallAudioSink />
+        {/* Poor-connection and reconnecting messages. Mounted alongside
+            CallAudioSink and for the same reason: a connectivity warning is most
+            useful precisely when the call is MINIMISED and the user is doing
+            something else, so it cannot live inside a call view. */}
+        <CallConnectivityWatcher />
         {/* Toasts are confirmations, not reading material: they clear quickly and
             can always be dismissed outright. Rapid toggles (mute/unmute) used to
             stack and cover the content underneath, so cap how many show at once. */}

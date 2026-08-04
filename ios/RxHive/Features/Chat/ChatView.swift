@@ -113,6 +113,10 @@ struct ChatView: View {
         VStack(spacing: 0) {
             header
 
+            if let ongoing = joinableGroupCall, !isSelecting {
+                ongoingCallBanner(ongoing)
+            }
+
             if let activePin, !isSelecting {
                 pinnedBanner(activePin)
             }
@@ -387,6 +391,75 @@ struct ChatView: View {
             Hairline()
         }
         .background(Theme.Color.surface)
+    }
+
+    // MARK: - Ongoing group call
+
+    /// A group call running in THIS conversation that this device is not in.
+    ///
+    /// `activeGroupCalls` has been populated from `call:group_active` since group calls
+    /// were built, and nothing read it — so a call was joinable only for as long as its
+    /// ringing screen was up. Let the ring lapse, decline it, or leave and want back in,
+    /// and there was no way in at all. Suppressed while we are in a call of our own,
+    /// where "Join" is not an offer that can be honoured.
+    private var joinableGroupCall: CallSignal? {
+        guard isGroup, !calls.hasLiveCall else { return nil }
+        return calls.activeGroupCalls[conversationID]
+    }
+
+    private func ongoingCallBanner(_ signal: CallSignal) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: Theme.Layout.spacing3) {
+                Image(systemName: signal.callType == .video ? "video.fill" : "phone.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.Color.primary)
+
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Call in progress")
+                        .font(Theme.Typography.micro)
+                        .foregroundStyle(Theme.Color.primary)
+                    Text(ongoingCallSubtitle(signal))
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.Color.textMuted)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 0)
+
+                Button {
+                    guard let callID = signal.callID else { return }
+                    calls.joinGroupCall(
+                        callID: callID,
+                        conversationID: conversationID,
+                        video: signal.callType == .video
+                    )
+                } label: {
+                    Text("Join")
+                        .font(Theme.Typography.font(size: 14, weight: .semibold))
+                        .foregroundStyle(Theme.Color.onPrimary)
+                        .padding(.horizontal, Theme.Layout.spacing4)
+                        .padding(.vertical, Theme.Layout.spacing2)
+                        .background(Capsule().fill(Theme.Color.primary))
+                }
+                .buttonStyle(PressScaleStyle())
+                .accessibilityLabel("Join the call in progress")
+            }
+            .padding(.horizontal, Theme.Layout.gutter)
+            .padding(.vertical, Theme.Layout.spacing2)
+
+            Hairline()
+        }
+        .background(Theme.Color.surface)
+    }
+
+    private func ongoingCallSubtitle(_ signal: CallSignal) -> String {
+        let names = (signal.participants ?? []).map(\.displayName)
+        switch names.count {
+        case 0: return signal.callType == .video ? "Video call" : "Voice call"
+        case 1: return "\(names[0]) is on the call"
+        case 2: return "\(names[0]) and \(names[1]) are on the call"
+        default: return "\(names[0]) and \(names.count - 1) others are on the call"
+        }
     }
 
     // MARK: - Message list

@@ -94,6 +94,38 @@ struct CallParticipantState: Identifiable {
 /// import a media type just to colour a dot.
 enum CallNetworkQuality {
     case excellent, good, poor, unknown
+
+    /// The wire value for `call:link_state`, so the peer can render the same grade.
+    var wireValue: String {
+        switch self {
+        case .excellent: return "excellent"
+        case .good: return "good"
+        case .poor: return "poor"
+        case .unknown: return "unknown"
+        }
+    }
+}
+
+/// Where the media session is, as the UI needs to describe it.
+///
+/// Distinct from "is there a call": a call whose room is `.reconnecting` is very much
+/// still a call — the SFU is re-establishing the session and audio usually resumes
+/// within a second or two. Treating that as a hang-up (which this used to, via
+/// `onRoomLost`) is what turned every tunnel, lift and Wi-Fi handover into a dropped
+/// call.
+enum CallMediaLink {
+    case connected
+    case reconnecting
+
+    /// The wire value for `call:link_state`. Matches the server's vocabulary in
+    /// `services/calls._PEER_STATES` exactly — a value outside it is dropped rather
+    /// than relayed, so the two must not drift.
+    var wireValue: String {
+        switch self {
+        case .connected: return "connected"
+        case .reconnecting: return "reconnecting"
+        }
+    }
 }
 
 // MARK: - Session
@@ -106,18 +138,58 @@ final class LiveKitSession: NSObject, ObservableObject {
     @Published private(set) var isMicEnabled = false
     @Published private(set) var isCameraEnabled = false
     @Published private(set) var networkQuality: CallNetworkQuality = .unknown
+    /// Whether the room is carrying right now. `.reconnecting` is NOT the end of the
+    /// call — see `CallMediaLink`.
+    @Published private(set) var mediaLink: CallMediaLink = .connected
 
-    /// Called when the room went away without us asking — SFU restart, network
-    /// loss, or the server tearing the room down. The store treats it as a hang-up.
+    /// Called when the room is gone for good — the SFU is unreachable and the
+    /// session cannot be re-established. The store treats it as a hang-up.
+    ///
+    /// Only reached after `LiveKitSession` has stopped trying. Previously it fired on
+    /// the first `didDisconnectWithError`, so a two-second dead spot ended the call.
     var onRoomLost: (() -> Void)?
     /// Called whenever room state changed, so the store can re-derive what it
     /// publishes without observing this object directly.
     var onStateChanged: (() -> Void)?
+    /// Called when the media link changes state, so the store can tell the peer
+    /// (`call:link_state`) that this side is struggling. The SFU tells nobody else.
+    var onMediaLinkChanged: ((CallMediaLink) -> Void)?
+    /// Called when the local connection grade changes, for the same reason.
+    var onQualityChanged: ((CallNetworkQuality) -> Void)?
+    /// Asks the store to fetch a fresh token and re-join. Owned by the store because
+    /// only it knows the call's type and whether the call is still live at all;
+    /// this class only knows that its room has gone.
+    var onNeedsRejoin: (() async -> Bool)?
 
     private(set) var callID: String?
+    /// The room identity this device connected with (`{userID}#{deviceID}`).
+    private(set) var identity: String?
     private var room: Room?
     private var syncTicker: Task<Void, Never>?
+    private var rejoinTask: Task<Void, Never>?
+    /// True while `rejoinTask` is inside `onNeedsRejoin`, which reaches back into
+    /// `join` → `leave`. Without it, `leave`'s `rejoinTask?.cancel()` would cancel the
+    /// very task calling it, and the cancellation would then abort the `room.connect`
+    /// that was about to succeed — a re-join that could never work.
+    private var isRejoining = false
     private let log = Logger(subsystem: "ai.rhythmrx.rxhive", category: "livekit")
+
+    /// Re-join budget, sized to sit inside the server's reconnect grace window
+    /// (`services/calls.RECONNECT_GRACE_SECONDS` = 40s) so the call row is still live
+    /// when the last attempt runs: 1 + 2 + 4 + 8 + 8 = 23s of waiting, plus the
+    /// connect attempts themselves.
+    private static let rejoinDelays: [Double] = [1, 2, 4, 8, 8]
+
+    /// The user half of a room identity. LiveKit gives us `{userID}#{deviceID}`; every
+    /// other layer — the socket's participant frames, the avatar lookup, the mute
+    /// relay — speaks in bare user ids.
+    ///
+    /// `nonisolated` because it is pure string work: the `RoomDelegate` callbacks are
+    /// nonisolated and would otherwise have to hop to the main actor just to read a
+    /// participant's user id.
+    nonisolated static func userID(of identity: String?) -> String {
+        (identity ?? "").split(separator: "#", maxSplits: 1).first.map(String.init) ?? ""
+    }
 
     // MARK: - URL resolution
 
@@ -186,17 +258,34 @@ final class LiveKitSession: NSObject, ObservableObject {
         // reason codes exist to prevent.
         try await Self.requireMicrophonePermission()
 
-        // Route audio before the SDK starts its engine, so the first packet already
-        // goes to the right output and the user never hears the call start in the
-        // earpiece and jump to the speaker.
-        Self.configureAudioSession(speaker: speaker)
+        // State the routing preference before the SDK starts its engine, so the first
+        // packet already goes to the right output and the user never hears the call
+        // start in the earpiece and jump to the speaker. This only records the
+        // preference — the SDK applies it as part of its own session configuration,
+        // which is what keeps echo cancellation intact. See `prefersSpeakerOutput`.
+        Self.prefersSpeakerOutput(speaker)
 
         let room = Room(
             delegate: self,
-            roomOptions: RoomOptions(adaptiveStream: true, dynacast: true)
+            // Audio capture options are stated explicitly rather than left to the
+            // defaults. They happen to match the SDK's defaults today, but echo
+            // cancellation is the single setting whose silent regression is most
+            // expensive to diagnose — a dependency bump that flipped a default would
+            // present as "the call echoes" with nothing in the diff to point at.
+            roomOptions: RoomOptions(
+                defaultAudioCaptureOptions: AudioCaptureOptions(
+                    echoCancellation: true,
+                    autoGainControl: true,
+                    noiseSuppression: true,
+                    highpassFilter: true
+                ),
+                adaptiveStream: true,
+                dynacast: true
+            )
         )
         self.room = room
         self.callID = callID
+        self.identity = token.identity
 
         do {
             try await room.connect(url: url, token: token.token)
@@ -206,9 +295,17 @@ final class LiveKitSession: NSObject, ObservableObject {
         }
 
         let outcome = try await publishLocalMedia(in: room, wantVideo: wantVideo)
+        setMediaLink(.connected)
         startSyncTicker()
         syncFromRoom()
         return outcome
+    }
+
+    private func setMediaLink(_ link: CallMediaLink) {
+        guard mediaLink != link else { return }
+        mediaLink = link
+        onMediaLinkChanged?(link)
+        onStateChanged?()
     }
 
     /// Publish mic (mandatory) and camera (best-effort on a video call).
@@ -249,14 +346,20 @@ final class LiveKitSession: NSObject, ObservableObject {
     func leave() async {
         syncTicker?.cancel()
         syncTicker = nil
+        if !isRejoining {
+            rejoinTask?.cancel()
+            rejoinTask = nil
+        }
         let room = self.room
         self.room = nil
         callID = nil
+        identity = nil
         remoteParticipants = []
         localVideoTrack = nil
         isMicEnabled = false
         isCameraEnabled = false
         networkQuality = .unknown
+        mediaLink = .connected
 
         if let room {
             // Unpublish explicitly rather than relying on disconnect: leaving the
@@ -266,7 +369,11 @@ final class LiveKitSession: NSObject, ObservableObject {
             try? await room.localParticipant.setMicrophone(enabled: false)
             await room.disconnect()
         }
-        Self.deactivateAudioSession()
+        // No `setActive(false)` here. The SDK deactivates its own session when the
+        // audio engine stops (AudioSessionEngineObserver, with
+        // .notifyOthersOnDeactivation), and doing it ourselves could deactivate the
+        // session out from under an engine that was still running — the same
+        // class of race that cost us echo cancellation while connecting.
         onStateChanged?()
     }
 
@@ -283,15 +390,51 @@ final class LiveKitSession: NSObject, ObservableObject {
         syncFromRoom()
     }
 
-    func setCamera(enabled: Bool) async {
-        guard let room else { return }
+    /// Turn the local camera on or off.
+    ///
+    /// Audio, the screen share and the room connection are untouched: this mutes or
+    /// unmutes exactly one publication. `LocalParticipant.set(source:enabled:)` keeps
+    /// the publication alive and calls `mute()`/`unmute()` on it, so nothing is
+    /// renegotiated and the far side sees the change as a track mute.
+    ///
+    /// `position` is passed explicitly because the SDK has a second path: when there is
+    /// **no publication to unmute** — a call joined as voice, or a track dropped and
+    /// re-published — it builds a new track from
+    /// `roomOptions.defaultCameraCaptureOptions`, which means the front camera. Without
+    /// this, somebody using the back camera who turned it off and on again would find
+    /// the front camera pointed at their face.
+    ///
+    /// Returns the state actually reached, so the caller does not have to assume the
+    /// hardware co-operated.
+    @discardableResult
+    func setCamera(enabled: Bool, position: AVCaptureDevice.Position? = nil) async -> Bool {
+        guard let room else { return enabled }
         do {
-            try await room.localParticipant.setCamera(enabled: enabled)
+            let options = (enabled && position != nil)
+                ? CameraCaptureOptions(position: position!)
+                : nil
+            try await room.localParticipant.setCamera(enabled: enabled, captureOptions: options)
             isCameraEnabled = enabled
+            syncFromRoom()
+            return enabled
         } catch {
             log.error("Camera toggle failed: \(error.localizedDescription, privacy: .public)")
+            // Re-read rather than assume: a failed enable can still have changed the
+            // publication, and `syncFromRoom` derives the flag from what is actually
+            // published. This is what puts the button back on its own.
+            syncFromRoom()
+            return isCameraEnabled
         }
-        syncFromRoom()
+    }
+
+    /// Which camera is capturing right now, or `nil` when none is.
+    ///
+    /// Read from the live capture device rather than tracked in a flag of our own, so it
+    /// stays true through a flip that failed and through a device the SDK chose for us.
+    var cameraPosition: AVCaptureDevice.Position? {
+        guard let track = room?.localParticipant.firstCameraVideoTrack as? LocalVideoTrack,
+              let capturer = track.capturer as? CameraCapturer else { return nil }
+        return capturer.position
     }
 
     /// Front/back switch. A no-op when there is no camera published.
@@ -302,16 +445,18 @@ final class LiveKitSession: NSObject, ObservableObject {
         syncFromRoom()
     }
 
-    /// Speakerphone. `overrideOutputAudioPort` is the only reliable way to move a
-    /// live `.playAndRecord` session between the earpiece and the loudspeaker;
-    /// changing the category mid-call drops audio for a moment.
+    /// Speakerphone.
+    ///
+    /// Goes through the SDK rather than calling `overrideOutputAudioPort` on the
+    /// shared session, which is what this did before. An override applied behind the
+    /// SDK's back is undone the next time its engine reconfigures the session (a
+    /// route change, an interruption, a track being republished mid-call), so the
+    /// button appeared to work and then silently stopped — and, worse, the write
+    /// raced the SDK's own configuration and could cost the session its
+    /// voice-processing unit, and with it echo cancellation. See
+    /// `prefersSpeakerOutput`.
     func setSpeaker(on: Bool) {
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.overrideOutputAudioPort(on ? .speaker : .none)
-        } catch {
-            log.notice("Speaker override failed: \(error.localizedDescription, privacy: .public)")
-        }
+        Self.prefersSpeakerOutput(on)
     }
 
     // MARK: - Room state
@@ -332,15 +477,38 @@ final class LiveKitSession: NSObject, ObservableObject {
     private func syncFromRoom() {
         guard let room else { return }
 
-        if room.connectionState == .disconnected {
-            log.notice("Room reported disconnected")
-            onRoomLost?()
+        // Connection state drives the media link, and — critically — `.reconnecting`
+        // is NOT a lost room.
+        //
+        // This block used to be `if room.connectionState == .disconnected { onRoomLost() }`
+        // and nothing else, with the store treating `onRoomLost` as a hang-up. Because
+        // the ticker polls every second, any interruption long enough for the SDK to
+        // notice ended the call — a tunnel, a lift, a Wi-Fi/cellular handover, an SFU
+        // restart during a deploy. LiveKit recovers most of those on its own within a
+        // second or two; all that was missing was the patience to let it.
+        switch room.connectionState {
+        case .reconnecting:
+            setMediaLink(.reconnecting)
+            // The roster is untrustworthy mid-reconnect; leave the tiles as they are
+            // rather than blanking the call and then repopulating it.
+            onStateChanged?()
             return
+        case .disconnected:
+            log.notice("Room reported disconnected")
+            handleRoomGone()
+            return
+        default:
+            setMediaLink(.connected)
         }
 
         var states: [CallParticipantState] = []
         for participant in room.remoteParticipants.values {
-            guard let identity = participant.identity?.stringValue else { continue }
+            guard let rawIdentity = participant.identity?.stringValue else { continue }
+            // Tiles are keyed by USER id, not by room identity, so this roster and the
+            // socket's `call:participant_joined` (which is the only source of avatars)
+            // describe the same person. See `LiveKitSession.userID(of:)`.
+            let identity = Self.userID(of: rawIdentity)
+            guard !identity.isEmpty else { continue }
             let screen = participant.firstScreenShareVideoTrack
             let camera = participant.firstCameraVideoTrack
             // `name` is optional in the LiveKit SDK and is often empty anyway: the
@@ -378,6 +546,11 @@ final class LiveKitSession: NSObject, ObservableObject {
     /// SDK versions silently stops being called instead of failing to compile. A
     /// cheap poll over a handful of participants means a renamed callback costs a
     /// second of latency rather than a call with no video in it.
+    ///
+    /// It is also, for the same reason, what drives `mediaLink`: polling
+    /// `room.connectionState` cannot silently stop working the way a renamed delegate
+    /// method can, and getting reconnection wrong is the difference between a call
+    /// that survives a dead spot and one that dies in it.
     private func startSyncTicker() {
         syncTicker?.cancel()
         syncTicker = Task { [weak self] in
@@ -389,29 +562,86 @@ final class LiveKitSession: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Audio session
+    // MARK: - Recovery
 
-    /// `.playAndRecord` + `.voiceChat` is the combination that gives a call echo
-    /// cancellation and the hardware AGC. `.allowBluetooth` (not
-    /// `.allowBluetoothA2DP`) is what routes to a headset's *microphone* as well as
-    /// its speaker.
-    static func configureAudioSession(speaker: Bool) {
-        let session = AVAudioSession.sharedInstance()
-        var options: AVAudioSession.CategoryOptions = [.allowBluetooth]
-        if speaker { options.insert(.defaultToSpeaker) }
-        do {
-            try session.setCategory(.playAndRecord, mode: .voiceChat, options: options)
-            try session.setActive(true, options: [])
-            try session.overrideOutputAudioPort(speaker ? .speaker : .none)
-        } catch {
-            Logger(subsystem: "ai.rhythmrx.rxhive", category: "livekit")
-                .error("Audio session setup failed: \(error.localizedDescription, privacy: .public)")
+    /// The room is gone. Try to get back in before declaring the call over.
+    ///
+    /// LiveKit's own reconnection covers a brief interruption; this covers the case
+    /// where the session is genuinely finished but the CALL is not — an SFU restart, a
+    /// signal socket killed by a captive portal, a device waking from sleep. The call
+    /// row is still `connected`, the peer is still in the room, and a fresh token gets
+    /// us back in. Only when every attempt has failed does the store hear about it.
+    private func handleRoomGone() {
+        guard rejoinTask == nil else { return }  // already trying
+        syncTicker?.cancel()
+        syncTicker = nil
+
+        // Drop the dead room, keep the call. `leave()` would also clear `callID`,
+        // which the store needs to identify what it is re-joining.
+        let dead = room
+        room = nil
+        if let dead { Task { await dead.disconnect() } }
+
+        guard onNeedsRejoin != nil else {
+            setMediaLink(.connected)
+            onRoomLost?()
+            return
+        }
+
+        setMediaLink(.reconnecting)
+        rejoinTask = Task { [weak self] in
+            for (attempt, delay) in Self.rejoinDelays.enumerated() {
+                try? await Task.sleep(for: .seconds(delay))
+                // `callID == nil` means `leave()` ran — the user hung up, or the call
+                // ended — so there is nothing left to rejoin.
+                guard let self, !Task.isCancelled, self.callID != nil else { return }
+                // A `join` from somewhere else got there first.
+                if self.room != nil { self.rejoinTask = nil; return }
+                self.log.notice("Rejoining the SFU (attempt \(attempt + 1))")
+                // The store re-fetches a token and calls `join`; `false` means the call
+                // itself is finished, so retrying can only delay the bad news.
+                self.isRejoining = true
+                let rejoined = await self.onNeedsRejoin?() == true
+                self.isRejoining = false
+                if rejoined {
+                    self.log.notice("Rejoined the SFU")
+                    self.rejoinTask = nil
+                    return
+                }
+                if Task.isCancelled { return }
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.log.error("Gave up rejoining the SFU; ending the call")
+            self.rejoinTask = nil
+            self.setMediaLink(.connected)
+            self.onRoomLost?()
         }
     }
 
-    /// Hand the session back so other audio (a voice note, the system) resumes.
-    static func deactivateAudioSession() {
-        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+    // MARK: - Audio session
+
+    /// Ask for the routing we want. **Never touch `AVAudioSession` directly.**
+    ///
+    /// This used to call `setCategory(.playAndRecord, mode: .voiceChat)`,
+    /// `setActive(true)` and `overrideOutputAudioPort` itself, before connecting —
+    /// and that was the cause of severe echo on device.
+    ///
+    /// The LiveKit SDK **owns the audio session**: `AudioSessionEngineObserver`
+    /// applies its own category, mode and options when the audio engine starts, and
+    /// deactivates the session when it stops. Configuring the same session by hand
+    /// races that. Whichever write lands last wins, so the session could end up in a
+    /// category/mode combination where iOS does **not** insert the voice-processing
+    /// I/O unit — which is what performs hardware acoustic echo cancellation. With it
+    /// absent the far end hears itself back, loudly, and no amount of software
+    /// tuning compensates. It also made the outcome nondeterministic: the same build
+    /// could sound fine or echo depending on the order the two configurations landed.
+    ///
+    /// `isSpeakerOutputPreferred` is the SDK's supported hook for exactly this
+    /// choice, and it applies through the SDK's own configuration pass, so there is
+    /// no race and echo cancellation is never lost. Speaker on for video (the phone
+    /// is held away from the face), receiver for voice (held to the ear).
+    static func prefersSpeakerOutput(_ speaker: Bool) {
+        AudioManager.shared.isSpeakerOutputPreferred = speaker
     }
 
     // MARK: - Permissions
@@ -540,9 +770,15 @@ extension LiveKitSession: RoomDelegate {
         let isLocal = participant is LocalParticipant
         Task { @MainActor [weak self] in
             guard let self else { return }
-            // Only the local leg is actionable — a remote peer's poor uplink is not
-            // something this user can do anything about.
-            if isLocal { self.networkQuality = mapped }
+            // Only the local leg drives our own indicator — a remote peer's poor uplink
+            // is not something this user can do anything about. But it IS relayed, so
+            // the other side can say so on their screen: the SFU reports quality to the
+            // affected participant only, which is why a peer with a dying connection
+            // used to look perfectly healthy from here.
+            if isLocal, self.networkQuality != mapped {
+                self.networkQuality = mapped
+                self.onQualityChanged?(mapped)
+            }
             self.onStateChanged?()
         }
     }
@@ -550,7 +786,10 @@ extension LiveKitSession: RoomDelegate {
     nonisolated func room(_ room: Room, didDisconnectWithError error: LiveKitError?) {
         Task { @MainActor [weak self] in
             guard let self, self.room === room else { return }
-            self.onRoomLost?()
+            // NOT a hang-up. `handleRoomGone` spends the re-join budget first, and only
+            // calls `onRoomLost` once it has run out — see the note there for why the
+            // old straight-to-`onRoomLost` behaviour lost calls that were recoverable.
+            self.handleRoomGone()
         }
     }
 
@@ -576,8 +815,35 @@ extension LiveKitSession: RoomDelegate {
 struct CallVideoView: UIViewRepresentable {
     let track: VideoTrack?
     /// `.fill` crops to the tile (camera), `.fit` letterboxes (screen share).
+    /// Both preserve the source aspect ratio — neither stretches.
     var fitsContent = false
-    var mirrored = false
+
+    /// Horizontal mirroring, and **the caller does not decide it**.
+    ///
+    /// This used to be `mirrored: Bool`, set to `true` for anything local. That is
+    /// wrong for half the cameras on the device: a self-view is mirrored because a
+    /// front camera shows you your own face and people expect a mirror, but the BACK
+    /// camera is pointed at the world, and mirroring the world puts every sign,
+    /// badge and screen in the scene back-to-front. `mirrored: tile.isLocal` in the
+    /// group grid and `mirrored: true` in the 1:1 self-view both did exactly that.
+    ///
+    /// A `Bool` at the call site cannot be right, because only the renderer knows
+    /// which camera is live *right now* — the answer changes under `flipCamera()`,
+    /// and it can change without us asking when the SDK falls back to another
+    /// device. So the decision is delegated: `.auto` mirrors iff the frame's
+    /// `captureDevice.facingPosition == .front` (`VideoView._shouldMirror`), and the
+    /// capture device arrives with every frame from the capturer, so a flip mid-call
+    /// is picked up on the next frame with no state of ours to keep in sync.
+    ///
+    /// For a REMOTE track there is no capture device, so `.auto` is `.off` — remote
+    /// video is never mirrored, which is what it must be: it has already been
+    /// composed the right way round by whoever sent it.
+    ///
+    /// This is display only, in either direction. `mirrorMode` ends as
+    /// `layer.transform` on the renderer's own layer, while the published frame goes
+    /// to `delegate?.capturer(_:didCapture:)` straight off the capture buffer — so
+    /// nothing here can mirror what the far side receives.
+    var mirror: VideoView.MirrorMode = .auto
 
     func makeUIView(context: Context) -> VideoView {
         let view = VideoView()
@@ -587,7 +853,7 @@ struct CallVideoView: UIViewRepresentable {
 
     func updateUIView(_ view: VideoView, context: Context) {
         view.layoutMode = fitsContent ? .fit : .fill
-        view.mirrorMode = mirrored ? .mirror : .off
+        view.mirrorMode = mirror
         if view.track !== track { view.track = track }
     }
 

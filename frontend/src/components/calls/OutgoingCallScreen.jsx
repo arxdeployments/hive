@@ -1,6 +1,6 @@
 import React, { useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { PhoneOff, ChevronDown, UserPlus, Lock } from 'lucide-react';
+import { PhoneOff, ChevronDown, Lock } from 'lucide-react';
 import useCallStore from '../../stores/callStore';
 import callSounds from '../../services/callSounds';
 import wsClient from '../../services/websocket';
@@ -59,9 +59,13 @@ export const OutgoingCallScreen = () => {
             <ChevronDown size={24} />
           </button>
           <div className="w-10" />
-          <button className="p-2 text-white/70">
-            <UserPlus size={22} />
-          </button>
+          {/* No "add people" here, deliberately. This screen is only up while a call is
+              still RINGING: a 1:1 cannot be added to at all (the server refuses —
+              promoting a direct call to a group is a separate feature with its own
+              consent question), and a group call is `connected` from the moment it is
+              created, so ActiveCallView owns it within the first frames. The button
+              that used to sit here was wired to nothing. */}
+          <div className="w-10" />
         </div>
 
         {/* Center - Avatar + Name + Status */}
@@ -94,9 +98,15 @@ export const OutgoingCallScreen = () => {
           </span>
         </div>
 
-        {/* End call */}
+        {/* End call. `data-testid` deliberately distinct from the in-call
+            `call-end-btn`: this button sends `call:cancel`, not `call:end`, and
+            sharing the id would let a test assert it had reached a live call when it
+            was in fact still ringing. Its absence was why nothing could assert on
+            the outgoing ring screen at all. */}
         <div className="flex justify-center pb-8 safe-bottom">
           <button onClick={handleEnd}
+            data-testid="call-cancel-btn"
+            aria-label="Cancel call"
             className="w-[72px] h-[72px] rounded-full bg-[#EF4444] flex items-center justify-center shadow-lg shadow-red-500/20 active:scale-90 transition-transform">
             <PhoneOff size={32} className="text-white" />
           </button>
