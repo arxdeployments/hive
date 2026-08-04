@@ -235,10 +235,7 @@ async def toggle_pin(conv_id: str, tenant: TenantContext = Depends(get_tenant)):
         if (pinned_count or 0) >= MAX_PINNED_CONVERSATIONS:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"You can pin up to {MAX_PINNED_CONVERSATIONS} chats. "
-                    "Unpin one first."
-                ),
+                detail=(f"You can pin up to {MAX_PINNED_CONVERSATIONS} chats. Unpin one first."),
             )
         lowest = await tenant.db.scalar(
             select(func.min(ConversationParticipant.pin_order)).where(

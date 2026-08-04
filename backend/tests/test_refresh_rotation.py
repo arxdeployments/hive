@@ -60,9 +60,7 @@ async def _age_revocation(raw: str, seconds: int) -> None:
 
 async def _live_tokens(user_id, client: str | None = None) -> list[RefreshToken]:
     async with SessionLocal() as db:
-        stmt = select(RefreshToken).where(
-            RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None)
-        )
+        stmt = select(RefreshToken).where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
         if client is not None:
             stmt = stmt.where(RefreshToken.client == client)
         return list((await db.execute(stmt)).scalars().all())

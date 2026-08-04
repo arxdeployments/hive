@@ -292,7 +292,7 @@ async def make_thumbnail(data: bytes) -> bytes | None:
 # edge (about 283px wide for portrait A4) was being upscaled roughly twofold.
 # 1000 puts a portrait page at ~707px wide, which covers the 2x case.
 PDF_THUMB_PX = 1000
-PDF_PAGE_PX = 1600    # long edge for full-viewer pages
+PDF_PAGE_PX = 1600  # long edge for full-viewer pages
 # Higher than the photo path and with 4:4:4 chroma. A PDF is text by definition,
 # and subsampled chroma is what makes small type look smeared rather than merely
 # small.
@@ -301,7 +301,7 @@ PDF_QUALITY = 88
 # hostile file reporting a huge count would otherwise turn the count itself into
 # an attack on both the DOM and the per-page endpoint.
 PDF_MAX_PAGES = 2000
-PDF_WINDOW = 10       # pages rendered per on-demand pass
+PDF_WINDOW = 10  # pages rendered per on-demand pass
 
 # PDFium is NOT thread-safe and pypdfium2 ships no lock of its own. anyio's
 # default thread limiter allows 40, so without this two renders could overlap.

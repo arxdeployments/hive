@@ -140,9 +140,7 @@ async def upload_file(
     thumbnail_key = None
     page_count = None
     thumb = None
-    if size <= storage.THUMBNAIL_SOURCE_LIMIT and (
-        file_type == "image" or content_type == "application/pdf"
-    ):
+    if size <= storage.THUMBNAIL_SOURCE_LIMIT and (file_type == "image" or content_type == "application/pdf"):
         file.file.seek(0)
         payload = await anyio.to_thread.run_sync(file.file.read)
         if file_type == "image":

@@ -628,9 +628,7 @@ async def test_declining_a_group_call_tells_the_others_and_does_not_end_it(
         assert (await db.get(CallParticipant, (call.id, users["bob"].id))).left_at is not None
 
 
-async def test_someone_already_in_a_group_call_cannot_decline_it(
-    two_orgs_with_users, captured_events
-):
+async def test_someone_already_in_a_group_call_cannot_decline_it(two_orgs_with_users, captured_events):
     """That is a leave, and hanging up sends one. Treating it as a decline would mark a
     live participant as gone while their media was still in the room."""
     users = two_orgs_with_users

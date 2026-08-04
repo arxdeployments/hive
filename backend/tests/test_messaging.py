@@ -107,9 +107,7 @@ async def test_delete_message_endpoint_is_gone(client, two_orgs_with_users):
     resp = await client.delete(f"/api/conversations/messages/{msg['_id']}")
     assert resp.status_code == 405, resp.text
 
-    resp = await client.delete(
-        f"/api/conversations/messages/{msg['_id']}", params={"for_everyone": "true"}
-    )
+    resp = await client.delete(f"/api/conversations/messages/{msg['_id']}", params={"for_everyone": "true"})
     assert resp.status_code == 405, resp.text
 
     # And the message is still there, intact and not tombstoned.
@@ -298,9 +296,7 @@ async def test_messages_around_edges_and_bad_anchor(client, two_orgs_with_users)
     # A garbage or foreign anchor is ignored, not an error — the caller gets the
     # newest window and anchor_id=null tells it the anchor did not resolve.
     for bad in ("not-a-uuid", "00000000-0000-0000-0000-000000000000"):
-        resp = await client.get(
-            f"/api/conversations/{conv}/messages", params={"around": bad, "limit": 3}
-        )
+        resp = await client.get(f"/api/conversations/{conv}/messages", params={"around": bad, "limit": 3})
         assert resp.status_code == 200, resp.text
         assert resp.json()["anchor_id"] is None
         assert resp.json()["has_newer"] is False

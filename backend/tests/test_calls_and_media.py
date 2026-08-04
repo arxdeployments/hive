@@ -110,9 +110,7 @@ async def test_two_devices_of_one_user_get_distinct_room_identities(client, two_
     assert user_id_from_identity(a) == user_id_from_identity(b) == str(users["alice"].id)
 
 
-async def test_ringing_call_is_not_joinable_by_the_callee_before_accepting(
-    client, two_orgs_with_users
-):
+async def test_ringing_call_is_not_joinable_by_the_callee_before_accepting(client, two_orgs_with_users):
     """A token while merely ringing would publish the callee into the room without
     them ever answering — the caller would hear a call they believed was ringing."""
     users = two_orgs_with_users
@@ -144,9 +142,7 @@ async def test_ringing_call_is_not_joinable_by_the_callee_before_accepting(
         assert (await alice.post(f"/api/calls/{call_id}/token")).status_code == 200
 
 
-async def test_active_call_lets_a_reconnecting_client_recover_its_call(
-    client, two_orgs_with_users
-):
+async def test_active_call_lets_a_reconnecting_client_recover_its_call(client, two_orgs_with_users):
     """The recovery path for every frame lost while a socket was down."""
     users = two_orgs_with_users
     call_id = await _seed_connected_call(users)
@@ -292,9 +288,7 @@ async def test_voice_note_duration_round_trip(client, two_orgs_with_users):
 
     users = two_orgs_with_users
     await login(client, "alice@a.com")
-    resp = await client.post(
-        "/api/conversations/direct", json={"participant_id": str(users["bob"].id)}
-    )
+    resp = await client.post("/api/conversations/direct", json={"participant_id": str(users["bob"].id)})
     assert resp.status_code == 200, resp.text
     conv = resp.json()["_id"]
 
