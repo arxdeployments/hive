@@ -94,6 +94,18 @@ const measuringContext = () => {
 
 const maxDpr = () => Math.min(2, window.devicePixelRatio || 1);
 
+/**
+ * How close together two taps on the same box must land to mean "type in this".
+ *
+ * A single tap never opens the caret, whatever the selection happened to be. The
+ * alternative — "a tap on an already-selected box edits it" — reads well until a box
+ * is selected for a reason the user did not choose: the one they just added is
+ * selected, so their first attempt to nudge it would raise the keyboard over the
+ * picture instead of moving it. Requiring a deliberate double-tap means a tap is
+ * always safe to use for picking something up.
+ */
+const DOUBLE_TAP_MS = 350;
+
 const ALIGNMENTS = [
   { key: 'left', icon: AlignLeft, label: 'Align left' },
   { key: 'center', icon: AlignCenter, label: 'Align centre' },
@@ -123,7 +135,27 @@ export const AnnotateStage = ({
 
   const { ref: stageRef, box } = useFittedBox(frameAspect, 16);
 
-  const [editingId, setEditingId] = useState(null);
+  /**
+   * Which box has the caret — as state (it drives rendering) plus a ref that is written
+   * in the same breath, so any handler can read the CURRENT value without having to
+   * reach for it from inside a `setEditingId` updater.
+   *
+   * That distinction is the whole reason the ref exists. `stopEditing` used to call
+   * `onEdit` from inside the updater, and React may run an updater during render — both
+   * eagerly, to see whether it can bail out, and again when an update queue is
+   * re-processed. So a parent dispatch happened mid-render of this component ("Cannot
+   * update a component while rendering a different component"), and it happened a
+   * variable number of times. That is the same class of bug as the original undo defect,
+   * where history was pushed from inside a `setEdit` updater: a side effect in an
+   * updater is not a side effect that runs once.
+   */
+  const [editingId, setEditingIdState] = useState(null);
+  const editingIdRef = useRef(null);
+  const setEditingId = useCallback((value) => {
+    const next = typeof value === 'function' ? value(editingIdRef.current) : value;
+    editingIdRef.current = next;
+    setEditingIdState(next);
+  }, []);
   /** Which colour the strip and the swatches are driving right now. */
   const [colorTarget, setColorTarget] = useState('text');
 
@@ -131,6 +163,8 @@ export const AnnotateStage = ({
   const liveRef = useRef(null);
   const dragRef = useRef(null);
   const textareaRef = useRef(null);
+  /** `{ id, at }` of the last tap that landed on a box — the double-tap detector. */
+  const lastTapRef = useRef(null);
 
   const texts = edit.texts || [];
   const selected = texts.find((t) => t.id === selectedId) || null;
@@ -156,27 +190,27 @@ export const AnnotateStage = ({
    * as edited and Revert would appear to have something to undo.
    */
   const stopEditing = useCallback(() => {
-    setEditingId((current) => {
-      if (!current) return null;
-      onEdit((prev) => {
-        const item = prev.texts.find((t) => t.id === current);
-        if (item && !item.text.trim()) {
-          return { ...prev, texts: prev.texts.filter((t) => t.id !== current) };
-        }
-        return prev;
-      });
-      return null;
+    const current = editingIdRef.current;
+    if (!current) return;
+    // Two plain calls, both from the event or effect that asked for them — NOT one
+    // nested inside the other's updater. See the note on `editingIdRef`.
+    setEditingId(null);
+    onEdit((prev) => {
+      const item = prev.texts.find((t) => t.id === current);
+      if (item && !item.text.trim()) {
+        return { ...prev, texts: prev.texts.filter((t) => t.id !== current) };
+      }
+      return prev;
     });
-  }, [onEdit]);
+  }, [onEdit, setEditingId]);
 
-  // Switching to the pen puts the caret away and drops the selection, so a
-  // stroke is never interpreted as a drag of whatever was selected.
+  // Switching to the pen closes the caret — typing while the pen is selected has
+  // nowhere to go. The SELECTION is deliberately kept: a text box stays movable,
+  // resizable and deletable with the pen active, so captions can be arranged
+  // without going back to the Text tool for every nudge.
   useEffect(() => {
-    if (tool !== 'text') {
-      stopEditing();
-      onSelect(null);
-    }
-  }, [tool, stopEditing, onSelect]);
+    if (tool !== 'text') stopEditing();
+  }, [tool, stopEditing]);
 
   useEffect(() => {
     if (!editingId) return;
@@ -229,6 +263,12 @@ export const AnnotateStage = ({
       onSelect(null);
       return;
     }
+    // Starting a stroke also clears the selection, so the handles and outline of a
+    // previously-picked box are not left floating over the drawing. This only runs
+    // for a pointerdown on bare picture — a box stops propagation, so grabbing one
+    // never lands here.
+    stopEditing();
+    if (selectedId) onSelect(null);
     event.preventDefault();
     capturePointer(event);
     const rect = event.currentTarget.getBoundingClientRect();
@@ -315,8 +355,20 @@ export const AnnotateStage = ({
 
   // ── Move and resize ──────────────────────────────────────────────────────
 
+  /**
+   * Start a move or a resize. Works with EITHER tool selected.
+   *
+   * It used to return early unless the Text tool was active, which meant a caption
+   * could not be nudged, resized or retyped without first going back to the tool
+   * picker — the pen made every text box inert. Boxes are now grabbable whenever
+   * the annotate stage is up.
+   *
+   * The trade that buys: with the pen active, a stroke can no longer START on top of
+   * a caption, because the box takes that pointerdown. Drawing THROUGH one still
+   * works — begin the stroke on bare picture and cross it — and being able to move
+   * the thing you can see is worth more than starting a line inside its bounds.
+   */
   const beginDrag = (item, mode) => (event) => {
-    if (tool !== 'text') return;
     event.preventDefault();
     event.stopPropagation();
     capturePointer(event);
@@ -373,8 +425,26 @@ export const AnnotateStage = ({
     if (!drag) return;
     releasePointer(event);
     dragRef.current = null;
-    // A tap, not a drag: open the caret on it.
-    if (!drag.moved && drag.mode === 'move') setEditingId(drag.id);
+    if (drag.moved || drag.mode !== 'move') return;
+
+    // A tap, not a drag:
+    //
+    //   single tap  — select. The box is now movable, resizable and deletable, and the
+    //                 finger is already on it so a drag continues naturally.
+    //   double tap  — open the caret.
+    //
+    // A single tap used to go straight to the caret, which made a box impossible to
+    // simply pick up: touching it to move it raised the keyboard, and the keyboard
+    // covered the picture being annotated. See DOUBLE_TAP_MS for why this is a real
+    // double-tap rather than "a tap on whatever was already selected".
+    const now = Date.now();
+    const previous = lastTapRef.current;
+    if (previous && previous.id === drag.id && now - previous.at < DOUBLE_TAP_MS) {
+      lastTapRef.current = null;
+      setEditingId(drag.id);
+      return;
+    }
+    lastTapRef.current = { id: drag.id, at: now };
   };
 
   // ── Colour routing ───────────────────────────────────────────────────────
@@ -442,8 +512,10 @@ export const AnnotateStage = ({
               />
 
               {/* Transparent chrome per text box: the glyphs are on the canvas
-                  underneath, these carry the interaction. Inert while the pen is
-                  selected, so a stroke can cross a caption. */}
+                  underneath, these carry the interaction. Live with EITHER tool
+                  selected — a caption is movable and retypable without going back to
+                  the Text tool. Inert only for the box currently holding the caret,
+                  where the textarea on top owns the pointer. */}
               {texts.map((item) => {
                 const rect = boxRect(item);
                 if (!rect) return null;
@@ -458,7 +530,7 @@ export const AnnotateStage = ({
                       top: rect.top,
                       width: rect.width,
                       height: rect.height,
-                      pointerEvents: tool === 'text' && !isEditing ? 'auto' : 'none',
+                      pointerEvents: isEditing ? 'none' : 'auto',
                       touchAction: 'none',
                       cursor: 'move',
                       outline: isSelected && !isEditing ? '1px dashed rgba(255,255,255,0.85)' : 'none',
@@ -612,7 +684,9 @@ export const AnnotateStage = ({
                 </>
               ) : (
                 <span className="text-[11px] text-[#525252]">
-                  {texts.length > 0 ? 'Tap a text box to edit or move it' : 'Drop a caption anywhere on the picture'}
+                  {texts.length > 0
+                    ? 'Tap a text box to move or resize it, double-tap to type'
+                    : 'Drop a caption anywhere on the picture'}
                 </span>
               )}
             </div>

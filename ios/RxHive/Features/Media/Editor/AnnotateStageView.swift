@@ -88,8 +88,19 @@ struct AnnotateStageView: View {
                     .task(id: rasterKey(box: box)) {
                         guard box.width > 1, box.height > 1 else { return }
                         // Device resolution, not point resolution — see `previewOutput`.
+                        // On the main actor deliberately: it reads UIScreen.main.
                         let output = MediaEditRenderer.previewOutput(source: source, edit: stripped, box: box)
-                        base = MediaEditRenderer.compose(image: image, source: source, edit: stripped, output: output)
+                        // Detached for the same reason as CropStageView: a `.task` in a
+                        // view body runs on the main actor, and this is a full
+                        // device-resolution composite.
+                        let edit = stripped
+                        let src = source
+                        let img = image
+                        let composed = await Task.detached(priority: .userInitiated) {
+                            MediaEditRenderer.compose(image: img, source: src, edit: edit, output: output)
+                        }.value
+                        guard !Task.isCancelled else { return }
+                        base = composed
                     }
                 }
 

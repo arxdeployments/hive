@@ -82,8 +82,20 @@ struct CropStageView: View {
                 .task(id: rasterKey(box: box)) {
                     guard box.width > 1, box.height > 1 else { return }
                     // Device resolution, not point resolution — see `previewOutput`.
+                    // Computed HERE, on the main actor, because it reads UIScreen.main.
                     let output = MediaEditRenderer.previewOutput(source: source, edit: uncropped, box: box)
-                    base = MediaEditRenderer.compose(image: image, source: source, edit: uncropped, output: output)
+                    // The composite itself is detached. A `.task` in a view body inherits
+                    // the view's main actor, so a device-resolution raster ran on the run
+                    // loop and froze the UI for the length of it — on a 12MP photo at 3x
+                    // that is long enough to drop the drag the user is mid-way through.
+                    let edit = uncropped
+                    let src = source
+                    let img = image
+                    let composed = await Task.detached(priority: .userInitiated) {
+                        MediaEditRenderer.compose(image: img, source: src, edit: edit, output: output)
+                    }.value
+                    guard !Task.isCancelled else { return }
+                    base = composed
                 }
             }
 

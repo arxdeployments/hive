@@ -75,6 +75,9 @@
 import { applyEditTransform, createCanvas, outputPixelSize } from './mediaEdit';
 
 /** Long edge, in pixels, a cropped clip is fitted inside. Never upscales. */
+/** How long to wait for a `seeked` that may never arrive. */
+const SEEK_TIMEOUT_MS = 4000;
+
 export const VIDEO_MAX_EDGE = 1920;
 
 /**
@@ -390,7 +393,29 @@ export async function renderCroppedVideo(file, edit, options = {}) {
     // blank canvas — captureStream emits whatever is on it at t=0.
     if (video.currentTime !== 0) {
       video.currentTime = 0;
-      await new Promise((resolve) => video.addEventListener('seeked', resolve, { once: true }));
+      // Bounded, and abortable.
+      //
+      // A bare `seeked` await has neither. If the engine never fires it for this
+      // blob — a truncated recording, an unusual codec — renderCroppedVideo never
+      // settles, the editor stays in its saving state forever, and Cancel does
+      // nothing, because the abort listener is not registered until further down.
+      // The timeout RESOLVES rather than rejecting: a seek that never reported
+      // completion has usually still landed on frame 0, and rendering from
+      // wherever the playhead is beats refusing to render at all.
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, SEEK_TIMEOUT_MS);
+        const onSeeked = () => { clearTimeout(timer); resolve(); };
+        const onAbort = () => {
+          clearTimeout(timer);
+          video.removeEventListener('seeked', onSeeked);
+          reject(abortError());
+        };
+        video.addEventListener('seeked', onSeeked, { once: true });
+        if (signal) {
+          if (signal.aborted) { onAbort(); return; }
+          signal.addEventListener('abort', onAbort, { once: true });
+        }
+      });
     }
     drawFrame();
 

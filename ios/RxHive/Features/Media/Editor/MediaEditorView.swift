@@ -64,8 +64,9 @@ struct MediaEditorView: View {
     let onSave: (Data, String, MediaEdit, UIImage?) -> Void
     let onCancel: () -> Void
 
-    @State private var edit: MediaEdit
-    @State private var history: [MediaEdit] = []
+    /// The edit AND its undo stack, as one value — see `MediaEditHistory` for why they
+    /// cannot be two separate pieces of state.
+    @State private var editHistory: MediaEditHistory
     @State private var tool: EditorTool = .crop
     @State private var aspect: AspectPreset = .free
     @State private var decoded: UIImage?
@@ -87,13 +88,12 @@ struct MediaEditorView: View {
         self.item = item
         self.onSave = onSave
         self.onCancel = onCancel
-        _edit = State(initialValue: item.edit)
+        _editHistory = State(initialValue: MediaEditHistory(item.edit))
     }
 
     /// The bytes every render starts from — never the previously saved output.
     private var original: Data { item.originalData }
 
-    private static let historyLimit = 40
 
     var body: some View {
         ZStack {
@@ -116,7 +116,7 @@ struct MediaEditorView: View {
                         CropStageView(
                             image: decoded,
                             source: decoded.size,
-                            edit: $edit,
+                            edit: editBinding,
                             aspect: $aspect,
                             onCommit: pushHistory
                         )
@@ -124,7 +124,7 @@ struct MediaEditorView: View {
                         AnnotateStageView(
                             image: decoded,
                             source: decoded.size,
-                            edit: $edit,
+                            edit: editBinding,
                             tool: tool,
                             ink: $ink,
                             pen: $pen,
@@ -195,7 +195,7 @@ struct MediaEditorView: View {
             EditorCircleButton(
                 symbol: "arrow.uturn.backward",
                 label: "Undo",
-                isEnabled: !isSaving && !history.isEmpty,
+                isEnabled: !isSaving && editHistory.canUndo,
                 action: undo
             )
             // Only offered when there is something to revert, so it never reads as a
@@ -304,7 +304,14 @@ struct MediaEditorView: View {
 
         // 2400px, not the export's 4096: the model stores fractions, so a smaller decode
         // is exact for editing and noticeably faster to compose per gesture.
-        guard let image = MediaEditRenderer.decode(data: bytes, maxEdge: 2400) else {
+        //
+        // Detached: `load()` is called from a `.task` and so inherits the view's main
+        // actor, which meant a full-resolution ImageIO decode blocked the run loop
+        // while the editor was opening — the sheet appeared frozen before it drew.
+        let image = await Task.detached(priority: .userInitiated) {
+            MediaEditRenderer.decode(data: bytes, maxEdge: 2400)
+        }.value
+        guard let image else {
             loadFailure = "That photo could not be opened for editing."
             return
         }
@@ -313,20 +320,29 @@ struct MediaEditorView: View {
 
     // MARK: History
 
+    /// The current model. Everything that renders or saves reads this.
+    private var edit: MediaEdit { editHistory.present }
+
+    /// What the stages mutate. Writes land on `editHistory.present`, so a change and the
+    /// `commit()` that precedes it act on the same value and cannot be reordered apart.
+    private var editBinding: Binding<MediaEdit> {
+        Binding(
+            get: { editHistory.present },
+            set: { editHistory.set($0) }
+        )
+    }
+
     private func pushHistory() {
-        history.append(edit)
-        if history.count > Self.historyLimit { history.removeFirst(history.count - Self.historyLimit) }
+        editHistory.commit()
     }
 
     private func undo() {
-        guard let previous = history.popLast() else { return }
-        edit = previous
+        guard editHistory.undo() else { return }
         selectedTextID = nil
     }
 
     private func revert() {
-        pushHistory()
-        edit = MediaEdit()
+        editHistory.reset()
         aspect = .free
         selectedTextID = nil
     }

@@ -128,18 +128,9 @@ struct MediaSendSheet: View {
     /// layout pass would be a UIKit hop on every frame. The floor covers the case where
     /// no window is found yet — better a little extra padding than chrome under the
     /// status bar.
-    private static let windowInsets: UIEdgeInsets = {
-        let found = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap(\.windows)
-            .first { $0.isKeyWindow }?
-            .safeAreaInsets
-        guard let found else { return UIEdgeInsets(top: 48, left: 0, bottom: 24, right: 0) }
-        return UIEdgeInsets(
-            top: max(found.top, 20), left: found.left,
-            bottom: max(found.bottom, 12), right: found.right
-        )
-    }()
+    /// Shared with the editor — see `EditorInsets.window`, which owns the lookup.
+    @MainActor
+    private static var windowInsets: UIEdgeInsets { EditorInsets.window }
 
     var body: some View {
         // The insets come from the window, not from SwiftUI.
