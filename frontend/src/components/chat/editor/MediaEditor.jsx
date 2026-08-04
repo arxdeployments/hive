@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { motion } from 'framer-motion';
 import { Check, Crop, History, Loader2, Pencil, Type, Undo2, X } from 'lucide-react';
@@ -62,11 +62,132 @@ import { ToolButton } from './editorKit';
 
 const MAX_HISTORY = 40;
 
+/**
+ * Undo history, as one reducer rather than two cooperating `useState`s.
+ *
+ * ## Why this is a reducer
+ *
+ * It used to be `const [edit] = useState()` plus `const [history] = useState([])`,
+ * with the commit implemented as a read-through of one to write the other:
+ *
+ *     setEdit((current) => {                    // ← updater, must be PURE
+ *       setHistory((stack) => [...stack, current]);   // ← but it has a side effect
+ *       return current;
+ *     });
+ *
+ * A `useState` updater is not a place to read state from. React treats updaters as
+ * pure functions it may call more than once and at times of its choosing — it
+ * invokes one eagerly to test whether it can skip a re-render, and it re-invokes
+ * every queued updater from the base state whenever an update queue is
+ * re-processed. Each of those invocations ran `setHistory` again, so a single
+ * finished stroke could push several entries, all of them the *same* early
+ * snapshot. Undo then popped one of those duplicates and restored a state from
+ * before any of the strokes existed — which is why Undo appeared to wipe the whole
+ * drawing instead of removing the last stroke.
+ *
+ * As a reducer the two live in one value and move together. `commit` and `apply`
+ * dispatched in the same event are reduced **in order, from the committed state**,
+ * by a pure function — so a stroke produces exactly one history entry, holding
+ * exactly the state before that stroke, and a replay recomputes the identical
+ * result instead of appending to it.
+ */
+/**
+ * Do these two edits describe the same picture?
+ *
+ * Reference equality is not enough. Every mutation goes through an updater that spreads
+ * a fresh object — `{ ...prev, rotation }` — so a gesture that changed nothing still
+ * produces a NEW `present` that is value-identical to the old one. A commit taken before
+ * such a gesture then leaves a snapshot the user cannot see the difference from, and
+ * restoring it reads as "I pressed Undo and nothing happened".
+ *
+ * Items inside the arrays are compared by reference on purpose: strokes and texts are
+ * only ever replaced immutably (`texts.map(t => t.id === id ? {...t, ...patch} : t)`), so
+ * an unchanged item is the same object, and this stays O(n) over a handful of entries
+ * rather than a deep walk over every point of every stroke.
+ */
+const sameList = (a, b) =>
+  a === b || (Array.isArray(a) && Array.isArray(b)
+    && a.length === b.length && a.every((item, i) => item === b[i]));
+
+const sameCrop = (a, b) =>
+  a === b || (!!a && !!b && a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h);
+
+export const sameEdit = (a, b) =>
+  a === b || (!!a && !!b
+    && a.rotation === b.rotation
+    && a.flipH === b.flipH
+    && a.flipV === b.flipV
+    && sameCrop(a.crop, b.crop)
+    && sameList(a.strokes, b.strokes)
+    && sameList(a.texts, b.texts));
+
+export const editHistoryReducer = (state, action) => {
+  switch (action.type) {
+    case 'apply': {
+      const next = typeof action.updater === 'function'
+        ? action.updater(state.present)
+        : action.updater;
+      if (next === state.present) return state;
+      return { ...state, present: next };
+    }
+
+    case 'commit': {
+      // A commit with nothing new since the last one would put a duplicate on the
+      // stack, and the user would have to press Undo twice to see anything move.
+      const last = state.past[state.past.length - 1];
+      if (last !== undefined && sameEdit(last, state.present)) return state;
+      return { ...state, past: [...state.past, state.present].slice(-MAX_HISTORY) };
+    }
+
+    // Step back to the last snapshot that actually looks different.
+    //
+    // Snapshots equal to the present are discarded rather than restored. A commit has to
+    // be opened at the START of a gesture, before it is known whether the gesture will
+    // change anything, so gestures that go nowhere — a tap on a resize handle, a slider
+    // put back where it was, a crop control touched and released — leave snapshots that
+    // are no-ops to restore. The button is enabled, the click registers, and the picture
+    // does not move.
+    //
+    // Handling it here rather than chasing every no-op commit at its source keeps one
+    // guarantee in one place: an enabled Undo always changes something.
+    case 'undo': {
+      let past = state.past;
+      while (past.length > 0) {
+        const candidate = past[past.length - 1];
+        past = past.slice(0, -1);
+        if (!sameEdit(candidate, state.present)) {
+          return { past, present: candidate };
+        }
+      }
+      // Nothing but no-ops: drop them so the button stops offering itself.
+      return state.past.length === 0 ? state : { ...state, past: [] };
+    }
+
+    // Revert is itself undoable: it records the state it replaced, so pressing it
+    // by accident (it sits next to Undo) costs one Undo rather than the whole edit.
+    case 'reset':
+      return {
+        past: [...state.past, state.present].slice(-MAX_HISTORY),
+        present: action.present,
+      };
+
+    default:
+      return state;
+  }
+};
+
 export const MediaEditor = ({ item, onSave, onClose }) => {
   const isVideo = item.category === 'video';
 
-  const [edit, setEdit] = useState(() => item.edit || emptyEdit());
-  const [history, setHistory] = useState([]);
+  const [editState, dispatchEdit] = useReducer(
+    editHistoryReducer,
+    undefined,
+    () => ({ past: [], present: item.edit || emptyEdit() })
+  );
+  const edit = editState.present;
+  // Not merely `past.length > 0`: a stack holding only snapshots equal to the present
+  // would light the button up for a press that cannot move anything. See the `undo` case.
+  const canUndo = editState.past.some((snapshot) => !sameEdit(snapshot, editState.present));
   const [mode, setMode] = useState('crop');
   const [source, setSource] = useState(null);
   const [loadError, setLoadError] = useState(null);
@@ -159,28 +280,37 @@ export const MediaEditor = ({ item, onSave, onClose }) => {
 
   // ── History ───────────────────────────────────────────────────────────────
 
+  /**
+   * Apply a change WITHOUT recording history. The stages call this for every
+   * pointermove of a drag and every slider tick; recording those would make one
+   * gesture into fifty undo steps.
+   */
+  const applyEdit = useCallback((updater) => {
+    dispatchEdit({ type: 'apply', updater });
+  }, []);
+
+  /**
+   * Mark the start of one undoable change. Called by a stage immediately BEFORE the
+   * `applyEdit` that performs it — the reducer sees the two in order and snapshots
+   * the state as it was before the change.
+   */
   const pushHistory = useCallback(() => {
-    setEdit((current) => {
-      setHistory((stack) => [...stack, current].slice(-MAX_HISTORY));
-      return current;
-    });
+    dispatchEdit({ type: 'commit' });
   }, []);
 
   const undo = useCallback(() => {
-    setHistory((stack) => {
-      if (stack.length === 0) return stack;
-      setEdit(stack[stack.length - 1]);
-      setSelectedTextId(null);
-      return stack.slice(0, -1);
-    });
+    dispatchEdit({ type: 'undo' });
+    // The selection is dropped rather than kept: the box it pointed at may be the
+    // very thing the undo removed, and a selection outline around nothing is worse
+    // than no selection.
+    setSelectedTextId(null);
   }, []);
 
   const revert = useCallback(() => {
-    pushHistory();
-    setEdit(emptyEdit());
+    dispatchEdit({ type: 'reset', present: emptyEdit() });
     setAspectKey('free');
     setSelectedTextId(null);
-  }, [pushHistory]);
+  }, []);
 
   // ── Escape, and the keyboard ──────────────────────────────────────────────
 
@@ -353,7 +483,7 @@ export const MediaEditor = ({ item, onSave, onClose }) => {
           icon={Undo2}
           label="Undo"
           onClick={undo}
-          disabled={saving || history.length === 0}
+          disabled={saving || !canUndo}
           testId="media-editor-undo"
         />
         {/* Only offered when there is something to revert, so it never reads as a
@@ -396,7 +526,7 @@ export const MediaEditor = ({ item, onSave, onClose }) => {
           sourceWidth={source.width}
           sourceHeight={source.height}
           edit={edit}
-          onEdit={setEdit}
+          onEdit={applyEdit}
           onCommit={pushHistory}
           aspectKey={aspectKey}
           onAspectKey={setAspectKey}
@@ -407,7 +537,7 @@ export const MediaEditor = ({ item, onSave, onClose }) => {
           sourceWidth={source.width}
           sourceHeight={source.height}
           edit={edit}
-          onEdit={setEdit}
+          onEdit={applyEdit}
           onCommit={pushHistory}
           tool={mode}
           ink={ink}

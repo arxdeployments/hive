@@ -284,7 +284,19 @@ struct EditorValueSlider: View {
 /// Read once and cached: they do not change for a portrait-locked screen, and reading
 /// them per layout pass would be a UIKit hop on every frame. Lifted from
 /// `MediaSendSheet`, which has the same problem and the same fix.
+/// The single place the key window's safe-area insets are read.
+///
+/// `UIApplication.shared` is main-actor-only UIKit state, so the requirement is encoded
+/// here rather than left to each call site to remember. The target builds in Swift 5
+/// language mode with no strict-concurrency setting, so this is not enforced today —
+/// which is exactly why it is worth stating: under Swift 6 the compiler will demand it,
+/// and the annotation is what makes that a no-op rather than an error in two files.
+///
+/// `MediaSendSheet` reads the same thing and had its own byte-identical copy; it now
+/// defers to this. Two copies of a cached lazy `static let` are also two separate
+/// caches, so they could disagree after a scene change.
 enum EditorInsets {
+    @MainActor
     static let window: UIEdgeInsets = {
         let found = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }

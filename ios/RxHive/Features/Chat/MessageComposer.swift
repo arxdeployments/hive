@@ -812,7 +812,14 @@ struct MessageComposer: View {
                 }
                 output = encoded
             default:
-                output = MediaTranscoder.image(data: data, filename: filename, quality: quality)
+                // Detached: ImageIO decode plus JPEG encode is synchronous and can run
+                // to hundreds of milliseconds on a full-resolution photo. This task is
+                // `@MainActor` (it mutates `uploads` and `toasts`), so running the
+                // encode inline froze the composer for every send. Only the raster work
+                // moves; the state mutations either side stay where they were.
+                output = await Task.detached(priority: .userInitiated) {
+                    MediaTranscoder.image(data: data, filename: filename, quality: quality)
+                }.value
             }
 
             guard !Task.isCancelled else {

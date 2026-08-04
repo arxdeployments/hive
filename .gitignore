@@ -41,3 +41,8 @@ DerivedData/
 ios/build/
 ios/RxHive.xcodeproj/project.xcworkspace/
 ios/RxHive.xcodeproj/xcuserdata/
+
+# Xcode device build output — 884 MB of artefacts that must never be committed.
+ios/build-device/
+# Local env backups written by the livekit node-ip helper.
+infra/.env.bak.*
