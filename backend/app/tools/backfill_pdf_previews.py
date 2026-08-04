@@ -88,14 +88,18 @@ async def _backfill_uploads(dry_run: bool) -> int:
     done = 0
     async with SessionLocal() as db:
         rows = (
-            await db.execute(
-                select(Upload).where(
-                    Upload.mime_type == PDF_MIME,
-                    Upload.page_count.is_(None),
-                    Upload.claimed.is_(False),
+            (
+                await db.execute(
+                    select(Upload).where(
+                        Upload.mime_type == PDF_MIME,
+                        Upload.page_count.is_(None),
+                        Upload.claimed.is_(False),
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         print(f"uploads (unclaimed): {len(rows)} PDF(s) without a page count")
         for u in rows:
             if dry_run:
@@ -131,8 +135,7 @@ async def main() -> None:
     up = await _backfill_uploads(args.dry_run)
 
     print(
-        f"\ndone: {done} rendered, {failed} unrenderable, {skipped} skipped"
-        f", {up} unclaimed upload(s) updated"
+        f"\ndone: {done} rendered, {failed} unrenderable, {skipped} skipped, {up} unclaimed upload(s) updated"
     )
     await engine.dispose()
 

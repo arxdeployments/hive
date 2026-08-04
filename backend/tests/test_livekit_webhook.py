@@ -270,8 +270,10 @@ async def test_participant_events_for_a_non_member_are_ignored(client, two_orgs_
     async with SessionLocal() as db:
         assert await db.get(CallParticipant, (call.id, users["carol"].id)) is None
         rows = (
-            await db.execute(select(CallParticipant).where(CallParticipant.call_id == call.id))
-        ).scalars().all()
+            (await db.execute(select(CallParticipant).where(CallParticipant.call_id == call.id)))
+            .scalars()
+            .all()
+        )
         assert len(rows) == 2
 
 

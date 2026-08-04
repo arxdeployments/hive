@@ -223,7 +223,9 @@ async def evict_other_devices(call: Call, user_id, keep_identity: str) -> int:
                     continue
                 logger.info(
                     "call.evicting_stale_leg call_id=%s user_id=%s identity=%s",
-                    call.id, user_id, p.identity,
+                    call.id,
+                    user_id,
+                    p.identity,
                 )
                 await client.room.remove_participant(
                     lk_api.RoomParticipantIdentity(room=call.room_name, identity=p.identity)
@@ -419,7 +421,11 @@ async def initiate_direct_call(
             _dispatch_call_push(callee.id, caller, ctype, call_id)
         logger.info(
             "call.initiated call_id=%s caller_id=%s callee_id=%s type=%s callee_online=%s",
-            call_id, caller.id, callee.id, ctype.value, callee_online,
+            call_id,
+            caller.id,
+            callee.id,
+            ctype.value,
+            callee_online,
         )
 
 
@@ -551,13 +557,14 @@ async def initiate_group_call(user: User, conversation_id: uuid.UUID, call_type:
         )
         logger.info(
             "call.group_initiated call_id=%s caller_id=%s conversation_id=%s members=%d",
-            call_id, caller.id, conversation_id, len(member_ids),
+            call_id,
+            caller.id,
+            conversation_id,
+            len(member_ids),
         )
 
 
-async def invite_to_call(
-    user: User, call_id: uuid.UUID, invitee_ids: list[uuid.UUID]
-) -> dict:
+async def invite_to_call(user: User, call_id: uuid.UUID, invitee_ids: list[uuid.UUID]) -> dict:
     """Pull people into a group call that is already running.
 
     The missing half of "group calling". `_join` admits only users who already hold a
@@ -655,9 +662,7 @@ async def invite_to_call(
         group_name = (conv.name if conv else None) or "Group call"
         roster = [
             _brief(u)
-            for u in (
-                await db.execute(select(User).where(User.id.in_(existing | {u.id for u in added})))
-            )
+            for u in (await db.execute(select(User).where(User.id.in_(existing | {u.id for u in added}))))
             .scalars()
             .all()
         ]
@@ -703,7 +708,10 @@ async def invite_to_call(
     )
     logger.info(
         "call.invited call_id=%s inviter_id=%s added=%d outcome=%s",
-        call_id, inviter.id, len(added), outcome,
+        call_id,
+        inviter.id,
+        len(added),
+        outcome,
     )
     return {"invited": [str(u.id) for u in added], "outcome": outcome}
 
@@ -745,7 +753,9 @@ async def _accept(user: User, call_id: uuid.UUID) -> None:
         if call.status != CallStatus.ringing:
             logger.info(
                 "call.accept.stale call_id=%s user_id=%s status=%s",
-                call_id, user.id, call.status.value,
+                call_id,
+                user.id,
+                call.status.value,
             )
             await publish_to_users(
                 [user.id],
@@ -763,7 +773,9 @@ async def _accept(user: User, call_id: uuid.UUID) -> None:
         await call_deadlines.cancel(call_deadlines.RING, str(call_id))
         logger.info(
             "call.accepted call_id=%s accepter_id=%s caller_id=%s",
-            call_id, user.id, call.initiated_by,
+            call_id,
+            user.id,
+            call.initiated_by,
         )
         # Both sides get this: the caller needs to know who answered, and the
         # accepter needs the server's confirmation that the call really moved to
@@ -1051,9 +1063,7 @@ _PEER_STATES = {"connected", "reconnecting"}
 _PEER_QUALITIES = {"excellent", "good", "poor", "unknown"}
 
 
-async def _relay_peer_state(
-    user: User, call_id: uuid.UUID, state: str | None, quality: str | None
-) -> None:
+async def _relay_peer_state(user: User, call_id: uuid.UUID, state: str | None, quality: str | None) -> None:
     """Tell the other participants how this client's own media link is doing.
 
     The SFU knows a peer is reconnecting but does not tell the *other* peers, and
@@ -1295,9 +1305,7 @@ async def handle_user_link_down(user: User) -> None:
     await call_deadlines.schedule(
         call_deadlines.GRACE, _grace_member(call_id, user.id), RECONNECT_GRACE_SECONDS
     )
-    logger.info(
-        "call.link_down call_id=%s user_id=%s grace=%ss", call_id, user.id, RECONNECT_GRACE_SECONDS
-    )
+    logger.info("call.link_down call_id=%s user_id=%s grace=%ss", call_id, user.id, RECONNECT_GRACE_SECONDS)
     await publish_to_users(
         [u for u in ids if u != user.id],
         {
@@ -1387,7 +1395,10 @@ async def _grace_expired(call_id: uuid.UUID, user_id: uuid.UUID) -> None:
 
     logger.info(
         "call.grace_expired call_id=%s user_id=%s status=%s initiator=%s",
-        call_id, user_id, status.value, is_initiator,
+        call_id,
+        user_id,
+        status.value,
+        is_initiator,
     )
 
     if status == CallStatus.ringing:
@@ -1489,9 +1500,7 @@ async def handle_call_ws_message(user: User, data: dict) -> None:
         await _relay_peer_state(user, call_id, data.get("state"), data.get("quality"))
 
 
-def mint_token(
-    call: Call, user: User, device_id: str | None = None, *, identity: str | None = None
-) -> str:
+def mint_token(call: Call, user: User, device_id: str | None = None, *, identity: str | None = None) -> str:
     """A room-scoped join token.
 
     `device_id` makes the identity unique per client. Callers that omit both

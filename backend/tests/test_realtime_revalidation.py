@@ -61,9 +61,7 @@ async def test_deactivated_sender_cannot_post_even_with_a_live_session(client):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         c.headers.update(CSRF)
         await login(c, "a@wssend.com")
-        conv = (
-            await c.post("/api/conversations/direct", json={"participant_id": str(b.id)})
-        ).json()["_id"]
+        conv = (await c.post("/api/conversations/direct", json={"participant_id": str(b.id)})).json()["_id"]
 
     await _deactivate(a.id)
 
@@ -72,9 +70,7 @@ async def test_deactivated_sender_cannot_post_even_with_a_live_session(client):
     async with SessionLocal() as db:
         sender = await db.get(User, a.id)
         try:
-            await send_message(
-                db, conversation_id=uuid.UUID(conv), sender=sender, content="should not land"
-            )
+            await send_message(db, conversation_id=uuid.UUID(conv), sender=sender, content="should not land")
             raise AssertionError("a deactivated user was able to send")
         except SendError as exc:
             assert exc.status_code == 403
@@ -90,8 +86,6 @@ async def test_an_active_sender_is_unaffected(client):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         c.headers.update(CSRF)
         await login(c, "a@wsact.com")
-        conv = (
-            await c.post("/api/conversations/direct", json={"participant_id": str(b.id)})
-        ).json()["_id"]
+        conv = (await c.post("/api/conversations/direct", json={"participant_id": str(b.id)})).json()["_id"]
         sent = await c.post(f"/api/conversations/{conv}/messages", json={"content": "fine"})
         assert sent.status_code == 200, sent.text

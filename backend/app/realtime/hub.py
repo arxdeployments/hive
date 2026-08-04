@@ -384,9 +384,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 # access a superadmin just revoked would keep receiving messages
                 # on this socket until its access token lapsed — up to the full
                 # token lifetime — even though its HTTP calls were already 401ing.
-                if client == MOBILE_CLIENT and (
-                    fresh.role == UserRole.superadmin or not fresh.mobile_access
-                ):
+                if client == MOBILE_CLIENT and (fresh.role == UserRole.superadmin or not fresh.mobile_access):
                     await websocket.close(code=4001, reason="Mobile access revoked")
                     break
 

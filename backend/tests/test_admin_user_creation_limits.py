@@ -49,9 +49,7 @@ async def _role_of(email) -> UserRole:
 
 async def _password_hash(email) -> str:
     async with SessionLocal() as db:
-        return (
-            await db.execute(User.__table__.select().where(User.email == email))
-        ).one().password_hash
+        return (await db.execute(User.__table__.select().where(User.email == email))).one().password_hash
 
 
 async def _fixture(name: str):
@@ -250,8 +248,9 @@ async def test_peer_admins_are_still_listed(client):
     lost people.
     """
     org, ward, _, _ = await _fixture("Visible Co")
-    await make_user("peer@visible.com", org_id=org.id, dept_id=ward.id, role=UserRole.org_admin,
-                    display_name="Peer Admin")
+    await make_user(
+        "peer@visible.com", org_id=org.id, dept_id=ward.id, role=UserRole.org_admin, display_name="Peer Admin"
+    )
 
     async with _as("adm@VisibleCo.com") as c:
         listed = (await c.get("/api/org-admin/users")).json()["data"]

@@ -64,12 +64,14 @@ async def test_superadmin_cannot_login_on_mobile_even_with_grant(client):
 async def test_web_login_is_unaffected_by_the_grant(client):
     """No client field, and client="web", both behave exactly as before."""
     await make_user("webonly@x.com")  # mobile_access defaults to False
-    assert (await client.post(
-        "/api/auth/login", json={"email": "webonly@x.com", "password": "TestPass1234"}
-    )).status_code == 200
-    assert (await client.post(
-        "/api/auth/login", json={"email": "webonly@x.com", "password": "TestPass1234", "client": "web"}
-    )).status_code == 200
+    assert (
+        await client.post("/api/auth/login", json={"email": "webonly@x.com", "password": "TestPass1234"})
+    ).status_code == 200
+    assert (
+        await client.post(
+            "/api/auth/login", json={"email": "webonly@x.com", "password": "TestPass1234", "client": "web"}
+        )
+    ).status_code == 200
 
 
 async def test_superadmin_web_login_still_works(client):
@@ -145,13 +147,7 @@ async def test_mobile_session_refresh_keeps_working_while_granted(client):
     # after the first refresh.
     async with SessionLocal() as db:
         live = (
-            (
-                await db.execute(
-                    select(RefreshToken).where(RefreshToken.revoked_at.is_(None))
-                )
-            )
-            .scalars()
-            .all()
+            (await db.execute(select(RefreshToken).where(RefreshToken.revoked_at.is_(None)))).scalars().all()
         )
         assert live and all(t.client == "mobile" for t in live)
 
@@ -213,22 +209,21 @@ async def test_revoking_via_admin_ends_mobile_session_but_not_web_session(client
     from tests.conftest import CSRF
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as web, AsyncClient(
-        transport=transport, base_url="http://test"
-    ) as phone:
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as web,
+        AsyncClient(transport=transport, base_url="http://test") as phone,
+    ):
         web.headers.update(CSRF)
         phone.headers.update(CSRF)
-        assert (await web.post(
-            "/api/auth/login", json={"email": "dual@x.com", "password": "TestPass1234"}
-        )).status_code == 200
-        assert (await phone.post(
-            "/api/auth/login", json=_mobile_login("dual@x.com")
-        )).status_code == 200
+        assert (
+            await web.post("/api/auth/login", json={"email": "dual@x.com", "password": "TestPass1234"})
+        ).status_code == 200
+        assert (await phone.post("/api/auth/login", json=_mobile_login("dual@x.com"))).status_code == 200
 
         await _superadmin_client(client)
-        assert (await client.put(
-            f"/api/admin/users/{target.id}", json={"mobile_access": False}
-        )).status_code == 200
+        assert (
+            await client.put(f"/api/admin/users/{target.id}", json={"mobile_access": False})
+        ).status_code == 200
 
         # Phone: signed out. 401 rather than 403 because the admin endpoint burns
         # the mobile refresh token outright, so the session is already gone before
