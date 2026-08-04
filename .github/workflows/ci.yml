@@ -25,6 +25,20 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping" --health-interval 5s
           --health-timeout 3s --health-retries 10
+      # The suite has always contained tests that upload for real —
+      # test_media_upload_and_authenticated_serving predates all of this — but
+      # this job had no object store, so they could only ever fail. It went
+      # unnoticed because the ruff-format step above failed first and the job
+      # never reached Tests. Same image and credentials as the e2e job.
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: rxhive
+          MINIO_ROOT_PASSWORD: rxhive-dev
+        ports: ["9000:9000"]
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s --health-timeout 3s --health-retries 20
     defaults:
       run:
         working-directory: backend
@@ -49,6 +63,10 @@ jobs:
         env:
           RXHIVE_DATABASE_URL: postgresql+asyncpg://rxhive:rxhive@localhost:5432/rxhive_test
           RXHIVE_REDIS_URL: redis://localhost:6379/0
+          RXHIVE_S3_ENDPOINT: http://localhost:9000
+          RXHIVE_S3_PUBLIC_ENDPOINT: http://localhost:9000
+          RXHIVE_S3_ACCESS_KEY: rxhive
+          RXHIVE_S3_SECRET_KEY: rxhive-dev
           RXHIVE_ENVIRONMENT: test
 
   frontend:
