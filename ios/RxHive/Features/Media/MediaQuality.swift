@@ -183,14 +183,45 @@ enum MediaTranscoder {
 
     // MARK: Video
 
-    /// Re-encode to MP4 at the chosen tier.
+    /// Re-encode to MP4 at the chosen tier, applying a crop/rotate/flip if there is one.
     ///
     /// The bytes arrive as `Data` (both the library picker and the camera hand them over
     /// that way), but `AVAssetExportSession` only reads a URL, so they go to a temp file
     /// first. That is not wasted work: the export writes to disk regardless, and the
     /// upload needs the result in memory anyway.
-    static func video(data: Data, filename: String, quality: MediaQuality) async -> Output {
+    ///
+    /// ## Two modes, and why they differ
+    ///
+    /// **No edit** — unchanged from before. A preset export, and every failure path
+    /// falls back to the ORIGINAL bytes, because a tier is an optimisation: sending
+    /// the file the user picked is always an acceptable answer.
+    ///
+    /// **With an edit** — one composition export, and every failure path returns nil.
+    /// A crop is not an optimisation. Silently falling back to the original would send
+    /// the UNCROPPED photo of whatever the user was cropping out, which is the worst
+    /// possible outcome and is invisible until a recipient sees it. That is also why
+    /// the keep-the-smaller guard below is skipped for an edited export: the original
+    /// being smaller is not a reason to send the wrong frame.
+    ///
+    /// The tier is expressed by scaling the composition's `renderSize` rather than by
+    /// `quality.videoPreset`, because `AVAssetExportPresetMediumQuality` has its own
+    /// fixed target dimensions and would rescale the composition — so the crop's pixel
+    /// size would not be the one that was asked for. `AVAssetExportPresetPassthrough`
+    /// is incompatible with a `videoComposition` outright.
+    ///
+    /// Returns nil ONLY when an edit was requested and could not be applied.
+    static func video(
+        data: Data,
+        filename: String,
+        quality: MediaQuality,
+        edit: MediaEdit? = nil
+    ) async -> Output? {
+        let wantsEdit = edit?.hasEdits == true
         let unchanged = Output(data: data, filename: filename)
+        /// A failure means "send the original" for a plain tier pass, and "refuse" for
+        /// an edit.
+        let giveUp: Output? = wantsEdit ? nil : unchanged
+
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("rxhive-transcode", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -203,16 +234,29 @@ enum MediaTranscoder {
             try? FileManager.default.removeItem(at: output)
         }
 
-        guard (try? data.write(to: input, options: .atomic)) != nil else { return unchanged }
+        guard (try? data.write(to: input, options: .atomic)) != nil else { return giveUp }
 
         let asset = AVURLAsset(url: input)
-        let available = AVAssetExportSession.exportPresets(compatibleWith: asset)
-        guard available.contains(quality.videoPreset),
-              let session = AVAssetExportSession(asset: asset, presetName: quality.videoPreset)
-        else { return unchanged }
+        let session: AVAssetExportSession
+        var videoComposition: AVMutableVideoComposition?
+
+        if wantsEdit, let edit {
+            guard let built = try? await VideoEditComposer.composition(for: asset, edit: edit, quality: quality),
+                  let composed = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetHighestQuality)
+            else { return nil }
+            videoComposition = built.0
+            session = composed
+        } else {
+            let available = AVAssetExportSession.exportPresets(compatibleWith: asset)
+            guard available.contains(quality.videoPreset),
+                  let plain = AVAssetExportSession(asset: asset, presetName: quality.videoPreset)
+            else { return giveUp }
+            session = plain
+        }
 
         session.outputURL = output
         session.outputFileType = .mp4
+        session.videoComposition = videoComposition
         // Puts the moov atom first so a recipient's player can start before the whole
         // file has arrived, which is the difference between a clip that plays on tap
         // and one that spins.
@@ -225,14 +269,17 @@ enum MediaTranscoder {
         guard session.status == .completed,
               let encoded = try? Data(contentsOf: output),
               !encoded.isEmpty
-        else { return unchanged }
-
-        // HD on already-compressed footage regularly comes out bigger than the source.
-        // Sending the original is both smaller and higher fidelity, so prefer it.
-        guard encoded.count < data.count else { return unchanged }
+        else { return giveUp }
 
         let base = (filename as NSString).deletingPathExtension
-        return Output(data: encoded, filename: "\(base.isEmpty ? "VID" : base).mp4")
+        let renamed = Output(data: encoded, filename: "\(base.isEmpty ? "VID" : base).mp4")
+        if wantsEdit { return renamed }
+
+        // HD on already-compressed footage regularly comes out bigger than the source.
+        // Sending the original is both smaller and higher fidelity, so prefer it —
+        // but only when there is no edit baked into these pixels.
+        guard encoded.count < data.count else { return unchanged }
+        return renamed
     }
 }
 

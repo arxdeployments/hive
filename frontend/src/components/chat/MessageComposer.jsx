@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback, memo } from 'react';
-import { Send, Smile, Paperclip, Mic, Image, FileText, Film, X, Loader2, Upload } from 'lucide-react';
+import { Send, Smile, Paperclip, Mic, Image, FileText, Film, Pencil, X, Loader2, Upload } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import {
   formatBytes,
@@ -8,6 +8,7 @@ import {
   saveQualityTier,
   transcodeImage,
 } from '../../utils/mediaQuality';
+import { describeEdits, hasEdits } from '../../utils/mediaEdit';
 import { extractVideoPoster } from '../../utils/videoPoster';
 import { useHoldToTalk } from '../../hooks/useHoldToTalk';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -21,6 +22,7 @@ import useChatStore from '../../stores/chatStore';
 import { FILE_ICONS, formatFileSize } from './DocumentBubble';
 import { AudioRecorderBar } from './AudioRecorderBar';
 import { StagedFilePreview } from './StagedFilePreview';
+import { MediaEditor } from './editor/MediaEditor';
 import useAudioRecorder from '../../hooks/useAudioRecorder';
 import { canRecordAudio } from '../../utils/audioFormat';
 
@@ -106,7 +108,15 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   const [dragOver, setDragOver] = useState(false);
   // Files chosen but NOT yet uploaded. Every category stages here now — nothing
   // reaches the network until the user confirms. Shape:
-  //   { id, file, url, name, category, size }
+  //   { id, file, url, name, category, size,
+  //     originalFile, edit, editedDuration }
+  //
+  // `file`/`url`/`name`/`size` are always the EFFECTIVE values — what would be
+  // sent right now — so every existing reader (the tiles, the preview,
+  // measureBatchSize, the send loop) needs no knowledge of editing at all.
+  // `originalFile` is the untouched pick and `edit` is the model that was applied
+  // to it; keeping both is what makes Revert exact and a second editing pass
+  // non-destructive. See utils/mediaEdit.js.
   const [stagedFiles, setStagedFiles] = useState([]);
   const [previewCaption, setPreviewCaption] = useState('');
   // Standard vs HD, persisted the way the other preferences in Settings are.
@@ -156,6 +166,9 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   // Index of the staged file being previewed full-size, or null. Nothing has been
   // uploaded at this point, so the preview reads the tray's own object URL.
   const [previewIndex, setPreviewIndex] = useState(null);
+  // Id — not index — of the staged file open in the editor. An id survives the
+  // batch being reordered or thinned underneath it; an index does not.
+  const [editingId, setEditingId] = useState(null);
 
   // Release every object URL we own on unmount, so closing a chat mid-selection
   // does not leak the decoded previews.
@@ -396,9 +409,48 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
           name: f.name || 'Pasted image',
           category: categorizeFile(f),
           size: f.size,
+          // The pick, kept for the lifetime of the staging so an edit can always
+          // be re-derived from it rather than from a previous edit's output.
+          originalFile: f,
+          edit: null,
+          // Measured during a video crop. Preferred over probing the re-encoded
+          // file, whose fragmented MP4 does not always report a duration.
+          editedDuration: null,
         })),
       ];
     });
+  };
+
+  /**
+   * A saved edit replaces the item's effective bytes.
+   *
+   * Exactly ONE object URL stays alive per item — the old one is revoked as the
+   * new one is created — which is what lets the six existing revoke sites keep
+   * working unchanged. The original `File` is deliberately NOT given a URL of its
+   * own; a revert re-derives from the retained `File` instead.
+   */
+  const applyEdit = (id, { file, edit, duration }) => {
+    // Minted OUTSIDE the updater. React invokes updaters twice under StrictMode (see
+    // index.jsx) and may discard a render and re-run them, so a createObjectURL in
+    // there produces a second URL nobody holds a reference to — pinning the whole
+    // edited image for the life of the tab. Hoisting it makes the updater idempotent.
+    const url = URL.createObjectURL(file);
+    setStagedFiles((prev) => prev.map((s) => {
+      if (s.id !== id) return s;
+      URL.revokeObjectURL(s.url);
+      return {
+        ...s,
+        file,
+        url,
+        // The extension can change — a cropped PNG, a cropped MP4 — and the
+        // server classifies on the name, so the tile has to show the new one.
+        name: file.name || s.name,
+        size: file.size,
+        edit: hasEdits(edit) ? edit : null,
+        editedDuration: duration ?? null,
+      };
+    }));
+    setEditingId(null);
   };
 
   // A staged file can disappear under the preview (removed, or the batch sent),
@@ -416,6 +468,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
       return [];
     });
     setPreviewCaption('');
+    setEditingId(null);
   };
 
   // ── Selection — every category stages for confirmation ────────────────────
@@ -576,6 +629,10 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
     // these upload, instead of watching a frozen composer.
     setStagedFiles([]);
     setPreviewCaption('');
+    // Cleared with the tray, not left dangling. A failed upload re-stages its item
+    // with the SAME id further down, so a stale editing id would pop the editor
+    // open again on top of a chat the user has already moved on from.
+    setEditingId(null);
     setUploading(true);
     batch.forEach((f) => uploadControllers.current.set(f.id, new AbortController()));
     setUploadJobs((prev) => [
@@ -609,7 +666,21 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
           // which is what happened unconditionally before.
           let mediaDuration = null;
           if (item.category === 'video') {
-            mediaDuration = (await extractVideoPoster(outgoing)).duration;
+            // A cropped clip already has its length measured, from the SOURCE
+            // rather than from the re-encode — MediaRecorder's fragmented MP4
+            // does not always carry a readable duration, so probing the output
+            // would lose a number we know exactly.
+            if (item.editedDuration) {
+              mediaDuration = item.editedDuration;
+            } else {
+              const probed = await extractVideoPoster(outgoing);
+              mediaDuration = probed.duration;
+              // extractVideoPoster mints an object URL for the poster it decoded, and
+              // for a File source it is not cached — this call site is its only owner
+              // and only wants the duration, so without this every video ever sent
+              // pins a 720px JPEG for the lifetime of the tab.
+              if (probed.posterUrl) URL.revokeObjectURL(probed.posterUrl);
+            }
           }
           await sendMediaFile(
             outgoing,
@@ -685,6 +756,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   // Remove one staged file, revoking its object URL — previously this dropped
   // the entry and leaked the URL for the lifetime of the tab.
   const removeStagedFile = (id) => {
+    if (editingId === id) setEditingId(null);
     setStagedFiles(prev => {
       const target = prev.find(s => s.id === id);
       if (target) URL.revokeObjectURL(target.url);
@@ -842,10 +914,14 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
               {stagedFiles.map((f) => {
                 const iconMeta = FILE_ICONS[(f.name.split('.').pop() || '').toLowerCase()];
                 const DocIcon = iconMeta?.icon || FileText;
+                // Only pictures and clips can be cropped or drawn on. A document
+                // has no geometry, and audio has no frame.
+                const editable = f.category === 'image' || f.category === 'video';
+                const editSummary = describeEdits(f.edit);
                 return (
                   <div
                     key={f.id}
-                    title={`${f.name}${f.size ? ` (${formatFileSize(f.size)})` : ''} — click to preview`}
+                    title={`${f.name}${f.size ? ` (${formatFileSize(f.size)})` : ''}${editSummary ? ` — ${editSummary}` : ''} — click to preview`}
                     role="button"
                     tabIndex={0}
                     onClick={() => setPreviewIndex(stagedFiles.findIndex(x => x.id === f.id))}
@@ -885,6 +961,32 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                     {f.category !== 'image' && f.category !== 'video' && (
                       <span className="absolute bottom-0 left-0 right-0 px-1 pb-0.5 text-[8px] leading-tight text-[#A3A3A3] truncate bg-black/60">
                         {f.name}
+                      </span>
+                    )}
+                    {/* Crop / draw. Top-LEFT so it cannot be confused with the
+                        remove button opposite it — these two are the pair of
+                        actions on a tile most costly to mix up. */}
+                    {editable && (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setEditingId(f.id); }}
+                        disabled={uploading}
+                        aria-label={`Edit ${f.name}`}
+                        title="Crop, draw or add text"
+                        data-testid="staged-file-edit"
+                        className="absolute top-0 left-0 w-5 h-5 bg-black/70 rounded-br flex items-center justify-center text-white hover:bg-[#10B981] hover:text-[#0A0A0A] transition-colors disabled:opacity-40"
+                      >
+                        <Pencil size={10} />
+                      </button>
+                    )}
+                    {/* Says the tile is no longer the file that was picked. Without
+                        it an edit is invisible at 60px and Revert reads as a
+                        button with nothing to undo. */}
+                    {f.edit && (
+                      <span
+                        className="absolute bottom-0 left-0 right-0 text-center text-[8px] leading-[11px] font-medium text-[#0A0A0A] bg-[#10B981]"
+                        data-testid="staged-file-edited"
+                      >
+                        Edited
                       </span>
                     )}
                     <button
@@ -937,6 +1039,21 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
             index={previewIndex}
             onIndex={setPreviewIndex}
             onClose={() => setPreviewIndex(null)}
+            onEdit={(id) => setEditingId(id)}
+            keysSuspended={Boolean(editingId)}
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Crop / draw / text, on the ORIGINAL bytes plus the saved model. Sits at
+          z-[1000], above the staged preview it can be opened from. */}
+      <AnimatePresence>
+        {editingId && stagedFiles.some((s) => s.id === editingId) && (
+          <MediaEditor
+            key={editingId}
+            item={stagedFiles.find((s) => s.id === editingId)}
+            onSave={(result) => applyEdit(editingId, result)}
+            onClose={() => setEditingId(null)}
           />
         )}
       </AnimatePresence>
