@@ -171,8 +171,35 @@ def _migrated_schema():
     except Exception:
         _run(_drop_schema())  # a half-built schema must not outlive the run
         raise
+    _ensure_object_store()
     yield
     _run(_drop_schema())
+
+
+def _ensure_object_store() -> None:
+    """Create the attachments bucket, the way the app does at start-up.
+
+    `app.main` calls `ensure_bucket()` in its lifespan, but httpx's ASGITransport
+    does not run lifespan events — so under pytest the bucket was never created,
+    and every test that really uploads (test_media_upload_and_authenticated_serving
+    and three others) failed with NoSuchBucket the moment CI finally had a MinIO
+    to talk to. It passed locally only because the dev container's app had already
+    created the bucket in the shared MinIO.
+
+    This is the object-store half of what the schema fixture above does for
+    Postgres: the suite guarantees its own preconditions rather than inheriting
+    them from whatever happens to be running.
+
+    Tolerant of there being no object store at all: the great majority of the
+    suite never touches one, and the handful that do will fail with a clear S3
+    error of their own rather than being masked by a fixture error here.
+    """
+    try:
+        from app.services.storage import ensure_bucket
+
+        ensure_bucket()
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        print(f"[conftest] object store unavailable, upload tests will fail: {exc}")
 
 
 @pytest.fixture(scope="session")
