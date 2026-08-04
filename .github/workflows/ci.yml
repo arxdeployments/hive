@@ -31,7 +31,12 @@ jobs:
       # unnoticed because the ruff-format step above failed first and the job
       # never reached Tests. Same image and credentials as the e2e job.
       minio:
-        image: bitnami/minio:latest
+        # minio/minio:edge-cicd, not bitnami/minio — Bitnami withdrew their public
+        # Docker Hub catalogue and that tag now 404s, which failed this job at
+        # container start before a single step ran. The edge-cicd tag is MinIO's
+        # own build for exactly this: its default command is `minio server /data`,
+        # and a GitHub Actions service container has no way to supply one.
+        image: minio/minio:edge-cicd
         env:
           MINIO_ROOT_USER: rxhive
           MINIO_ROOT_PASSWORD: rxhive-dev
@@ -122,7 +127,12 @@ jobs:
           --health-cmd "redis-cli ping" --health-interval 5s
           --health-timeout 3s --health-retries 10
       minio:
-        image: bitnami/minio:latest
+        # minio/minio:edge-cicd, not bitnami/minio — Bitnami withdrew their public
+        # Docker Hub catalogue and that tag now 404s, which failed this job at
+        # container start before a single step ran. The edge-cicd tag is MinIO's
+        # own build for exactly this: its default command is `minio server /data`,
+        # and a GitHub Actions service container has no way to supply one.
+        image: minio/minio:edge-cicd
         env:
           MINIO_ROOT_USER: rxhive
           MINIO_ROOT_PASSWORD: rxhive-dev
