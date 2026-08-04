@@ -14,8 +14,8 @@ from app.db.models import (
     MessageType,
     ParticipantRole,
     User,
+    UserRole,
 )
-from app.db.models import UserRole
 from app.realtime.redis_bus import publish_to_users
 from app.services import enrich
 from app.utils import now_utc

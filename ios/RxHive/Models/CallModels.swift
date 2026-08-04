@@ -97,6 +97,128 @@ struct CallToken: Codable {
     /// `CallService.resolveSFUURL` for how that is handled.
     let url: String?
     let room: String
+    /// The room identity minted for this device: `{user_id}#{device_id}`.
+    ///
+    /// Not the bare user id, deliberately. A LiveKit identity must be unique per
+    /// connection or the SFU evicts the earlier client as a duplicate — silently,
+    /// which is why "the call connects and then one side goes quiet" produced no
+    /// error anywhere. `LiveKitSession` splits it to correlate room participants
+    /// with the user ids the socket talks about.
+    let identity: String?
+    /// How long the server will hold this call open while a participant's link is
+    /// down. Echoed so the client's own retry budget can be sized against the
+    /// server's policy rather than duplicating the number.
+    let reconnectGraceSeconds: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case token, url, room, identity
+        case reconnectGraceSeconds = "reconnect_grace_seconds"
+    }
+}
+
+/// `POST /api/calls/{call_id}/invite` — who was rung, and why anyone was not.
+///
+/// The per-invitee outcome is the point: a flat success for a partial result is how you
+/// end up waiting for somebody the server never called. `outcome` is keyed by user id;
+/// `invited` lists only the ones actually rung.
+struct CallInviteResult: Codable, Hashable {
+    let invited: [String]
+    let outcome: [String: String]
+
+    /// What to tell the user about one refusal. `nil` for `invited`, which is reported
+    /// as a count rather than name by name.
+    static func message(for outcome: String, who: String) -> String? {
+        switch outcome {
+        case "invited": return nil
+        case "already_invited": return "\(who) is already on the call"
+        case "unavailable": return "\(who) is unavailable"
+        case "different_org": return "\(who) is outside your organisation"
+        case "call_full": return "\(who) could not be added — the call is full"
+        default: return "\(who) could not be added"
+        }
+    }
+}
+
+/// `GET /api/calls/active` and the `call:resume` frame
+/// (`services/calls.active_call_state`).
+///
+/// The recovery path for every `call:*` frame lost while the socket was down. Those
+/// are fire-and-forget publishes to a Redis channel: anything sent while this device
+/// was reconnecting went to a channel with no subscriber and evaporated. A ring
+/// delivered during a two-second Wi-Fi handover used to be gone for good — the
+/// server rang on for the rest of its window while the phone showed nothing at all.
+struct ActiveCallState: Codable, Hashable {
+    let callID: String
+    /// `ringing` | `connected`. Nothing else is ever live.
+    let status: String
+    let callType: CallType
+    let isGroup: Bool
+    let conversationID: String?
+    let room: String
+    let initiatedBy: String?
+    let isInitiator: Bool
+    let caller: CallParticipantBrief?
+    let groupName: String?
+    /// Everyone on the call row, joined or not.
+    let participants: [CallParticipantBrief]
+    /// Who has actually joined the room.
+    let joined: [String]
+    /// Whether *this* user has joined. The difference between resuming into a live
+    /// room and being put back on the ringer — a callee who never accepted must not
+    /// be dropped straight into a conversation.
+    let selfJoined: Bool
+    let startedAt: Date?
+    let answeredAt: Date?
+    /// Seconds of ring window left, so a resumed ringing screen counts down against
+    /// the server's clock instead of restarting a timer of its own.
+    let ringExpiresIn: Double?
+    /// `{user_id: "up" | "down"}` — who is currently absent, so a resumed UI can
+    /// show "Connecting…" for a peer that dropped while we were away.
+    let peerLinks: [String: String]
+
+    var isRinging: Bool { status == "ringing" }
+    var isConnected: Bool { status == "connected" }
+
+    /// The same call as a `CallSignal`, so a recovered call flows through exactly the
+    /// code paths a live one does. One set of state transitions to reason about rather
+    /// than a parallel "resumed call" path that drifts out of step with the real one.
+    var asSignal: CallSignal {
+        CallSignal(
+            callID: callID,
+            callType: callType,
+            caller: caller,
+            conversationID: conversationID,
+            calleeID: nil,
+            isGroup: isGroup,
+            groupName: groupName,
+            accepterID: nil,
+            duration: nil,
+            reason: nil,
+            message: nil,
+            participants: participants,
+            participant: nil,
+            participantID: nil
+        )
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case callID = "call_id"
+        case status
+        case callType = "call_type"
+        case isGroup = "is_group"
+        case conversationID = "conversation_id"
+        case room
+        case initiatedBy = "initiated_by"
+        case isInitiator = "is_initiator"
+        case caller
+        case groupName = "group_name"
+        case participants, joined
+        case selfJoined = "self_joined"
+        case startedAt = "started_at"
+        case answeredAt = "answered_at"
+        case ringExpiresIn = "ring_expires_in"
+        case peerLinks = "peer_links"
+    }
 }
 
 /// A user inside a call-history row (`services/calls.py:serialize_call`).

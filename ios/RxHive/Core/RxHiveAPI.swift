@@ -440,8 +440,43 @@ enum RxHiveAPI {
     }
 
     /// LiveKit join credentials for a call I'm a participant of.
-    static func callToken(callID: String) async throws -> CallToken {
-        try await api.send(.post, "/api/calls/\(callID)/token", as: CallToken.self)
+    ///
+    /// `deviceID` becomes the suffix of the room identity, so this install is a
+    /// distinct SFU participant from the same user's browser. Without it both shared
+    /// the bare user id and whichever connected second was evicted as a duplicate —
+    /// with no error raised on either side.
+    static func callToken(callID: String, deviceID: String) async throws -> CallToken {
+        struct Body: Encodable { let device_id: String }
+        return try await api.send(
+            .post, "/api/calls/\(callID)/token",
+            body: Body(device_id: deviceID),
+            as: CallToken.self
+        )
+    }
+
+    /// Add people to a group call that is already running.
+    ///
+    /// REST rather than a `call:*` socket frame because the caller needs the ANSWER: a
+    /// per-invitee outcome, so the UI can say "Priya is in another organisation" instead
+    /// of reporting a flat success for a partial result. Every other call action is
+    /// fire-and-forget and belongs on the socket; this one is a request.
+    static func inviteToCall(callID: String, userIDs: [String]) async throws -> CallInviteResult {
+        struct Body: Encodable { let user_ids: [String] }
+        return try await api.send(
+            .post, "/api/calls/\(callID)/invite",
+            body: Body(user_ids: userIDs),
+            as: CallInviteResult.self
+        )
+    }
+
+    /// The call this client should currently be showing, if any.
+    ///
+    /// Read on connect, on reconnect, and on returning to the foreground. This is how
+    /// the app recovers a ring or a live call whose socket frames were published while
+    /// it had no socket — see `ActiveCallState`. `nil` is the normal answer.
+    static func activeCall() async throws -> ActiveCallState? {
+        struct Response: Decodable { let call: ActiveCallState? }
+        return try await api.send(.get, "/api/calls/active", as: Response.self).call
     }
 
     static func createCallLink(callType: String = "video") async throws -> CallLinkInfo {

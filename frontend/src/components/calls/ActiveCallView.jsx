@@ -3,14 +3,15 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   PhoneOff, Mic, MicOff, Video, VideoOff, Volume2,
   MoreHorizontal, ChevronDown, UserPlus, Lock,
-  Monitor, MonitorOff, MonitorUp, MessageSquare
+  Monitor, MonitorOff, MonitorUp, MessageSquare, SwitchCamera
 } from 'lucide-react';
-import useCallStore from '../../stores/callStore';
+import useCallStore, { isCallStalled } from '../../stores/callStore';
 import { StreamVideo } from './StreamVideo';
 import livekitClient from '../../services/livekitClient';
 import callSounds from '../../services/callSounds';
 import wsClient from '../../services/websocket';
 import { VideoGrid } from './VideoGrid';
+import { AddParticipantsModal } from './AddParticipantsModal';
 
 const formatDuration = (s) => {
   const total = Math.max(0, Math.floor(s || 0));
@@ -50,17 +51,52 @@ const localProfile = () => {
    LiveKit carried on streaming. Do not add an <audio> back into this view: the
    sink is a singleton and two elements on one stream echo. */
 
-const NetworkDot = ({ quality }) => {
-  const color =
-    quality === 'excellent' ? '#10B981' : quality === 'poor' ? '#EF4444' : '#F59E0B';
-  const label =
-    quality === 'excellent' ? 'Excellent connection'
+const NetworkDot = ({ quality, reconnecting }) => {
+  const color = reconnecting
+    ? '#F59E0B'
+    : quality === 'excellent' ? '#10B981' : quality === 'poor' ? '#EF4444' : '#F59E0B';
+  const label = reconnecting
+    ? 'Reconnecting'
+    : quality === 'excellent' ? 'Excellent connection'
       : quality === 'poor' ? 'Poor connection'
         : 'Good connection';
   return (
     <span className="inline-flex items-center" title={label} aria-label={label}>
-      <span className="w-2 h-2 rounded-full" style={{ backgroundColor: color }} />
+      <span
+        className={`w-2 h-2 rounded-full ${reconnecting ? 'animate-pulse' : ''}`}
+        style={{ backgroundColor: color }}
+      />
     </span>
+  );
+};
+
+/**
+ * The reconnect banner.
+ *
+ * Deliberately an overlay on the live call rather than a replacement for it: the
+ * call has NOT ended, the SFU is very often still carrying audio, and swapping the
+ * screen out would tell the user the opposite. It sits over whatever was already
+ * there — video keeps its last frame, the controls stay reachable so they can still
+ * hang up — and disappears the moment the link is back.
+ */
+const ReconnectingBanner = ({ visible }) => {
+  if (!visible) return null;
+  return (
+    // Fixed, and pointer-events-none, so one definition works identically over the
+    // 1:1 video, group grid and voice layouts without any of them reserving space
+    // for it — and so it can never swallow a tap meant for the hang-up button
+    // underneath, which is the one control that must stay reachable while the call
+    // is struggling.
+    <div className="fixed top-0 left-0 right-0 z-[9999] flex justify-center pt-16 pointer-events-none">
+      <div
+        role="status"
+        aria-live="polite"
+        className="flex items-center gap-2 px-4 py-2 rounded-full bg-black/70 backdrop-blur-md border border-[#F59E0B]/40"
+      >
+        <span className="w-2 h-2 rounded-full bg-[#F59E0B] animate-pulse" />
+        <span className="text-[13px] text-white/90">Connecting…</span>
+      </div>
+    </div>
   );
 };
 
@@ -83,18 +119,52 @@ const CallControl = ({ icon: Icon, active, onClick, label, disabled, testId }) =
   </button>
 );
 
+/**
+ * "Add people", for group calls only.
+ *
+ * Hidden on a 1:1 rather than disabled: the server refuses to add a third party to a
+ * direct call by design (it would silently change what two people agreed to be in), so
+ * there is nothing this could do there. It used to be rendered on every call screen and
+ * wired to nothing at all.
+ */
+const AddPeopleButton = ({ onClick }) => (
+  <button
+    onClick={onClick}
+    data-testid="call-add-people-btn"
+    aria-label="Add people to call"
+    className="p-2 text-white/70 hover:text-white active:scale-90 transition-transform"
+  >
+    <UserPlus size={22} />
+  </button>
+);
+
 export const ActiveCallView = () => {
   const {
     callState, callId, callType, callDuration, isMuted, isCameraOn,
     showCallUI, incomingCaller, isMinimized, isGroupCall, remoteParticipants,
-    localStream, isScreenSharing, activeSpeakerIds, networkQuality,
+    localStream, localScreenStream, isScreenSharing, activeSpeakerIds, networkQuality,
   } = useCallStore();
+  const pendingInvitees = useCallStore((s) => s.pendingInvitees);
 
   const [showMore, setShowMore] = useState(false);
+  const [showAddPeople, setShowAddPeople] = useState(false);
+  /**
+   * Whether this machine has a second camera to switch to.
+   *
+   * `livekitClient.flipCamera()` has existed the whole time with **no caller
+   * anywhere in the app**, so on a phone browser the back camera was unreachable:
+   * `getUserMedia` defaults to the front one and nothing could change it. Gated on an
+   * actual device count rather than on a user-agent guess — a laptop with one webcam
+   * gets no button, and a phone or a desk with two gets one that works.
+   */
+  const [canFlipCamera, setCanFlipCamera] = useState(false);
   // Speaker lives in the store now: as local state it was destroyed on every
   // minimise, and it was purely cosmetic — nothing acted on the flag. CallAudioSink
   // mutes its elements from it, so the button now does something real.
   const speakerOn = useCallStore((s) => s.speakerOn);
+  // Our media link, our signalling link, or a peer's — any of the three means the
+  // call is not currently carrying, and all three read as "Connecting…" to the user.
+  const reconnecting = useCallStore(isCallStalled);
 
   const isConnecting = callState === 'connecting';
   const isConnected = callState === 'connected';
@@ -105,6 +175,23 @@ export const ActiveCallView = () => {
   // IncomingCallOverlay — this view covers the live call and its teardown only.
   const isVisible =
     (isConnecting || isConnected || isEnded) && showCallUI && !isMinimized;
+
+  // Count the cameras once the call is up.
+  //
+  // Deliberately after the call starts: `enumerateDevices` only reveals labels and a
+  // full device list once a capture permission has been granted, so counting before
+  // the camera is open under-reports on some browsers.
+  useEffect(() => {
+    if (!isVideo || callState !== 'connected') return;
+    let cancelled = false;
+    navigator.mediaDevices?.enumerateDevices?.()
+      .then((devices) => {
+        if (cancelled) return;
+        setCanFlipCamera(devices.filter((d) => d.kind === 'videoinput').length > 1);
+      })
+      .catch(() => { /* no permission, no list — leave the control hidden */ });
+    return () => { cancelled = true; };
+  }, [isVideo, callState]);
 
   // Call lifecycle sounds.
   useEffect(() => {
@@ -127,10 +214,14 @@ export const ActiveCallView = () => {
   const initial = name.charAt(0).toUpperCase();
   const callerAvatar = resolveAvatar(incomingCaller?.avatar_url);
 
+  // Reconnecting outranks the duration. A clock ticking over dead audio is the most
+  // misleading thing a call UI can show, and it is exactly what happened before: the
+  // SFU had dropped us and the timer carried on regardless.
   let statusText = '';
-  if (isConnecting) statusText = 'Connecting';
+  if (isEnded) statusText = 'Call ended';
+  else if (reconnecting) statusText = 'Connecting…';
+  else if (isConnecting) statusText = 'Connecting';
   else if (isConnected) statusText = formatDuration(callDuration);
-  else if (isEnded) statusText = 'Call ended';
 
   // ---- Handlers ----
   const handleEnd = () => {
@@ -152,11 +243,27 @@ export const ActiveCallView = () => {
     });
   };
 
-  const handleToggleCamera = () => {
-    const nextOn = !isCameraOn;
-    livekitClient.setCameraEnabled(nextOn);
+  /**
+   * Camera on/off.
+   *
+   * The target is read from the STORE, not from this render's `isCameraOn`: two taps
+   * inside one frame both see the same stale prop, so both would ask for the same
+   * state and the second tap would appear to do nothing. `livekitClient` updates the
+   * store optimistically and serialises the operations, so reading it here means tap N
+   * always asks for the opposite of what tap N-1 asked for.
+   *
+   * The peer is told the state actually REACHED, once the operation settles — telling
+   * them the requested state would leave them showing a camera that failed to open.
+   * LiveKit also relays the mute natively (`TrackMuted`/`TrackUnmuted`), so this frame
+   * is the belt to that braces: it is what gets a correct roster to a client whose SFU
+   * subscription is lagging, and it is the only channel that reaches someone who has
+   * not subscribed to this track at all.
+   */
+  const handleToggleCamera = async () => {
+    const target = !useCallStore.getState().isCameraOn;
+    const reached = await livekitClient.setCameraEnabled(target);
     wsClient.send({
-      type: 'call:toggle_media', call_id: callId, media_type: 'video', enabled: nextOn,
+      type: 'call:toggle_media', call_id: callId, media_type: 'video', enabled: reached,
     });
   };
 
@@ -164,6 +271,8 @@ export const ActiveCallView = () => {
     if (isScreenSharing) livekitClient.stopScreenShare();
     else livekitClient.startScreenShare();
   };
+
+  const handleFlipCamera = () => livekitClient.flipCamera();
 
   const handleMinimize = () => useCallStore.getState().toggleMinimize();
 
@@ -222,6 +331,8 @@ export const ActiveCallView = () => {
             )}
           </div>
 
+          <ReconnectingBanner visible={reconnecting} />
+
           {/* Top overlay */}
           <div className="absolute top-0 left-0 right-0 bg-gradient-to-b from-black/70 to-transparent p-4 flex items-center justify-between">
             <button onClick={handleMinimize} className="p-2 text-white/70 hover:text-white">
@@ -230,7 +341,7 @@ export const ActiveCallView = () => {
             <div className="text-center">
               <p className="text-sm text-white font-medium">{remoteName}</p>
               <p className="text-xs text-white/60 flex items-center justify-center gap-1.5">
-                <NetworkDot quality={networkQuality} />
+                <NetworkDot quality={networkQuality} reconnecting={reconnecting} />
                 {statusText}
               </p>
             </div>
@@ -243,6 +354,9 @@ export const ActiveCallView = () => {
           <div className="flex items-center justify-center gap-4 sm:gap-5 mb-5">
             <CallControl icon={isMuted ? MicOff : Mic} active={isMuted} onClick={handleToggleMute} label={isMuted ? 'Unmute' : 'Mute'} testId="call-mute-btn" />
             <CallControl icon={isCameraOn ? Video : VideoOff} active={!isCameraOn} onClick={handleToggleCamera} label="Camera" testId="call-camera-btn" />
+            {canFlipCamera && isCameraOn && (
+              <CallControl icon={SwitchCamera} onClick={handleFlipCamera} label="Flip" testId="call-flip-camera-btn" />
+            )}
             <CallControl icon={isScreenSharing ? MonitorOff : Monitor} active={isScreenSharing} onClick={handleToggleScreenShare} label="Share" testId="call-screenshare-btn" />
             <CallControl icon={Volume2} active={speakerOn} onClick={() => useCallStore.getState().toggleSpeaker()} label="Speaker" />
           </div>
@@ -263,22 +377,27 @@ export const ActiveCallView = () => {
         initial={{ opacity: 0 }} animate={{ opacity: 1 }}
         className="fixed inset-0 z-[9998] bg-[#0A0A0A] flex flex-col"
       >
+        <ReconnectingBanner visible={reconnecting} />
 
         <div className="flex items-center justify-between px-4 py-3 flex-shrink-0">
           <button onClick={handleMinimize} className="p-2 text-white/70"><ChevronDown size={20} /></button>
           <div className="text-center">
             <p className="text-sm text-white font-medium">Group Call</p>
             <p className="text-xs text-white/50 flex items-center justify-center gap-1.5">
-              <NetworkDot quality={networkQuality} />
-              {remoteParticipants.length + 1} participants · {statusText}
+              <NetworkDot quality={networkQuality} reconnecting={reconnecting} />
+              {remoteParticipants.length + 1} participants
+              {pendingInvitees.length > 0 && ` · ${pendingInvitees.length} ringing`}
+              {' · '}{statusText}
             </p>
           </div>
-          <div className="w-10" />
+          <AddPeopleButton onClick={() => setShowAddPeople(true)} />
         </div>
 
         <VideoGrid
           remoteParticipants={remoteParticipants}
+          pendingInvitees={pendingInvitees}
           localStream={localStream}
+          localScreenStream={localScreenStream}
           localName={me.name}
           localAvatarUrl={me.avatar}
           localId={me.id}
@@ -288,10 +407,19 @@ export const ActiveCallView = () => {
           activeSpeakerIds={speakers}
         />
 
+        <AddParticipantsModal
+          isOpen={showAddPeople}
+          onClose={() => setShowAddPeople(false)}
+          callId={callId}
+        />
+
         <div className="bg-[#0A0A0A]/80 backdrop-blur-xl px-6 py-5 safe-bottom flex-shrink-0">
           <div className="flex items-center justify-center gap-4 sm:gap-5 mb-5">
             <CallControl icon={isMuted ? MicOff : Mic} active={isMuted} onClick={handleToggleMute} label={isMuted ? 'Unmute' : 'Mute'} testId="call-mute-btn" />
             {isVideo && <CallControl icon={isCameraOn ? Video : VideoOff} active={!isCameraOn} onClick={handleToggleCamera} label="Camera" testId="call-camera-btn" />}
+            {canFlipCamera && isCameraOn && (
+              <CallControl icon={SwitchCamera} onClick={handleFlipCamera} label="Flip" testId="call-flip-camera-btn" />
+            )}
             <CallControl icon={isScreenSharing ? MonitorOff : Monitor} active={isScreenSharing} onClick={handleToggleScreenShare} label="Share" testId="call-screenshare-btn" />
             <CallControl icon={Volume2} active={speakerOn} onClick={() => useCallStore.getState().toggleSpeaker()} label="Speaker" />
           </div>
@@ -312,6 +440,7 @@ export const ActiveCallView = () => {
       className="fixed inset-0 z-[9998] flex flex-col"
       style={{ background: 'linear-gradient(180deg, #1a3a2a 0%, #0A0A0A 40%, #0A0A0A 100%)' }}
     >
+      <ReconnectingBanner visible={reconnecting && !isEnded} />
 
       {/* Top bar */}
       <div className="flex items-center justify-between px-4 pt-12 pb-2 flex-shrink-0">
@@ -319,15 +448,19 @@ export const ActiveCallView = () => {
           <ChevronDown size={24} />
         </button>
         <div className="w-10" />
-        <button className="p-2 text-white/70 hover:text-white active:scale-90 transition-transform" aria-label="Add people">
-          <UserPlus size={22} />
-        </button>
+        {isGroupCall ? <AddPeopleButton onClick={() => setShowAddPeople(true)} /> : <div className="w-10" />}
       </div>
+
+      <AddParticipantsModal
+        isOpen={showAddPeople}
+        onClose={() => setShowAddPeople(false)}
+        callId={callId}
+      />
 
       {/* Center — avatar + name + status */}
       <div className="flex-1 min-h-0 overflow-hidden flex flex-col items-center justify-center px-6">
         <motion.div
-          animate={isConnecting ? { scale: [1, 1.04, 1] } : {}}
+          animate={isConnecting || (reconnecting && !isEnded) ? { scale: [1, 1.04, 1] } : {}}
           transition={{ repeat: Infinity, duration: 2, ease: 'easeInOut' }}
           className="relative mb-6"
         >
@@ -348,7 +481,7 @@ export const ActiveCallView = () => {
         <h2 className="text-[22px] font-semibold text-white mb-1.5 text-center">{name}</h2>
 
         <div className="flex items-center gap-1.5">
-          {isConnecting ? (
+          {isConnecting || (reconnecting && !isEnded) ? (
             <span className="text-[15px] text-white/50 flex items-center gap-1">
               {statusText}
               <span className="inline-flex gap-0.5 ml-0.5">
@@ -361,7 +494,7 @@ export const ActiveCallView = () => {
             <span className="text-[15px] text-white/40">{statusText}</span>
           ) : (
             <span className="text-[15px] text-white/50 font-mono tracking-wide flex items-center gap-1.5">
-              <NetworkDot quality={networkQuality} />
+              <NetworkDot quality={networkQuality} reconnecting={reconnecting} />
               {statusText}
             </span>
           )}

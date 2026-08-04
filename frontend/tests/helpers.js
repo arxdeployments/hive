@@ -22,7 +22,7 @@ async function apiLogin(request, email, password) {
  * `request` fixture already carries a cookie jar, so the superadmin session set
  * by login is reused for the subsequent admin calls.
  */
-export async function seedOrgWithUsers(request, suffix) {
+export async function seedOrgWithUsers(request, suffix, names = ['alice', 'bob']) {
   const login = await request.post(`${API}/api/auth/login`, {
     headers: H,
     data: { email: SUPERADMIN_EMAIL, password: SUPERADMIN_PASSWORD },
@@ -45,7 +45,7 @@ export async function seedOrgWithUsers(request, suffix) {
   ).json();
 
   const users = {};
-  for (const name of ['alice', 'bob']) {
+  for (const name of names) {
     const email = `${name}.${suffix}@rxhive-e2e.com`;
     const password = 'E2ePassword123';
     const resp = await request.post(`${API}/api/admin/users`, {

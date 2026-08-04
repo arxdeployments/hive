@@ -130,6 +130,10 @@ All E2E traffic shares one source IP, so raise the login budget for those runs:
 
 ## Troubleshooting: "the call won't connect"
 
+See [`docs/CALLS.md`](docs/CALLS.md) for the full picture — architecture, the wire
+contract every client implements, and a gap analysis of the six distinct causes
+that used to present as "calls are unreliable". The short version for an operator:
+
 **Symptom** — the call rings, the other side answers, then it drops or stays
 silent/black. Messaging is unaffected.
 
@@ -149,13 +153,40 @@ silent/black. Messaging is unaffected.
    | Your microphone is in use by another app | another app holds the device |
    | Camera blocked — continuing with audio only | camera failed; the call is live, audio-only |
    | That call is no longer active | the call ended before this side joined |
+   | Connection lost — reconnecting… | a link dropped; the call is being recovered, not over |
+   | Poor internet connection | either end's uplink is graded poor by the SFU |
 3. Open the browser console: every join failure logs
    `[call:<context>] join failed (<reason>)` with the underlying LiveKit or
-   `getUserMedia` error.
+   `getUserMedia` error, and every signal is logged as `[call] -> sent …` /
+   `[call] joining SFU …` so a whole call can be reconstructed from one console.
 4. Still failing? The SFU key/secret must match the API's exactly
    (`LIVEKIT_KEYS="<key>: <secret>"` vs `RXHIVE_LIVEKIT_API_KEY`/`_SECRET`) —
    a mismatch surfaces as the SFU rejecting the token, not as a network error.
    In production also confirm the UDP media range is open (see below).
+
+**Symptom** — the call ends by itself after a network blip, or a long call drops
+for no reason.
+
+Grep the API log for the lifecycle, which names every decision:
+
+```bash
+grep -E 'call\.(initiated|accepted|link_down|link_up|grace_expired|ring_timeout|ended)' api.log
+```
+
+A `call.link_down` with no matching `call.link_up` inside
+`RECONNECT_GRACE_SECONDS` (40s) is a client that never came back — look at that
+client, not the server. A `call.grace_expired` immediately after a
+`call.link_down` means the reconnect itself is failing.
+
+**Symptom** — an iOS user never receives calls unless the app is open.
+
+Expected, and documented: waking a suspended iOS app for a call needs an APNs
+VoIP push, which this backend cannot send (`push_subscriptions` holds Web Push
+endpoints only). Web clients *are* woken. See
+[§6 of `docs/CALLS.md`](docs/CALLS.md#6-known-remaining-limitation-background-ringing-on-mobile)
+for what closing that would take. The ring window is 45 seconds and the ring is
+re-delivered the moment the app opens, so a call remains answerable for its
+whole window rather than being lost.
 
 ## Production notes
 

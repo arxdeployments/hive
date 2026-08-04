@@ -23,6 +23,15 @@ enum OutboundFrame: Encodable {
     case callJoin(callID: String)
     case callLeave(callID: String)
     case callToggleMedia(callID: String, mediaType: String, enabled: Bool)
+    /// Tell the other participants how OUR media link is doing.
+    ///
+    /// The SFU reports connection quality to the affected participant only, and says
+    /// nothing at all to the others about a peer reconnecting. Without this frame a
+    /// user whose network was failing looked completely healthy from the other side —
+    /// a frozen picture and a running duration timer with no explanation — so only
+    /// one of the two people in the call could tell what was happening.
+    /// Relayed by `services/calls._relay_peer_state` as `call:peer_state`.
+    case callLinkState(callID: String, state: String?, quality: String?)
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -38,6 +47,8 @@ enum OutboundFrame: Encodable {
         case callID = "call_id"
         case mediaType = "media_type"
         case enabled
+        case state
+        case quality
     }
 
     func encode(to encoder: Encoder) throws {
@@ -91,6 +102,12 @@ enum OutboundFrame: Encodable {
             try c.encode(callID, forKey: .callID)
             try c.encode(mediaType, forKey: .mediaType)
             try c.encode(enabled, forKey: .enabled)
+
+        case let .callLinkState(callID, state, quality):
+            try c.encode("call:link_state", forKey: .type)
+            try c.encode(callID, forKey: .callID)
+            try c.encodeIfPresent(state, forKey: .state)
+            try c.encodeIfPresent(quality, forKey: .quality)
         }
     }
 }
@@ -198,11 +215,26 @@ enum RealtimeEvent {
     case callParticipantJoined(CallSignal)
     case callParticipantLeft(CallSignal)
     case callMediaToggle(callID: String?, userID: String?, mediaType: String?, enabled: Bool)
+    /// A peer told us about ITS OWN link — `reconnecting`/`connected`, and/or a
+    /// quality grade. The only channel by which this device can learn the other
+    /// side is struggling; see `OutboundFrame.callLinkState`.
+    case callPeerState(callID: String?, userID: String?, state: String?, quality: String?)
+    /// The server's full picture of a call, sent on (re)connect. Everything this
+    /// client may have missed while its socket was down, in one frame — the
+    /// `call:*` events themselves are fire-and-forget publishes and are simply gone.
+    case callResume(ActiveCallState?)
     case callGroupStarted(CallSignal)
     case callGroupEnded(CallSignal)
     case callGroupActive(CallSignal)
     case callGroupAlreadyActive(CallSignal)
     case callGroupParticipants(CallSignal)
+    /// Somebody in the call added people. Carries the briefs of the invitees, so the
+    /// grid can show them ringing rather than having them appear from nowhere when
+    /// they answer — and so an invite nobody answers leaves visible evidence.
+    case callParticipantsInvited(CallSignal)
+    /// An invitee said no. Group calls only: a declined 1:1 is `call:declined`, which
+    /// ends the call, whereas one person refusing a group call must leave it running.
+    case callParticipantDeclined(CallSignal)
 
     /// A type this build does not know. Kept as a case so it can be logged rather
     /// than silently dropped, which is how a protocol addition goes unnoticed.

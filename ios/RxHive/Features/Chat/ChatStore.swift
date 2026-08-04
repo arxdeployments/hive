@@ -486,12 +486,15 @@ final class ChatStore: ObservableObject {
         case .crossOrg:
             await loadConversations()
 
-        // Calls are CallStore's business.
+        // Calls are CallStore's business. Enumerated rather than defaulted so a new
+        // call event has to be routed deliberately in both stores instead of being
+        // silently swallowed here.
         case .callIncoming, .callAccepted, .callDeclined, .callCancelled, .callEnded,
              .callBusy, .callMissed, .callUnavailable, .callFull, .callError,
              .callRingingStarted, .callParticipantJoined, .callParticipantLeft,
-             .callMediaToggle, .callGroupStarted, .callGroupEnded, .callGroupActive,
-             .callGroupAlreadyActive, .callGroupParticipants:
+             .callMediaToggle, .callPeerState, .callResume, .callGroupStarted,
+             .callGroupEnded, .callGroupActive, .callGroupAlreadyActive,
+             .callGroupParticipants, .callParticipantsInvited, .callParticipantDeclined:
             break
         }
     }
