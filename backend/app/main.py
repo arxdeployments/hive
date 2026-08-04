@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import logging
 from contextlib import asynccontextmanager
@@ -26,6 +27,35 @@ MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 CSRF_EXEMPT_PATHS = {"/api/auth/login", "/api/auth/refresh", "/api/livekit/webhook"}
 
 
+# How often each worker looks for call deadlines that have come due. Every worker
+# sweeps; claiming is atomic, so N workers cost N cheap ZRANGEBYSCOREs per tick and
+# firing is never duplicated. Two seconds is well inside the precision a ring
+# timeout or a reconnect grace window needs.
+CALL_SWEEP_INTERVAL_SECONDS = 2
+
+
+async def _call_deadline_sweeper() -> None:
+    """Fire ring timeouts and reconnect-grace expiries whoever scheduled them.
+
+    The safety net that makes call timers survive a worker restart. Previously they
+    were asyncio tasks in a per-process dict: a deploy mid-ring left the call
+    `ringing` forever, so the caller heard ringback with no timeout and the row
+    never reached history. See app/services/call_deadlines.py.
+    """
+    from app.services.calls import sweep_due_deadlines
+
+    while True:
+        try:
+            await asyncio.sleep(CALL_SWEEP_INTERVAL_SECONDS)
+            await sweep_due_deadlines()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Never let one bad tick end the sweeper — that would silently take
+            # every future call timeout with it.
+            logger.exception("call deadline sweep failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Production secret validation happens in Settings (config.py) and raises at
@@ -35,7 +65,11 @@ async def lifespan(app: FastAPI):
 
         ensure_bucket()
     await hub.registry.start()
+    sweeper = asyncio.create_task(_call_deadline_sweeper())
     yield
+    sweeper.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await sweeper
     await hub.registry.stop()
     await close_redis()
     await engine.dispose()

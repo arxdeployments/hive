@@ -54,12 +54,20 @@ class LocalRegistry:
         self._lock = asyncio.Lock()
 
     async def add(self, user_id: uuid.UUID, conn_id: str, ws: WebSocket) -> None:
+        # SUBSCRIBE FIRST, then register the socket.
+        #
+        # The other order leaves a window in which this worker holds a live socket it
+        # has not yet subscribed a channel for, so anything published to that user in
+        # the meantime is dropped by the broker with no subscriber. It is a small
+        # window, but a reconnecting client's first act is to be sent its resumed call
+        # state, and losing that frame is precisely the failure this whole path exists
+        # to prevent. Subscribing to a channel with no sockets yet is harmless: the
+        # reader simply finds an empty bucket and moves on.
+        if self._pubsub is not None and str(user_id) not in self.connections:
+            with contextlib.suppress(Exception):
+                await self._pubsub.subscribe(user_channel(user_id))
         async with self._lock:
-            bucket = self.connections.setdefault(str(user_id), {})
-            first_for_user = not bucket
-            bucket[conn_id] = ws
-        if first_for_user and self._pubsub is not None:
-            await self._pubsub.subscribe(user_channel(user_id))
+            self.connections.setdefault(str(user_id), {})[conn_id] = ws
 
     async def remove(self, user_id: uuid.UUID, conn_id: str) -> None:
         async with self._lock:
@@ -71,6 +79,17 @@ class LocalRegistry:
         if last_for_user and self._pubsub is not None:
             with contextlib.suppress(Exception):
                 await self._pubsub.unsubscribe(user_channel(user_id))
+            # A reconnect that landed between the pop above and this unsubscribe would
+            # otherwise be left holding a live socket on an unsubscribed channel — the
+            # user would appear online and receive nothing at all until their next
+            # reconnect. Cheap to re-check, and the window is exactly the one a client
+            # hits when it drops and immediately reconnects, which is the common case
+            # mid-call.
+            async with self._lock:
+                resubscribe = str(user_id) in self.connections
+            if resubscribe:
+                with contextlib.suppress(Exception):
+                    await self._pubsub.subscribe(user_channel(user_id))
 
     _pubsub = None
 
@@ -282,6 +301,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         json.dumps({"type": "connected", "user_id": str(user.id), "timestamp": iso_z(now_utc())})
     )
 
+    # A socket coming up is the only moment we can repair call state this user missed
+    # while it was down: closing any grace window a previous drop opened, and
+    # re-delivering the ring (or full connected state) that was published to a channel
+    # with no subscriber. That second half is what makes a call placed during the
+    # callee's reconnect survive at all — previously the ring was simply lost and the
+    # phone never rang, while the server went on ringing for another forty seconds.
+    #
+    # Best-effort: a Redis hiccup here must not refuse an otherwise good socket.
+    # Clients additionally fetch GET /api/calls/active on connect, so a frame lost
+    # here still self-heals.
+    from app.services.calls import resume_calls_for
+
+    with contextlib.suppress(Exception):
+        await resume_calls_for(user.id)
+
     window_start = now_utc()
     window_count = 0
     try:
@@ -290,6 +324,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=HEARTBEAT_TIMEOUT)
             except TimeoutError:
                 break  # no ping for >60s — drop the connection
+            except RuntimeError:
+                # Starlette raises RuntimeError, not WebSocketDisconnect, when a receive
+                # follows a disconnect it has already recorded internally — which happens
+                # when the client vanishes at roughly the same moment as the heartbeat
+                # deadline. It is an ordinary disconnect and the teardown in `finally`
+                # handles it identically; letting it escape logged a full "Exception in
+                # ASGI application" traceback for each one, which is exactly the noise
+                # that hides the errors worth reading.
+                break
 
             if len(raw) > MAX_MESSAGE_BYTES:
                 await websocket.send_text(json.dumps({"type": "error", "detail": "Message too large"}))
@@ -370,7 +413,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     db_user.last_seen_at = now_utc()
                     await db.commit()
             await _broadcast_presence(user, "offline")
-            from app.services.calls import handle_user_disconnect
+            # NOT a hang-up. This opens a grace window and tells the peers to show
+            # "Connecting…"; the call is only resolved if the user is still missing
+            # when the window closes. See services/calls.handle_user_link_down for
+            # why ending the call here was wrong — most importantly, this path runs
+            # every time the 15-minute access cookie lapses, and it used to kill
+            # every call that outlived the remaining cookie lifetime.
+            from app.services.calls import handle_user_link_down
 
             with contextlib.suppress(Exception):
-                await handle_user_disconnect(user)
+                await handle_user_link_down(user)

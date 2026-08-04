@@ -50,15 +50,32 @@ self.addEventListener('push', (event) => {
     payload = { title: 'RX HIVE', body: event.data ? event.data.text() : '' };
   }
   const title = payload.title || 'RX HIVE';
+  // An incoming CALL, not a message. This is the only channel that reaches a client
+  // whose WebSocket is gone — the `call:incoming` frame is published to a channel
+  // with no subscriber and evaporates — so it is the difference between a ring the
+  // user can answer and a missed call they never knew about.
+  const isCall = payload.kind === 'call';
   const options = {
     body: payload.body || '',
     icon: '/icons/icon-192.png',
     badge: '/icons/icon-192.png',
     tag: payload.tag || 'rxhive',
     renotify: true,
+    // Stays on screen until acted on, and vibrates like a ring rather than a ping.
+    // A call notification that auto-dismisses after a few seconds is worse than
+    // none: the ring window is 45 seconds and the user has to be able to find it.
+    requireInteraction: isCall,
+    vibrate: isCall ? [400, 200, 400, 200, 400] : undefined,
     // convId is carried separately from the url so notificationclick can tell a
-    // focused tab WHICH conversation to open, which a url alone cannot do.
-    data: { url: payload.url || '/chat', convId: payload.conversation_id || null },
+    // focused tab WHICH conversation to open, which a url alone cannot do. callId
+    // does the same job for a ring: the page fetches GET /api/calls/active on
+    // focus, so this is a hint for logging rather than the mechanism.
+    data: {
+      url: payload.url || '/chat',
+      convId: payload.conversation_id || null,
+      callId: payload.call_id || null,
+      isCall,
+    },
   };
   event.waitUntil(self.registration.showNotification(title, options));
 });
@@ -83,6 +100,13 @@ self.addEventListener('notificationclick', (event) => {
         // user looking at whatever they had open.
         if (convId && 'postMessage' in existing) {
           existing.postMessage({ type: 'rxhive:open-conversation', convId });
+        }
+        if (data.isCall && 'postMessage' in existing) {
+          // Nudge the page to reconcile with the server immediately rather than
+          // waiting for its next reconnect. Focusing already triggers the
+          // visibilitychange wake in services/websocket.js, so this is the belt to
+          // that braces — the ring is recovered from GET /api/calls/active either way.
+          existing.postMessage({ type: 'rxhive:incoming-call', callId: data.callId || null });
         }
         return existing.focus();
       }

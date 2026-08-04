@@ -135,9 +135,30 @@ def classify(ext: str) -> str:
 
 
 def _endpoint_parts(url: str) -> tuple[str, bool]:
+    """Split an endpoint into (host[:port], secure), with the host LOWERCASED.
+
+    The lowercasing is load-bearing, not tidiness. SigV4 signs the `Host` header
+    verbatim, and **browsers always send the host lowercased** — while curl, and this
+    process, send whatever case was configured. So a mixed-case endpoint (an mDNS
+    name like `Carins-MacBook-Air.local`, or any hostname someone typed with capitals)
+    produces presigned URLs that work from every tool you would reach for to test
+    them, and fail in the one place that matters:
+
+        curl  "…Carins-MacBook-Air.local:9000/…?X-Amz-Signature=…"  -> 200
+        <img src=same-url>                                          -> 403
+
+    MinIO answers `SignatureDoesNotMatch`, which reads as a credentials or clock
+    problem and sends you looking at the keys. The visible symptom is simply that
+    every image in the app is a broken-image icon.
+
+    Hostnames are case-insensitive for resolution, so normalising here costs nothing
+    and makes what we sign match what a browser will ask for. Only the host is
+    touched — the bucket and key are case-SENSITIVE and never pass through here.
+    """
     parts = urlsplit(url)
     secure = parts.scheme == "https"
-    return parts.netloc or parts.path, secure
+    netloc = parts.netloc or parts.path
+    return netloc.lower(), secure
 
 
 @lru_cache
@@ -424,9 +445,14 @@ def rewrite_to_public(url: str, public_endpoint: str) -> str:
     query = f"?{parts.query}" if parts.query else ""
     if public.startswith(("http://", "https://")):
         pub = urlsplit(public)
-        if (pub.scheme, pub.netloc) == (parts.scheme, parts.netloc):
+        # Host lowercased for the same reason as in `_endpoint_parts`: a browser will
+        # lowercase it before sending, and if that differs from what was signed the
+        # signature fails. Matters most here, where a mixed-case *public* endpoint
+        # would break the URL even when the signing endpoint was clean.
+        netloc = pub.netloc.lower()
+        if (pub.scheme, netloc) == (parts.scheme, parts.netloc):
             return url
-        return f"{pub.scheme}://{pub.netloc}{pub.path.rstrip('/')}{parts.path}{query}"
+        return f"{pub.scheme}://{netloc}{pub.path.rstrip('/')}{parts.path}{query}"
     # Same-origin path prefix (e.g. "/s3"), resolved by the browser.
     return f"{public}{parts.path}{query}"
 

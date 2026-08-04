@@ -94,6 +94,25 @@ final class RealtimeClient: NSObject, ObservableObject {
     /// that sentence is the difference between the right screen and a wrong one.
     var onUnauthorized: ((String) -> Void)?
 
+    /// Whether a call is live right now. Set by `CallStore`, and consulted for two
+    /// decisions this class cannot make on its own:
+    ///
+    ///  * **Backgrounding.** `applicationDidEnterBackground` tears the socket down
+    ///    because iOS suspends the process and the socket dies silently anyway. But
+    ///    during a call the process is NOT suspended — the `audio` background mode in
+    ///    Info.plist keeps it running — so tearing the socket down there was pure
+    ///    self-harm: glancing at another app mid-call dropped signalling, and the
+    ///    server (before it learned to grant a grace window) ended the call outright.
+    ///  * **Reconnect pacing.** A 30-second backoff ceiling is right for chat and
+    ///    far too slow for a call, where every second of it is a second of the
+    ///    server's reconnect grace window spent doing nothing.
+    var hasLiveCall: () -> Bool = { false }
+
+    /// Called on every successful (re)connection, after the server's `connected`
+    /// frame. `CallStore` uses it to re-read call state that may have changed while
+    /// the socket was away — the frames sent in that window are gone for good.
+    var onReconnected: (() -> Void)?
+
     /// The most recent close reason, captured by the delegate. `closeCode` alone
     /// cannot distinguish "token expired" from "mobile access revoked": the server
     /// sends 4001 for both and puts the difference in the reason.
@@ -201,6 +220,7 @@ final class RealtimeClient: NSObject, ObservableObject {
         if frame.type == "connected" {
             attempt = 0
             state = .connected
+            onReconnected?()
         }
         guard let event = map(frame) else {
             log.notice("Unhandled event type \(frame.type, privacy: .public)")
@@ -255,7 +275,14 @@ final class RealtimeClient: NSObject, ObservableObject {
         state = .reconnecting(attempt: attempt)
         // Exponential with a 30s ceiling, plus jitter so a server restart doesn't
         // bring every client back in the same instant.
-        let base = min(pow(2.0, Double(min(attempt, 5))), 30)
+        //
+        // While a call is live the ceiling drops to two seconds. The server holds a
+        // disconnected participant's call open for `RECONNECT_GRACE_SECONDS` (40s);
+        // backing off for 30 of those spends most of the window doing nothing, and a
+        // single further failure runs past it and loses a call that would have
+        // resumed. Chat can afford to wait; a call the user is sitting in cannot.
+        let ceiling: Double = hasLiveCall() ? 2 : 30
+        let base = min(pow(2.0, Double(min(attempt, 5))), ceiling)
         let delay = base + Double.random(in: 0...1)
         reconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
@@ -308,7 +335,19 @@ final class RealtimeClient: NSObject, ObservableObject {
     /// iOS suspends the process in the background, which silently kills the
     /// socket; there is no close event to react to. So the connection is torn down
     /// on the way out and rebuilt on the way in, rather than discovered dead.
+    ///
+    /// **Except during a call.** The `audio` background mode in Info.plist keeps the
+    /// process running for the whole call, so the socket does *not* die and there is
+    /// nothing to pre-empt. Cancelling it here was actively harmful: glancing at
+    /// another app, taking a photo, or reading a notification mid-call dropped
+    /// signalling, which meant the hang-up button could not be delivered, the peer's
+    /// state stopped arriving, and the server treated it as the participant leaving.
+    /// Keeping it open is what makes "put the phone down for a second" a non-event.
     func applicationDidEnterBackground() {
+        if hasLiveCall() {
+            log.notice("Backgrounded during a call; keeping the socket open")
+            return
+        }
         pingTimer?.cancel(); pingTimer = nil
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
@@ -449,6 +488,8 @@ final class RealtimeClient: NSObject, ObservableObject {
         case "call:group_active":        return .callGroupActive(signal(frame))
         case "call:group_already_active": return .callGroupAlreadyActive(signal(frame))
         case "call:group_participants":  return .callGroupParticipants(signal(frame))
+        case "call:participants_invited": return .callParticipantsInvited(signal(frame))
+        case "call:participant_declined": return .callParticipantDeclined(signal(frame))
         case "call:media_toggle":
             return .callMediaToggle(
                 callID: frame.string("call_id"),
@@ -456,6 +497,15 @@ final class RealtimeClient: NSObject, ObservableObject {
                 mediaType: frame.string("media_type"),
                 enabled: frame.bool("enabled") ?? true
             )
+        case "call:peer_state":
+            return .callPeerState(
+                callID: frame.string("call_id"),
+                userID: frame.string("user_id"),
+                state: frame.string("state"),
+                quality: frame.string("quality")
+            )
+        case "call:resume":
+            return .callResume(frame.decode(ActiveCallState.self, at: "call", using: decoder))
 
         default:
             return .unknown(type: frame.type)

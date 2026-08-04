@@ -1,6 +1,6 @@
 import { toast } from 'sonner';
 import useChatStore from '../stores/chatStore';
-import useCallStore from '../stores/callStore';
+import useCallStore, { hasLiveCall, LINK_OK, LINK_RECONNECTING } from '../stores/callStore';
 import livekitClient from './livekitClient';
 import { refreshSession, sessionRejected, setSignOutReason } from '../api/client';
 import { withDerivedStatus, applyReadReceipt } from '../utils/messageStatus';
@@ -23,6 +23,36 @@ function joinLiveKit(callId, context, onFatal) {
     });
 }
 
+/**
+ * How long an Accept may sit unanswered by the SERVER before we tell the user.
+ *
+ * Pressing Answer is the point of no return for the user's patience: if the
+ * `call:accept` frame never reaches the server (socket closed under it) or the
+ * `call:accepted` reply never comes back, the old code left "Connecting…" on
+ * screen indefinitely with no timeout and no error — indistinguishable from every
+ * other reason a call fails. Comfortably longer than a reconnect + retry, and far
+ * shorter than the server's 45s ring window, so the user hears about it while the
+ * call could still in principle be salvaged by redialling.
+ *
+ * **It covers the signalling gap only, and is disarmed the moment a join begins.**
+ * Letting it also cover the media join was a real regression: the token round trip,
+ * `getUserMedia` and `room.connect` are legitimately slow on a real network, and
+ * when the deadline passed mid-join the handler sent `call:end` to the peer. The
+ * join then completed anyway, so this side showed a healthy call while the other
+ * side had been told it was over — one client "connected", the other never. The
+ * join reports its own failures with specific reasons (utils/callErrors) and
+ * `room.connect` has its own timeout; a second, blinder deadline over the top of
+ * that can only destroy calls that were about to succeed.
+ */
+const ACCEPT_TIMEOUT_MS = 20000;
+
+/** Reconnect ceiling while a call is live. A 30s backoff is fine for chat and
+ *  useless for a call the user is sitting in. */
+const IN_CALL_RECONNECT_MAX_MS = 2000;
+
+/** How long a ping has to be answered before the socket is treated as a ghost. */
+const PONG_TIMEOUT_MS = 10000;
+
 // Auth rides in httpOnly cookies — the WS handshake carries them automatically
 // (same-origin in production behind Caddy, and via the Vite proxy in dev).
 class RxHiveWebSocket {
@@ -37,18 +67,98 @@ class RxHiveWebSocket {
     this._active = false;
     /// The call this client answered, so only the answering device joins the SFU.
     this._acceptedCallId = null;
+    this._acceptTimer = null;
+    /// Guards against two overlapping resume fetches on a flapping connection.
+    this._resuming = false;
 
-    // An SFU drop we did not ask for ends the call here, and tells the server.
+    // An SFU drop ends the call here — but only once livekitClient has exhausted
+    // its re-join attempts, so a network blip no longer reaches this point at all.
     // Without this the room could vanish underneath a "connected" UI and nothing
-    // in the app would notice — the exact shape of the web-accept failure.
+    // in the app would notice.
     livekitClient.onUnexpectedDisconnect = (callId, reason) => {
       const cs = useCallStore.getState();
-      if (cs.callState === 'idle' || cs.callState === 'ended') return;
-      console.warn('[call] ending call after an unexpected SFU disconnect', { callId, reason });
+      if (!hasLiveCall(cs)) return;
+      console.warn('[call] ending call after an unrecoverable SFU disconnect', { callId, reason });
       toast.error('Call disconnected');
       cs.endCall();
       if (callId) this.send({ type: 'call:end', call_id: callId });
     };
+
+    // Relay our own link health to the other side. The SFU tells only us that our
+    // uplink is failing, so without this a peer whose network was dying looked
+    // perfectly healthy from across the call: a frozen picture and a running
+    // duration timer, with nothing to explain either.
+    livekitClient.onLocalLinkState = (callId, patch) => {
+      if (!callId) return;
+      this.send({ type: 'call:link_state', call_id: callId, ...patch });
+    };
+
+    this._installConnectivityListeners();
+  }
+
+  /**
+   * Reconnect the moment the browser says it can, rather than waiting out a
+   * backoff timer.
+   *
+   * Without these a laptop that woke from sleep, or a phone that regained signal,
+   * sat disconnected until the next scheduled attempt — up to 30 seconds, during
+   * which an incoming call could not be delivered at all. `visibilitychange`
+   * matters just as much: background tabs have their timers throttled to roughly
+   * one per minute, so the heartbeat that is supposed to notice a dead socket can
+   * itself be asleep.
+   */
+  _installConnectivityListeners() {
+    if (typeof window === 'undefined' || this._connectivityBound) return;
+    this._connectivityBound = true;
+
+    const wake = (why) => {
+      if (!this._active || this._intentionalClose) return;
+      if (this.isOpen()) {
+        // Open according to us — but a socket that died with the network can stay
+        // "open" for minutes. Ping now; the pong timeout closes it if it is a ghost.
+        this._ping();
+        return;
+      }
+      console.info('[WS] reconnecting early:', why);
+      this.reconnectAttempts = 0;
+      this.connect();
+    };
+
+    window.addEventListener('online', () => wake('network online'));
+
+    // `offline` is the fastest and most definitive signal there is: the browser is
+    // telling us nothing can be sent. Without it the earliest this client could
+    // notice was the heartbeat — up to 30s for the next ping plus 10s for the pong
+    // to time out — during which a live call showed a happily ticking duration.
+    // The requirement is that the user is told their connection has gone; a
+    // forty-second wait to say so does not meet it.
+    window.addEventListener('offline', () => {
+      if (!this._active || this._intentionalClose) return;
+      console.warn('[WS] browser reports offline');
+      if (hasLiveCall(useCallStore.getState())) {
+        useCallStore.getState().setSignalLinkState(LINK_RECONNECTING);
+      }
+      useChatStore.getState().setWsConnected(false);
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') wake('tab visible');
+    });
+    window.addEventListener('pageshow', (e) => {
+      if (e.persisted) wake('restored from page cache');
+    });
+
+    // A tapped call notification. Handled here rather than in a page component
+    // because it must work whatever route the user is on — the ring is not a chat
+    // feature, and Chat.jsx is not always mounted.
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('message', (event) => {
+        if (event.data?.type !== 'rxhive:incoming-call') return;
+        console.info('[call] woken by a call notification', event.data.callId || '');
+        wake('call notification');
+        this._resumeCallState();
+      });
+    }
   }
 
   connect() {
@@ -84,10 +194,18 @@ class RxHiveWebSocket {
     const wasReconnect = this.reconnectAttempts > 0;
     this.reconnectAttempts = 0;
     useChatStore.getState().setWsConnected(true);
+    useCallStore.getState().setSignalLinkState(LINK_OK);
 
     if (wasReconnect) {
       this._syncAfterReconnect();
     }
+
+    // Always, not only on a reconnect: a socket opened on a fresh page load has to
+    // discover a call that is already ringing or connected too. This is the client
+    // half of the fix for every `call:*` frame lost while the socket was down —
+    // they are fire-and-forget publishes, so a ring delivered during a two-second
+    // handover was previously gone for good and the phone never rang.
+    this._resumeCallState();
 
     while (this.messageQueue.length > 0) {
       const msg = this.messageQueue.shift();
@@ -109,7 +227,158 @@ class RxHiveWebSocket {
     }
   }
 
+  /**
+   * Ask the server what call this client should be in, and reconcile.
+   *
+   * The server also pushes `call:incoming` / `call:resume` on connect, so this is
+   * belt-and-braces — but it is the half that cannot be lost, and it is the only
+   * path that works on a cold page load. Deliberately additive: it never ends a
+   * call, only adopts one we are missing or rejoins a room we should be in.
+   */
+  async _resumeCallState() {
+    if (this._resuming) return;
+    this._resuming = true;
+    try {
+      const client = (await import('../api/client')).default;
+      const { data } = await client.get('/api/calls/active');
+      this._applyResumedCall(data?.call || null);
+    } catch (err) {
+      // A failed resume costs a stale UI until the next connect, never a wrong
+      // decision — so it is logged and dropped rather than acted on.
+      console.warn('[call] could not resume call state:', err?.message || err);
+    } finally {
+      this._resuming = false;
+    }
+  }
+
+  /**
+   * Adopt the server's view of the live call.
+   *
+   * Four cases, and the distinctions matter:
+   *  - nothing live, but this client thinks otherwise → the call ended while we
+   *    were away; clear up rather than leaving a dead call on screen forever.
+   *  - ringing, we are the callee → show the ringer (this is the recovered ring).
+   *  - connected and we had joined → rejoin the room if we are not in it.
+   *  - connected group call we never joined → offer "Join call", don't hijack the
+   *    screen with a ringer for a call already in progress.
+   */
+  _applyResumedCall(call) {
+    const cs = useCallStore.getState();
+
+    if (!call) {
+      if (hasLiveCall(cs) && cs.callState !== 'outgoing_ringing') {
+        console.info('[call] server reports no live call; clearing local state');
+        livekitClient.leave();
+        cs.resetCall();
+      }
+      return;
+    }
+
+    for (const [userId, state] of Object.entries(call.peer_links || {})) {
+      if (userId !== this._currentUserId()) {
+        cs.setPeerState(userId, { state: state === 'down' ? LINK_RECONNECTING : LINK_OK });
+      }
+    }
+
+    const isRinging = call.status === 'ringing';
+
+    if (isRinging && !call.is_initiator) {
+      if (cs.callId !== call.call_id) {
+        console.info('[call] recovered a ring missed while offline', call.call_id);
+        cs.receiveIncomingCall(
+          call.call_id, call.caller, call.call_type, call.is_group, call.conversation_id
+        );
+      }
+      return;
+    }
+
+    if (isRinging && call.is_initiator) {
+      // Our own outgoing ring, recovered — a reload or a dropped socket during the
+      // 45 seconds the server keeps ringing. Without this the caller's screen went
+      // blank while the callee's phone was still ringing, and the only way out was
+      // to wait for the timeout.
+      if (cs.callId !== call.call_id) {
+        console.info('[call] recovered our own outgoing ring', call.call_id);
+        const peer = (call.participants || [])
+          .find((p) => p.id !== this._currentUserId()) || null;
+        cs.initiateCall(
+          call.call_id, call.call_type, call.is_group, call.conversation_id, peer
+        );
+      }
+      return;
+    }
+
+    if (call.status === 'connected' && call.is_group && !call.self_joined) {
+      if (call.conversation_id) {
+        cs.setActiveGroupCall(call.conversation_id, {
+          call_id: call.call_id,
+          participants: call.participants,
+          call_type: call.call_type,
+        });
+      }
+      return;
+    }
+
+    if (call.status !== 'connected' || !call.self_joined) return;
+
+    // We belong in this room. Re-establish the UI first so the user sees the call
+    // rather than a blank app, then get the media back.
+    if (cs.callId !== call.call_id) {
+      console.info('[call] recovered a connected call missed while offline', call.call_id);
+      useCallStore.setState({
+        callId: call.call_id,
+        callType: call.call_type,
+        isGroupCall: call.is_group,
+        conversationId: call.conversation_id,
+        incomingCaller: call.caller,
+        showCallUI: true,
+      });
+      for (const p of call.participants || []) {
+        if (p.id !== this._currentUserId()) cs.addRemoteParticipant(p);
+      }
+      cs.setCallState('connecting');
+      cs.callConnected();
+      this._acceptedCallId = call.call_id;
+    }
+
+    if (!livekitClient.isEngaged(call.call_id)) {
+      console.info('[call] rejoining the room after a signalling reconnect', call.call_id);
+      joinLiveKit(call.call_id, 'resume', () => {
+        useCallStore.getState().endCall();
+        this.send({ type: 'call:end', call_id: call.call_id });
+      });
+    }
+  }
+
+  /**
+   * Arm/clear the "Answer went nowhere" timeout. See ACCEPT_TIMEOUT_MS.
+   */
+  _armAcceptTimeout(callId) {
+    this._clearAcceptTimeout();
+    this._acceptTimer = setTimeout(() => {
+      this._acceptTimer = null;
+      const cs = useCallStore.getState();
+      if (cs.callId !== callId) return;
+      if (cs.callState === 'connected') return;
+      console.warn('[call] accept timed out with no connection', callId);
+      toast.error('Could not connect the call. Check your connection and try again.');
+      livekitClient.leave();
+      this.send({ type: 'call:end', call_id: callId });
+      cs.resetCall();
+    }, ACCEPT_TIMEOUT_MS);
+  }
+
+  _clearAcceptTimeout() {
+    if (this._acceptTimer) {
+      clearTimeout(this._acceptTimer);
+      this._acceptTimer = null;
+    }
+  }
+
   _onMessage(event) {
+    // Bytes arrived on this socket, so our signalling is not gone. Recorded before
+    // the frame is even parsed — the proof is the delivery, not the contents.
+    this._noteSignalAlive();
     try {
       const data = JSON.parse(event.data);
       this._routeMessage(data);
@@ -118,9 +387,48 @@ class RxHiveWebSocket {
     }
   }
 
+  /**
+   * The socket is demonstrably alive: stop claiming our signalling is down.
+   *
+   * `_onOpen` used to be the ONLY path back to `LINK_OK`, and that is not enough,
+   * because a socket does not have to DIE for us to have marked it down. The
+   * `offline` listener marks signalling down the instant the browser says nothing
+   * can be sent — which is right, and is the whole point of that listener — but a
+   * brief outage can begin and end with the SAME socket still `OPEN`: a Wi-Fi /
+   * cellular handover, an interface flap, a VPN reconnecting, or CDP's network
+   * emulation in the E2E suite. No close event, so no reopen, so nothing ever
+   * cleared the flag. One leg of `isCallStalled` stayed latched and "Connecting…"
+   * sat over a call whose audio had been flowing for minutes — and, because
+   * `resetCall` deliberately does not touch socket state, it sat over the NEXT
+   * call too. Measured on a video call recovering from a ~6s outage: one socket,
+   * opened once, never closed, `readyState` 1 for the whole thing.
+   *
+   * An inbound frame is the proof, and the `pong` answering `_ping()` is the
+   * specific one that lands within milliseconds of the network returning. A socket
+   * that can deliver TO us but not send is not distinguishable from here and does
+   * not need to be: its unanswered ping abandons it and marks signalling down
+   * again.
+   *
+   * Unconditional, not gated on `hasLiveCall`: a flag left latched by a call that
+   * has since ended is exactly the state that must not survive into the next one.
+   */
+  _noteSignalAlive() {
+    if (useCallStore.getState().signalLinkState !== LINK_RECONNECTING) return;
+    useCallStore.getState().setSignalLinkState(LINK_OK);
+  }
+
   async _onClose(event) {
     this._stopHeartbeat();
     useChatStore.getState().setWsConnected(false);
+
+    // Losing signalling mid-call is a "Connecting…", not a hang-up. The server
+    // holds the call open for its reconnect grace window and the SFU very often
+    // keeps carrying audio throughout, so tearing anything down here would end
+    // calls that were about to recover — including on the routine 4001 every
+    // client takes when its 15-minute access cookie lapses.
+    if (hasLiveCall(useCallStore.getState())) {
+      useCallStore.getState().setSignalLinkState(LINK_RECONNECTING);
+    }
 
     if (event.code === 4001) {
       // Access cookie expired — refresh the session, then reconnect.
@@ -453,10 +761,23 @@ class RxHiveWebSocket {
 
       // ===== CALL SIGNALS (media itself flows through LiveKit, not here) =====
       case 'call:incoming': {
-        callStore.getState().receiveIncomingCall(
+        const cs = callStore.getState();
+        // `replayed` marks a ring re-delivered because our socket was down when the
+        // original was published (services/calls.replay_pending_ring). Idempotent by
+        // call id: the same ring arriving twice must not restart the ringer or clear
+        // a call we have already answered.
+        if (cs.callId === data.call_id && hasLiveCall(cs)) break;
+        cs.receiveIncomingCall(
           data.call_id, data.caller, data.call_type,
           data.is_group, data.conversation_id
         );
+        break;
+      }
+      case 'call:resume': {
+        // The server's full picture of a call we may have missed frames for.
+        // Reconciled through the same path as the REST resume so there is one
+        // decision table for "what should be on screen", not two.
+        this._applyResumedCall(data.call || null);
         break;
       }
       case 'call:ringing_started': {
@@ -464,15 +785,49 @@ class RxHiveWebSocket {
         if (cs.callState === 'outgoing_ringing' && data.call_id && !cs.callId) {
           callStore.setState({ callId: data.call_id });
         }
+        // Not a refusal — the server rings for its full window regardless, and the
+        // callee's socket may well reappear before it closes. Said once, quietly,
+        // so the caller understands why it may take a moment.
+        if (data.callee_online === false) {
+          toast.info('They may be offline — still ringing', { duration: 4000 });
+        }
+        break;
+      }
+      // A peer told us about ITS OWN link. This is the only way this client can
+      // learn that the other side is struggling: the SFU relays connection quality
+      // to nobody but the affected participant.
+      case 'call:peer_state': {
+        if (!data.user_id) break;
+        callStore.getState().setPeerState(data.user_id, {
+          ...(data.state ? { state: data.state } : {}),
+          ...(data.quality ? { quality: data.quality } : {}),
+        });
         break;
       }
       case 'call:group_started': {
+        // The id, first of all.
+        //
+        // A group call is opened with `call:group_initiate`, which carries a
+        // conversation id — the CALL id is minted by the server and comes back here.
+        // Nothing recorded it, so the initiator of every group call held
+        // `callId: null` (initiateCall is called with an explicit null) for the entire
+        // call. Media still worked, because the join is handed `data.call_id`
+        // directly, which is exactly why this survived: everything keyed on the id
+        // silently did nothing instead. `call:end` from the initiator's own Hang up
+        // went out as `call_id: null` and the server dropped it — the call only really
+        // ended via the LiveKit webhook or the reconnect grace expiring — and any REST
+        // action on the call (adding people) built a `/api/calls/null/...` URL.
+        if (data.call_id) callStore.setState({ callId: data.call_id });
         callStore.getState().setCallState('connected');
         callStore.getState().callConnected();
         joinLiveKit(data.call_id, 'group_started', () => callStore.getState().resetCall());
         break;
       }
       case 'call:group_participants': {
+        // Same reason as `call:group_started`: this is the server's authoritative id for
+        // the call this client was just admitted to, and a joiner who arrived through
+        // the conversation's Join affordance rather than a ring may not have it yet.
+        if (data.call_id) callStore.setState({ callId: data.call_id });
         for (const participant of (data.participants || [])) {
           callStore.getState().addRemoteParticipant({
             id: participant.id,
@@ -484,6 +839,15 @@ class RxHiveWebSocket {
         // confirmation that the join was accepted — so it's where a group
         // participant connects media. (call:group_started only reaches the
         // initiator, so relying on that alone left joiners silent.)
+        if (livekitClient.isEngaged(data.call_id)) {
+          this._clearAcceptTimeout();
+          break;
+        }
+        // Disarmed here, before the join, not after it — see the note on
+        // ACCEPT_TIMEOUT_MS. The server has answered, so the gap this watchdog covers
+        // is closed; letting it also cover the media join means a slow-but-successful
+        // join gets `call:end` sent out from under it.
+        this._clearAcceptTimeout();
         callStore.getState().setCallState('connected');
         callStore.getState().callConnected();
         joinLiveKit(data.call_id, 'group_join', () => callStore.getState().resetCall());
@@ -530,7 +894,17 @@ class RxHiveWebSocket {
           break;
         }
 
+        // Already in this room — a duplicate or replayed `call:accepted` (both
+        // sides get one, the server replays it for a retried Accept, and a
+        // reconnect can re-deliver it). Re-joining would tear down working media.
+        if (livekitClient.isEngaged(joinId)) {
+          this._clearAcceptTimeout();
+          break;
+        }
+
         console.info('[call] joining SFU after accept', { callId: joinId, accepter: data.accepter_id });
+        // Disarmed before the join, not after — see the note on ACCEPT_TIMEOUT_MS.
+        this._clearAcceptTimeout();
         cs.acceptCall();
         joinLiveKit(joinId, 'accepted', () => {
           callStore.getState().endCall();
@@ -539,16 +913,19 @@ class RxHiveWebSocket {
         break;
       }
       case 'call:declined': {
+        this._clearAcceptTimeout();
         livekitClient.leave();
         callStore.getState().endCall();
         break;
       }
       case 'call:ended': {
+        this._clearAcceptTimeout();
         livekitClient.leave();
         callStore.getState().endCall();
         break;
       }
       case 'call:cancelled': {
+        this._clearAcceptTimeout();
         livekitClient.leave();
         callStore.getState().resetCall();
         break;
@@ -577,6 +954,23 @@ class RxHiveWebSocket {
         callStore.getState().addRemoteParticipant(data.participant);
         break;
       }
+      // Someone in the call added people. Recorded so the grid shows them ringing
+      // instead of having them appear from nowhere when they answer — and so an invite
+      // nobody answers leaves visible evidence rather than none.
+      case 'call:participants_invited': {
+        if (data.call_id && data.call_id !== callStore.getState().callId) break;
+        callStore.getState().addPendingInvitees(data.participants || []);
+        break;
+      }
+      // An invitee said no. Only group calls send this — a declined 1:1 is
+      // `call:declined`, which ends the call.
+      case 'call:participant_declined': {
+        if (data.call_id && data.call_id !== callStore.getState().callId) break;
+        const who = data.participant?.display_name;
+        callStore.getState().removePendingInvitee(data.participant_id);
+        toast.info(who ? `${who} declined the call` : 'Someone declined the call');
+        break;
+      }
       case 'call:participant_left': {
         callStore.getState().removeRemoteParticipant(data.participant_id);
         break;
@@ -600,12 +994,20 @@ class RxHiveWebSocket {
         break;
       }
       case 'call:error': {
-        // `reason` is the accept/decline refusal path added on the server: the call
-        // had already rung out, been cancelled or ended. It used to return silently,
-        // which left the UI sitting on "Connecting" with nothing to act on.
+        // `reason` is the accept/join/decline refusal path on the server: the call
+        // had already rung out, been cancelled or ended. These used to return
+        // silently, which left the UI sitting on "Connecting" with nothing to act on.
         console.warn('[call] server refused a call action', data);
+        // An error for a call this client is not in — a stale tab, a second device —
+        // must not tear down the call we ARE in.
+        const errored = data.call_id;
+        const current = callStore.getState().callId;
+        if (errored && current && errored !== current) break;
+        this._clearAcceptTimeout();
         if (data.reason === 'no_longer_ringing') {
           toast.info(data.status === 'missed' ? 'Call already ended' : 'Call is no longer available');
+        } else if (data.reason === 'not_joinable') {
+          toast.info('That call has already finished');
         } else if (data.reason) {
           toast.error('That call is no longer available');
         } else {
@@ -657,10 +1059,17 @@ class RxHiveWebSocket {
       this._acceptedCallId = data.call_id || null;
     } else if (data?.type === 'call:end' || data?.type === 'call:decline' || data?.type === 'call:cancel') {
       this._acceptedCallId = null;
+      this._clearAcceptTimeout();
     }
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this._rawSend(data);
+      // Answering is the one action whose silence is unbearable: from here the user
+      // is staring at "Connecting…" with no way to tell a slow network from a call
+      // that will never connect. Armed only once the frame is actually on the wire.
+      if (data?.type === 'call:accept' || data?.type === 'call:join') {
+        this._armAcceptTimeout(data.call_id);
+      }
       return true;
     }
 
@@ -693,6 +1102,18 @@ class RxHiveWebSocket {
         callId: data.call_id || null,
         readyState: this.ws ? this.ws.readyState : 'no socket',
       });
+      // Tell the USER, not just the console, for the frames where silence is a
+      // dead end they cannot diagnose. `call:link_state` is pure telemetry and
+      // `call:toggle_media` is cosmetic, so those stay quiet; the rest are the
+      // user pressing a button and deserve an answer. Reconnecting immediately
+      // rather than waiting out the backoff gives the retry a chance to land.
+      const loud = ['call:accept', 'call:join', 'call:initiate', 'call:group_initiate',
+        'call:decline', 'call:cancel', 'call:end'];
+      if (loud.includes(data.type)) {
+        toast.error('No connection — the call could not be signalled. Reconnecting…');
+        this.reconnectAttempts = 0;
+        this.connect();
+      }
       return false;
     }
     if (import.meta.env.DEV) {
@@ -777,17 +1198,86 @@ class RxHiveWebSocket {
     });
   }
 
+  /**
+   * Abandon a socket we can no longer trust, and get a new one.
+   *
+   * `close()` is NOT enough on its own, and assuming it was is what made a lost
+   * network unrecoverable. A WebSocket closed while the network is gone cannot
+   * complete its closing handshake, so it parks in `CLOSING` **and never fires
+   * `onclose`** — measured, not theorised: readyState 2 for the whole of a
+   * 70-second outage. Everything hanging off `_onClose` therefore never ran. No
+   * "Connecting…", no reconnect scheduled, and the call left on screen with a
+   * duration timer counting up over dead audio, indefinitely.
+   *
+   * So the socket is dropped by reference rather than by handshake: handlers
+   * detached, `this.ws` nulled, state and reconnect driven from here. Whatever the
+   * zombie does afterwards reaches nothing.
+   */
+  _abandonSocket(reason) {
+    const zombie = this.ws;
+    this.ws = null;
+    this._stopHeartbeat();
+    console.warn('[WS] abandoning the socket:', reason);
+
+    if (zombie) {
+      // Detached first: a late `onclose` from this socket must not be mistaken for
+      // the CURRENT socket closing and schedule a second, competing reconnect.
+      zombie.onopen = null;
+      zombie.onmessage = null;
+      zombie.onclose = null;
+      zombie.onerror = null;
+      try {
+        zombie.close();
+      } catch {
+        /* already gone */
+      }
+    }
+
+    useChatStore.getState().setWsConnected(false);
+    if (hasLiveCall(useCallStore.getState())) {
+      useCallStore.getState().setSignalLinkState(LINK_RECONNECTING);
+    }
+    this._scheduleReconnect();
+  }
+
   _startHeartbeat() {
     this._stopHeartbeat();
     this.heartbeatInterval = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.send({ type: 'ping' });
-        this.pongTimeout = setTimeout(() => {
-          console.warn('[WS] No pong received, reconnecting...');
-          if (this.ws) this.ws.close();
-        }, 10000);
+      // A socket that is not OPEN is the thing a heartbeat exists to catch.
+      //
+      // This used to be `if (readyState === OPEN) { ping }` with no else — so the
+      // moment the socket stopped being OPEN the heartbeat went quiet and the client
+      // sat there forever. Skipping the check is the one behaviour a liveness probe
+      // must never have.
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        this._abandonSocket(`readyState=${this.ws ? this.ws.readyState : 'no socket'}`);
+        return;
       }
+      this._ping();
     }, 30000);
+  }
+
+  /**
+   * Probe the socket, and hold it to an answer.
+   *
+   * The deadline is the point. A socket whose network died can sit in `OPEN`
+   * indefinitely, so an unanswered ping is the only thing that proves it is a
+   * ghost. `wake()` used to ping without one, which meant a network that came back
+   * on a different interface — the socket still `OPEN`, still dead — waited for the
+   * next heartbeat tick before anyone noticed: up to 30s, plus 10s for its pong,
+   * with the call showing "Connecting…" throughout.
+   *
+   * The deadline is only armed if the frame actually left, so a ping dropped by
+   * `send` for a closed socket cannot condemn the socket that replaces it.
+   */
+  _ping() {
+    if (this.pongTimeout) clearTimeout(this.pongTimeout);
+    this.pongTimeout = null;
+    if (!this.send({ type: 'ping' })) return;
+    this.pongTimeout = setTimeout(() => {
+      this.pongTimeout = null;
+      this._abandonSocket(`no pong within ${PONG_TIMEOUT_MS / 1000}s`);
+    }, PONG_TIMEOUT_MS);
   }
 
   _stopHeartbeat() {
@@ -812,9 +1302,18 @@ class RxHiveWebSocket {
     //
     // The attempt counter needs no clamp: Math.pow overflows to Infinity and
     // Math.min caps it at maxReconnectDelay, so the ceiling already holds.
+    //
+    // While a call is live the ceiling drops to two seconds. A 30-second backoff is
+    // right for chat, where the cost of waiting is a late message, and wrong for a
+    // call: the server holds the call open for its reconnect grace window, so every
+    // second spent backing off is a second of that window spent doing nothing, and
+    // running past it loses a call that would otherwise have resumed.
+    const ceiling = hasLiveCall(useCallStore.getState())
+      ? IN_CALL_RECONNECT_MAX_MS
+      : this.maxReconnectDelay;
     const delay = immediate
       ? 100
-      : Math.min(1000 * Math.pow(2, this.reconnectAttempts), this.maxReconnectDelay)
+      : Math.min(1000 * Math.pow(2, this.reconnectAttempts), ceiling)
         + Math.random() * 1000;
     this.reconnectAttempts++;
 
@@ -944,6 +1443,7 @@ class RxHiveWebSocket {
     this._intentionalClose = true;
     this._active = false;
     this._stopHeartbeat();
+    this._clearAcceptTimeout();
     if (this.ws) {
       this.ws.close(1000, 'User disconnected');
       this.ws = null;

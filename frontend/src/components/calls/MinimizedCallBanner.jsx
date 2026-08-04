@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useMotionValue } from 'framer-motion';
 import { Mic, MicOff, PhoneOff, Video } from 'lucide-react';
-import useCallStore from '../../stores/callStore';
+import useCallStore, { isCallStalled } from '../../stores/callStore';
 import livekitClient from '../../services/livekitClient';
 import wsClient from '../../services/websocket';
 import { StreamVideo } from './StreamVideo';
@@ -74,6 +74,10 @@ export const MinimizedCallBanner = () => {
   const remoteParticipants = useCallStore((s) => s.remoteParticipants);
   const activeSpeakerIds = useCallStore((s) => s.activeSpeakerIds);
   const storedPosition = useCallStore((s) => s.miniPosition);
+  // A minimised call is exactly when a user most needs to be told the connection
+  // has gone: they are looking at something else and would otherwise discover it
+  // by talking into silence.
+  const reconnecting = useCallStore(isCallStalled);
 
   const isVideo = callType === 'video';
   const size = isVideo ? SIZE.video : SIZE.voice;
@@ -161,9 +165,13 @@ export const MinimizedCallBanner = () => {
     || shown?.display_name
     || (callState === 'outgoing_ringing' ? 'Calling…' : 'Active call');
 
-  const status = callState === 'connected'
-    ? formatDuration(callDuration)
-    : callState === 'outgoing_ringing' ? 'Ringing…' : 'Connecting…';
+  // Reconnecting outranks the duration here for the same reason as in the full
+  // view: a clock ticking over dead audio is worse than no clock at all.
+  const status = reconnecting
+    ? 'Connecting…'
+    : callState === 'connected'
+      ? formatDuration(callDuration)
+      : callState === 'outgoing_ringing' ? 'Ringing…' : 'Connecting…';
 
   return (
     // AnimatePresence WRAPS the conditional. It used to sit below an early

@@ -48,6 +48,27 @@ export const notifyCameraUnavailable = (reason) => {
 };
 
 /**
+ * A camera the user asked for MID-CALL and could not have.
+ *
+ * Deliberately not `notifyCameraUnavailable`: that says "continuing with audio only",
+ * which is the right sentence when a call is being established and the wrong one
+ * entirely when somebody has just pressed the camera button on a call that is already
+ * running — nothing is "continuing", their tap simply did not take, and the button has
+ * gone back to off. This says that instead.
+ */
+export const notifyCameraToggleFailed = (reason) => {
+  const message =
+    reason === 'permission_denied'
+      ? 'Camera blocked — allow camera access in your browser settings.'
+      : reason === 'device_busy'
+        ? 'Camera is in use by another app — close it and try again.'
+        : reason === 'device_missing'
+          ? 'No camera found.'
+          : 'Could not turn on your camera.';
+  toast.error(message, { duration: 6000 });
+};
+
+/**
  * Handle call-related errors with user-friendly messages.
  */
 export const handleCallError = (error, context = '') => {

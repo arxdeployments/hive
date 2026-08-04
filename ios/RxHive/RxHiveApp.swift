@@ -33,6 +33,12 @@ struct RxHiveApp: App {
                 auth.applicationDidEnterBackground()
             case .active:
                 auth.applicationWillEnterForeground()
+                // Returning to the foreground is the other moment call state can be
+                // stale: while backgrounded (with no call live) the socket is down, so
+                // any `call:*` frame published in that window went to a channel with no
+                // subscriber and is gone. Asking the server is the only way to find out
+                // that a call is ringing right now.
+                Task { await calls.reconcileWithServer() }
             default:
                 break
             }

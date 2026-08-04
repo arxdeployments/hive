@@ -5,9 +5,26 @@ rtc:
   port_range_start: 50000
   port_range_end: 50100
   tcp_port: 7881
-  # When the server sits behind NAT, set use_external_ip so clients get the
-  # public address in ICE candidates.
-  use_external_ip: true
+  # The address clients are told to send media to, in ICE candidates.
+  #
+  # `use_external_ip: true` makes the SFU STUN out and advertise the host's PUBLIC
+  # address. That is right for a deployed server behind NAT and wrong for anything
+  # on a LAN: a phone on the same Wi-Fi cannot reach its own network's public IP
+  # (home routers rarely hairpin), so signalling succeeds, the call shows as
+  # connected, and no media ever arrives. Nothing in the logs says so — it looks
+  # exactly like a broken app.
+  #
+  # It is also wrong to advertise nothing: with use_external_ip off and no node_ip,
+  # the SFU offers its own container address (172.x on the compose bridge), which no
+  # client outside Docker can reach either.
+  #
+  # So: set LIVEKIT_NODE_IP in infra/.env to the host's LAN address when testing
+  # against a phone or another machine, and leave it empty for a real deployment,
+  # which restores use_external_ip. Substituted at start-up by the livekit service's
+  # entrypoint, for the same reason webhook.api_key is — livekit-server does not
+  # expand env vars inside its config file.
+  use_external_ip: __LIVEKIT_USE_EXTERNAL_IP__
+  node_ip: __LIVEKIT_NODE_IP__
 redis:
   address: redis:6379
 

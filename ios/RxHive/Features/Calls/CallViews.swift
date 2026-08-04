@@ -86,10 +86,32 @@ final class CallSounds {
 
     private init() {}
 
+    /// Route the *ringing* tones to the speaker.
+    ///
+    /// `.playback`, not the call's `.playAndRecord`. This used to call
+    /// `LiveKitSession.configureAudioSession(speaker:)`, which meant a ringtone
+    /// configured the whole **call** session — microphone included — seconds before
+    /// LiveKit started its audio engine and configured it again. Two writers to one
+    /// session is how the session ended up without its voice-processing unit, and
+    /// without that there is no hardware echo cancellation.
+    ///
+    /// A ringtone needs no microphone and no interaction with the call session at
+    /// all: `.playback` routes to the speaker on its own, so a ringtone is audible
+    /// without the phone being at an ear. When the call connects, `stopAll()` hands
+    /// the session back and the SDK configures it for the call, alone.
+    private func routeTonesToSpeaker() {
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [])
+            try session.setActive(true, options: [])
+        } catch {
+            // An inaudible ringtone is not worth failing a call over — the UI still
+            // rings visually and the haptics still fire.
+        }
+    }
+
     func startRingtone() {
-        // Route to the speaker before ringing: a ringtone in the earpiece is
-        // inaudible unless the phone is already against an ear.
-        LiveKitSession.configureAudioSession(speaker: true)
+        routeTonesToSpeaker()
         play(
             Self.tone(
                 segments: [(800, 0.15), (0, 0.05), (600, 0.15), (0, 0.05), (800, 0.15)],
@@ -102,7 +124,7 @@ final class CallSounds {
     }
 
     func startRingback() {
-        LiveKitSession.configureAudioSession(speaker: true)
+        routeTonesToSpeaker()
         play(
             Self.tone(segments: [(440, 0.5), (0, 0.1), (440, 0.5)], totalDuration: 3.0),
             looping: true,
@@ -125,6 +147,12 @@ final class CallSounds {
         player = nil
         hapticTask?.cancel()
         hapticTask = nil
+        // Deliberately does NOT deactivate the session. During accept this runs
+        // moments before (or after) LiveKit starts its audio engine, and
+        // deactivating underneath it is the race that costs the call its echo
+        // cancellation. Leaving the `.playback` category in place is harmless — the
+        // SDK sets the call's own category when its engine starts, and iOS releases
+        // a playback session on its own once nothing is playing.
     }
 
     private func play(_ data: Data, looping: Bool, volume: Float) {
@@ -302,12 +330,15 @@ private struct RingingDots: View {
     }
 }
 
-/// Connection-quality dot. Only ever reflects the *local* leg — a remote peer's
-/// bad uplink is not something this user can act on.
+/// Connection-quality dot. Reflects the *local* leg's grade, or a reconnect on
+/// either side — a remote peer's grade is not something this user can act on, but a
+/// remote peer being absent very much affects what they are hearing.
 private struct NetworkQualityDot: View {
     let quality: CallNetworkQuality
+    var reconnecting = false
 
     private var color: Color {
+        if reconnecting { return Theme.Color.warning }
         switch quality {
         case .excellent: return Theme.Color.primary
         case .good: return Theme.Color.warning
@@ -317,6 +348,7 @@ private struct NetworkQualityDot: View {
     }
 
     private var label: String {
+        if reconnecting { return "Reconnecting" }
         switch quality {
         case .excellent: return "Excellent connection"
         case .good: return "Good connection"
@@ -329,7 +361,51 @@ private struct NetworkQualityDot: View {
         Circle()
             .fill(color)
             .frame(width: 7, height: 7)
+            .opacity(reconnecting ? 0.45 : 1)
+            .animation(
+                reconnecting ? .easeInOut(duration: 0.7).repeatForever() : .default,
+                value: reconnecting
+            )
             .accessibilityLabel(label)
+    }
+}
+
+/// The reconnect banner.
+///
+/// An overlay on the live call, deliberately not a replacement for it: the call has
+/// NOT ended, the SFU is very often still carrying audio, and swapping the screen out
+/// would tell the user the opposite of the truth. It floats over whatever was already
+/// there — video keeps its last frame, and the hang-up button stays reachable, which
+/// matters most precisely when the connection is struggling.
+private struct ReconnectingBanner: View {
+    let isVisible: Bool
+
+    var body: some View {
+        VStack {
+            if isVisible {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(Theme.Color.warning)
+                        .frame(width: 7, height: 7)
+                    Text("Connecting…")
+                        .font(Theme.Typography.font(size: 13, weight: .medium))
+                        .foregroundStyle(Theme.Color.text)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(
+                    Capsule()
+                        .fill(Theme.Color.bg.opacity(0.75))
+                        .overlay(Capsule().stroke(Theme.Color.warning.opacity(0.4), lineWidth: 1))
+                )
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .accessibilityAddTraits(.updatesFrequently)
+            }
+            Spacer()
+        }
+        .padding(.top, 56)
+        .allowsHitTesting(false)
+        .animation(Theme.Motion.ease, value: isVisible)
     }
 }
 
@@ -539,6 +615,9 @@ struct OutgoingCallView: View {
 /// The live call: 1:1 video, group grid, or the voice/connecting/ended avatar view.
 struct ActiveCallView: View {
     @EnvironmentObject private var calls: CallStore
+    @EnvironmentObject private var auth: AuthStore
+
+    @State private var showAddPeople = false
 
     private var isConnected: Bool {
         if case .active = calls.phase { return true }
@@ -550,8 +629,15 @@ struct ActiveCallView: View {
         return false
     }
 
+    /// Any leg of the call currently not carrying — ours, our signalling, or a peer's.
+    private var isReconnecting: Bool { calls.isStalled }
+
     private var statusText: String {
         if isEnded { return "Call ended" }
+        // Reconnecting outranks the duration. A clock ticking over dead audio is the
+        // single most misleading thing a call UI can show, and it is exactly what
+        // happened before: the SFU had dropped us and the timer carried on regardless.
+        if isReconnecting { return "Connecting…" }
         if isConnected { return calls.elapsedLabel }
         return "Connecting"
     }
@@ -566,6 +652,7 @@ struct ActiveCallView: View {
                 avatarCall
             }
         }
+        .overlay(ReconnectingBanner(isVisible: isReconnecting && !isEnded))
         .onChange(of: calls.phase) { _, phase in
             switch phase {
             case .active: CallSounds.shared.playConnected()
@@ -625,7 +712,9 @@ struct ActiveCallView: View {
         ZStack {
             RoundedRectangle(cornerRadius: 14).fill(Theme.Color.surface)
             if calls.isCameraOn, let track = calls.localVideoTrack {
-                CallVideoView(track: track, mirrored: true)
+                // No `mirror:` — the default is facing-aware. Forcing `.mirror` here
+                // flipped the back camera too. See CallVideoView.mirror.
+                CallVideoView(track: track)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
             } else {
                 Image(systemName: "video.slash.fill")
@@ -647,11 +736,49 @@ struct ActiveCallView: View {
         ZStack {
             Theme.Color.bg.ignoresSafeArea()
             VStack(spacing: 0) {
-                topBar(title: calls.peerName, subtitle: "\(calls.participants.count + 1) participants")
+                topBar(
+                    title: calls.peerName,
+                    subtitle: participantSubtitle,
+                    // Group calls only. The server refuses to add a third party to a
+                    // 1:1 by design, so there is nothing this could do on the other
+                    // call screens.
+                    onAddPeople: { showAddPeople = true }
+                )
                 VideoGrid()
                 controls
             }
         }
+        .sheet(isPresented: $showAddPeople) {
+            GroupMemberPickerView(
+                excludedUserIDs: alreadyOnCall,
+                title: "Add to call",
+                everyoneExcludedTitle: "Everyone is already here",
+                everyoneExcludedMessage:
+                    "Every active person in your organization is already on this call or being called."
+            ) { picked in
+                await calls.invite(
+                    userIDs: picked.map(\.id),
+                    names: Dictionary(picked.map { ($0.id, $0.displayName) }, uniquingKeysWith: { first, _ in first })
+                )
+            }
+        }
+    }
+
+    /// "3 participants", plus who is still being rung — an invite that has not been
+    /// answered is worth saying out loud rather than leaving as a silent tile.
+    private var participantSubtitle: String {
+        let count = calls.participants.count + 1
+        let people = "\(count) participant\(count == 1 ? "" : "s")"
+        guard !calls.pendingInvitees.isEmpty else { return people }
+        return "\(people) · \(calls.pendingInvitees.count) ringing"
+    }
+
+    /// Nobody who is already here, on their way here, or is us.
+    private var alreadyOnCall: Set<String> {
+        var ids = Set(calls.participants.map(\.id))
+        ids.formUnion(calls.pendingInvitees.map(\.id))
+        if let me = auth.currentUser?.id { ids.insert(me) }
+        return ids
     }
 
     // MARK: Voice / connecting / ended
@@ -683,7 +810,7 @@ struct ActiveCallView: View {
                     name: calls.peerName,
                     avatarPath: calls.peerAvatarPath,
                     isGroup: calls.isGroupCall,
-                    pulsing: !isConnected && !isEnded,
+                    pulsing: (!isConnected || isReconnecting) && !isEnded,
                     highlighted: calls.participants.contains { $0.isSpeaking }
                 )
                 .padding(.bottom, Theme.Layout.spacing6)
@@ -695,7 +822,7 @@ struct ActiveCallView: View {
                     .padding(.horizontal, Theme.Layout.spacing6)
 
                 HStack(spacing: Theme.Layout.spacing2) {
-                    if isConnected {
+                    if isConnected && !isReconnecting {
                         NetworkQualityDot(quality: calls.networkQuality)
                         Text(statusText)
                             .font(Theme.Typography.subheadline.monospacedDigit())
@@ -727,7 +854,11 @@ struct ActiveCallView: View {
 
     // MARK: Chrome
 
-    private func topBar(title: String, subtitle: String? = nil) -> some View {
+    private func topBar(
+        title: String,
+        subtitle: String? = nil,
+        onAddPeople: (() -> Void)? = nil
+    ) -> some View {
         HStack {
             Button {
                 calls.minimise()
@@ -747,7 +878,7 @@ struct ActiveCallView: View {
                     .foregroundStyle(Theme.Color.text)
                     .lineLimit(1)
                 HStack(spacing: 5) {
-                    NetworkQualityDot(quality: calls.networkQuality)
+                    NetworkQualityDot(quality: calls.networkQuality, reconnecting: isReconnecting)
                     Text([subtitle, statusText].compactMap { $0 }.joined(separator: " · "))
                         .font(Theme.Typography.micro.monospacedDigit())
                         .foregroundStyle(Theme.Color.textMuted)
@@ -756,18 +887,29 @@ struct ActiveCallView: View {
 
             Spacer()
 
-            if calls.isVideoCall && calls.isCameraOn {
-                Button {
-                    calls.flipCamera()
-                } label: {
-                    Image(systemName: "arrow.triangle.2.circlepath.camera")
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(Theme.Color.text.opacity(0.8))
-                        .frame(width: Theme.Layout.minTouchTarget, height: Theme.Layout.minTouchTarget)
+            HStack(spacing: 0) {
+                if let onAddPeople {
+                    Button(action: onAddPeople) {
+                        Image(systemName: "person.badge.plus")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(Theme.Color.text.opacity(0.8))
+                            .frame(width: Theme.Layout.minTouchTarget, height: Theme.Layout.minTouchTarget)
+                    }
+                    .accessibilityLabel("Add people to call")
                 }
-                .accessibilityLabel("Switch camera")
-            } else {
-                Color.clear.frame(width: Theme.Layout.minTouchTarget, height: Theme.Layout.minTouchTarget)
+                if calls.isVideoCall && calls.isCameraOn {
+                    Button {
+                        calls.flipCamera()
+                    } label: {
+                        Image(systemName: "arrow.triangle.2.circlepath.camera")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(Theme.Color.text.opacity(0.8))
+                            .frame(width: Theme.Layout.minTouchTarget, height: Theme.Layout.minTouchTarget)
+                    }
+                    .accessibilityLabel("Switch camera")
+                } else if onAddPeople == nil {
+                    Color.clear.frame(width: Theme.Layout.minTouchTarget, height: Theme.Layout.minTouchTarget)
+                }
             }
         }
         .padding(.horizontal, Theme.Layout.spacing2)
@@ -834,9 +976,19 @@ struct MinimisedCallPill: View {
     }
 
     private var status: String {
+        // A minimised call is exactly when the user most needs to be told the connection
+        // has gone — they are looking at something else and would otherwise find out by
+        // talking into silence.
+        if calls.isStalled { return "Connecting…" }
         if case .active = calls.phase { return calls.elapsedLabel }
         if case .outgoing = calls.phase { return "Ringing…" }
         return "Connecting…"
+    }
+
+    /// Amber while reconnecting, green while carrying. The dot is the only status this
+    /// window has room for, so it has to be honest.
+    private var statusTint: Color {
+        calls.isStalled ? Theme.Color.warning : Theme.Color.primary
     }
 
     /// True when the featured participant has a frame worth showing. A video call
@@ -865,7 +1017,7 @@ struct MinimisedCallPill: View {
                         }
                         HStack(spacing: 4) {
                             Circle()
-                                .fill(Theme.Color.primary)
+                                .fill(statusTint)
                                 .frame(width: 6, height: 6)
                             Text(status)
                                 .font(Theme.Typography.micro.monospacedDigit())
@@ -894,7 +1046,7 @@ struct MinimisedCallPill: View {
                                 .lineLimit(1)
                             Text(status)
                                 .font(Theme.Typography.micro.monospacedDigit())
-                                .foregroundStyle(Theme.Color.primary)
+                                .foregroundStyle(statusTint)
                         }
                         Spacer(minLength: 0)
                     }
@@ -955,7 +1107,16 @@ struct VideoGrid: View {
     @EnvironmentObject private var calls: CallStore
     @EnvironmentObject private var auth: AuthStore
 
-    /// Local first, then remotes in the store's (name-sorted) order.
+    /// Local first, then the remotes worth looking at, then whoever is still ringing.
+    ///
+    /// The local tile is pinned: a call where you cannot see yourself reads as broken.
+    /// Past that, the order is whoever is contributing — talking first, then anyone with
+    /// a live camera or screen share — rather than whoever happened to join earliest.
+    /// With more people than fit on a phone screen, join order puts the person currently
+    /// speaking below the fold as often as not.
+    ///
+    /// Ties keep the store's name sort, which is what stops tiles reshuffling on every
+    /// roster rebuild.
     private var tiles: [Tile] {
         var result: [Tile] = [
             Tile(
@@ -968,10 +1129,11 @@ struct VideoGrid: View {
                 isSpeaking: false,
                 isScreenShare: false,
                 isLocal: true,
-                hasMedia: true
+                hasMedia: true,
+                isRinging: false
             )
         ]
-        result.append(contentsOf: calls.participants.map { participant in
+        let remotes = calls.participants.map { participant in
             Tile(
                 id: participant.id,
                 name: participant.displayName,
@@ -982,7 +1144,33 @@ struct VideoGrid: View {
                 isSpeaking: participant.isSpeaking,
                 isScreenShare: participant.isScreenShare,
                 isLocal: false,
-                hasMedia: participant.hasMedia
+                hasMedia: participant.hasMedia,
+                isRinging: false
+            )
+        }
+        result.append(contentsOf: remotes.enumerated().sorted { lhs, rhs in
+            if lhs.element.isSpeaking != rhs.element.isSpeaking { return lhs.element.isSpeaking }
+            let lhsLive = lhs.element.isScreenShare || lhs.element.track != nil
+            let rhsLive = rhs.element.isScreenShare || rhs.element.track != nil
+            if lhsLive != rhsLive { return lhsLive }
+            return lhs.offset < rhs.offset
+        }.map(\.element))
+
+        // Invited, not answered. Last, always: a placeholder must never push somebody
+        // who is actually in the call off the visible part of the grid.
+        result.append(contentsOf: calls.pendingInvitees.map { brief in
+            Tile(
+                id: "pending-\(brief.id)",
+                name: brief.displayName,
+                avatarPath: brief.avatarURL,
+                track: nil,
+                isMuted: false,
+                isCameraOff: true,
+                isSpeaking: false,
+                isScreenShare: false,
+                isLocal: false,
+                hasMedia: false,
+                isRinging: true
             )
         })
         return result
@@ -1046,6 +1234,10 @@ struct VideoGrid: View {
         let isScreenShare: Bool
         let isLocal: Bool
         let hasMedia: Bool
+        /// Invited, still ringing. Labelled differently from a participant who is
+        /// merely connecting: an avatar with no label is indistinguishable from
+        /// somebody whose camera is off, which would claim they are on the call.
+        let isRinging: Bool
     }
 }
 
@@ -1058,12 +1250,20 @@ private struct VideoTile: View {
                 .fill(Theme.Color.surface)
 
             if let track = tile.track {
-                CallVideoView(track: track, fitsContent: tile.isScreenShare, mirrored: tile.isLocal)
+                // `mirrored: tile.isLocal` was the group-call bug: it mirrored the
+                // local tile whichever camera was feeding it. The default mirrors a
+                // front camera and leaves a back camera alone, per frame.
+                CallVideoView(track: track, fitsContent: tile.isScreenShare)
                     .clipShape(RoundedRectangle(cornerRadius: Theme.Layout.radiusCard))
             } else {
                 VStack(spacing: Theme.Layout.spacing2) {
                     Avatar(name: tile.name, urlPath: tile.avatarPath, size: 64)
-                    if !tile.hasMedia {
+                        .opacity(tile.isRinging ? 0.5 : 1)
+                    if tile.isRinging {
+                        Text("Ringing…")
+                            .font(Theme.Typography.micro)
+                            .foregroundStyle(Theme.Color.primary)
+                    } else if !tile.hasMedia {
                         Text("Connecting…")
                             .font(Theme.Typography.micro)
                             .foregroundStyle(Theme.Color.textMuted)
