@@ -288,37 +288,50 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     last_active_check = now_utc()
     conn_id = uuid.uuid4().hex
     await registry.add(user.id, conn_id, websocket)
-    came_online = await presence.mark_online(user.id, conn_id)
-    if came_online:
-        async with SessionLocal() as db:
-            db_user = await db.get(User, user.id)
-            if db_user:
-                db_user.last_seen_at = now_utc()
-                await db.commit()
-        await _broadcast_presence(user, "online")
-
-    await websocket.send_text(
-        json.dumps({"type": "connected", "user_id": str(user.id), "timestamp": iso_z(now_utc())})
-    )
-
-    # A socket coming up is the only moment we can repair call state this user missed
-    # while it was down: closing any grace window a previous drop opened, and
-    # re-delivering the ring (or full connected state) that was published to a channel
-    # with no subscriber. That second half is what makes a call placed during the
-    # callee's reconnect survive at all — previously the ring was simply lost and the
-    # phone never rang, while the server went on ringing for another forty seconds.
-    #
-    # Best-effort: a Redis hiccup here must not refuse an otherwise good socket.
-    # Clients additionally fetch GET /api/calls/active on connect, so a frame lost
-    # here still self-heals.
-    from app.services.calls import resume_calls_for
-
-    with contextlib.suppress(Exception):
-        await resume_calls_for(user.id)
-
-    window_start = now_utc()
-    window_count = 0
+    # The try opens HERE — immediately after the socket enters the registry —
+    # rather than after the handshake below, because the teardown in `finally` is
+    # the only thing that ever removes it. Three of the awaits between this line
+    # and the receive loop raise in ordinary operation: presence.mark_online talks
+    # to Redis, the last_seen_at block talks to Postgres, and send_text fails
+    # outright for a tab that navigated away mid-handshake. With the guard
+    # starting later, any of those escaping left the entry in
+    # LocalRegistry.connections and the user's Redis channel subscribed for the
+    # life of the process — nothing else prunes them. A Redis blip during a
+    # reconnect storm therefore leaked a socket per failed handshake, left _reader
+    # fanning every future event at a dead connection, drifted the ws_local_sockets
+    # gauge upward permanently, and skipped handle_user_link_down so a call the
+    # user was in never got its grace window.
     try:
+        came_online = await presence.mark_online(user.id, conn_id)
+        if came_online:
+            async with SessionLocal() as db:
+                db_user = await db.get(User, user.id)
+                if db_user:
+                    db_user.last_seen_at = now_utc()
+                    await db.commit()
+            await _broadcast_presence(user, "online")
+
+        await websocket.send_text(
+            json.dumps({"type": "connected", "user_id": str(user.id), "timestamp": iso_z(now_utc())})
+        )
+
+        # A socket coming up is the only moment we can repair call state this user missed
+        # while it was down: closing any grace window a previous drop opened, and
+        # re-delivering the ring (or full connected state) that was published to a channel
+        # with no subscriber. That second half is what makes a call placed during the
+        # callee's reconnect survive at all — previously the ring was simply lost and the
+        # phone never rang, while the server went on ringing for another forty seconds.
+        #
+        # Best-effort: a Redis hiccup here must not refuse an otherwise good socket.
+        # Clients additionally fetch GET /api/calls/active on connect, so a frame lost
+        # here still self-heals.
+        from app.services.calls import resume_calls_for
+
+        with contextlib.suppress(Exception):
+            await resume_calls_for(user.id)
+
+        window_start = now_utc()
+        window_count = 0
         while True:
             try:
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=HEARTBEAT_TIMEOUT)
