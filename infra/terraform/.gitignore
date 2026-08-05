@@ -1,5 +1,9 @@
 .terraform/
-.terraform.lock.hcl
+# .terraform.lock.hcl is deliberately NOT ignored. HashiCorp's guidance is to
+# commit it: the provider constraints here are ~> ranges, so without the lock a
+# fresh clone resolves whatever the registry serves that day and two operators
+# can apply the same code against different provider builds. It also records the
+# checksums that make a provider swap detectable.
 *.tfstate
 *.tfstate.*
 *.tfvars

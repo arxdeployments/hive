@@ -1,7 +1,11 @@
 FROM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci || npm install
+# `npm ci` alone, not `npm ci || npm install`. The fallback made a lockfile that
+# disagreed with package.json a silent non-event: npm install would resolve
+# fresh versions, write a different tree than CI's `npm ci` step validated, and
+# the docker-images job could never detect the drift it exists to catch.
+RUN npm ci
 COPY . .
 RUN npm run build
 

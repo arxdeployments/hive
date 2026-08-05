@@ -1,0 +1,19 @@
+# Without this, `COPY . .` in the Dockerfile copies the host's node_modules over
+# the one `npm ci` just built inside the image — macOS/arm64 native binaries
+# landing in a linux container — and ships .git and dist into the build stage.
+# It also sent the entire directory to the daemon as build context on every
+# build, including anything a developer happens to have lying around.
+node_modules
+dist
+test-results
+playwright-report
+.git
+.gitignore
+Dockerfile
+.dockerignore
+
+# Never let a real environment file into the build context. `.env.example` is
+# the template and is re-included below.
+.env
+.env.*
+!.env.example

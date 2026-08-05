@@ -5,9 +5,27 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege for GITHUB_TOKEN. With no `permissions:` block the token
+# inherits the repository default, which for older repositories is write-all —
+# every job here, including the ones that execute third-party actions and a
+# remote install script, would hold a token that can push to main and edit
+# releases. Nothing in this workflow writes to the repository; it checks out
+# code and runs tests. Artifact upload does not need `contents: write`.
+permissions:
+  contents: read
+
+# One run per ref. Without this, three pushes to a branch in quick succession
+# run three full pipelines to completion — and this pipeline boots Postgres,
+# Redis, MinIO, a LiveKit SFU and a browser. Superseded PR runs are cancelled;
+# pushes to main are not, so main always has a complete result per commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 25  # Postgres + Redis + MinIO come up, then ~170 tests
     services:
       postgres:
         image: postgres:16-alpine
@@ -76,6 +94,7 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # npm ci, lint and a Vite build
     defaults:
       run:
         working-directory: frontend
@@ -96,6 +115,7 @@ jobs:
     # Catches frontend calls to endpoints the API doesn't expose. This class of
     # bug lints and builds cleanly and only fails at runtime in a browser.
     runs-on: ubuntu-latest
+    timeout-minutes: 10  # a pip install and one text scan
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -106,8 +126,35 @@ jobs:
       - run: pip install -r backend/requirements.txt
       - run: python scripts/check_contracts.py
 
+  terraform:
+    # The infrastructure had no automated check of any kind: a syntax error, a
+    # bad reference or an unformatted file was discovered by an operator running
+    # a live apply against production. `init -backend=false` needs no AWS
+    # credentials and no state, so this is a pure static check.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/terraform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9"
+          terraform_wrapper: false
+      - name: Format
+        run: terraform fmt -check -recursive -diff
+      - name: Init (no backend, no credentials)
+        # Uses the committed .terraform.lock.hcl, which carries checksums for
+        # linux_amd64 among four platforms — without those this step cannot
+        # resolve providers on a Linux runner at all.
+        run: terraform init -backend=false -input=false
+      - name: Validate
+        run: terraform validate -no-color
+
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 40  # full stack + LiveKit + Playwright; the suite runs ~4 min locally
     needs: [backend, frontend]
     services:
       postgres:
@@ -180,13 +227,20 @@ jobs:
 
       - name: Start API
         working-directory: backend
-        run: |
-          uvicorn app.main:app --host 127.0.0.1 --port 8000 &
-          echo "API_PID=$!" >> $GITHUB_ENV
+        # No PID is recorded: nothing read the API_PID that used to be exported
+        # here, so it promised a cleanup step that does not exist. The runner is
+        # torn down with the job, which is what actually stops the process.
+        run: uvicorn app.main:app --host 127.0.0.1 --port 8000 &
 
-      # Calling tests need a real SFU; without one they skip rather than fail.
+      # Calling tests need a real SFU. Without one they skip rather than fail —
+      # which is why this step must fail loudly instead: a silent skip takes the
+      # 18 calling specs out of the run and the job still reports green.
       - name: Start LiveKit SFU
         run: |
+          # pipefail, because the default is for `curl ... | bash` to report the
+          # exit status of bash alone. A failed or empty download then "succeeds"
+          # and the missing binary only surfaces further down.
+          set -o pipefail
           curl -sSL https://get.livekit.io | bash
           cat > /tmp/livekit.yaml <<'YAML'
           port: 7880
@@ -200,7 +254,21 @@ jobs:
           YAML
           LIVEKIT_KEYS="devkey: devsecret-at-least-32-characters-long" \
             livekit-server --config /tmp/livekit.yaml &
-          for i in $(seq 1 30); do curl -sf http://127.0.0.1:7880 >/dev/null && break; sleep 1; done
+          # A bare `for ... do curl && break; sleep 1; done` always exits 0 — the
+          # loop's status is the last `sleep`. So an SFU that never came up left
+          # this step green, global-setup logged "calling tests will skip", and
+          # the job passed having tested no calls at all. Calls are the part of
+          # this app that breaks most; losing that coverage silently is worse
+          # than a red build.
+          ready=
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:7880 >/dev/null; then ready=1; break; fi
+            sleep 1
+          done
+          if [ -z "$ready" ]; then
+            echo "::error::LiveKit SFU never answered on :7880 — the calling E2E tests would silently skip."
+            exit 1
+          fi
 
       - name: Install frontend + browsers
         working-directory: frontend
@@ -224,6 +292,7 @@ jobs:
 
   docker-images:
     runs-on: ubuntu-latest
+    timeout-minutes: 25  # two image builds from cold
     needs: [backend, frontend]
     steps:
       - uses: actions/checkout@v4
