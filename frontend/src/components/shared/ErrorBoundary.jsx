@@ -1,5 +1,5 @@
 import React from 'react';
-import { AlertTriangle, RefreshCw } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, RefreshCw } from 'lucide-react';
 
 export class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -61,19 +61,42 @@ export class ChatErrorBoundary extends React.Component {
     console.error('RxHive Chat Panel Error:', error, errorInfo);
   }
 
+  // Retry alone is only an escape route when the panel is one pane of several.
+  // Where the fallback is the entire screen — the mobile chat panel, whose own
+  // back button died with the panel — a deterministic error re-throws straight
+  // back into this fallback and there is nothing else to touch. Callers in that
+  // position pass onBack to put a second, always-working exit next to Try again.
   render() {
     if (this.state.hasError) {
+      const { onBack, backLabel = 'Back to chats' } = this.props;
       return (
         <div className="flex-1 flex items-center justify-center bg-[#0A0A0A]">
           <div className="text-center p-6">
             <AlertTriangle size={24} className="text-[#EF4444] mx-auto mb-3" />
             <p className="text-[#A3A3A3] text-sm mb-3">Something went wrong in this panel.</p>
-            <button
-              onClick={() => this.setState({ hasError: false })}
-              className="px-4 py-1.5 bg-[#1F1F1F] text-[#F5F5F5] rounded-[6px] text-xs hover:bg-[#2A2A2A] transition-colors"
-            >
-              Try again
-            </button>
+            <div className="flex items-center justify-center gap-2">
+              <button
+                onClick={() => this.setState({ hasError: false })}
+                className="px-4 py-1.5 bg-[#1F1F1F] text-[#F5F5F5] rounded-[6px] text-xs hover:bg-[#2A2A2A] transition-colors"
+                data-testid="chat-error-retry"
+              >
+                Try again
+              </button>
+              {onBack && (
+                // Clearing hasError here is belt-and-braces: the mobile caller
+                // unmounts this boundary, and React batches both updates so the
+                // unmount wins. It only matters for a caller that keeps the
+                // boundary mounted, where leaving hasError set would strand it.
+                <button
+                  onClick={() => { this.setState({ hasError: false }); onBack(); }}
+                  className="flex items-center gap-1.5 px-4 py-1.5 bg-[#1F1F1F] text-[#F5F5F5] rounded-[6px] text-xs hover:bg-[#2A2A2A] transition-colors"
+                  data-testid="chat-error-back"
+                >
+                  <ArrowLeft size={12} />
+                  {backLabel}
+                </button>
+              )}
+            </div>
           </div>
         </div>
       );
