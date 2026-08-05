@@ -78,7 +78,15 @@ class Settings(BaseSettings):
     livekit_api_key: str = "devkey"
     livekit_api_secret: str = "devsecret-at-least-32-characters-long"
 
-    max_upload_bytes: int = 100 * 1024 * 1024  # 100 MB
+    # One upload ceiling for every kind of file, read by services/storage.py.
+    #
+    # 2 GB is not arbitrary. Starlette spools a multipart upload to a temp file
+    # once it passes 1 MB, and media.py hands that file object straight to S3, so
+    # the API never holds the payload in memory — but it does hold it on the
+    # instance's DISK for the length of the request. Two or three concurrent
+    # uploads at this size are what the box can absorb, not twenty. Lower it on a
+    # smaller instance.
+    max_upload_bytes: int = 2 * 1024 * 1024 * 1024  # 2 GB
     password_min_length: int = 10
 
     seed_superadmin_email: str = "admin@rhythmrx.ai"

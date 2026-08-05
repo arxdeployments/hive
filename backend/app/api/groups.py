@@ -10,7 +10,7 @@ descriptions, and a role_changed broadcast for creator succession on leave.
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.core.deps import TenantContext, get_tenant
@@ -32,15 +32,21 @@ MAX_GROUP_MEMBERS = 256
 _ADMIN_ROLES = (ParticipantRole.creator, ParticipantRole.admin)
 
 
+# Conversation.name is String(200); anything longer reached Postgres and came
+# back as a value-too-long DataError, i.e. a 500 for what is plainly bad input.
+# description and avatar_url are unbounded TEXT columns and need no cap here.
+_GROUP_NAME_MAX = 200
+
+
 class CreateGroupRequest(BaseModel):
-    name: str
+    name: str = Field(max_length=_GROUP_NAME_MAX)
     description: str | None = None
     avatar_url: str | None = None
     member_ids: list[str]
 
 
 class UpdateGroupRequest(BaseModel):
-    name: str | None = None
+    name: str | None = Field(default=None, max_length=_GROUP_NAME_MAX)
     description: str | None = None
     avatar_url: str | None = None
     admin_only_messages: bool | None = None

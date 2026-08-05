@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import uuid
 
 import jwt
 from httpx import ASGITransport, AsyncClient
@@ -259,17 +260,32 @@ async def test_unknown_types_are_stored_as_octet_stream(client, two_orgs_with_us
             assert resp.json()["mime_type"] == "application/octet-stream", name
 
 
-async def test_upload_still_refuses_past_the_ceiling(client, two_orgs_with_users):
+async def test_upload_still_refuses_past_the_ceiling(client, two_orgs_with_users, monkeypatch):
     """One limit for every type now, but there is still a limit.
 
-    Asserted against the constant rather than by uploading 2 GB, which no test
-    should do. The route reads UploadFile.size, so this checks the branch is
-    wired to the right number rather than exercising the byte count.
+    This only ever asserted that the constant equalled 2 GB, so deleting the size
+    check from the upload route entirely would not have failed it. The ceiling is
+    lowered for the duration instead, which exercises the real rejection branch
+    without a test moving two gigabytes.
     """
     from app.services import storage
 
-    assert storage.MAX_UPLOAD_BYTES == 2 * 1024 * 1024 * 1024
+    # The shipped ceiling is the deliberate one, and it comes from the setting
+    # rather than a literal, so RXHIVE_MAX_UPLOAD_BYTES actually moves it.
+    assert storage.MAX_UPLOAD_BYTES == get_settings().max_upload_bytes
+    assert get_settings().max_upload_bytes == 2 * 1024 * 1024 * 1024
     assert storage.THUMBNAIL_SOURCE_LIMIT < storage.MAX_UPLOAD_BYTES
+
+    # Lowered for the duration so the real rejection branch runs without a test
+    # moving two gigabytes.
+    monkeypatch.setattr(storage, "MAX_UPLOAD_BYTES", 32)
+    async with _client_for("alice@a.com") as alice:
+        resp = await alice.post("/api/upload", files={"file": ("big.bin", io.BytesIO(b"x" * 64))})
+        assert resp.status_code == 400
+        assert "large" in resp.json()["detail"].lower()
+        # Just under the ceiling still succeeds — the branch discriminates.
+        ok = await alice.post("/api/upload", files={"file": ("small.bin", io.BytesIO(b"x" * 16))})
+        assert ok.status_code == 200, ok.text
 
 
 async def test_voice_note_duration_round_trip(client, two_orgs_with_users):
@@ -319,3 +335,66 @@ async def test_voice_note_duration_round_trip(client, two_orgs_with_users):
     resp = await client.get(f"/api/conversations/{conv}/messages")
     loaded = [m for m in resp.json()["messages"] if m["_id"] == sent["_id"]][0]
     assert loaded["duration"] == 12.4
+
+
+async def _seed_ringing_call(users) -> str:
+    """An inbound call to bob that is still ringing — the badge's live case."""
+    async with SessionLocal() as db:
+        call = Call(
+            org_id=users["org_a"].id,
+            initiated_by=users["alice"].id,
+            type=CallType.voice,
+            status=CallStatus.ringing,
+            room_name="",
+        )
+        db.add(call)
+        await db.flush()
+        call.room_name = room_name_for(call.id)
+        db.add_all(
+            [
+                CallParticipant(call_id=call.id, user_id=users["alice"].id),
+                CallParticipant(call_id=call.id, user_id=users["bob"].id),
+            ]
+        )
+        await db.commit()
+        return str(call.id)
+
+
+async def test_mark_seen_leaves_calls_that_are_still_ringing_unseen(client, two_orgs_with_users):
+    """Opening the Calls tab mid-ring must not pre-read the call that follows.
+
+    CallParticipant rows exist from initiation, so mark-seen used to stamp seen_at
+    on a call that was still ringing. When the ring then timed out into `missed`,
+    missed-count still skipped it — the one call the user most needed flagged was
+    the one silently marked read.
+    """
+    users = two_orgs_with_users
+    call_id = await _seed_ringing_call(users)
+
+    async with _client_for("bob@a.com") as bob:
+        assert (await bob.post("/api/calls/mark-seen")).status_code == 200
+
+        # The ring times out into a missed call, exactly as _ring_timeout does.
+        async with SessionLocal() as db:
+            call = await db.get(Call, uuid.UUID(call_id))
+            call.status = CallStatus.missed
+            await db.commit()
+
+        resp = await bob.get("/api/calls/missed-count")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["count"] == 1, "mark-seen swallowed a call that had not happened yet"
+
+
+async def test_mark_seen_still_clears_calls_that_have_finished(client, two_orgs_with_users):
+    """The other half of the contract: settled calls are cleared as before."""
+    users = two_orgs_with_users
+    call_id = await _seed_ringing_call(users)
+    async with SessionLocal() as db:
+        call = await db.get(Call, uuid.UUID(call_id))
+        call.status = CallStatus.missed
+        await db.commit()
+
+    async with _client_for("bob@a.com") as bob:
+        assert (await bob.get("/api/calls/missed-count")).json()["count"] == 1
+        assert (await bob.post("/api/calls/mark-seen")).status_code == 200
+        assert (await bob.get("/api/calls/missed-count")).json()["count"] == 0
