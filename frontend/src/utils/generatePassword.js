@@ -13,6 +13,14 @@ const DIGITS = '0123456789';
 const SYMBOLS = '!@#$%';
 const CHARS = LETTERS + DIGITS + SYMBOLS;
 
+// The longest password worth generating. bcrypt ignores everything past 72 bytes,
+// so enforce_password_policy rejects rather than silently truncates there
+// (BCRYPT_MAX_PASSWORD_BYTES, backend/app/core/security.py) — a longer value would
+// be refused on submit exactly like the missing-digit case above. Every character
+// in the alphabet is single-byte ASCII, so a character count is a byte count and
+// the frontend limit is the same number as the backend's.
+const MAX_LEN = 72;
+
 // Bytes come from the CSPRNG in blocks rather than one getRandomValues call per
 // character, because every draw below can reject and redraw.
 function byteReader() {
@@ -38,8 +46,17 @@ function byteReader() {
  * construction rather than merely close. The same rule covers the smaller ranges
  * used for the reserved characters and the shuffle below, where the bias would be
  * larger still: n = 10 splits 256 into 25 slots for six digits and 26 for four.
+ *
+ * The n <= 256 bound is checked rather than assumed, because exceeding it does not
+ * degrade the draw, it hangs the thread: for n > 256, `256 % n` is 256 and `limit`
+ * is 0, so `b >= limit` holds for every possible byte and the redraw loop below
+ * never terminates. One byte cannot address more than 256 values; a wider range
+ * needs a wider draw, not a wider argument.
  */
 function uniform(nextByte, n) {
+  if (!Number.isInteger(n) || n < 1 || n > 256) {
+    throw new RangeError(`uniform: n must be an integer in 1..256, got ${n}`);
+  }
   const limit = 256 - (256 % n);
   let b;
   do {
@@ -59,14 +76,16 @@ function uniform(nextByte, n) {
  * The generated value is the credential the new user is handed to sign in with.
  *
  * Always contains at least one letter and one digit, so the result is accepted by
- * enforce_password_policy for any `len` at or above the configured minimum. Two
- * characters is the floor at which that guarantee is expressible at all, and a
- * shorter password could not satisfy the policy's length rule regardless, so a
- * smaller `len` is a caller bug rather than something to silently round up.
+ * enforce_password_policy for any `len` in range. Two characters is the floor at
+ * which that guarantee is expressible at all, and a shorter password could not
+ * satisfy the policy's length rule regardless, so a smaller `len` is a caller bug
+ * rather than something to silently round up. MAX_LEN is the ceiling for the same
+ * reason in the other direction: past it the backend refuses the value, so
+ * returning one would hand back a credential that cannot be used.
  */
 export function generatePassword(len = 12) {
-  if (!Number.isInteger(len) || len < 2) {
-    throw new RangeError('generatePassword: len must be an integer >= 2');
+  if (!Number.isInteger(len) || len < 2 || len > MAX_LEN) {
+    throw new RangeError(`generatePassword: len must be an integer between 2 and ${MAX_LEN}`);
   }
   const nextByte = byteReader();
   const out = [
