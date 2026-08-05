@@ -3,7 +3,7 @@
 import uuid
 
 from fastapi import HTTPException
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -61,6 +61,24 @@ async def get_or_create_direct(
         and (me.org_id is None or other.org_id is None or me.org_id != other.org_id)
     ):
         raise HTTPException(status_code=403, detail="You are not permitted to message this person")
+
+    # Serialize the check-then-act below, per pair of users. Nothing in the schema
+    # constrains "one direct conversation per pair" — conversations has only an
+    # org_id index — so two requests that interleave between the lookup and the
+    # commit both create one. That is reachable in ordinary use, not just under
+    # load: POST /api/conversations/direct, forward_message's contact fan-out and
+    # initiate_direct_call all land here, so Alice tapping call on Bob at the
+    # moment Bob opens a chat with her is enough. The duplicates are permanent and
+    # user-visible — two threads with the same person, each holding half the
+    # history — and neither client has any way to merge them.
+    #
+    # An advisory lock rather than a unique index because the index would need a
+    # migration over existing data that may already contain duplicates. The lock
+    # is transaction-scoped, so the commit below releases it.
+    lo, hi = sorted((me.id, other.id), key=str)
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:pair, 0))").bindparams(pair=f"direct:{lo}:{hi}")
+    )
 
     existing = await find_direct(db, me.id, other.id)
     if existing is not None:

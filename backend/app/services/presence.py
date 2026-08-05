@@ -18,12 +18,21 @@ def _key(user_id) -> str:
 
 
 async def mark_online(user_id: uuid.UUID, conn_id: str) -> bool:
-    """Register a connection. Returns True if the user just came online."""
-    redis = get_redis()
+    """Register a connection. Returns True if the user just came online.
+
+    MULTI, because the caller uses the result as an edge trigger and separate
+    round trips lose that edge: when a phone and a browser tab connect within the
+    same few milliseconds both SADDs land before either SCARD, so both read
+    count == 2, both return False, and nobody ever publishes the `online`
+    presence event — the user stays grey to every conversation partner until
+    something unrelated forces a refetch.
+    """
+    pipe = get_redis().pipeline(transaction=True)
     key = _key(user_id)
-    added = await redis.sadd(key, conn_id)
-    await redis.expire(key, _TTL)
-    count = await redis.scard(key)
+    pipe.sadd(key, conn_id)
+    pipe.expire(key, _TTL)
+    pipe.scard(key)
+    added, _, count = await pipe.execute()
     return bool(added) and count == 1
 
 
@@ -32,11 +41,16 @@ async def refresh(user_id: uuid.UUID) -> None:
 
 
 async def mark_offline(user_id: uuid.UUID, conn_id: str) -> bool:
-    """Deregister a connection. Returns True if the user just went offline."""
-    redis = get_redis()
+    """Deregister a connection. Returns True if the user just went offline.
+
+    MULTI for the same reason as mark_online: the `offline` broadcast is an edge.
+    """
+    pipe = get_redis().pipeline(transaction=True)
     key = _key(user_id)
-    await redis.srem(key, conn_id)
-    return await redis.scard(key) == 0
+    pipe.srem(key, conn_id)
+    pipe.scard(key)
+    _, count = await pipe.execute()
+    return count == 0
 
 
 async def is_online(user_id) -> bool:
