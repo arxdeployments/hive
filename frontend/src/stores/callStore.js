@@ -56,6 +56,14 @@ const useCallStore = create((set, get) => ({
   callStartTime: null,
   callDuration: 0,
   durationInterval: null,
+  /**
+   * Handle for the 2s "Call ended" card timer, so a call that starts inside that
+   * window can cancel it. Without it, endCall's timer fired unconditionally and
+   * called resetCall on whatever call happened to be live by then — so an
+   * incoming call arriving within two seconds of the previous one ending had its
+   * ringing UI wiped out from under the user, with no missed-call trace.
+   */
+  endTimer: null,
   isMinimized: false,
   showCallUI: false,
   // Speaker (remote audio audible). Moved off ActiveCallView's local useState,
@@ -103,18 +111,27 @@ const useCallStore = create((set, get) => ({
    * stayed null on every outgoing call, so the mini window fell through to the
    * literal string 'Active Call' for anything the local user placed.
    */
-  initiateCall: (callId, callType, isGroup = false, conversationId = null, peer = null) => set({
-    callState: 'outgoing_ringing', callId, callType, isGroupCall: isGroup,
-    conversationId, showCallUI: true, isCameraOn: callType === 'video',
-    incomingCaller: peer,
-    mediaLinkState: LINK_OK, peerStates: {},
+  initiateCall: (callId, callType, isGroup = false, conversationId = null, peer = null) => set((prev) => {
+    // A new call cancels the previous call's teardown timer.
+    if (prev.endTimer) clearTimeout(prev.endTimer);
+    return {
+      callState: 'outgoing_ringing', callId, callType, isGroupCall: isGroup,
+      conversationId, showCallUI: true, isCameraOn: callType === 'video',
+      incomingCaller: peer, endTimer: null,
+      mediaLinkState: LINK_OK, peerStates: {},
+    };
   }),
 
-  receiveIncomingCall: (callId, caller, callType, isGroup = false, conversationId = null) => set({
-    callState: 'incoming_ringing', callId, callType,
-    incomingCaller: caller, isGroupCall: isGroup,
-    conversationId, showCallUI: true,
-    mediaLinkState: LINK_OK, peerStates: {},
+  receiveIncomingCall: (callId, caller, callType, isGroup = false, conversationId = null) => set((prev) => {
+    // The case this guard exists for: a call arriving inside the previous
+    // call's 2s "ended" window.
+    if (prev.endTimer) clearTimeout(prev.endTimer);
+    return {
+      callState: 'incoming_ringing', callId, callType,
+      incomingCaller: caller, isGroupCall: isGroup,
+      conversationId, showCallUI: true, endTimer: null,
+      mediaLinkState: LINK_OK, peerStates: {},
+    };
   }),
 
   setCallState: (state) => set({ callState: state }),
@@ -140,21 +157,30 @@ const useCallStore = create((set, get) => ({
   },
 
   endCall: () => {
-    const { durationInterval } = get();
+    const { durationInterval, endTimer } = get();
     if (durationInterval) clearInterval(durationInterval);
-    set({ callState: 'ended', showCallUI: true });
-    setTimeout(() => get().resetCall(), 2000);
+    if (endTimer) clearTimeout(endTimer);
+    // Capture which call this teardown belongs to. The timer below must only
+    // clear the state it was scheduled for — two seconds is long enough for the
+    // next call to have already started.
+    const endedId = get().callId;
+    const timer = setTimeout(() => {
+      const s = get();
+      if (s.callState === 'ended' && s.callId === endedId) s.resetCall();
+    }, 2000);
+    set({ callState: 'ended', showCallUI: true, endTimer: timer });
   },
 
   resetCall: () => {
-    const { durationInterval } = get();
+    const { durationInterval, endTimer } = get();
     if (durationInterval) clearInterval(durationInterval);
+    if (endTimer) clearTimeout(endTimer);
     set({
       callState: 'idle', callId: null, callType: null, isGroupCall: false,
       conversationId: null, localUser: null, remoteParticipants: [],
       pendingInvitees: [],
       incomingCaller: null, isMuted: false, isCameraOn: true,
-      callStartTime: null, callDuration: 0, durationInterval: null,
+      callStartTime: null, callDuration: 0, durationInterval: null, endTimer: null,
       isMinimized: false, showCallUI: false,
       speakerOn: true,
       localStream: null, localScreenStream: null, isScreenSharing: false,

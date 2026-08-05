@@ -612,8 +612,10 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       if (!store.conversations.some(c => c._id === data._id)) {
         store.setConversations([data, ...store.conversations]);
       }
+      // `convId` stamps the seed with the conversation it was written for, so a
+      // draft can never be handed to a different one — see the render site.
       const seed = quoteMsg
-        ? { token: `${quoteMsg._id}-${Date.now()}`, text: privateQuoteFor(quoteMsg) }
+        ? { convId: data._id, token: `${quoteMsg._id}-${Date.now()}`, text: privateQuoteFor(quoteMsg) }
         : null;
       if (data._id === conversationId) {
         // Already open: the conversation-switch effect that normally applies the
@@ -1430,10 +1432,25 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
             </div>
           ) : (
             <MessageComposer
+              // Keyed, so switching conversations REMOUNTS the composer rather
+              // than just re-rendering it. Its text and staged attachments live
+              // in local state with no reset of their own, so without this a
+              // message typed for one person stayed in the box when you opened
+              // someone else's thread — and `handleSend` targets whatever
+              // conversation is current, so the next Send delivered it to them.
+              // Staged images behaved the same way. The sibling per-conversation
+              // state is already reset by the [conversationId] effect above; the
+              // composer's simply lives one component down, out of its reach.
+              key={conversationId}
               conversationId={conversationId}
               onSend={handleSend}
               replyTo={replyTo}
-              draft={draft}
+              // Only ever this conversation's own draft. The effect that clears
+              // `draft` on a switch runs AFTER the remount above, so on the
+              // render that mounts the new composer this state still holds the
+              // previous conversation's seed — and the composer seeds itself
+              // from it on mount. Filtering here is ordering-independent.
+              draft={draft && draft.convId === conversationId ? draft : null}
             />
           )}
         </>
