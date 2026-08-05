@@ -2,9 +2,11 @@ import { toast } from 'sonner';
 import useChatStore from '../stores/chatStore';
 import useCallStore, { hasLiveCall, LINK_OK, LINK_RECONNECTING } from '../stores/callStore';
 import livekitClient from './livekitClient';
+import callSounds from './callSounds';
 import { refreshSession, sessionRejected, setSignOutReason } from '../api/client';
 import { withDerivedStatus, applyReadReceipt } from '../utils/messageStatus';
 import { handleCallJoinError, notifyCameraUnavailable } from '../utils/callErrors';
+import { isDesktopNotifDisabled } from '../utils/notificationPrefs';
 
 /**
  * Join the SFU and surface what happened. Every join site shares this so a
@@ -1352,22 +1354,11 @@ class RxHiveWebSocket {
   }
 
   _playNotificationSound() {
-    try {
-      if (localStorage.getItem('rxhive_notif_sound') === 'off') return;
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const oscillator = audioCtx.createOscillator();
-      const gainNode = audioCtx.createGain();
-      oscillator.connect(gainNode);
-      gainNode.connect(audioCtx.destination);
-      oscillator.frequency.value = 800;
-      oscillator.type = 'sine';
-      gainNode.gain.setValueAtTime(0.1, audioCtx.currentTime);
-      gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
-      oscillator.start(audioCtx.currentTime);
-      oscillator.stop(audioCtx.currentTime + 0.3);
-    } catch {
-      // autoplay policy may block audio
-    }
+    // Delegated to the shared sound manager, which owns one long-lived
+    // AudioContext. This built a new one per message and never closed it, and
+    // read the mute preference as 'off' — a value Settings never writes — so the
+    // toggle did nothing and the tone died off after the sixth message anyway.
+    callSounds.playMessage();
   }
 
   /**
@@ -1383,7 +1374,10 @@ class RxHiveWebSocket {
   async _showBrowserNotification(msg, convId, store) {
     try {
       if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
-      if (localStorage.getItem('rxhive_desktop_notif') === 'off') return;
+      // Was `=== 'off'`, which Settings never writes — it assigns a boolean, so
+      // the stored value is "true"/"false". Turning desktop notifications off
+      // therefore had no effect whatsoever.
+      if (isDesktopNotifDisabled()) return;
       // hasFocus() alone is not enough: a focused window on another tab still
       // means the user cannot see this conversation.
       if (document.hasFocus() && document.visibilityState === 'visible'

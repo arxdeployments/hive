@@ -1,3 +1,5 @@
+import { isSoundMuted } from '../utils/notificationPrefs';
+
 /**
  * Call sound manager using Web Audio API.
  * Respects user's notification sound settings.
@@ -17,7 +19,7 @@ class CallSoundManager {
   }
 
   _isMuted() {
-    return localStorage.getItem('rxhive_notif_sound') === 'false';
+    return isSoundMuted();
   }
 
   _playTone(freq, duration, volume = 0.1) {
@@ -34,7 +36,31 @@ class CallSoundManager {
       osc.start(ctx.currentTime);
       osc.stop(ctx.currentTime + duration);
       this._activeOscillators.push(osc);
+      // Drop it again when it finishes. `stopAll` was the only thing that ever
+      // emptied this array, which is survivable for call tones — a call has a
+      // bounded number of them — but playMessage() below runs once per inbound
+      // message, and a long session would otherwise retain an oscillator node
+      // for every message ever received.
+      osc.onended = () => {
+        const i = this._activeOscillators.indexOf(osc);
+        if (i !== -1) this._activeOscillators.splice(i, 1);
+      };
     } catch {}
+  }
+
+  /**
+   * The inbound-message tone.
+   *
+   * Lives here rather than in websocket.js, which had its own copy that
+   * constructed a brand new AudioContext for every single message and never
+   * closed one. Browsers cap concurrent contexts — Chrome at six — so after the
+   * sixth message the constructor threw, the throw was swallowed by that
+   * method's own catch, and message tones simply stopped for the rest of the
+   * session while each abandoned context kept its audio thread alive.
+   */
+  playMessage() {
+    if (this._isMuted()) return;
+    this._playTone(800, 0.3, 0.1);
   }
 
   playRingtone() {

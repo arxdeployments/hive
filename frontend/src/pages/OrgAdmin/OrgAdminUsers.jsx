@@ -6,10 +6,7 @@ import { PageTransition } from '../../components/common/PageTransition';
 import { useAuth } from '../../contexts/AuthContext';
 import client from '../../api/client';
 
-function genPassword(len=12) {
-  const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%';
-  let r = ''; for (let i=0;i<len;i++) r += c.charAt(Math.floor(Math.random()*c.length)); return r;
-}
+import { generatePassword as genPassword } from '../../utils/generatePassword';
 
 export default function OrgAdminUsers() {
   const { user: me } = useAuth();

@@ -5,13 +5,9 @@ import useCallStore from '../../stores/callStore';
 import wsClient from '../../services/websocket';
 import livekitClient from '../../services/livekitClient';
 import callSounds from '../../services/callSounds';
+import { isSoundMuted as isSoundOff } from '../../utils/notificationPrefs';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
-
-const isSoundOff = () => {
-  const setting = localStorage.getItem('rxhive_notif_sound');
-  return setting === 'off' || setting === 'false';
-};
 
 export const IncomingCallOverlay = () => {
   const { callState, callId, callType, incomingCaller, showCallUI, isGroupCall } = useCallStore();
