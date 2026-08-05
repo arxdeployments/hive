@@ -579,6 +579,48 @@ export function rectFrameToSource(rect, edit) {
   };
 }
 
+// A fold swaps the two edges on the axis it folded, and leaves the other axis alone.
+const FOLD_HORIZONTAL = { e: 'w', w: 'e' };
+const FOLD_VERTICAL = { n: 's', s: 'n' };
+const swapAnchor = (anchor, table) =>
+  (anchor ? [...anchor].map((c) => table[c] || c).join('') : anchor);
+
+/**
+ * Fold a drag whose span has gone negative, and report which edge the finger is on
+ * once it has.
+ *
+ * Dragging the east handle back past the west edge gives a negative width, which would
+ * render inside-out, so the rect is folded. But folding also SWAPS the roles of the two
+ * edges: the edge the gesture is not holding — the one fixed where the drag started — is
+ * now `x + w` rather than `x`, and the moving edge is `x`. That is precisely what a 'w'
+ * anchor describes, so the anchor has to fold with the rect.
+ *
+ * They are returned together because they are one fact, and a caller that applies the
+ * fold without the swap is the bug this exists to prevent: `clampFrameRect` decides
+ * which edge to pin from the anchor it is handed, so given the original 'e' it pins the
+ * LEFT edge of a rect whose left edge is the one being dragged. An east drag from
+ * `{ x: 0.2, w: 0.1 }` folded to `{ x: -0.2, w: 0.4 }` then came back as
+ * `{ x: 0, w: 0.4 }` — the fixed right edge pushed from 0.2 out to 0.4 by a gesture
+ * that was pulling the other way, so the crop grew on the side the finger had left.
+ *
+ * @returns {{rect: {x: number, y: number, w: number, h: number}, anchor: string}}
+ */
+export function foldDragRect(rect, anchor) {
+  let { x, y, w, h } = rect;
+  let folded = anchor;
+  if (w < 0) {
+    x += w;
+    w = -w;
+    folded = swapAnchor(folded, FOLD_HORIZONTAL);
+  }
+  if (h < 0) {
+    y += h;
+    h = -h;
+    folded = swapAnchor(folded, FOLD_VERTICAL);
+  }
+  return { rect: { x, y, w, h }, anchor: folded };
+}
+
 /**
  * Clamp a rect the user is dragging, in FRAME space, honouring a locked ratio.
  *
@@ -642,6 +684,10 @@ export function clampFrameRect(rect, frameWidth, frameHeight, ratio = null, anch
   // 'w' holds the right, 's' holds the top, 'n' holds the bottom. For the 'w'/'n'
   // cases the incoming rect still carries that fixed edge — CropStage moves x and w
   // by equal and opposite amounts — so `x + w` is the edge to preserve.
+  //
+  // This reads the anchor as given, so a drag that folded past its opposite edge must
+  // hand over the FOLDED anchor: see `foldDragRect`, which is the only thing that knows
+  // a fold happened (by the time a rect arrives here its span is positive again).
   const holdLeft = !!anchor?.includes('e');
   const holdRight = !!anchor?.includes('w');
   const holdTop = !!anchor?.includes('s');
@@ -660,17 +706,38 @@ export function clampFrameRect(rect, frameWidth, frameHeight, ratio = null, anch
   else if (holdBottom) maxH = fixedBottom;
 
   if (ratio) {
-    // Both axes shrink by the same factor, or the locked ratio would not survive
-    // being fitted.
-    const scale = Math.min(1, maxW / w, maxH / h);
+    // The fit AND the minimum in ONE uniform factor, because a ratio survives a uniform
+    // scale and nothing else.
+    //
+    // The fit on its own is uniform and was fine. The minimum used to be applied after
+    // it, per axis, by the two `Math.max` lines that now live in the `else` — and a fit
+    // that drove one axis under MIN_CROP_SPAN then had only THAT axis lifted. So a crop
+    // locked to 16:9 came back at some other shape: dragging the north handle to the top
+    // of the picture with the bottom edge already 5% from the frame's edge returned a
+    // rect whose displayed ratio was 1.07 instead of the 0.5625 the user had chosen, and
+    // the lock is not re-applied afterwards, so that shape went into the export.
+    //
+    // Same construction as the `grow` step in the ratio pass above — clamp a single
+    // factor between "big enough for the minimum" and "small enough for the frame" —
+    // with the frame fit standing in for its floor of 1. Ordering the three the way it
+    // does keeps the same precedence the free path has always had: the minimum beats the
+    // fit (the fixed edge shifts by a hair rather than the handles piling up), and the
+    // frame beats both, because it is the one constraint with nowhere left to give. On
+    // an aspect so extreme that the minimum cannot be reached inside the frame at all,
+    // that last cap wins and the rect stays correctly proportioned instead — no preset
+    // gets anywhere near it (they would need a displayed ratio beyond 25:1).
+    const fit = Math.min(1, maxW / w, maxH / h);
+    const scale = Math.min(
+      Math.max(MIN_CROP_SPAN / w, MIN_CROP_SPAN / h, fit),
+      1 / w,
+      1 / h
+    );
     w *= scale;
     h *= scale;
   } else {
-    w = Math.min(w, maxW);
-    h = Math.min(h, maxH);
+    w = Math.max(Math.min(w, maxW), MIN_CROP_SPAN);
+    h = Math.max(Math.min(h, maxH), MIN_CROP_SPAN);
   }
-  w = Math.max(w, MIN_CROP_SPAN);
-  h = Math.max(h, MIN_CROP_SPAN);
 
   // Re-seat the held edge, now that the span is final.
   if (holdRight) x = fixedRight - w;

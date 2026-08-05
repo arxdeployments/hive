@@ -8,6 +8,7 @@ import {
   clampCrop,
   clampFrameRect,
   cropOf,
+  foldDragRect,
   frameSize,
   isQuarterTurned,
   normalizeRotation,
@@ -136,12 +137,13 @@ export const CropStage = ({
     if (start.anchor.includes('e')) { next.w = start.rect.w + dx; }
     if (start.anchor.includes('n')) { next.y = start.rect.y + dy; next.h = start.rect.h - dy; }
     if (start.anchor.includes('s')) { next.h = start.rect.h + dy; }
-    // Dragged past the opposite edge: fold the rect rather than letting a
-    // negative span through, which would render inside-out.
-    if (next.w < 0) { next.x += next.w; next.w = -next.w; }
-    if (next.h < 0) { next.y += next.h; next.h = -next.h; }
+    // Dragged past the opposite edge: fold the rect rather than letting a negative
+    // span through, which would render inside-out — and carry the anchor through the
+    // fold with it, because the finger is now on the OPPOSITE edge and
+    // `clampFrameRect` pins whichever edge the anchor names.
+    const folded = foldDragRect(next, start.anchor);
 
-    writeFrameRect(clampFrameRect(next, frame.width, frame.height, ratio, start.anchor));
+    writeFrameRect(clampFrameRect(folded.rect, frame.width, frame.height, ratio, folded.anchor));
   };
 
   const endDrag = (event) => {

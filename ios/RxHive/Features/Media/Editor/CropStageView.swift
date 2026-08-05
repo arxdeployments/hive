@@ -289,12 +289,14 @@ struct CropStageView: View {
                 if anchor.holdsNorth { next.origin.y = start.minY + dy; next.size.height = start.height - dy }
                 if anchor.holdsSouth { next.size.height = start.height + dy }
                 // Dragged past the opposite edge: fold the rect rather than letting a
-                // negative span through, which would render inside-out.
-                if next.size.width < 0 { next.origin.x += next.size.width; next.size.width = -next.size.width }
-                if next.size.height < 0 { next.origin.y += next.size.height; next.size.height = -next.size.height }
+                // negative span through, which would render inside-out — and carry the
+                // anchor through the fold with it, because the finger is now on the
+                // OPPOSITE handle and `clampFrameRect` pins whichever edge the anchor
+                // names.
+                let folded = MediaEditGeometry.foldDragRect(next, anchor: anchor)
 
                 write(MediaEditGeometry.clampFrameRect(
-                    next, frame: frame, ratio: aspect.ratio, anchor: anchor
+                    folded.rect, frame: frame, ratio: aspect.ratio, anchor: folded.anchor
                 ))
             }
             .onEnded { _ in
