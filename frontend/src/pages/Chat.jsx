@@ -198,7 +198,12 @@ export default function Chat() {
                     mobile branch did not, so on a phone any render throw in the
                     chat pane escaped to the root and blanked the whole app
                     instead of the one pane. */}
-                <ChatErrorBoundary>
+                {/* onBack on the boundary too, not just the panel: this
+                    fallback is the whole phone screen, and ChatPanel's own back
+                    button is gone with the panel that threw. Without it, a
+                    deterministic error leaves Try again as the only control,
+                    showMessages stuck true, and no route back to the sidebar. */}
+                <ChatErrorBoundary onBack={handleBack}>
                   <ChatPanel
                     conversationId={activeConversationId}
                     onBack={handleBack}
