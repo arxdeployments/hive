@@ -192,11 +192,19 @@ export default function Chat() {
                 transition={{ duration: 0.25, ease: [0.2, 0.8, 0.2, 1] }}
                 className="w-full h-full"
               >
-                <ChatPanel
-                  conversationId={activeConversationId}
-                  onBack={handleBack}
-                  isMobile={true}
-                />
+                {/* Inside the motion.div, not around it: AnimatePresence needs
+                    the keyed motion.div as its direct child or the slide breaks.
+                    The desktop branch below has always had this boundary; the
+                    mobile branch did not, so on a phone any render throw in the
+                    chat pane escaped to the root and blanked the whole app
+                    instead of the one pane. */}
+                <ChatErrorBoundary>
+                  <ChatPanel
+                    conversationId={activeConversationId}
+                    onBack={handleBack}
+                    isMobile={true}
+                  />
+                </ChatErrorBoundary>
               </motion.div>
             ) : (
               <motion.div
@@ -207,10 +215,12 @@ export default function Chat() {
                 transition={{ duration: 0.25, ease: [0.2, 0.8, 0.2, 1] }}
                 className="w-full h-full"
               >
-                <ChatSidebar
-                  onSelectConversation={handleSelectConversation}
-                  isMobile={true}
-                />
+                <ChatErrorBoundary>
+                  <ChatSidebar
+                    onSelectConversation={handleSelectConversation}
+                    isMobile={true}
+                  />
+                </ChatErrorBoundary>
               </motion.div>
             )}
           </AnimatePresence>

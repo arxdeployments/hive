@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { Eye, EyeOff } from 'lucide-react';
 
 export const FloatingInput = ({
@@ -11,6 +11,12 @@ export const FloatingInput = ({
   'data-testid': testId,
   ...props
 }) => {
+  // The label floats over the input and is pointer-events-none, so it was never
+  // associated with it: no htmlFor, no id, no aria-label. Screen readers
+  // therefore announced the login form as two unlabelled edit fields, with no
+  // way to tell the email box from the password box. useId keeps the pairing
+  // unique across the several FloatingInputs a page can render.
+  const id = useId();
   const [focused, setFocused] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const isActive = focused || (value && value.length > 0);
@@ -19,6 +25,7 @@ export const FloatingInput = ({
   return (
     <div className="relative w-full">
       <input
+        id={id}
         type={inputType}
         value={value}
         onChange={onChange}
@@ -32,9 +39,14 @@ export const FloatingInput = ({
           ${type === 'password' ? 'pr-12' : ''}
         `}
         placeholder=" "
+        // The error state is otherwise border colour alone, which is invisible
+        // to a screen reader and to anyone who cannot distinguish the two greens.
+        aria-invalid={error ? true : undefined}
+        // Spread last so a caller can still override id or aria-*.
         {...props}
       />
       <label
+        htmlFor={id}
         className={`absolute left-4 transition-all duration-200 pointer-events-none
           ${isActive
             ? 'top-2 text-xs ' + (error ? 'text-[#EF4444]' : 'text-[#10B981]')
