@@ -403,7 +403,6 @@ export const ActiveCallView = () => {
           localId={me.id}
           isMuted={isMuted}
           isCameraOn={isCameraOn}
-          isScreenSharing={isScreenSharing}
           activeSpeakerIds={speakers}
         />
 

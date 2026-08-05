@@ -121,7 +121,6 @@ export const VideoGrid = ({
   localId = 'local',
   isMuted = false,
   isCameraOn = true,
-  isScreenSharing = false,
   activeSpeakerIds = [],
 }) => {
   const speakers = Array.isArray(activeSpeakerIds) ? activeSpeakerIds : [];

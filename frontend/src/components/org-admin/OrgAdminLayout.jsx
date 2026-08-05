@@ -13,7 +13,7 @@ const navItems = [
 
 export const OrgAdminLayout = () => {
   const { user } = useAuth();
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed] = useState(false);
 
   return (
     <div className="min-h-screen bg-[#0A0A0A] flex">

@@ -7,7 +7,7 @@ export const ConversationSearch = ({ conversationId, isOpen, onClose, onScrollTo
   const [query, setQuery] = useState('');
   const [matches, setMatches] = useState([]);
   const [currentIdx, setCurrentIdx] = useState(0);
-  const [loading, setLoading] = useState(false);
+  const [, setLoading] = useState(false);
 
   const search = useCallback(async () => {
     if (!query.trim() || !conversationId) { setMatches([]); return; }

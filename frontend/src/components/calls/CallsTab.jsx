@@ -182,7 +182,7 @@ export const ScheduleCallModal = ({
 
 export const CallsTab = () => {
   const { user } = useAuth();
-  const { missedCallCount, setMissedCallCount } = useCallStore();
+  const { setMissedCallCount } = useCallStore();
   const [calls, setCalls] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('all');

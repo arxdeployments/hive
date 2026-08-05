@@ -148,7 +148,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   // the next render, so the scroll has to wait for the row to exist — resolved by
   // the effect below rather than a setTimeout guess.
   const pendingJumpRef = useRef(null);
-  const [jumpLoading, setJumpLoading] = useState(false);
+  const [, setJumpLoading] = useState(false);
 
   const virtuosoRef = useRef(null);
 
