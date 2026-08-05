@@ -16,7 +16,15 @@ export default [
     plugins: { react, 'react-hooks': reactHooks },
     rules: {
       ...js.configs.recommended.rules,
-      ...reactHooks.configs.recommended.rules,
+      // `recommended-latest` rather than `recommended`: on this plugin version the
+      // latter is still the eslintrc-shaped object, whose `plugins` is an array of
+      // strings that flat config rejects. Only `.rules` is spread here so either
+      // name works today and both carry the same two rules, but naming the
+      // flat-native config keeps that from being load-bearing — a later reader who
+      // spreads the whole object, as the other entries in this file do, gets a
+      // working config instead of a schema error. Safe on the declared `^5.2.0`:
+      // `recommended-latest` was added in 5.2.0 itself.
+      ...reactHooks.configs['recommended-latest'].rules,
       // Without this, `no-unused-vars` cannot see JSX. Every identifier used only
       // in markup — `<motion.div>`, a destructured `icon: Icon` — was reported
       // unused, which is where 44 of the 77 warnings in this project came from:
