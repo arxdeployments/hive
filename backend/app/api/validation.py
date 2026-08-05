@@ -9,7 +9,7 @@ same organization name as far as availability is concerned.
 """
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import require_superadmin
@@ -48,6 +48,8 @@ async def validate_user_email(
     if not value:
         return {"available": False}
     taken = (
-        await db.execute(select(User.id).where(func.lower(User.email) == value).limit(1))
+        # CITEXT equality is case-insensitive and uses the unique index;
+        # lower(email) does not. See app/api/auth.py.
+        await db.execute(select(User.id).where(User.email == value).limit(1))
     ).scalar_one_or_none()
     return {"available": taken is None}

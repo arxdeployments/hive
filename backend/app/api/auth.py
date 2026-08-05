@@ -19,17 +19,16 @@ the previous build did.
 
 import datetime as dt
 import logging
-import uuid
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import func, select, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.deps import get_current_user
-from app.core.rate_limit import login_limiter, refresh_limiter
+from app.core.rate_limit import login_limiter, password_limiter, refresh_limiter
 from app.core.security import (
     ACCESS_COOKIE,
     MOBILE_CLIENT,
@@ -160,14 +159,18 @@ async def login(
     db: AsyncSession = Depends(get_db),
     _rl: None = Depends(login_limiter),
 ):
-    stmt = select(User).where(func.lower(User.email) == body.email.lower())
+    # users.email is CITEXT with a UNIQUE btree index, so `==` is already
+    # case-insensitive. Wrapping it in lower() made the comparison lower(email)
+    # instead of email, which that index cannot serve: every sign-in — including
+    # every failed one — sequentially scanned the whole users table.
+    stmt = select(User).where(User.email == body.email)
     user = (await db.execute(stmt)).scalar_one_or_none()
     if user is None:
         # Equalize timing so a missing account can't be distinguished from a
         # wrong password by response latency (user-enumeration defense).
-        verify_password(body.password, _DUMMY_HASH)
+        await verify_password(body.password, _DUMMY_HASH)
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    if not verify_password(body.password, user.password_hash):
+    if not await verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     if not user.is_active:
         raise HTTPException(status_code=401, detail="Account is deactivated")
@@ -344,29 +347,44 @@ class ChangePasswordRequest(BaseModel):
 @router.post("/change-password")
 async def change_password(
     body: ChangePasswordRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
+    _rl: None = Depends(password_limiter),
 ):
+    # Rate-limited like the admin reset it mirrors: this route verifies
+    # current_password, so an attacker sitting on a hijacked session could
+    # otherwise brute-force it offline-fast and take the account outright.
     from app.core.security import PasswordPolicyError, enforce_password_policy, hash_password
 
-    if not verify_password(body.current_password, user.password_hash):
+    if not await verify_password(body.current_password, user.password_hash):
         raise HTTPException(status_code=401, detail="Current password is incorrect")
     try:
         enforce_password_policy(body.new_password)
     except PasswordPolicyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    user.password_hash = hash_password(body.new_password)
+    user.password_hash = await hash_password(body.new_password)
     user.must_change_password = False
-    # Revoke every other session on password change.
+    # Revoke every OTHER session on password change — the caller keeps the one
+    # they are changing it from, which is the whole point of "other".
+    #
+    # Revoking the caller's own token too (what this did) signed the user out of
+    # the tab they had just used, silently: no client re-authenticates here, so
+    # the session died at the next refresh, up to access_token_minutes later, with
+    # no visible connection to the password change. Worse, that refresh presented
+    # a revoked token with no successor, which is indistinguishable from a replay,
+    # so every password change also logged a "token reuse — revoking that client's
+    # session family" theft warning against an account that was never attacked.
+    raw_refresh = request.cookies.get(REFRESH_COOKIE)
+    current_hash = hash_refresh_token(raw_refresh) if raw_refresh else None
     tokens = (
         await db.execute(
             select(RefreshToken).where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
         )
     ).scalars()
     for t in tokens:
+        if current_hash is not None and t.token_hash == current_hash:
+            continue
         t.revoked_at = now_utc()
     await db.commit()
     return {"message": "Password changed"}
-
-
-_ = uuid  # placate linters for uuid used in typing of deps

@@ -1,5 +1,6 @@
 """Password hashing, JWT minting/verification, refresh-token helpers."""
 
+import asyncio
 import datetime as dt
 import hashlib
 import re
@@ -13,6 +14,15 @@ from app.core.config import get_settings
 
 JWT_ALGORITHM = "HS256"
 
+BCRYPT_ROUNDS = 12
+
+# bcrypt hashes at most the first 72 bytes of a password and silently discards
+# the rest, so without a cap a 100-character password and its own 72-byte prefix
+# are the same credential — the extra length is security theatre. Capping at the
+# boundary keeps every stored hash valid, which pre-hashing (the other usual fix)
+# would not: that would invalidate every password already on file.
+BCRYPT_MAX_PASSWORD_BYTES = 72
+
 ACCESS_COOKIE = "rx_access"
 REFRESH_COOKIE = "rx_refresh"
 
@@ -23,15 +33,28 @@ WEB_CLIENT = "web"
 MOBILE_CLIENT = "mobile"
 
 
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=12)).decode()
+def _hash_password_sync(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode()
 
 
-def verify_password(password: str, password_hash: str) -> bool:
+def _verify_password_sync(password: str, password_hash: str) -> bool:
     try:
         return bcrypt.checkpw(password.encode(), password_hash.encode())
     except ValueError:
         return False
+
+
+# bcrypt at cost 12 is ~170ms of uninterruptible CPU. Called straight from an
+# `async def` handler that is 170ms the event loop cannot serve anyone else, so a
+# burst of sign-ins stalls every unrelated request — including WebSocket pings and
+# the health probe — behind the queue. Both helpers therefore run in the default
+# thread pool, where the GIL is released for the duration of the C hash.
+async def hash_password(password: str) -> str:
+    return await asyncio.to_thread(_hash_password_sync, password)
+
+
+async def verify_password(password: str, password_hash: str) -> bool:
+    return await asyncio.to_thread(_verify_password_sync, password, password_hash)
 
 
 class PasswordPolicyError(ValueError):
@@ -47,6 +70,10 @@ def enforce_password_policy(password: str) -> None:
     settings = get_settings()
     if len(password) < settings.password_min_length:
         raise PasswordPolicyError(f"Password must be at least {settings.password_min_length} characters")
+    if len(password.encode()) > BCRYPT_MAX_PASSWORD_BYTES:
+        # Rejected rather than truncated: silently accepting a longer password
+        # and only honouring its prefix is the behaviour this guards against.
+        raise PasswordPolicyError(f"Password must be at most {BCRYPT_MAX_PASSWORD_BYTES} bytes")
     if not re.search(r"[A-Za-z]", password) or not re.search(r"\d", password):
         raise PasswordPolicyError("Password must contain both letters and numbers")
 

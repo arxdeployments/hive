@@ -302,7 +302,9 @@ async def create_user(
 
     email = body.email.strip().lower()
     taken = (
-        await db.execute(select(User.id).where(func.lower(User.email) == email).limit(1))
+        # CITEXT equality is case-insensitive and uses the unique index;
+        # lower(email) does not. See app/api/auth.py.
+        await db.execute(select(User.id).where(User.email == email).limit(1))
     ).scalar_one_or_none()
     if taken is not None:
         raise HTTPException(status_code=400, detail="Email already in use")
@@ -329,7 +331,7 @@ async def create_user(
         dept_id=dept.id,
         email=email,
         display_name=sanitize_text(body.display_name).strip(),
-        password_hash=hash_password(body.password),
+        password_hash=await hash_password(body.password),
         role=UserRole.member,
         is_active=True,
         created_by=admin.id,
@@ -363,7 +365,10 @@ async def get_user(
 
 
 class OrgUpdateUser(BaseModel):
-    display_name: str | None = None
+    # Bounded at the User.display_name column width. The create schema above caps
+    # this and the update schema did not, so a rename past the column length was
+    # a 500 on commit where the identical value on create was a clean 422.
+    display_name: str | None = Field(default=None, max_length=200)
     dept_id: str | None = None
     role: str | None = None
     is_active: bool | None = None
@@ -437,7 +442,7 @@ async def reset_user_password(
 ):
     target = await _load_org_user(db, admin, user_id)
     temp = generate_password()
-    target.password_hash = hash_password(temp)
+    target.password_hash = await hash_password(temp)
     target.must_change_password = True
     await _revoke_refresh_tokens(db, target.id)
     await log_audit(
@@ -514,7 +519,8 @@ async def create_department(
 
 
 class OrgUpdateDept(BaseModel):
-    name: str | None = None
+    # Department.name is String(200) — see OrgUpdateUser.display_name.
+    name: str | None = Field(default=None, max_length=200)
     description: str | None = None
 
 
@@ -614,7 +620,8 @@ async def get_org_settings(
 
 
 class OrgSettingsUpdate(BaseModel):
-    name: str | None = None
+    # Organization.name is String(200) — see OrgUpdateUser.display_name.
+    name: str | None = Field(default=None, max_length=200)
     logo_url: str | None = None
 
 

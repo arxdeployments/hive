@@ -62,9 +62,23 @@ def _msg_uuid(msg_id: str) -> uuid.UUID:
 
 
 def _require_org_access(conv: Conversation, tenant: TenantContext) -> None:
+    """Gate the conversation read paths: right org, and still live.
+
+    Called only from the GET routes, so deactivating a conversation revokes
+    reading it without touching the delete/leave writes that have to keep working
+    on an inactive row.
+    """
     # Mirrors the send path: non-cross-org conversations must match the caller's org.
     if conv.type.value != "cross_org" and conv.org_id != tenant.user.org_id:
         raise HTTPException(status_code=403, detail="Access denied")
+    # Deactivation is the only lever a superadmin has to cut a tenant off from a
+    # cross-org group: DELETE /api/admin/cross-org-groups/{id} and the archive
+    # route both just set is_active = False and leave the participant rows in
+    # place. Nothing on the read side checked the flag, so membership outlived
+    # the revocation — the group vanished from GET /api/conversations while its
+    # entire message history stayed readable to anyone who kept the id.
+    if not conv.is_active:
+        raise HTTPException(status_code=404, detail="Conversation not found")
 
 
 async def _participants_of(db, conv_uuid: uuid.UUID) -> list[ConversationParticipant]:

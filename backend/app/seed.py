@@ -7,7 +7,7 @@ no hardcoded defaults ship in code. Safe to run on every boot.
 import asyncio
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.core.security import hash_password
@@ -24,9 +24,7 @@ async def seed() -> None:
         return
     async with SessionLocal() as db:
         existing = (
-            await db.execute(
-                select(User).where(func.lower(User.email) == settings.seed_superadmin_email.lower())
-            )
+            await db.execute(select(User).where(User.email == settings.seed_superadmin_email))
         ).scalar_one_or_none()
         if existing:
             logger.info("[seed] superadmin already present")
@@ -35,7 +33,7 @@ async def seed() -> None:
             User(
                 email=settings.seed_superadmin_email,
                 display_name="Super Admin",
-                password_hash=hash_password(settings.seed_superadmin_password),
+                password_hash=await hash_password(settings.seed_superadmin_password),
                 role=UserRole.superadmin,
                 is_active=True,
             )

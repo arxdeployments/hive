@@ -797,7 +797,7 @@ async def create_user(
         dept_id=did,
         email=str(body.email),
         display_name=sanitize_text(body.display_name).strip(),
-        password_hash=hash_password(body.password),
+        password_hash=await hash_password(body.password),
         role=_db_role(body.role),
         is_active=True,
         mobile_access=body.mobile_access,
@@ -984,7 +984,7 @@ async def reset_user_password(
 ):
     user = await _get_user_or_404(db, user_id)
     temporary_password = generate_password(12)
-    user.password_hash = hash_password(temporary_password)
+    user.password_hash = await hash_password(temporary_password)
     # Fixes: the account must change it on next login, and old sessions die.
     user.must_change_password = True
     await _revoke_refresh_tokens(db, [user.id])
