@@ -7,18 +7,84 @@ import UIKit
 /// Carries the bytes rather than a library reference: the picker has already handed
 /// them over, the upload needs them in memory, and holding a `PhotosPickerItem` would
 /// mean loading them twice.
+///
+/// ## Mutated in place, never replaced
+///
+/// The editable fields are `var` and an edit assigns to them — `items[index].data = …`
+/// rather than `items[index] = PendingMedia(…)`. That is not a style choice: `id` is
+/// declared with an initializer expression, so it is excluded from the synthesized
+/// memberwise init and there is no way to construct a replacement carrying the same
+/// id. A fresh id makes the filmstrip's `ForEach(…, id: \.element.id)` treat the cell as
+/// a delete plus an insert — it flickers and loses its state — so mutation is the only
+/// correct shape.
+///
+/// ## The original is kept for the whole staging
+///
+/// `data`/`filename`/`preview` are always the EFFECTIVE values: what would be sent right
+/// now. `originalData`/`originalFilename`/`originalPreview` are the untouched pick, and
+/// `edit` is the model applied to them. Keeping both is what makes Revert exact and a
+/// second editing pass non-destructive — see `MediaEdit`.
 struct PendingMedia: Identifiable {
     let id = UUID()
-    let data: Data
-    let filename: String
+    var data: Data
+    var filename: String
     let isVideo: Bool
-    /// Poster frame for a video, decoded thumbnail for a photo.
-    let preview: UIImage?
+    /// Poster frame for a video, decoded thumbnail for a photo. Recomposed when an edit
+    /// is saved, or the sheet would keep showing the un-edited picture while sending the
+    /// edited one.
+    var preview: UIImage?
     /// Videos only — a temp file, because `AVPlayer` cannot play from `Data`.
-    let playbackURL: URL?
-    let duration: TimeInterval?
+    var playbackURL: URL?
+    var duration: TimeInterval?
+
+    /// The pick, untouched, for as long as this item is staged.
+    let originalData: Data
+    let originalFilename: String
+    let originalPreview: UIImage?
+
+    /// What has been applied to the original. Empty means "this is the pick".
+    ///
+    /// For a photo the bytes in `data` are already baked from it. For a clip they are
+    /// NOT — the crop is applied by the composition export inside
+    /// `MediaTranscoder.video` at send time, one pass instead of two, so the model has
+    /// to travel with the item.
+    var edit = MediaEdit()
+
+    var isEdited: Bool { edit.hasEdits }
 
     var sizeLabel: String { MediaFormatting.byteLabel(data.count) }
+
+    /// Every construction site passes only the pick; the originals are derived here so a
+    /// caller cannot forget to record them.
+    init(
+        data: Data,
+        filename: String,
+        isVideo: Bool,
+        preview: UIImage?,
+        playbackURL: URL?,
+        duration: TimeInterval?
+    ) {
+        self.data = data
+        self.filename = filename
+        self.isVideo = isVideo
+        self.preview = preview
+        self.playbackURL = playbackURL
+        self.duration = duration
+        self.originalData = data
+        self.originalFilename = filename
+        self.originalPreview = preview
+    }
+
+    /// Take the editor's result.
+    ///
+    /// A revert arrives here too, as an empty `edit` with the original bytes — so there
+    /// is one path back to the pick rather than a separate undo.
+    mutating func apply(data: Data, filename: String, edit: MediaEdit, preview: UIImage?) {
+        self.data = data
+        self.filename = filename
+        self.edit = edit
+        if let preview { self.preview = preview }
+    }
 }
 
 /// The confirm-and-send step for photos and video.
@@ -45,6 +111,11 @@ struct MediaSendSheet: View {
     @State private var index = 0
     @State private var showQualitySheet = false
     @State private var estimate: String?
+    /// Index of the item open in the editor, or nil. An index rather than an id because
+    /// the write-back has to land in `items`, which is indexed.
+    @State private var editingIndex: Int?
+    /// One player, rebuilt only when the clip being looked at actually changes.
+    @State private var player: AVPlayer?
     @FocusState private var captionFocused: Bool
 
     private var current: PendingMedia? {
@@ -57,18 +128,9 @@ struct MediaSendSheet: View {
     /// layout pass would be a UIKit hop on every frame. The floor covers the case where
     /// no window is found yet — better a little extra padding than chrome under the
     /// status bar.
-    private static let windowInsets: UIEdgeInsets = {
-        let found = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap(\.windows)
-            .first { $0.isKeyWindow }?
-            .safeAreaInsets
-        guard let found else { return UIEdgeInsets(top: 48, left: 0, bottom: 24, right: 0) }
-        return UIEdgeInsets(
-            top: max(found.top, 20), left: found.left,
-            bottom: max(found.bottom, 12), right: found.right
-        )
-    }()
+    /// Shared with the editor — see `EditorInsets.window`, which owns the lookup.
+    @MainActor
+    private static var windowInsets: UIEdgeInsets { EditorInsets.window }
 
     var body: some View {
         // The insets come from the window, not from SwiftUI.
@@ -104,9 +166,39 @@ struct MediaSendSheet: View {
         .onChange(of: items.count) { _, count in
             if count == 0 { onCancel() } else if index >= count { index = count - 1 }
         }
-        // Re-measured whenever the item or the tier changes, so the number on screen is
-        // always the number this send will cost.
-        .task(id: "\(index)-\(quality.rawValue)-\(items.count)") {
+        // Keyed on the clip's own file, so paging the filmstrip or cropping swaps the
+        // player and typing a caption does not.
+        .task(id: current?.playbackURL) {
+            guard let url = current?.playbackURL, current?.isVideo == true else {
+                player?.pause()
+                player = nil
+                return
+            }
+            player?.pause()
+            player = AVPlayer(url: url)
+        }
+        // Crop / draw / text, on the ORIGINAL bytes plus the saved model.
+        .fullScreenCover(isPresented: Binding(
+            get: { editingIndex != nil },
+            set: { if !$0 { editingIndex = nil } }
+        )) {
+            if let editingIndex, items.indices.contains(editingIndex) {
+                MediaEditorView(
+                    item: items[editingIndex],
+                    onSave: { data, filename, edit, preview in
+                        // Mutated in place so the item keeps its id — see `PendingMedia`.
+                        items[editingIndex].apply(data: data, filename: filename, edit: edit, preview: preview)
+                        self.editingIndex = nil
+                    },
+                    onCancel: { self.editingIndex = nil }
+                )
+            }
+        }
+        // Re-measured whenever the item, the tier or the item's BYTES change, so the
+        // number on screen is always the number this send will cost. The byte count is in
+        // the key on purpose: an edit swaps the data at the same index with the same
+        // count, and without it the pre-edit size would stay on screen.
+        .task(id: "\(index)-\(quality.rawValue)-\(items.count)-\(current?.data.count ?? 0)-\(current?.edit.summary ?? "")") {
             estimate = nil
             guard let current, !current.isVideo else { return }
             let data = current.data
@@ -139,8 +231,19 @@ struct MediaSendSheet: View {
 
             Spacer()
 
+            // Crop, draw, add text. Offered here because this is the size at which
+            // someone actually decides a photo needs straightening — a 54pt filmstrip
+            // thumbnail is not.
+            circleButton("crop.rotate", label: "Edit this item") {
+                captionFocused = false
+                editingIndex = index
+            }
+
             if items.count > 1 {
                 circleButton("trash", label: "Remove this item") {
+                    // The preview file belongs to this item and nothing else will free
+                    // it once the item is gone.
+                    MediaTranscoder.discardPreviewFile(items[index].playbackURL)
                     items.remove(at: index)
                 }
             }
@@ -205,13 +308,23 @@ struct MediaSendSheet: View {
 
     @ViewBuilder
     private func preview(for item: PendingMedia) -> some View {
-        if item.isVideo, let url = item.playbackURL {
+        if item.isVideo, !item.isEdited, item.playbackURL != nil {
             // Native controls rather than a poster and a play badge: this is the last
             // chance to check the clip is the right one before it is sent.
-            VideoPlayer(player: AVPlayer(url: url))
+            //
+            // The player is held in `@State`, not constructed here. Built inline it was a
+            // brand-new `AVPlayer` on every body evaluation — and `caption` is `@State`
+            // on this same view, so every keystroke in the caption field threw the clip
+            // back to frame zero. Reviewing a take and captioning it were mutually
+            // exclusive.
+            VideoPlayer(player: player)
                 .aspectRatio(contentMode: .fit)
                 .frame(maxWidth: .infinity)
         } else if let image = item.preview {
+            // A cropped clip deliberately falls through to the composed poster rather
+            // than the player: the bytes are still the original until the export runs at
+            // send time, so playing them would show the UNCROPPED frame and quietly
+            // contradict what the editor was just used to do.
             Image(uiImage: image)
                 .resizable()
                 .scaledToFit()
@@ -287,6 +400,13 @@ struct MediaSendSheet: View {
                         Text("• \(label)")
                     }
                     Text("• \(quality == .hd ? "HD" : "Standard")")
+                    // Says the item is no longer the file that was picked. Without it an
+                    // edit is invisible here and Revert reads as a button with nothing to
+                    // undo.
+                    if current.isEdited {
+                        Text("• \(current.edit.summary)")
+                            .foregroundStyle(Theme.Color.primary)
+                    }
                 }
                 .font(Theme.Typography.micro)
                 .foregroundStyle(.white.opacity(0.55))

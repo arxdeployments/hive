@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { ChevronLeft, ChevronRight, Download, X } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Download, Pencil, X } from 'lucide-react';
 import { AudioPlayer } from './AudioPlayer';
 import { FILE_ICONS, formatFileSize } from './DocumentBubble';
+import { describeEdits } from '../../utils/mediaEdit';
 
 /**
  * Full-size look at a file that has been SELECTED but not yet sent.
@@ -25,7 +26,18 @@ import { FILE_ICONS, formatFileSize } from './DocumentBubble';
  * whatever the OS uses. Images, video and audio DO render — img-src and media-src
  * already permit blob:.
  */
-export const StagedFilePreview = ({ files, index, onIndex, onClose }) => {
+/**
+ * `keysSuspended` is set while the editor is open on top of this.
+ *
+ * It has to be a prop rather than something this component can work out for itself.
+ * Both keydown handlers sit on `window` in the capture phase, and listeners on one
+ * target fire in REGISTRATION order — this component mounts first, so its handler
+ * runs first and `stopPropagation` in the editor's handler comes too late to stop
+ * it. One Escape would close both layers. Not installing the listener at all is the
+ * only version that cannot race, and it fixes the quieter half of the same bug:
+ * arrow keys were paging this preview invisibly behind the editor.
+ */
+export const StagedFilePreview = ({ files, index, onIndex, onClose, onEdit, keysSuspended = false }) => {
   const file = files[index];
   const many = files.length > 1;
 
@@ -37,6 +49,7 @@ export const StagedFilePreview = ({ files, index, onIndex, onClose }) => {
   // Escape closes, arrows page — a viewer that traps the keyboard is worse than
   // no viewer.
   useEffect(() => {
+    if (keysSuspended) return undefined;
     const onKey = (e) => {
       if (e.key === 'Escape') { e.stopPropagation(); onClose(); }
       else if (many && e.key === 'ArrowLeft') prev();
@@ -44,7 +57,7 @@ export const StagedFilePreview = ({ files, index, onIndex, onClose }) => {
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [onClose, prev, next, many]);
+  }, [onClose, prev, next, many, keysSuspended]);
 
   if (!file) return null;
 
@@ -71,8 +84,24 @@ export const StagedFilePreview = ({ files, index, onIndex, onClose }) => {
           <span className="block text-[11px] text-white/60">
             {file.category}{file.size ? ` · ${formatFileSize(file.size)}` : ''}
             {many ? ` · ${index + 1} of ${files.length}` : ''}
+            {file.edit ? ` · ${describeEdits(file.edit)}` : ''}
           </span>
         </span>
+        {/* Crop, draw, add text. Offered here as well as on the tray tile because
+            this is the size at which someone actually decides a photo needs
+            straightening — a 60px thumbnail is not. Pictures and clips only. */}
+        {onEdit && (file.category === 'image' || file.category === 'video') && (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onEdit(file.id); }}
+            aria-label="Edit this file"
+            title="Crop, draw or add text"
+            data-testid="staged-preview-edit"
+            className="p-2 text-white/70 hover:text-white rounded-full hover:bg-white/10 transition-colors"
+          >
+            <Pencil size={18} />
+          </button>
+        )}
         {/* Download the LOCAL file — useful for documents you cannot render. */}
         <a
           href={file.url}

@@ -216,7 +216,16 @@ struct MessageComposer: View {
                     pendingMedia = []
                     send(media: items, caption: caption, quality: quality)
                 },
-                onCancel: { pendingMedia = [] }
+                onCancel: {
+                    // Each staged clip owns a temp file holding a full copy of its bytes
+                    // (`stagePreviewFile`), and `send(media:)` is the only other place
+                    // that frees them — so picking a 4K clip and backing out used to
+                    // strand it on disk for the rest of the app's life.
+                    for item in pendingMedia {
+                        MediaTranscoder.discardPreviewFile(item.playbackURL)
+                    }
+                    pendingMedia = []
+                }
             )
         }
         .fileImporter(
@@ -612,6 +621,11 @@ struct MessageComposer: View {
                 filename: item.filename,
                 kind: item.isVideo ? .video : .image,
                 quality: quality,
+                // Photos arrive already baked — `MediaEditorView` rendered them the
+                // moment the user pressed Done. A clip's crop is applied HERE instead, in
+                // the same export that applies the tier: two exports would mean two H.264
+                // generations and double the wait for the same result.
+                edit: item.isVideo ? item.edit : nil,
                 // The caption rides on the first item only, as it does on the web — five
                 // bubbles repeating the same sentence reads as a bug.
                 caption: offset == 0 ? caption : "",
@@ -767,13 +781,15 @@ struct MessageComposer: View {
         filename: String,
         kind: AttachmentKind,
         quality: MediaQuality,
+        edit: MediaEdit? = nil,
         caption: String,
         replyID: String?
     ) {
+        let isCropping = kind == .video && edit?.hasEdits == true
         let job = UploadJob(
             filename: filename,
             kind: kind,
-            status: kind == .video ? "Compressing…" : "Preparing…"
+            status: isCropping ? "Cropping…" : (kind == .video ? "Compressing…" : "Preparing…")
         )
         uploads.append(job)
 
@@ -781,9 +797,29 @@ struct MessageComposer: View {
             let output: MediaTranscoder.Output
             switch kind {
             case .video:
-                output = await MediaTranscoder.video(data: data, filename: filename, quality: quality)
+                // nil ONLY when an edit was requested and could not be applied. Falling
+                // back to the original there would send the UNCROPPED clip — the whole
+                // frame the user was cropping out — and nobody would find out until a
+                // recipient watched it. So it fails loudly instead.
+                guard let encoded = await MediaTranscoder.video(
+                    data: data, filename: filename, quality: quality, edit: edit
+                ) else {
+                    if !Task.isCancelled {
+                        toasts.error("\(filename) couldn't be cropped, so it wasn't sent.")
+                    }
+                    uploads.removeAll { $0.id == job.id }
+                    return
+                }
+                output = encoded
             default:
-                output = MediaTranscoder.image(data: data, filename: filename, quality: quality)
+                // Detached: ImageIO decode plus JPEG encode is synchronous and can run
+                // to hundreds of milliseconds on a full-resolution photo. This task is
+                // `@MainActor` (it mutates `uploads` and `toasts`), so running the
+                // encode inline froze the composer for every send. Only the raster work
+                // moves; the state mutations either side stay where they were.
+                output = await Task.detached(priority: .userInitiated) {
+                    MediaTranscoder.image(data: data, filename: filename, quality: quality)
+                }.value
             }
 
             guard !Task.isCancelled else {
