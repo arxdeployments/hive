@@ -109,7 +109,6 @@ class LiveKitClient {
     this.callId = null;
     /** The room identity the server minted for this device: `{userId}#{deviceId}`. */
     this.identity = null;
-    this._screenSharePublication = null;
     this._joinOptions = null;
     this._rejoinTimer = null;
     this._rejoining = false;
@@ -438,27 +437,14 @@ class LiveKitClient {
         console.warn('[call] SFU disconnected', { reason, callId: this.callId });
         this._handleUnexpectedDisconnect(reason);
       })
+      // Both directions go through the same derivation. A publish that only ever
+      // wrote the streams, paired with an unpublish that also cleared
+      // `isScreenSharing`, is a one-way ratchet: see `_syncLocalMedia`.
       .on(RoomEvent.LocalTrackPublished, () => {
-        useCallStore.setState({ localStream: this._localStream(), localScreenStream: this._localScreenStream() });
+        this._syncLocalMedia();
       })
       .on(RoomEvent.LocalTrackUnpublished, () => {
-        // `isScreenSharing` is derived here, not left to whoever unpublished.
-        //
-        // A share can end without `stopScreenShare()` ever being called: the browser's
-        // own "Stop sharing" bar, or closing the shared tab or window, ends the
-        // MediaStreamTrack, and livekit-client's `handleTrackEnded` responds by
-        // unpublishing a ScreenShare source itself. That arrives here — so
-        // `localScreenStream` correctly went null while the flag stayed true, leaving the
-        // store claiming a share with no publication behind it. The Share button kept
-        // reading "Stop sharing", and because the click handler branches on the flag, the
-        // next press called `stopScreenShare()` on an already-stopped share: it looked
-        // dead, and sharing only resumed on a second press.
-        const screenStream = this._localScreenStream();
-        useCallStore.setState({
-          localStream: this._localStream(),
-          localScreenStream: screenStream,
-          isScreenSharing: !!screenStream,
-        });
+        this._syncLocalMedia();
       });
   }
 
@@ -611,6 +597,45 @@ class LiveKitClient {
     return stream.getTracks().length ? stream : null;
   }
 
+  /**
+   * Write the local media state — both streams AND `isScreenSharing` — from the room's
+   * own publications, rather than trusting whoever last called start/stop.
+   *
+   * The flag has to be derived because publications change without anyone asking, in
+   * both directions:
+   *
+   *  - A share can END on its own. The browser's "Stop sharing" bar, or closing the
+   *    shared tab or window, ends the MediaStreamTrack, and livekit-client's
+   *    `handleTrackEnded` unpublishes the ScreenShare source itself — no call to
+   *    `stopScreenShare()`. So `localScreenStream` correctly went null while the flag
+   *    stayed true, leaving the store claiming a share with no publication behind it.
+   *    The Share button kept reading "Stop sharing", and because its click handler
+   *    branches on the flag, the next press called `stopScreenShare()` on an
+   *    already-stopped share: it looked dead, and sharing only resumed on a second press.
+   *  - A share can be REPUBLISHED on its own. Recovering a dropped signal connection
+   *    runs `republishAllTracks()`, which unpublishes every publication and immediately
+   *    publishes it again — screen share included (it is exempt from the track *restart*
+   *    inside that loop, not from the republish). That is an unpublished event followed
+   *    by a published event, so clearing the flag on unpublish without restoring it on
+   *    publish left it false with the share still running and still on the wire: the
+   *    button read "Share screen" mid-share, pressing it asked the browser for a SECOND
+   *    share instead of stopping the first, and `localCovered` in ActiveCallView put an
+   *    avatar over the local tile of a call that was actively sharing a screen.
+   *
+   * Deriving on every publish and unpublish also makes this order-independent, which
+   * matters because `republishAllTracks` runs its per-publication cycles under
+   * `Promise.all` — the events interleave. Each one re-reads the whole publication set,
+   * so whichever fires last leaves the flag right.
+   */
+  _syncLocalMedia() {
+    const screenStream = this._localScreenStream();
+    useCallStore.setState({
+      localStream: this._localStream(),
+      localScreenStream: screenStream,
+      isScreenSharing: !!screenStream,
+    });
+  }
+
   /** Rebuild every remote tile from the room. Used after a reconnect, when the
    *  deltas we would normally apply were delivered to nobody. */
   _resyncAll() {
@@ -628,7 +653,11 @@ class LiveKitClient {
     store.remoteParticipants
       .filter((p) => p.stream && !present.has(p.id))
       .forEach((p) => store.removeRemoteParticipant(p.id));
-    useCallStore.setState({ localStream: this._localStream(), localScreenStream: this._localScreenStream() });
+    // Local media too, not just the roster. `Reconnected` is emitted *after*
+    // `republishAllTracks()` has resolved (Room.handleSignalRestarted awaits it), so
+    // this is the authoritative correction point for a screen share that was
+    // unpublished and republished while we were away.
+    this._syncLocalMedia();
   }
 
   _syncParticipant(participant) {
@@ -843,7 +872,6 @@ class LiveKitClient {
     this.callId = null;
     this.identity = null;
     this._lastReportedQuality = null;
-    this._screenSharePublication = null;
     if (room) {
       try {
         await room.disconnect();
