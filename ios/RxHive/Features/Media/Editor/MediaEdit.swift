@@ -628,11 +628,112 @@ enum MediaEditGeometry {
             }
         }
 
+        // Fit into the frame by stopping the DRAGGED edge at the boundary, not by
+        // sliding the whole rect.
+        //
+        // The position clamp at the bottom keeps the size and moves the origin, so on its
+        // own an ordinary overshoot past the edge of the picture drags the opposite edge
+        // along with it. Pulling the east handle right from x=0.5,w=0.3 returned
+        // x=0.3,w=0.7: the left edge, which the finger was not holding, jumped inward, and
+        // a big enough overshoot saturated at x=0,w=1 and selected the whole image. Every
+        // resize anchor had it, in both axes.
+        //
+        // Which edge is fixed follows from the anchor: dragging east holds the left edge,
+        // west holds the right, south holds the top, north holds the bottom. For the
+        // west/north cases the incoming rect still carries that fixed edge —
+        // CropStageView moves the origin and the size by equal and opposite amounts — so
+        // maxX/maxY is the edge to preserve.
+        //
+        // The anchor is read as given, so a drag that folded past its own opposite edge
+        // must hand over the FOLDED anchor: see `foldDragRect`, which is the only thing
+        // that can know a fold happened, because by the time a rect arrives here its span
+        // is positive again.
+        let holdLeft = anchor?.holdsEast ?? false
+        let holdRight = anchor?.holdsWest ?? false
+        let holdTop = anchor?.holdsSouth ?? false
+        let holdBottom = anchor?.holdsNorth ?? false
+        // From the INCOMING rect, not from the already-clamped span: w was capped to 1 at
+        // the top of this function, so once a drag overshoots far enough for that cap to
+        // bite, maxX is no longer the edge the drag was holding.
+        let fixedRight = min(max(rect.maxX, MediaEditLimits.minCropSpan), 1)
+        let fixedBottom = min(max(rect.maxY, MediaEditLimits.minCropSpan), 1)
+
+        var maxW: CGFloat = 1
+        var maxH: CGFloat = 1
+        if holdLeft { maxW = 1 - min(max(x, 0), 1 - MediaEditLimits.minCropSpan) }
+        else if holdRight { maxW = fixedRight }
+        if holdTop { maxH = 1 - min(max(y, 0), 1 - MediaEditLimits.minCropSpan) }
+        else if holdBottom { maxH = fixedBottom }
+
+        if ratio != nil {
+            // The fit AND the minimum in ONE uniform factor, because a ratio survives a
+            // uniform scale and nothing else.
+            //
+            // The fit on its own is uniform and was fine. The minimum used to be applied
+            // after it, per axis, by the two `max` lines that now live in the `else` — and
+            // a fit that drove one axis under `minCropSpan` then had only THAT axis lifted.
+            // So a crop locked to 16:9 came back at some other shape: dragging the north
+            // handle to the top of the picture with the bottom edge already 5% from the
+            // frame's edge returned a rect whose displayed ratio was 1.07 instead of the
+            // 0.5625 the user chose, and the lock is not re-applied afterwards, so that
+            // shape went into the export.
+            //
+            // Same construction as the `grow` step in the ratio pass above — clamp a single
+            // factor between "big enough for the minimum" and "small enough for the frame"
+            // — with the frame fit standing in for its floor of 1. Ordering the three this
+            // way keeps the precedence the free path has always had: the minimum beats the
+            // fit (the fixed edge shifts by a hair rather than the handles piling up), and
+            // the frame beats both, because it is the one constraint with nowhere left to
+            // give. On an aspect so extreme that the minimum cannot be reached inside the
+            // frame at all, that last cap wins and the rect stays correctly proportioned
+            // instead — no preset gets near it (they would need a displayed ratio past 25:1).
+            let fit = min(1, maxW / w, maxH / h)
+            let scale = min(
+                max(MediaEditLimits.minCropSpan / w, MediaEditLimits.minCropSpan / h, fit),
+                1 / w, 1 / h
+            )
+            w *= scale
+            h *= scale
+        } else {
+            w = max(min(w, maxW), MediaEditLimits.minCropSpan)
+            h = max(min(h, maxH), MediaEditLimits.minCropSpan)
+        }
+
+        // Re-seat the held edge, now that the span is final.
+        if holdRight { x = fixedRight - w }
+        if holdBottom { y = fixedBottom - h }
+
         return CGRect(
             x: min(max(x, 0), max(0, 1 - w)),
             y: min(max(y, 0), max(0, 1 - h)),
             width: w, height: h
         )
+    }
+
+    /// Fold a drag whose span has gone negative, and report which handle the finger is on
+    /// once it has.
+    ///
+    /// Dragging the east handle back past the west edge gives a negative width, which
+    /// would render inside-out, so the rect is folded — `standardized` IS that fold: the
+    /// origin becomes the minimum corner and the size its absolute value.
+    ///
+    /// But folding also SWAPS the roles of the two edges. The edge the gesture is not
+    /// holding — the one fixed where the drag started — is now maxX rather than minX, and
+    /// the moving edge is minX. That is precisely what a west anchor describes, so the
+    /// anchor has to fold with the rect.
+    ///
+    /// They are returned together because they are one fact, and a caller that applies the
+    /// fold without the swap is the bug this exists to prevent: `clampFrameRect` decides
+    /// which edge to pin from the anchor it is handed, so given the original east it pins
+    /// the LEFT edge of a rect whose left edge is the one being dragged. An east drag from
+    /// x=0.2,w=0.1 folded to x=-0.2,w=0.4 then came back as x=0,w=0.4 — the fixed right
+    /// edge pushed from 0.2 out to 0.4 by a gesture that was pulling the other way, so the
+    /// crop grew on the side the finger had left.
+    static func foldDragRect(_ rect: CGRect, anchor: CropAnchor) -> (rect: CGRect, anchor: CropAnchor) {
+        var folded = anchor
+        if rect.size.width < 0 { folded = folded.mirroredHorizontally }
+        if rect.size.height < 0 { folded = folded.mirroredVertically }
+        return (rect.standardized, folded)
     }
 
     /// The largest frame rect of the given ratio that fits, centred.
@@ -724,6 +825,35 @@ enum CropAnchor: String, CaseIterable, Identifiable {
     var holdsSouth: Bool { self == .sw || self == .s || self == .se }
     var holdsWest: Bool { self == .nw || self == .w || self == .sw }
     var holdsEast: Bool { self == .ne || self == .e || self == .se }
+
+    /// The handle a HORIZONTAL fold puts the finger on: east ↔ west, the other axis
+    /// untouched. A drag that never crossed the vertical axis keeps its north/south half,
+    /// which is why this is not a full point reflection. See
+    /// `MediaEditGeometry.foldDragRect`.
+    var mirroredHorizontally: CropAnchor {
+        switch self {
+        case .nw: return .ne
+        case .ne: return .nw
+        case .sw: return .se
+        case .se: return .sw
+        case .e: return .w
+        case .w: return .e
+        case .n, .s: return self
+        }
+    }
+
+    /// The same for a VERTICAL fold: north ↔ south, east/west untouched.
+    var mirroredVertically: CropAnchor {
+        switch self {
+        case .nw: return .sw
+        case .sw: return .nw
+        case .ne: return .se
+        case .se: return .ne
+        case .n: return .s
+        case .s: return .n
+        case .e, .w: return self
+        }
+    }
 
     var label: String { "Resize crop \(rawValue)" }
 
