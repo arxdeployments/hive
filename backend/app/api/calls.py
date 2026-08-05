@@ -95,9 +95,22 @@ async def missed_count(user: User = Depends(get_current_user), db: AsyncSession 
 
 @router.post("/mark-seen")
 async def mark_seen(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Clear the missed-call badge for calls that have actually finished.
+
+    In-flight calls are excluded. The CallParticipant row is written when the call
+    is initiated, so it already exists while the phone is ringing: opening the
+    Calls tab during an incoming ring used to stamp seen_at on that row, and when
+    the ring then timed out into `missed` the badge stayed at zero — the one
+    missed call the user most needed to see was the one silently marked read.
+    """
+    in_flight = select(Call.id).where(Call.status.in_(_ACTIVE_STATUSES))
     await db.execute(
         update(CallParticipant)
-        .where(CallParticipant.user_id == user.id, CallParticipant.seen_at.is_(None))
+        .where(
+            CallParticipant.user_id == user.id,
+            CallParticipant.seen_at.is_(None),
+            CallParticipant.call_id.notin_(in_flight),
+        )
         .values(seen_at=now_utc())
     )
     await db.commit()
@@ -140,7 +153,8 @@ async def get_link(code: str, user: User = Depends(get_current_user), db: AsyncS
 
 
 class ScheduleCallRequest(BaseModel):
-    title: str
+    # ScheduledCall.title is String(300); longer titles 500'd on commit.
+    title: str = Field(max_length=300)
     description: str | None = None
     start_time: str
     end_time: str | None = None

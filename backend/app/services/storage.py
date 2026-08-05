@@ -64,12 +64,12 @@ DOC_EXTS = {
 # One ceiling for every kind of file. There is no per-category limit any more and
 # no allow-list of extensions: any format may be sent.
 #
-# 2 GB is not arbitrary. Starlette spools a multipart upload to a temp file once
-# it passes 1 MB, and media.py hands that file object straight to S3, so the API
-# never holds the payload in memory — but it does hold it on the instance's DISK
-# for the length of the request. Two or three concurrent uploads at this size are
-# what the box can absorb, not twenty.
-MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+# Sourced from settings so RXHIVE_MAX_UPLOAD_BYTES actually does something: this
+# was a hardcoded literal while config.py carried a `max_upload_bytes` nothing
+# read, so an operator who set that variable — or read it to learn the limit —
+# got a silent 2 GB instead of the 100 MB the setting advertised. The default
+# lives in config.py and is unchanged at 2 GB; see the rationale there.
+MAX_UPLOAD_BYTES = get_settings().max_upload_bytes
 
 # Above this we skip preview generation rather than attempt it.
 #
