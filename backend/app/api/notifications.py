@@ -1,5 +1,7 @@
 """Notifications (net-new vs the Mongo build): in-app list + Web Push subs."""
 
+import anyio
+import anyio.to_thread
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select, update
@@ -12,6 +14,11 @@ from app.db.session import get_db
 from app.utils import iso_z
 
 router = APIRouter(prefix="/api/notifications", tags=["notifications"])
+
+# Wall-clock budget for the SSRF check's DNS lookup. Generous for a real push
+# service (Google/Mozilla resolve in single-digit ms) and short enough that a
+# deliberately slow nameserver costs one request rather than the worker.
+PUSH_ENDPOINT_RESOLVE_TIMEOUT = 2.0
 
 
 @router.get("/vapid-key")
@@ -80,7 +87,16 @@ async def subscribe(
         raise HTTPException(status_code=400, detail="Endpoint required")
     # SSRF guard: the server will POST to this URL, so it must be a public HTTPS
     # push service — never an internal/loopback address.
-    if not validate_push_endpoint(endpoint):
+    #
+    # Off the event loop and on a deadline. The check resolves the hostname with
+    # socket.getaddrinfo, which is the blocking libc resolver and takes no timeout
+    # of its own: the hostname here is entirely caller-chosen, so any authenticated
+    # user could point it at a black-holing nameserver and freeze this worker —
+    # every HTTP request, every WebSocket, and the call-deadline sweeper — for the
+    # tens of seconds resolv.conf allows.
+    with anyio.move_on_after(PUSH_ENDPOINT_RESOLVE_TIMEOUT) as scope:
+        endpoint_ok = await anyio.to_thread.run_sync(validate_push_endpoint, endpoint)
+    if scope.cancelled_caught or not endpoint_ok:
         raise HTTPException(status_code=400, detail="Invalid push endpoint")
     existing = (
         await db.execute(select(PushSubscription).where(PushSubscription.endpoint == endpoint))

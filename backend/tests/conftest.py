@@ -248,7 +248,7 @@ async def make_user(
         user = User(
             email=email,
             display_name=display_name or email.split("@")[0].title(),
-            password_hash=hash_password(password),
+            password_hash=await hash_password(password),
             role=role,
             org_id=org_id,
             dept_id=dept_id,

@@ -464,6 +464,12 @@ async def conversation_media(
         # (type=text returned text messages reshaped as media items).
         raise HTTPException(status_code=400, detail="Invalid media type")
     conv = await tenant.require_membership(conv_uuid)
+    # Same revocation gate as the message read paths in api/messages.py: a
+    # deactivated conversation keeps its participant rows, so without this the
+    # media/docs/links tab still served the whole archive of a group the caller
+    # had been cut off from.
+    if not conv.is_active:
+        raise HTTPException(status_code=404, detail="Conversation not found")
     db = tenant.db
 
     if media_type == _LINK_TYPE:

@@ -133,3 +133,39 @@ async def test_password_policy_enforced_on_change(client):
         json={"current_password": "TestPass1234", "new_password": "LongEnoughPass99"},
     )
     assert resp.status_code == 200
+
+
+async def test_password_longer_than_bcrypt_can_hash_is_rejected(client):
+    """bcrypt hashes only the first 72 bytes and discards the rest silently, so
+    without this cap a long password and its own 72-byte prefix are one credential."""
+    await make_user("mira@x.com")
+    await login(client, "mira@x.com")
+    resp = await client.post(
+        "/api/auth/change-password",
+        json={"current_password": "TestPass1234", "new_password": "A1" + "x" * 71},
+    )
+    assert resp.status_code == 400
+    assert "72 bytes" in resp.json()["detail"]
+    # The 72-byte boundary itself is still allowed.
+    resp = await client.post(
+        "/api/auth/change-password",
+        json={"current_password": "TestPass1234", "new_password": "A1" + "x" * 70},
+    )
+    assert resp.status_code == 200
+
+
+async def test_change_password_is_rate_limited(client):
+    """This route verifies current_password, so it is an online guessing surface
+    and is throttled like the admin reset it mirrors."""
+    await make_user("nate@x.com")
+    await login(client, "nate@x.com")
+    statuses = []
+    for _ in range(8):
+        resp = await client.post(
+            "/api/auth/change-password",
+            json={"current_password": "WrongPass1234", "new_password": "LongEnoughPass99"},
+        )
+        statuses.append(resp.status_code)
+    assert 401 in statuses  # the guesses themselves are rejected
+    assert 429 in statuses  # and the limiter cuts the attempt off
+    assert statuses[-1] == 429
