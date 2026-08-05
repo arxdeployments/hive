@@ -381,4 +381,69 @@ final class CallResilienceTests: XCTestCase {
         XCTAssertTrue(reached, "with no room the requested state is reported back unchanged")
         XCTAssertNil(session.cameraPosition, "no room means no capture device to report")
     }
+
+
+    // MARK: - Terminal phase
+
+    /// `.ended` is a *held* phase: the only thing that clears it is the auto-reset
+    /// task `teardown` schedules, and that task is scheduled only when a call was
+    /// actually live. Tearing down to `.ended` from idle therefore parked the
+    /// store in `.ended` for good — and CallOverlayHost renders `.ended`
+    /// full-screen, so the app sat behind an undismissable "Call ended" card over
+    /// a call that never happened, recoverable only by relaunching.
+    ///
+    /// One stray frame did it. `.callEnded`, `.callDeclined`, `.callBusy` and
+    /// `.callUnavailable` tore down unconditionally, unlike `.callGroupEnded`
+    /// which always guarded on `hasLiveCall`; a late frame for a dismissed call,
+    /// or one re-delivered when the socket resumes, arrives while idle by
+    /// definition.
+    @MainActor
+    func testTearingDownToEndedWithNoLiveCallLandsOnIdleInstead() {
+        XCTAssertEqual(
+            CallStore.resolvedTerminal(.ended, wasLive: false), .idle,
+            "an ended phase with no call behind it can never be cleared"
+        )
+        XCTAssertEqual(
+            CallStore.resolvedTerminal(.ended, wasLive: true), .ended,
+            "a real call must still show its Call ended card"
+        )
+        // Terminals that are not `.ended` are self-clearing and pass through.
+        XCTAssertEqual(CallStore.resolvedTerminal(.idle, wasLive: true), .idle)
+        XCTAssertEqual(CallStore.resolvedTerminal(.idle, wasLive: false), .idle)
+    }
+
+    /// The precondition the guards on those four frames rest on: a freshly built
+    /// store is idle, so `hasLiveCall` is false and a stray terminal frame is
+    /// dropped before it can toast about a call that is not happening.
+    @MainActor
+    func testAFreshStoreHasNoLiveCall() {
+        XCTAssertFalse(CallStore().hasLiveCall)
+    }
+
+    // MARK: - Rejoin budget
+
+    /// The rejoin loop must tell "this attempt failed" apart from "the user hung
+    /// up". It used `callID != nil` for that, but `join` clears `callID` on its
+    /// own failure paths too — so the first unreachable SFU ended the whole
+    /// five-attempt budget AND skipped `onRoomLost`, leaving the call on
+    /// "Reconnecting…" until the user force-quit.
+    @MainActor
+    func testAFailedJoinAttemptDoesNotEndTheRejoinBudget() async {
+        let session = LiveKitSession()
+        XCTAssertFalse(session.rejoinAbandoned, "a fresh session has a budget to spend")
+
+        // What join's own failure paths do.
+        await session.leave(endingCall: false)
+        XCTAssertFalse(
+            session.rejoinAbandoned,
+            "a failed attempt must leave the remaining attempts available"
+        )
+
+        // What a hang-up does.
+        await session.leave()
+        XCTAssertTrue(
+            session.rejoinAbandoned,
+            "a teardown from outside must stop the loop retrying a call that ended"
+        )
+    }
 }
