@@ -1,4 +1,3 @@
-import React from 'react';
 import { Check, CheckCheck, Clock, Star, Pin } from 'lucide-react';
 
 /**

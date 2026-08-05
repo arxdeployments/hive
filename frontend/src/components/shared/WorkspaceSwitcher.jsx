@@ -1,4 +1,3 @@
-import React from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Building2, MessageSquare } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';

@@ -1,4 +1,3 @@
-import React from 'react';
 
 export const TypingIndicator = ({ users }) => {
   if (!users || Object.keys(users).length === 0) return null;

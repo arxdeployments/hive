@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Plus, Search, Pencil, Trash2, Building2, Loader2, ChevronLeft, ChevronRight } from 'lucide-react';
 import { toast } from 'sonner';
@@ -35,7 +35,7 @@ export default function Organizations() {
       });
       setOrgs(data.data);
       setTotal(data.total);
-    } catch (err) {
+    } catch {
       toast.error('Failed to load organizations');
     } finally {
       setLoading(false);
@@ -125,7 +125,7 @@ export default function Organizations() {
       await client.put(`/api/admin/organizations/${org._id}`, { is_active: !org.is_active });
       toast.success(`Organization ${org.is_active ? 'deactivated' : 'activated'}`);
       fetchOrgs();
-    } catch (err) {
+    } catch {
       toast.error('Failed to update status');
     }
   };

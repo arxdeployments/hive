@@ -9,7 +9,7 @@
  * strip above the content, so nothing needs a second "back" navigation state.
  */
 
-import React, { useEffect, useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X } from 'lucide-react';
 

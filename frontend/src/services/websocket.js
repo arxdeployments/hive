@@ -1365,7 +1365,7 @@ class RxHiveWebSocket {
       gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
       oscillator.start(audioCtx.currentTime);
       oscillator.stop(audioCtx.currentTime + 0.3);
-    } catch (e) {
+    } catch {
       // autoplay policy may block audio
     }
   }
@@ -1434,7 +1434,7 @@ class RxHiveWebSocket {
         store.setActiveConversation(convId);
         notif.close();
       };
-    } catch (e) {
+    } catch {
       // Notification may fail in some contexts
     }
   }

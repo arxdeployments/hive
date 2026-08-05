@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { AlertTriangle, Check, ChevronLeft, Lock, LockOpen, Mic, Pause, Send, Trash2, Loader2 } from 'lucide-react';
 import { AudioPlayer } from './AudioPlayer';
 import { LiveWaveform } from './Waveform';

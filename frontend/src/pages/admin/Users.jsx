@@ -1,8 +1,8 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Plus, Search, Pencil, Trash2, Users as UsersIcon, Loader2,
-  ChevronLeft, ChevronRight, ChevronDown, Copy, RefreshCw, X, Check,
+  Plus, Search, Pencil, Users as UsersIcon, Loader2,
+  ChevronLeft, ChevronRight, ChevronDown, Copy, RefreshCw, X,
   Smartphone
 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -40,7 +40,6 @@ export default function UsersPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [editUser, setEditUser] = useState(null);
   const [resetPwResult, setResetPwResult] = useState(null);
-  const [createdPw, setCreatedPw] = useState(null);
 
   // Create form
   const [createOrg, setCreateOrg] = useState(null);
@@ -77,7 +76,7 @@ export default function UsersPage() {
       try {
         const { data } = await client.get('/api/admin/organizations', { params: { limit: 100 } });
         setOrgs(data.data);
-      } catch (err) { toast.error('Failed to load organizations'); }
+      } catch { toast.error('Failed to load organizations'); }
     })();
   }, []);
 
@@ -88,7 +87,7 @@ export default function UsersPage() {
       try {
         const { data } = await client.get('/api/admin/departments', { params: { org_id: selectedOrg._id, limit: 100 } });
         setDepts(data.data);
-      } catch (err) { setDepts([]); }
+      } catch { setDepts([]); }
     })();
   }, [selectedOrg]);
 
@@ -104,7 +103,7 @@ export default function UsersPage() {
       const { data } = await client.get('/api/admin/users', { params });
       setUsers(data.data);
       setTotal(data.total);
-    } catch (err) {
+    } catch {
       toast.error('Failed to load users');
     } finally {
       setLoading(false);
@@ -187,7 +186,6 @@ export default function UsersPage() {
         role: createRole,
         mobile_access: createMobileAccess,
       });
-      setCreatedPw(createPassword);
       toast.success('User created successfully', {
         description: `Password: ${createPassword}`,
         duration: 10000,
@@ -240,7 +238,7 @@ export default function UsersPage() {
           onClick: () => { navigator.clipboard.writeText(data.temporary_password); toast.success('Password copied!'); }
         }
       });
-    } catch (err) {
+    } catch {
       toast.error('Failed to reset password');
     }
   };

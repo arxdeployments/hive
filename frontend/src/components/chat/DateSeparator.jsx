@@ -1,4 +1,3 @@
-import React from 'react';
 
 export const DateSeparator = ({ date }) => {
   const formatDate = (dateStr) => {

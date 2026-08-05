@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import { useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { PhoneOff, ChevronDown, Lock } from 'lucide-react';
 import useCallStore from '../../stores/callStore';

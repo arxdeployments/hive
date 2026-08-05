@@ -1,4 +1,3 @@
-import React from 'react';
 import { PageTransition } from '../../components/common/PageTransition';
 import { Settings as SettingsIcon } from 'lucide-react';
 

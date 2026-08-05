@@ -1,10 +1,9 @@
-import React, { memo, useCallback, useEffect, useRef } from 'react';
-import { AlertTriangle, Ban, ChevronDown, Mic } from 'lucide-react';
+import { memo, useCallback, useEffect, useRef } from 'react';
+import { AlertTriangle, Ban, ChevronDown } from 'lucide-react';
 import { ImageBubble } from './ImageBubble';
 import { DocumentBubble } from './DocumentBubble';
 import { AudioPlayer } from './AudioPlayer';
 import { MessageFooter } from './MessageFooter';
-import { FullscreenVideoViewer } from './FullscreenVideoViewer';
 import { VideoBubble } from './VideoBubble';
 
 const LONG_PRESS_MS = 500;

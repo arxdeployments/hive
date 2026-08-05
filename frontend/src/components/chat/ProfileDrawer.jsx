@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Pencil, Camera, Mail, Building2, FolderTree, LogOut } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
@@ -79,7 +79,7 @@ export const ProfileDrawer = ({ isOpen, onClose }) => {
         toast.success('Avatar updated');
         checkAuth();
       }
-    } catch (err) { toast.error('Failed to upload avatar'); }
+    } catch { toast.error('Failed to upload avatar'); }
   };
 
   if (!isOpen) return null;

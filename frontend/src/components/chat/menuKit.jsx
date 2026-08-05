@@ -8,7 +8,7 @@
  * positioned in viewport coordinates and flip above the anchor (and shift
  * horizontally) when they would otherwise run off-screen.
  */
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { toast } from 'sonner';
 import client from '../../api/client';

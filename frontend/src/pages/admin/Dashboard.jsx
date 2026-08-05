@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { Building2, FolderTree, Users, Activity } from 'lucide-react';
 import { PageTransition } from '../../components/common/PageTransition';

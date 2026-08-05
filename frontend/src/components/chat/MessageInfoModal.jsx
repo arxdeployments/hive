@@ -1,6 +1,5 @@
-import React from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, Check, CheckCheck, Clock } from 'lucide-react';
+import { X, CheckCheck, Clock } from 'lucide-react';
 
 export const MessageInfoModal = ({ info, isOpen, onClose }) => {
   if (!isOpen || !info) return null;

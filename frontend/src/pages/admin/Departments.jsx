@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Plus, Search, Pencil, Trash2, FolderTree, Loader2, ChevronLeft, ChevronRight, ChevronDown } from 'lucide-react';
 import { toast } from 'sonner';
@@ -31,7 +31,7 @@ export default function Departments() {
       try {
         const { data } = await client.get('/api/admin/organizations', { params: { limit: 100 } });
         setOrgs(data.data);
-      } catch (err) {
+      } catch {
         toast.error('Failed to load organizations');
       }
     };
@@ -47,7 +47,7 @@ export default function Departments() {
       });
       setDepts(data.data);
       setTotal(data.total);
-    } catch (err) {
+    } catch {
       toast.error('Failed to load departments');
     } finally {
       setLoading(false);

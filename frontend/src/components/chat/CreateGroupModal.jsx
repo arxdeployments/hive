@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Search, X, ArrowLeft, Camera, Users, Loader2 } from 'lucide-react';
 import client from '../../api/client';
@@ -35,7 +35,7 @@ export const CreateGroupModal = ({
     try {
       const { data } = await client.get('/api/users/contacts', { params: { search } });
       setContacts(data);
-    } catch (err) { /* ignore */ }
+    } catch { /* ignore */ }
     finally { setLoading(false); }
   }, [search]);
 

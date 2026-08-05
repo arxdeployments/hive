@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useMotionValue } from 'framer-motion';
 import { Mic, MicOff, PhoneOff, Video } from 'lucide-react';
 import useCallStore, { isCallStalled } from '../../stores/callStore';

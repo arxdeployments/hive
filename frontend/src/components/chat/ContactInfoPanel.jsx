@@ -22,7 +22,7 @@
  * conversation is used, which is how ChatPanel opens the panel today.
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Check,
   Copy,

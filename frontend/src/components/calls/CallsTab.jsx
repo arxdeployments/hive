@@ -1,15 +1,13 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Phone, Video, Link2, Hash, Calendar, PhoneIncoming, PhoneOutgoing, PhoneMissed, X, Clock } from 'lucide-react';
 import { formatRelativeTime } from '../../utils/helpers';
 import client from '../../api/client';
 import useCallStore from '../../stores/callStore';
-import { PageTransition } from '../common/PageTransition';
 import wsClient from '../../services/websocket';
 import { useAuth } from '../../contexts/AuthContext';
 import { toast } from 'sonner';
 
-const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 
 // Local datetime-local default: now + 1 hour, rounded, in the input's expected format.
 const defaultScheduleTime = () => {

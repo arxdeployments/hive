@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { ChatSidebar } from '../components/chat/ChatSidebar';
 import { ChatPanel } from '../components/chat/ChatPanel';

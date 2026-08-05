@@ -1,6 +1,6 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Plus, Search, Pencil, Trash2, Globe, Archive, RotateCcw, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react';
+import { Plus, Search, Trash2, Globe, Archive, RotateCcw, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
 import client from '../../api/client';
@@ -37,7 +37,7 @@ export default function CrossOrgGroups() {
       });
       setGroups(data.data);
       setTotal(data.total);
-    } catch (err) { toast.error('Failed to load groups'); }
+    } catch { toast.error('Failed to load groups'); }
     finally { setLoading(false); }
   }, [page, search, status]);
 
@@ -48,7 +48,7 @@ export default function CrossOrgGroups() {
     try {
       const { data } = await client.get('/api/admin/organizations/all');
       setAllOrgs(data);
-    } catch (err) { toast.error('Failed to load organizations'); }
+    } catch { toast.error('Failed to load organizations'); }
   };
 
   // Load users for selected orgs
@@ -56,7 +56,7 @@ export default function CrossOrgGroups() {
     try {
       const { data } = await client.get(`/api/admin/organizations/${orgId}/users`);
       setOrgUsers(prev => ({ ...prev, [orgId]: data }));
-    } catch (err) { /* ignore */ }
+    } catch { /* ignore */ }
   };
 
   useEffect(() => {
@@ -135,7 +135,7 @@ export default function CrossOrgGroups() {
       await client.post(`/api/admin/cross-org-groups/${group._id}/archive`);
       toast.success(group.is_active ? 'Group archived' : 'Group unarchived');
       fetchGroups();
-    } catch (err) { toast.error('Failed'); }
+    } catch { toast.error('Failed'); }
   };
 
   const handleDelete = async () => {
@@ -146,7 +146,7 @@ export default function CrossOrgGroups() {
       setDeleteGroup(null);
       setDeleteConfirm('');
       fetchGroups();
-    } catch (err) { toast.error('Failed to delete'); }
+    } catch { toast.error('Failed to delete'); }
   };
 
   const totalPages = Math.ceil(total / limit);

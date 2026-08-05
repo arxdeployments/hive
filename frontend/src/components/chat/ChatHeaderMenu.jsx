@@ -18,7 +18,7 @@
  * The action still fires for those, so the integrator can log/react — but it
  * must NOT re-run the request or open a second scheduling modal.
  */
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bell,
   BellOff,

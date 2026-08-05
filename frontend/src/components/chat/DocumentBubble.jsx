@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { AnimatePresence } from 'framer-motion';
 import { FileText, FileSpreadsheet, File, FileArchive, Download } from 'lucide-react';
 import { PdfViewer } from './PdfViewer';

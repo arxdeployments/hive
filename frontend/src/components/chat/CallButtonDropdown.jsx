@@ -13,7 +13,7 @@
  * carried out here (create-link + clipboard, and the shared ScheduleCallModal) —
  * the integrator should not repeat them.
  */
-import React, { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { Calendar, ChevronDown, ChevronRight, Link2, Phone, Video } from 'lucide-react';
 import { ScheduleCallModal } from '../calls/CallsTab';
 import { MenuItem, MenuSurface, createAndCopyCallLink } from './menuKit';

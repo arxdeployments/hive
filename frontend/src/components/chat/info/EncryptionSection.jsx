@@ -9,7 +9,6 @@
  * privacy promise; it would be a false security claim.
  */
 
-import React from 'react';
 import { Building2, Info, Lock, ServerCog, ShieldCheck } from 'lucide-react';
 
 const POINTS = [
