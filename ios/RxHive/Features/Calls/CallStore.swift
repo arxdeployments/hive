@@ -1038,22 +1038,48 @@ final class CallStore: ObservableObject {
             guard signal.callID == nil || signal.callID == currentCallID, hasLiveCall else { return }
             await teardown(to: .ended)
 
-        case .callDeclined:
+        // The four 1:1 terminal frames below now carry the same guard
+        // `.callGroupEnded` above has always had. They match on the call id and
+        // require a live call; each of them already carried a CallSignal, so
+        // ignoring it was an omission rather than a limitation.
+        //
+        // Without the guard a frame that arrives while idle tore the store down
+        // to `.ended` — and `.ended` is only ever cleared by the auto-reset that
+        // teardown schedules *when a call was live*, so it stuck permanently
+        // behind a full-screen overlay that hangUp() cannot dismiss (it is a
+        // no-op in `.ended`) and the reconnect reconcile does not clear (it only
+        // acts `if hasLiveCall`). Only a force-quit recovered it.
+        //
+        // Two ways in, both ordinary. Signed in on web and phone: the backend
+        // publishes call:ended to the user's channel, so every socket that user
+        // holds gets it, including the idle phone. And on one device: the peer
+        // sends both the socket frame and the REST call, so call:ended can
+        // arrive twice — the first while `.active` arms the 2s reset, the second
+        // lands inside that window and cancels it for good.
+        //
+        // `resolvedTerminal` in teardown is the backstop if a future caller
+        // skips this guard; these guards additionally stop the spurious toast,
+        // which the backstop cannot.
+        case .callDeclined(let signal):
+            guard signal.callID == nil || signal.callID == currentCallID, hasLiveCall else { return }
             toasts?.show("Call declined")
             await teardown(to: .ended)
 
-        case .callEnded:
+        case .callEnded(let signal):
+            guard signal.callID == nil || signal.callID == currentCallID, hasLiveCall else { return }
             await teardown(to: .ended)
 
         case .callCancelled:
             // The caller gave up; nothing to say beyond removing the ring.
             await teardown(to: .idle)
 
-        case .callBusy:
+        case .callBusy(let signal):
+            guard signal.callID == nil || signal.callID == currentCallID, hasLiveCall else { return }
             toasts?.show("They're on another call")
             await teardown(to: .ended)
 
-        case .callUnavailable:
+        case .callUnavailable(let signal):
+            guard signal.callID == nil || signal.callID == currentCallID, hasLiveCall else { return }
             toasts?.show("They're unavailable right now")
             await teardown(to: .ended)
 
@@ -1357,6 +1383,28 @@ final class CallStore: ObservableObject {
 
     // MARK: - Teardown
 
+    /// Where a teardown should actually leave `phase`.
+    ///
+    /// `.ended` is a *held* state: the only thing that ever clears it is the
+    /// auto-reset task below, and that task is scheduled only when a call was
+    /// live. Tearing down to `.ended` with nothing live therefore parked the
+    /// store in `.ended` permanently — and CallOverlayHost renders `.ended`
+    /// full-screen, so the app sat behind an undismissable "Call ended" card
+    /// with no call and no way out but a relaunch.
+    ///
+    /// A single stray frame was enough: `.callEnded`, `.callDeclined`,
+    /// `.callBusy` and `.callUnavailable` all tore down unconditionally, unlike
+    /// `.callGroupEnded`, which already guarded on `hasLiveCall`. A late frame
+    /// for a call that had just been dismissed, or one re-delivered on socket
+    /// resume, arrives while idle by definition.
+    ///
+    /// Static and non-private so the invariant can be tested without a seam into
+    /// the private socket-event path.
+    static func resolvedTerminal(_ terminal: Phase, wasLive: Bool) -> Phase {
+        if case .ended = terminal, !wasLive { return .idle }
+        return terminal
+    }
+
     private func teardown(to terminal: Phase) async {
         timerTask?.cancel()
         timerTask = nil
@@ -1367,7 +1415,7 @@ final class CallStore: ObservableObject {
         // `onRoomLost`/`onStateChanged`, and handling those mid-teardown would
         // recurse straight back into here.
         let wasLive = hasLiveCall
-        phase = terminal
+        phase = Self.resolvedTerminal(terminal, wasLive: wasLive)
         isConnecting = false
         await session.leave()
 

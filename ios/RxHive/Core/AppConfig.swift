@@ -20,12 +20,43 @@ enum AppConfig {
                 """
                 RXHIVE_API_URL is missing or malformed in Info.plist.
                 Set it per configuration, e.g. Debug -> http://localhost:8000,
-                Release -> https://rxhive.example.com
+                Release -> your production API origin.
                 """
             )
         }
+        #if !DEBUG
+        // The guard above only rejects a URL that is missing or malformed, and
+        // the placeholder this repo ships in the Release configuration —
+        // https://rxhive.example.com, marked "CHANGE ME before shipping" — is
+        // neither. It parses, so the app launches, and then every single request
+        // fails against a domain that does not exist. Nothing before this point
+        // could tell the difference between "not configured" and "offline".
+        //
+        // Refusing to launch mirrors what the backend already does with its own
+        // placeholders (Settings._reject_placeholder_secrets_in_prod), and what
+        // this very property already does for a malformed URL. A crash at launch
+        // is caught by whoever builds the archive; a silently dead network layer
+        // is caught by a tester, or by a user.
+        if isPlaceholderHost(url) {
+            fatalError(
+                """
+                RXHIVE_API_URL is still the shipped placeholder (\(url.host ?? "?")).
+                Set the production API origin on the Release configuration before archiving.
+                """
+            )
+        }
+        #endif
         return url
     }()
+
+    /// True for the example.com hosts this repo ships as placeholders.
+    ///
+    /// Separate and non-private so it can be tested without building for release;
+    /// the call site above is the only thing gated on configuration.
+    static func isPlaceholderHost(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        return host == "example.com" || host.hasSuffix(".example.com")
+    }
 
     /// WebSocket origin, derived from `apiBaseURL` so the two can never disagree.
     /// http -> ws, https -> wss.

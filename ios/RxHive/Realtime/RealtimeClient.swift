@@ -241,9 +241,30 @@ final class RealtimeClient: NSObject, ObservableObject {
             // reconnect immediately rather than backing off, because the user is
             // very likely looking at the screen right now.
             let reason = lastCloseReason
+            // Drop the dead socket and stop claiming `.connected` BEFORE awaiting
+            // the refresh. This close arrives every ~15 minutes for every
+            // connected user, and the refresh behind it is two or three round
+            // trips; for that whole window `state` still read `.connected` and
+            // `task` still pointed at the closed socket, so `send(_:)`'s guard
+            // passed and every frame written in that window went into a dead
+            // socket and was dropped with nothing but a log line. Tapping Answer
+            // in that window sent an accept the server never received.
+            task = nil
+            state = .connecting
             Task { [weak self] in
                 guard let self else { return }
-                switch await self.onTokenExpired?() ?? .unreachable {
+                let outcome = await self.onTokenExpired?() ?? .unreachable
+                // `disconnect()` may have run while the refresh was in flight, and
+                // it does not cancel this Task. Without re-reading the flag, a
+                // sign-out mid-refresh re-opened the socket for a signed-out user
+                // — and if the cookies were already cleared, parked `state` at
+                // `.connecting` for the rest of the process. `scheduleReconnect`
+                // already re-checks this; this path did not.
+                guard !self.intentionallyClosed else {
+                    self.state = .idle
+                    return
+                }
+                switch outcome {
                 case .valid:
                     self.attempt = 0
                     self.openSocket()

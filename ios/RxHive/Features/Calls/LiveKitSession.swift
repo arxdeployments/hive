@@ -171,6 +171,13 @@ final class LiveKitSession: NSObject, ObservableObject {
     /// the handle if it is still the one the handle refers to, so a task finishing late
     /// cannot clear a newer attempt's handle.
     private var rejoinGeneration = 0
+    /// Set by a real teardown (`leave(endingCall: true)`) and cleared when a new
+    /// rejoin begins. The rejoin loop's stop condition, kept separate from
+    /// `callID` because `join`'s own failure paths clear that too. See `leave`.
+    ///
+    /// `private(set)` rather than `private` so the discriminator can be asserted
+    /// directly; the retry loop that consumes it needs a live SFU to exercise.
+    private(set) var rejoinAbandoned = false
     /// True while `rejoinTask` is inside `onNeedsRejoin`, which reaches back into
     /// `join` → `leave`. Without it, `leave`'s `rejoinTask?.cancel()` would cancel the
     /// very task calling it, and the cancellation would then abort the `room.connect`
@@ -253,7 +260,13 @@ final class LiveKitSession: NSObject, ObservableObject {
         speaker: Bool
     ) async throws -> CallJoinOutcome {
         if room != nil, self.callID == callID { return CallJoinOutcome(cameraUnavailable: false, cameraFailure: nil) }
-        await leave()
+        // `endingCall: false`: this is clearing the way for the join below, not
+        // ending anything. When the join IS a rejoin attempt, flagging
+        // abandonment here would stop the very loop that called us — which is
+        // the bug this whole flag exists to fix, reintroduced one line earlier.
+        // A genuinely unrelated previous call is handled by the rejoinTask
+        // cancellation above, which runs whenever we are not already rejoining.
+        await leave(endingCall: false)
 
         let url = try Self.resolveSFUURL(token.url)
 
@@ -294,7 +307,8 @@ final class LiveKitSession: NSObject, ObservableObject {
         do {
             try await room.connect(url: url, token: token.token)
         } catch {
-            await leave()
+            // Not the call ending — just this attempt. See leave().
+            await leave(endingCall: false)
             throw CallJoinError(Self.connectFailure(error), "could not reach the SFU at \(url)", underlying: error)
         }
 
@@ -321,7 +335,8 @@ final class LiveKitSession: NSObject, ObservableObject {
             try await room.localParticipant.setMicrophone(enabled: true)
             isMicEnabled = true
         } catch {
-            await leave()
+            // Not the call ending — just this attempt. See leave().
+            await leave(endingCall: false)
             throw CallJoinError(Self.mediaFailure(error), "could not publish the microphone", underlying: error)
         }
 
@@ -347,13 +362,32 @@ final class LiveKitSession: NSObject, ObservableObject {
     }
 
     /// Tear everything down. Safe to call when there is no room.
-    func leave() async {
+    ///
+    /// `endingCall: false` is for `join`'s own failure paths, and only those.
+    ///
+    /// The rejoin loop needs to tell "the user hung up, stop trying" apart from
+    /// "this attempt failed, make the next one", and it used `callID == nil` for
+    /// that. But `join` tears down on its own failures too, so a failed rejoin
+    /// attempt cleared the very flag the loop consults before the next one: the
+    /// five-attempt, 23-second budget collapsed to one attempt, and because the
+    /// loop returned at that guard it never reached `onRoomLost` either. An SFU
+    /// down for two seconds longer than the first retry left the call sitting on
+    /// "Reconnecting…" until the user force-quit.
+    ///
+    /// An explicit flag rather than the id, because the id is also nil for a
+    /// join that failed before it got one — a malformed SFU URL throws above the
+    /// assignment — and that case must still exhaust the budget and report the
+    /// room lost rather than stall in the same silent way.
+    func leave(endingCall: Bool = true) async {
         syncTicker?.cancel()
         syncTicker = nil
         if !isRejoining {
             rejoinTask?.cancel()
             rejoinTask = nil
         }
+        // `endingCall` governs the rejoin budget and nothing else; the session
+        // state below is torn down either way.
+        if endingCall { rejoinAbandoned = true }
         let room = self.room
         self.room = nil
         callID = nil
@@ -595,6 +629,8 @@ final class LiveKitSession: NSObject, ObservableObject {
         setMediaLink(.reconnecting)
         rejoinGeneration &+= 1
         let generation = rejoinGeneration
+        // A fresh budget: only a teardown from outside stops this one.
+        rejoinAbandoned = false
         rejoinTask = Task { [weak self] in
             // Cleared on EVERY exit, not just the two that used to do it by hand.
             // Three of the returns below left the handle pointing at a finished
@@ -615,9 +651,11 @@ final class LiveKitSession: NSObject, ObservableObject {
             }
             for (attempt, delay) in Self.rejoinDelays.enumerated() {
                 try? await Task.sleep(for: .seconds(delay))
-                // `callID == nil` means `leave()` ran — the user hung up, or the call
-                // ended — so there is nothing left to rejoin.
-                guard let self, !Task.isCancelled, self.callID != nil else { return }
+                // `rejoinAbandoned` means a teardown ran from outside — the user hung
+                // up, or the call ended — so there is nothing left to rejoin. This was
+                // `callID != nil`, which `join` also clears when an *attempt* fails,
+                // so one unreachable SFU ended the whole budget. See `leave`.
+                guard let self, !Task.isCancelled, !self.rejoinAbandoned else { return }
                 // A `join` from somewhere else got there first.
                 if self.room != nil { return }
                 self.log.notice("Rejoining the SFU (attempt \(attempt + 1))")
