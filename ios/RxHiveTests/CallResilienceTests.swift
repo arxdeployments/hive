@@ -420,6 +420,82 @@ final class CallResilienceTests: XCTestCase {
         XCTAssertFalse(CallStore().hasLiveCall)
     }
 
+    // MARK: - Terminal frame correlation
+
+    /// A terminal frame must name the call it is ending. `.callCancelled` named
+    /// none at all — it ignored its signal and tore down whatever was live — so a
+    /// cancel for a ring that was already over ended the call the user had since
+    /// answered. The other terminal frames read the id but treated a missing one
+    /// as a match, which is the same hole with an extra step.
+    @MainActor
+    func testATerminalFrameForAnotherCallCannotEndThisOne() {
+        XCTAssertTrue(
+            CallStore.terminalFrameIsOurs(
+                frameCallID: "call-b", currentCallID: "call-b",
+                awaitingCallID: false, hasLiveCall: true, seenCallIDs: ["call-a", "call-b"]
+            ),
+            "the frame for the call we are on is the whole point"
+        )
+        XCTAssertFalse(
+            CallStore.terminalFrameIsOurs(
+                frameCallID: "call-a", currentCallID: "call-b",
+                awaitingCallID: false, hasLiveCall: true, seenCallIDs: ["call-a", "call-b"]
+            ),
+            "a late cancel for a finished ring must not end the live call"
+        )
+        XCTAssertFalse(
+            CallStore.terminalFrameIsOurs(
+                frameCallID: nil, currentCallID: "call-b",
+                awaitingCallID: false, hasLiveCall: true, seenCallIDs: []
+            ),
+            "a frame that names no call cannot be correlated to one, so it ends nothing"
+        )
+        XCTAssertFalse(
+            CallStore.terminalFrameIsOurs(
+                frameCallID: "call-a", currentCallID: nil,
+                awaitingCallID: false, hasLiveCall: false, seenCallIDs: ["call-a"]
+            ),
+            "with nothing live there is nothing to tear down"
+        )
+    }
+
+    /// The one window with no id to match on: our own outgoing ring, before
+    /// `call:ringing_started` comes back. `initiate_direct_call` answers
+    /// `call:busy` *instead of* `ringing_started` when the callee is already on a
+    /// call, so a frame arriving in that window is the reply to the call we just
+    /// placed — unless it names a call we have already held, which makes it stale.
+    @MainActor
+    func testAFrameInTheWindowBeforeTheIdArrivesEndsTheRingItAnswers() {
+        XCTAssertTrue(
+            CallStore.terminalFrameIsOurs(
+                frameCallID: "call-new", currentCallID: nil,
+                awaitingCallID: true, hasLiveCall: true, seenCallIDs: ["call-old"]
+            ),
+            "call:busy is the only frame this ring will ever get; dropping it rings out"
+        )
+        XCTAssertFalse(
+            CallStore.terminalFrameIsOurs(
+                frameCallID: "call-old", currentCallID: nil,
+                awaitingCallID: true, hasLiveCall: true, seenCallIDs: ["call-old"]
+            ),
+            "a frame for a call we have already been in is stale, not our new ring"
+        )
+        XCTAssertFalse(
+            CallStore.terminalFrameIsOurs(
+                frameCallID: nil, currentCallID: nil,
+                awaitingCallID: true, hasLiveCall: true, seenCallIDs: []
+            ),
+            "no id on either side is not a match, it is two unknowns"
+        )
+        XCTAssertFalse(
+            CallStore.terminalFrameIsOurs(
+                frameCallID: "call-new", currentCallID: nil,
+                awaitingCallID: false, hasLiveCall: true, seenCallIDs: []
+            ),
+            "only an initiator still waiting on an id has an excuse for not matching"
+        )
+    }
+
     // MARK: - Rejoin budget
 
     /// The rejoin loop must tell "this attempt failed" apart from "the user hung
@@ -444,6 +520,75 @@ final class CallResilienceTests: XCTestCase {
         XCTAssertTrue(
             session.rejoinAbandoned,
             "a teardown from outside must stop the loop retrying a call that ended"
+        )
+    }
+
+    /// The recovery loop end to end: every attempt in the budget is spent against an
+    /// unreachable SFU, and the store is told the room is gone exactly once, after
+    /// the last one.
+    ///
+    /// The test above pins the *discriminator* the first-attempt-exit bug corrupted,
+    /// but it never runs the loop — so the same regression, reintroduced anywhere
+    /// between the sleep and `onRoomLost`, would leave it green. This drives
+    /// `handleRoomGone()` itself. It is only testable at all because the budget is
+    /// injectable: at production delays this would sit here for 23 seconds.
+    ///
+    /// Both failure shapes matter and both are asserted. Too few attempts is a call
+    /// abandoned while the server was still holding it open (its grace window is 40s,
+    /// which the budget is sized to fit inside). More than one `onRoomLost` is a
+    /// hang-up delivered per failed attempt rather than per lost call.
+    @MainActor
+    func testEveryRejoinAttemptIsSpentBeforeTheCallIsDeclaredLost() async {
+        // Same number of attempts as production, none of the waiting.
+        let session = LiveKitSession(
+            rejoinDelays: [Double](repeating: 0, count: LiveKitSession.defaultRejoinDelays.count)
+        )
+
+        var attempts = 0
+        session.onNeedsRejoin = {
+            attempts += 1
+            return false  // the SFU stays unreachable for the whole budget
+        }
+        var lostCount = 0
+        let lost = expectation(description: "onRoomLost once the budget is spent")
+        session.onRoomLost = {
+            lostCount += 1
+            lost.fulfill()
+        }
+
+        session.handleRoomGone()
+        XCTAssertEqual(
+            session.mediaLink, .reconnecting,
+            "the call screen must say Reconnecting for as long as attempts remain"
+        )
+
+        await fulfillment(of: [lost], timeout: 5)
+
+        XCTAssertEqual(
+            attempts, LiveKitSession.defaultRejoinDelays.count,
+            "a failed attempt must cost one attempt, not the whole budget"
+        )
+        XCTAssertEqual(
+            lostCount, 1,
+            "the call is lost once, not once per failed attempt"
+        )
+        XCTAssertEqual(
+            session.mediaLink, .connected,
+            "giving up must clear Reconnecting; the call is over, not still trying"
+        )
+    }
+
+    /// The budget's shape is the contract with the server, not a free parameter:
+    /// `services/calls.RECONNECT_GRACE_SECONDS` is 40s, and the last attempt has to
+    /// start while the call row is still open. Growing the delays past that window
+    /// means the final attempts are spent re-joining a call the server has already
+    /// finalised.
+    @MainActor
+    func testTheRejoinBudgetFitsInsideTheServersGraceWindow() {
+        XCTAssertEqual(LiveKitSession.defaultRejoinDelays, [1, 2, 4, 8, 8])
+        XCTAssertLessThan(
+            LiveKitSession.defaultRejoinDelays.reduce(0, +), 40,
+            "the budget must run out before the server stops holding the call open"
         )
     }
 }

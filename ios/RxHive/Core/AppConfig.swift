@@ -55,7 +55,12 @@ enum AppConfig {
     /// the call site above is the only thing gated on configuration.
     static func isPlaceholderHost(_ url: URL) -> Bool {
         guard let host = url.host?.lowercased() else { return false }
-        return host == "example.com" || host.hasSuffix(".example.com")
+        // The trailing dot of a fully-qualified name is dropped first. `example.com.`
+        // resolves to exactly the same nowhere as `example.com`, but Foundation keeps
+        // the dot in `host` (measured, not assumed — Swift 6.3), so both comparisons
+        // below miss it and the placeholder walks through the release guard.
+        let name = host.hasSuffix(".") ? String(host.dropLast()) : host
+        return name == "example.com" || name.hasSuffix(".example.com")
     }
 
     /// WebSocket origin, derived from `apiBaseURL` so the two can never disagree.
