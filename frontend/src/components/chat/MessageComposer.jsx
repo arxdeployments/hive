@@ -1178,7 +1178,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
             onChange={(e) => { setText(e.target.value); handleTyping(); }}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
-            onFocus={(e) => {
+            onFocus={() => {
               // Prevent browser from scrolling page to show input
               setTimeout(() => { window.scrollTo(0, 0); document.body.scrollTop = 0; }, 0);
             }}

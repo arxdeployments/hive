@@ -22,7 +22,7 @@ const FILTER_TABS = [
   { key: 'groups', label: 'Groups' },
 ];
 
-export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
+export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
   const { user } = useAuth();
   const navigate = useNavigate();
   // Narrow selectors: `useChatStore()` subscribed the whole sidebar (and every
@@ -199,7 +199,7 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
             } catch { toast.error('Failed to open conversation'); }
             setSearch(''); setShowGlobalSearch(false);
           }}
-          onSelectMessage={(convId, msgId) => { onSelectConversation(convId); setSearch(''); setShowGlobalSearch(false); }}
+          onSelectMessage={(convId) => { onSelectConversation(convId); setSearch(''); setShowGlobalSearch(false); }}
           onClose={() => setShowGlobalSearch(false)}
         />
       </div>
