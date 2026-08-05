@@ -628,6 +628,54 @@ export function clampFrameRect(rect, frameWidth, frameHeight, ratio = null, anch
     }
   }
 
+  // Fit into the frame by stopping the DRAGGED edge at the boundary, not by
+  // sliding the whole rect.
+  //
+  // This used to be `clamp(x, 0, 1 - w)` with the span left alone, which kept the
+  // size and moved the position — so an ordinary overshoot past the edge of the
+  // picture dragged the opposite edge along with it. Pulling the east handle right
+  // from x=0.5,w=0.3 returned x=0.3,w=0.7: the left edge, which the finger was not
+  // holding, jumped inward, and a big enough overshoot saturated at x=0,w=1 and
+  // selected the whole image. Every resize anchor had it, in both axes.
+  //
+  // Which edge is fixed follows from the anchor: dragging 'e' holds the left edge,
+  // 'w' holds the right, 's' holds the top, 'n' holds the bottom. For the 'w'/'n'
+  // cases the incoming rect still carries that fixed edge — CropStage moves x and w
+  // by equal and opposite amounts — so `x + w` is the edge to preserve.
+  const holdLeft = !!anchor?.includes('e');
+  const holdRight = !!anchor?.includes('w');
+  const holdTop = !!anchor?.includes('s');
+  const holdBottom = !!anchor?.includes('n');
+  // From the INCOMING rect, not from the already-clamped span: `w` was capped to 1
+  // at the top of this function, so once a drag overshoots far enough for that cap
+  // to bite, `x + w` is no longer the edge the drag was holding.
+  const fixedRight = clamp(rect.x + rect.w, MIN_CROP_SPAN, 1);
+  const fixedBottom = clamp(rect.y + rect.h, MIN_CROP_SPAN, 1);
+
+  let maxW = 1;
+  let maxH = 1;
+  if (holdLeft) maxW = 1 - clamp(x, 0, 1 - MIN_CROP_SPAN);
+  else if (holdRight) maxW = fixedRight;
+  if (holdTop) maxH = 1 - clamp(y, 0, 1 - MIN_CROP_SPAN);
+  else if (holdBottom) maxH = fixedBottom;
+
+  if (ratio) {
+    // Both axes shrink by the same factor, or the locked ratio would not survive
+    // being fitted.
+    const scale = Math.min(1, maxW / w, maxH / h);
+    w *= scale;
+    h *= scale;
+  } else {
+    w = Math.min(w, maxW);
+    h = Math.min(h, maxH);
+  }
+  w = Math.max(w, MIN_CROP_SPAN);
+  h = Math.max(h, MIN_CROP_SPAN);
+
+  // Re-seat the held edge, now that the span is final.
+  if (holdRight) x = fixedRight - w;
+  if (holdBottom) y = fixedBottom - h;
+
   return {
     x: clamp(x, 0, Math.max(0, 1 - w)),
     y: clamp(y, 0, Math.max(0, 1 - h)),
