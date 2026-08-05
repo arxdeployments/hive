@@ -442,7 +442,23 @@ class LiveKitClient {
         useCallStore.setState({ localStream: this._localStream(), localScreenStream: this._localScreenStream() });
       })
       .on(RoomEvent.LocalTrackUnpublished, () => {
-        useCallStore.setState({ localStream: this._localStream(), localScreenStream: this._localScreenStream() });
+        // `isScreenSharing` is derived here, not left to whoever unpublished.
+        //
+        // A share can end without `stopScreenShare()` ever being called: the browser's
+        // own "Stop sharing" bar, or closing the shared tab or window, ends the
+        // MediaStreamTrack, and livekit-client's `handleTrackEnded` responds by
+        // unpublishing a ScreenShare source itself. That arrives here — so
+        // `localScreenStream` correctly went null while the flag stayed true, leaving the
+        // store claiming a share with no publication behind it. The Share button kept
+        // reading "Stop sharing", and because the click handler branches on the flag, the
+        // next press called `stopScreenShare()` on an already-stopped share: it looked
+        // dead, and sharing only resumed on a second press.
+        const screenStream = this._localScreenStream();
+        useCallStore.setState({
+          localStream: this._localStream(),
+          localScreenStream: screenStream,
+          isScreenSharing: !!screenStream,
+        });
       });
   }
 
