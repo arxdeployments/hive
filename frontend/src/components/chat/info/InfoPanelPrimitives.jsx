@@ -10,7 +10,6 @@
  * primary #10B981, danger #EF4444.
  */
 
-import React from 'react';
 import { createPortal } from 'react-dom';
 import { Loader2 } from 'lucide-react';
 

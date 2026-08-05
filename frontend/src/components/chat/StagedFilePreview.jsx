@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect } from 'react';
+import { useCallback, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { ChevronLeft, ChevronRight, Download, Pencil, X } from 'lucide-react';
 import { AudioPlayer } from './AudioPlayer';

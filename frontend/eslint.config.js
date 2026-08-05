@@ -1,4 +1,5 @@
 import js from '@eslint/js';
+import react from 'eslint-plugin-react';
 import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
 
@@ -12,11 +13,31 @@ export default [
       globals: { ...globals.browser },
       parserOptions: { ecmaFeatures: { jsx: true } },
     },
-    plugins: { 'react-hooks': reactHooks },
+    plugins: { react, 'react-hooks': reactHooks },
     rules: {
       ...js.configs.recommended.rules,
       ...reactHooks.configs.recommended.rules,
-      'no-unused-vars': ['warn', { varsIgnorePattern: '^[A-Z_]', argsIgnorePattern: '^_' }],
+      // Without this, `no-unused-vars` cannot see JSX. Every identifier used only
+      // in markup — `<motion.div>`, a destructured `icon: Icon` — was reported
+      // unused, which is where 44 of the 77 warnings in this project came from:
+      // false ones. `varsIgnorePattern: '^[A-Z_]'` had been added to mask them,
+      // but that only covers Capitalized names, so lowercase `motion` still
+      // warned in 41 files. Deleting those "unused" imports compiles cleanly and
+      // then throws ReferenceError in the browser, because Vite does not resolve
+      // identifiers at build time — the warnings were actively dangerous to act
+      // on, so nobody acted on any of them and the real ones sat in the noise.
+      'react/jsx-uses-vars': 'error',
+      // The other half, and an ERROR because both fast gates miss it. A component
+      // referenced in JSX but not in scope — a deleted import, a renamed export,
+      // a bad merge — is a ReferenceError the moment the element renders, yet
+      // `vite build` passes it (it does not resolve identifiers) and so does core
+      // `no-undef` (it does not descend into JSX). Only the Playwright suite
+      // catches it today: three and a half minutes in, and only on a page some
+      // test actually opens. This catches it in seconds, everywhere.
+      'react/jsx-no-undef': 'error',
+      // The pattern escape hatch is gone with the cause fixed: a genuinely unused
+      // Capitalized import is now reported instead of silently exempted.
+      'no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
       'no-empty': ['error', { allowEmptyCatch: true }],
       'react-hooks/exhaustive-deps': 'off',
       // A `const` referenced above its initializer is a runtime ReferenceError

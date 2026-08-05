@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, Download, ChevronLeft, ChevronRight, CornerUpLeft } from 'lucide-react';
 import { useZoomPan } from '../../hooks/useZoomPan';
@@ -97,7 +97,7 @@ export const FullscreenImageViewer = ({
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-    } catch (err) {
+    } catch {
       // Fallback: let the browser fetch the media URL directly. The API sets an
       // attachment disposition and cookies flow automatically.
       const a = document.createElement('a');

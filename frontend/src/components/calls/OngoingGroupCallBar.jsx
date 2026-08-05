@@ -1,4 +1,3 @@
-import React from 'react';
 import { Phone, Video } from 'lucide-react';
 import useCallStore, { hasLiveCall } from '../../stores/callStore';
 import wsClient from '../../services/websocket';

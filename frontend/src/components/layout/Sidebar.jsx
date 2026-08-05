@@ -1,4 +1,3 @@
-import React, { useState } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -9,8 +8,6 @@ import {
   Globe,
   Settings,
   LogOut,
-  ChevronLeft,
-  Menu
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useNavigate } from 'react-router-dom';

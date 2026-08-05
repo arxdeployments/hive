@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { FullscreenImageViewer } from './FullscreenImageViewer';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';

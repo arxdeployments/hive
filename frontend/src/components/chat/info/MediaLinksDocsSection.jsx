@@ -12,7 +12,7 @@
  * browser should be able to do by accident.
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   CheckCircle2,
   Circle,

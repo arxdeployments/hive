@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import client, { setSignOutReason } from '../api/client';
 
 const AuthContext = createContext(null);
@@ -71,7 +71,7 @@ export const AuthProvider = ({ children }) => {
   const logout = async () => {
     try {
       await client.post('/api/auth/logout');
-    } catch (err) {
+    } catch {
       // ignore — cookies are cleared server-side; local state resets regardless
     }
     localStorage.removeItem('user');

@@ -1,6 +1,6 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { motion } from 'framer-motion';
-import { Plus, Search, Pencil, Loader2, RefreshCw, Copy, X, ChevronDown, Info } from 'lucide-react';
+import { Plus, Search, Pencil, Loader2, RefreshCw, Copy, X, Info } from 'lucide-react';
 import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
 import { useAuth } from '../../contexts/AuthContext';

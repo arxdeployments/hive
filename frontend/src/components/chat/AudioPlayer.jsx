@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Play, Pause, Mic } from 'lucide-react';
 import { formatDuration } from '../../utils/audioFormat';
 import { PeaksWaveform } from './Waveform';

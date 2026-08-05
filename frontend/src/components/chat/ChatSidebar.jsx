@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion } from 'framer-motion';
 import { MessageSquarePlus, Users, Search, Settings } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
@@ -196,7 +196,7 @@ export const ChatSidebar = ({ onSelectConversation, isMobile, onBack }) => {
               const { data } = await client.post('/api/conversations/direct', { participant_id: contactId });
               await fetchConversations();
               onSelectConversation(data._id);
-            } catch (err) { toast.error('Failed to open conversation'); }
+            } catch { toast.error('Failed to open conversation'); }
             setSearch(''); setShowGlobalSearch(false);
           }}
           onSelectMessage={(convId, msgId) => { onSelectConversation(convId); setSearch(''); setShowGlobalSearch(false); }}

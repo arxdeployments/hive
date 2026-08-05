@@ -30,6 +30,10 @@ test-results/
 # Local data
 /data/
 backend/.local-uploads/
+# Redis snapshots. A dev redis-server started from a working directory writes its
+# dump here; frontend/dump.rdb was tracked this way and held a stale local
+# rate-limit counter.
+dump.rdb
 
 # Xcode (ios/). Per-user state and build output, none of which belongs in git.
 xcuserdata/

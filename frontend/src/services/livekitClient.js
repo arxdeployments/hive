@@ -831,7 +831,7 @@ class LiveKitClient {
     if (room) {
       try {
         await room.disconnect();
-      } catch (err) {
+      } catch {
         // already gone
       }
     }

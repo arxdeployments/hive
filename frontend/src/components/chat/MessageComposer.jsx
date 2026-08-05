@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback, memo } from 'react';
+import { useState, useRef, useEffect, useCallback, memo } from 'react';
 import { Send, Smile, Paperclip, Mic, Image, FileText, Film, Pencil, X, Loader2, Upload } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import {
@@ -33,7 +33,6 @@ const MAX_DOC_SIZE = 100 * 1024 * 1024;    // 100MB
 
 const VIDEO_ACCEPT = '.mp4,.mov,.webm,.m4v';
 const AUDIO_ACCEPT = '.mp3,.m4a,.wav,.ogg,.aac';
-const DOC_ACCEPT = '.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip';
 
 // How many files the confirmation tray will hold at once. Images and video each
 // hold a live object URL that the browser decodes for the thumbnail, so this is

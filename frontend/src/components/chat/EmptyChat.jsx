@@ -1,4 +1,3 @@
-import React from 'react';
 import { Lock, MessageSquare } from 'lucide-react';
 
 export const EmptyChat = () => {

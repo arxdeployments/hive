@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import { memo } from 'react';
 import { Pin, Globe } from 'lucide-react';
 import useChatStore, { EMPTY_TYPING } from '../../stores/chatStore';
 

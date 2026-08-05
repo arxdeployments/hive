@@ -61,7 +61,7 @@
  * data-testids: `message-menu` on the surface, `message-menu-<action>` on every row.
  * (The hover trigger itself is `message-menu-trigger`, and lives in MessageBubble.)
  */
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { motion } from 'framer-motion';
 import {

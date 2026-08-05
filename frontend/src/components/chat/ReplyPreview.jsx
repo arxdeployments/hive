@@ -1,5 +1,4 @@
-import React from 'react';
-import { X, Image } from 'lucide-react';
+import { X } from 'lucide-react';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 

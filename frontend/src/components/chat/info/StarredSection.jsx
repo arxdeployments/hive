@@ -11,7 +11,7 @@
  * render "Document · report.pdf".
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AudioLines, File as FileIcon, Film, Star } from 'lucide-react';
 import { toast } from 'sonner';
 import client from '../../../api/client';

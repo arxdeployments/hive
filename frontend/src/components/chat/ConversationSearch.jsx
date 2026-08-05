@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { useState, useEffect, useCallback } from 'react';
+import { motion } from 'framer-motion';
 import { Search, X, ChevronUp, ChevronDown } from 'lucide-react';
 import client from '../../api/client';
 
@@ -21,7 +21,7 @@ export const ConversationSearch = ({ conversationId, isOpen, onClose, onScrollTo
       if (data.matches?.length > 0 && onScrollToMessage) {
         onScrollToMessage(data.matches[0].message_id);
       }
-    } catch (err) { setMatches([]); }
+    } catch { setMatches([]); }
     finally { setLoading(false); }
   }, [query, conversationId, onScrollToMessage]);
 

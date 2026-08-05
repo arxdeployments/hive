@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Search, MessageSquare, Users, FileText } from 'lucide-react';
+import { FileText } from 'lucide-react';
 import client from '../../api/client';
 
 export const GlobalSearchResults = ({ query, isOpen, onSelectConversation, onSelectContact, onSelectMessage, onClose }) => {
@@ -13,7 +13,7 @@ export const GlobalSearchResults = ({ query, isOpen, onSelectConversation, onSel
     try {
       const { data } = await client.get('/api/search', { params: { q: query, types: 'conversations,contacts,messages' } });
       setResults(data);
-    } catch (err) { /* ignore */ }
+    } catch { /* ignore */ }
     finally { setLoading(false); }
   }, [query]);
 
