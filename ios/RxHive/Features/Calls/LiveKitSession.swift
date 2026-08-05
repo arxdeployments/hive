@@ -167,6 +167,10 @@ final class LiveKitSession: NSObject, ObservableObject {
     private var room: Room?
     private var syncTicker: Task<Void, Never>?
     private var rejoinTask: Task<Void, Never>?
+    /// Identifies the attempt `rejoinTask` currently holds. A rejoin task only clears
+    /// the handle if it is still the one the handle refers to, so a task finishing late
+    /// cannot clear a newer attempt's handle.
+    private var rejoinGeneration = 0
     /// True while `rejoinTask` is inside `onNeedsRejoin`, which reaches back into
     /// `join` → `leave`. Without it, `leave`'s `rejoinTask?.cancel()` would cancel the
     /// very task calling it, and the cancellation would then abort the `room.connect`
@@ -589,14 +593,33 @@ final class LiveKitSession: NSObject, ObservableObject {
         }
 
         setMediaLink(.reconnecting)
+        rejoinGeneration &+= 1
+        let generation = rejoinGeneration
         rejoinTask = Task { [weak self] in
+            // Cleared on EVERY exit, not just the two that used to do it by hand.
+            // Three of the returns below left the handle pointing at a finished
+            // task, and `handleRoomGone` opens with `guard rejoinTask == nil`, so
+            // once that happened every future room loss was silently ignored and
+            // `onRoomLost` never fired again. Not just for the rest of the call:
+            // CallStore holds one long-lived LiveKitSession, so the dead handle
+            // outlived the call that stranded it and disabled recovery for the
+            // process. The reachable path is a hang-up during a rejoin —
+            // `leave()` deliberately skips the cancel while `isRejoining`, and
+            // clears `callID`, so the next pass returns at the `callID` guard.
+            //
+            // Generation-guarded: a task that exits after `leave()` has already
+            // dropped the handle and a newer attempt has claimed it must not
+            // clear the newer attempt's handle out from under it.
+            defer {
+                if let self, self.rejoinGeneration == generation { self.rejoinTask = nil }
+            }
             for (attempt, delay) in Self.rejoinDelays.enumerated() {
                 try? await Task.sleep(for: .seconds(delay))
                 // `callID == nil` means `leave()` ran — the user hung up, or the call
                 // ended — so there is nothing left to rejoin.
                 guard let self, !Task.isCancelled, self.callID != nil else { return }
                 // A `join` from somewhere else got there first.
-                if self.room != nil { self.rejoinTask = nil; return }
+                if self.room != nil { return }
                 self.log.notice("Rejoining the SFU (attempt \(attempt + 1))")
                 // The store re-fetches a token and calls `join`; `false` means the call
                 // itself is finished, so retrying can only delay the bad news.
@@ -605,14 +628,12 @@ final class LiveKitSession: NSObject, ObservableObject {
                 self.isRejoining = false
                 if rejoined {
                     self.log.notice("Rejoined the SFU")
-                    self.rejoinTask = nil
                     return
                 }
                 if Task.isCancelled { return }
             }
             guard let self, !Task.isCancelled else { return }
             self.log.error("Gave up rejoining the SFU; ending the call")
-            self.rejoinTask = nil
             self.setMediaLink(.connected)
             self.onRoomLost?()
         }
