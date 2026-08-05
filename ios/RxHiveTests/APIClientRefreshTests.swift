@@ -450,6 +450,36 @@ final class APIClientRefreshTests: XCTestCase {
         )
         assertRefreshCookiePresent("A foreign 401 must not touch our credential")
     }
+
+    // MARK: - (j) a refresh that outlives the session it was refreshing
+
+    /// `RealtimeClient` refreshes on the server's 4001 close, and nothing cancels
+    /// that Task. `intentionallyClosed` was the only thing standing between a
+    /// refresh and the connection: it is set by `disconnect()` and cleared again by
+    /// the next `connect()`, so a sign-out followed by a sign-in — or a
+    /// backgrounding — left a stale refresh reading "still fine to reconnect" about
+    /// a session that no longer existed.
+    ///
+    /// Each outcome did its own damage: `.valid` opened a second socket over the new
+    /// session's and orphaned the first until the server's 65s heartbeat timeout,
+    /// `.unreachable` scheduled a reconnect on top of a live socket, and `.rejected`
+    /// signed the new session out over a verdict about the old one. So the check is
+    /// on the generation, not the flag.
+    @MainActor
+    func test_aRefreshFromAReplacedSessionOwnsNothing() {
+        XCTAssertTrue(
+            RealtimeClient.connectionIsCurrent(captured: 7, current: 7, intentionallyClosed: false),
+            "the ordinary 15-minute refresh reconnects its own live connection"
+        )
+        XCTAssertFalse(
+            RealtimeClient.connectionIsCurrent(captured: 7, current: 8, intentionallyClosed: false),
+            "a sign-out and sign-in leaves the flag clear, so only the generation catches it"
+        )
+        XCTAssertFalse(
+            RealtimeClient.connectionIsCurrent(captured: 7, current: 7, intentionallyClosed: true),
+            "a sign-out with no sign-in behind it must not reconnect either"
+        )
+    }
 }
 
 // MARK: - Notification recording

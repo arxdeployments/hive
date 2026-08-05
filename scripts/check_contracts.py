@@ -63,21 +63,27 @@ WEB = re.compile(rf"client\.({VERBS})\(\s*[`'\"]([^`'\"]+)")
 # the upload helpers all put the verb and the path adjacent in that order.
 IOS = re.compile(rf'\.({VERBS})\s*,\s*"([^"]+)"', re.IGNORECASE)
 
-total, failures = 0, []
+failures = []
 for label, root, glob, pattern in (
     ("web", "frontend/src", "*.js*", WEB),
     ("iOS", "ios/RxHive", "*.swift", IOS),
 ):
     calls, missing = scan(root, glob, pattern)
     print(f"checked {calls} {label} API calls against {len(routes)} backend routes")
-    total += calls
+    if not calls:
+        # Per client, not in aggregate. A regex that silently stops matching turns
+        # its half of this guard into a no-op that passes forever, and the totals
+        # hid exactly that: the iOS pattern could match nothing while the web half
+        # kept the total healthy, so the run reported success having checked no iOS
+        # calls at all — the client CI never builds, and the whole reason this
+        # script grew an iOS half.
+        #
+        # Exits here rather than carrying on: a scan that found nothing cannot
+        # speak to drift either way, and "no missing routes" from a broken pattern
+        # is worse than no answer.
+        print(f"\nFAIL — matched no {label} API calls; the {label} scan pattern has gone stale")
+        sys.exit(1)
     failures += missing
-
-if not total:
-    # A regex that silently stops matching would otherwise turn this whole guard
-    # into a no-op that passes forever.
-    print("\nFAIL — matched no API calls at all; the scan patterns have gone stale")
-    sys.exit(1)
 
 if failures:
     print("\nFAIL — client calls with no matching backend route:")

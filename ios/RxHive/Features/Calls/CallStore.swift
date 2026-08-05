@@ -30,7 +30,17 @@ final class CallStore: ObservableObject {
 
     // MARK: Published state
 
-    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var phase: Phase = .idle {
+        didSet {
+            // Remember every call id this store has held. That record is what tells
+            // a stale terminal frame apart from the outgoing ring we have no id for
+            // yet — see `terminalFrameIsOurs`. Recorded here rather than at each of
+            // the eight assignments to `phase` so that none of them can forget to.
+            guard let id = currentCallID, !seenCallIDs.contains(id) else { return }
+            seenCallIDs.append(id)
+            if seenCallIDs.count > Self.seenCallIDLimit { seenCallIDs.removeFirst() }
+        }
+    }
     /// Answered (or accepted by the other side) and joining the room. A distinct
     /// flag rather than a Phase case because the screen is the active-call screen
     /// with a "Connecting" label — the same view, not another one.
@@ -149,6 +159,11 @@ final class CallStore: ObservableObject {
     private var signalledMedia: [String: (muted: Bool?, cameraOff: Bool?)] = [:]
     /// Set while we are the initiator and the server has not yet told us the call id.
     private var awaitingCallID = false
+    /// Call ids this store has held, oldest first. Not history — its only job is to
+    /// recognise a call as one we have already been in, so it is bounded and never
+    /// read for anything a user sees.
+    private var seenCallIDs: [String] = []
+    private static let seenCallIDLimit = 32
     /// The call answered on *this* device. Only that device may join the SFU room,
     /// because every device of one user shares a single LiveKit identity and a second
     /// join evicts the first. Cleared on teardown.
@@ -1035,61 +1050,76 @@ final class CallStore: ObservableObject {
 
         case .callGroupEnded(let signal):
             if let conversationID = signal.conversationID { activeGroupCalls[conversationID] = nil }
-            guard signal.callID == nil || signal.callID == currentCallID, hasLiveCall else { return }
+            guard terminalFrameIsOurs(signal) else { return }
             await teardown(to: .ended)
 
-        // The four 1:1 terminal frames below now carry the same guard
-        // `.callGroupEnded` above has always had. They match on the call id and
-        // require a live call; each of them already carried a CallSignal, so
-        // ignoring it was an omission rather than a limitation.
+        // Every terminal frame below is correlated to the call we are holding
+        // before anything is torn down — `terminalFrameIsOurs` is the whole rule,
+        // including why our own not-yet-identified outgoing ring is the one case
+        // that cannot match on an id. Each of these frames always carried a
+        // CallSignal, so reading it is closing an omission rather than adding a
+        // capability.
         //
-        // Without the guard a frame that arrives while idle tore the store down
-        // to `.ended` — and `.ended` is only ever cleared by the auto-reset that
-        // teardown schedules *when a call was live*, so it stuck permanently
-        // behind a full-screen overlay that hangUp() cannot dismiss (it is a
-        // no-op in `.ended`) and the reconnect reconcile does not clear (it only
-        // acts `if hasLiveCall`). Only a force-quit recovered it.
+        // Two distinct failures come from getting this wrong. A frame naming a
+        // *different* live call ends the call the user is actually on — a delayed
+        // `call:cancelled` for a ring that is already over arriving mid-call was
+        // enough, because that branch ignored its signal outright.
         //
-        // Two ways in, both ordinary. Signed in on web and phone: the backend
-        // publishes call:ended to the user's channel, so every socket that user
-        // holds gets it, including the idle phone. And on one device: the peer
-        // sends both the socket frame and the REST call, so call:ended can
-        // arrive twice — the first while `.active` arms the 2s reset, the second
-        // lands inside that window and cancels it for good.
+        // And a frame arriving while *idle* tore the store down to `.ended` —
+        // which is only ever cleared by the auto-reset that teardown schedules
+        // *when a call was live*, so it stuck permanently behind a full-screen
+        // overlay that hangUp() cannot dismiss (it is a no-op in `.ended`) and
+        // the reconnect reconcile does not clear (it only acts `if hasLiveCall`).
+        // Only a force-quit recovered it. Two ways in, both ordinary: signed in
+        // on web and phone, the backend publishes call:ended to the user's
+        // channel so every socket that user holds gets it, including the idle
+        // phone; and on one device the peer sends both the socket frame and the
+        // REST call, so call:ended arrives twice — the first while `.active` arms
+        // the 2s reset, the second lands inside that window and cancels it for
+        // good.
         //
-        // `resolvedTerminal` in teardown is the backstop if a future caller
-        // skips this guard; these guards additionally stop the spurious toast,
-        // which the backstop cannot.
+        // `resolvedTerminal` in teardown is the backstop for the idle case if a
+        // future caller skips this guard; it cannot catch the wrong-call case,
+        // and it cannot stop the spurious toast either.
         case .callDeclined(let signal):
-            guard signal.callID == nil || signal.callID == currentCallID, hasLiveCall else { return }
+            guard terminalFrameIsOurs(signal) else { return }
             toasts?.show("Call declined")
             await teardown(to: .ended)
 
         case .callEnded(let signal):
-            guard signal.callID == nil || signal.callID == currentCallID, hasLiveCall else { return }
+            guard terminalFrameIsOurs(signal) else { return }
             await teardown(to: .ended)
 
-        case .callCancelled:
+        case .callCancelled(let signal):
             // The caller gave up; nothing to say beyond removing the ring.
+            guard terminalFrameIsOurs(signal) else { return }
             await teardown(to: .idle)
 
         case .callBusy(let signal):
-            guard signal.callID == nil || signal.callID == currentCallID, hasLiveCall else { return }
+            guard terminalFrameIsOurs(signal) else { return }
             toasts?.show("They're on another call")
             await teardown(to: .ended)
 
         case .callUnavailable(let signal):
-            guard signal.callID == nil || signal.callID == currentCallID, hasLiveCall else { return }
+            guard terminalFrameIsOurs(signal) else { return }
             toasts?.show("They're unavailable right now")
             await teardown(to: .ended)
 
         case .callMissed(let signal):
             // Both sides get this frame. Only the callee's copy carries `caller`,
-            // which is how the badge knows whose miss it was.
+            // which is how the badge knows whose miss it was. The badge counts the
+            // miss whether or not this device held the call — an idle second device
+            // of the same user must still show it — but only the device that held
+            // the call has a ring screen to clear.
             if signal.caller != nil { missedCallCount += 1 }
+            guard terminalFrameIsOurs(signal) else { return }
             await teardown(to: .idle)
 
         case .callFull(let signal):
+            // A refusal of *a* join attempt, addressed to the user rather than to
+            // the device that attempted it, so a second device — possibly one in
+            // another call — sees it too. Only the caller of the join owns it.
+            guard terminalFrameIsOurs(signal) else { return }
             toasts?.error(signal.message ?? "That call is full")
             await teardown(to: .idle)
 
@@ -1398,6 +1428,52 @@ final class CallStore: ObservableObject {
     /// for a call that had just been dismissed, or one re-delivered on socket
     /// resume, arrives while idle by definition.
     ///
+    /// Whether a terminal frame is about the call this store is holding.
+    ///
+    /// Every terminal frame the server sends — `call:ended`, `:declined`,
+    /// `:cancelled`, `:busy`, `:unavailable`, `:group_ended` — carries a
+    /// `call_id`, so a frame that names another call, or names none at all, must
+    /// never tear a call down. Stale ones are ordinary rather than exotic:
+    /// `publish_to_users` addresses a *user*, so every socket that user holds
+    /// sees a peer's hang-up, including a device that has already moved on to the
+    /// next call; and a hang-up arrives twice (socket frame plus REST), so the
+    /// second copy lands after the first has been acted on.
+    ///
+    /// One case has nothing to compare against: our own outgoing ring, in the
+    /// window between pressing call and `call:ringing_started` bringing the id
+    /// back. That window is not hypothetical — `initiate_direct_call` answers
+    /// `call:busy` *instead of* `ringing_started` when the callee is already on a
+    /// call, so demanding a match there drops the only frame that will ever come
+    /// and leaves the caller ringing at nobody until the 45-second timeout. A
+    /// frame naming a call we have already held is stale by definition; anything
+    /// else is the ring we are waiting on an id for, since this store holds one
+    /// call at a time.
+    ///
+    /// Static and non-private for the same reason as `resolvedTerminal` below:
+    /// testable without a seam into the private socket-event path.
+    static func terminalFrameIsOurs(
+        frameCallID: String?,
+        currentCallID: String?,
+        awaitingCallID: Bool,
+        hasLiveCall: Bool,
+        seenCallIDs: [String]
+    ) -> Bool {
+        guard hasLiveCall else { return false }
+        if let currentCallID { return frameCallID == currentCallID }
+        guard awaitingCallID, let frameCallID else { return false }
+        return !seenCallIDs.contains(frameCallID)
+    }
+
+    private func terminalFrameIsOurs(_ signal: CallSignal) -> Bool {
+        Self.terminalFrameIsOurs(
+            frameCallID: signal.callID,
+            currentCallID: currentCallID,
+            awaitingCallID: awaitingCallID,
+            hasLiveCall: hasLiveCall,
+            seenCallIDs: seenCallIDs
+        )
+    }
+
     /// Static and non-private so the invariant can be tested without a seam into
     /// the private socket-event path.
     static func resolvedTerminal(_ terminal: Phase, wasLive: Bool) -> Phase {

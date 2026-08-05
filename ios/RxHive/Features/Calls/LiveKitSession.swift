@@ -176,7 +176,8 @@ final class LiveKitSession: NSObject, ObservableObject {
     /// `callID` because `join`'s own failure paths clear that too. See `leave`.
     ///
     /// `private(set)` rather than `private` so the discriminator can be asserted
-    /// directly; the retry loop that consumes it needs a live SFU to exercise.
+    /// directly. The loop that consumes it is driven in a test too, through
+    /// `handleRoomGone()` with a zero-delay `rejoinDelays`.
     private(set) var rejoinAbandoned = false
     /// True while `rejoinTask` is inside `onNeedsRejoin`, which reaches back into
     /// `join` → `leave`. Without it, `leave`'s `rejoinTask?.cancel()` would cancel the
@@ -189,7 +190,21 @@ final class LiveKitSession: NSObject, ObservableObject {
     /// (`services/calls.RECONNECT_GRACE_SECONDS` = 40s) so the call row is still live
     /// when the last attempt runs: 1 + 2 + 4 + 8 + 8 = 23s of waiting, plus the
     /// connect attempts themselves.
-    private static let rejoinDelays: [Double] = [1, 2, 4, 8, 8]
+    /// `nonisolated` because it is read from `init`'s default argument, which is
+    /// evaluated outside the actor. Safe: an immutable array of `Double`.
+    nonisolated static let defaultRejoinDelays: [Double] = [1, 2, 4, 8, 8]
+
+    /// The budget this instance actually spends. Injectable for one reason: those
+    /// delays add up to 23 seconds of real sleeping, so the loop that consumes them
+    /// could not be covered by a test, and its stop condition had already been wrong
+    /// once — see `rejoinAbandoned`. A test passes zero delays and drives the same
+    /// loop, same attempts, same order. Production never passes anything.
+    private let rejoinDelays: [Double]
+
+    init(rejoinDelays: [Double] = LiveKitSession.defaultRejoinDelays) {
+        self.rejoinDelays = rejoinDelays
+        super.init()
+    }
 
     /// The user half of a room identity. LiveKit gives us `{userID}#{deviceID}`; every
     /// other layer — the socket's participant frames, the avatar lookup, the mute
@@ -609,7 +624,12 @@ final class LiveKitSession: NSObject, ObservableObject {
     /// signal socket killed by a captive portal, a device waking from sleep. The call
     /// row is still `connected`, the peer is still in the room, and a fresh token gets
     /// us back in. Only when every attempt has failed does the store hear about it.
-    private func handleRoomGone() {
+    ///
+    /// Internal rather than private so a test can drive the recovery loop directly.
+    /// Production reaches it two ways, both of which need a live room — the sync
+    /// ticker seeing `.disconnected` and the room delegate's `didDisconnectWithError`
+    /// — which is why this loop went uncovered while its stop condition was wrong.
+    func handleRoomGone() {
         guard rejoinTask == nil else { return }  // already trying
         syncTicker?.cancel()
         syncTicker = nil
@@ -629,6 +649,9 @@ final class LiveKitSession: NSObject, ObservableObject {
         setMediaLink(.reconnecting)
         rejoinGeneration &+= 1
         let generation = rejoinGeneration
+        // Captured by value, like `generation`: the loop reads it before `self` has
+        // been unwrapped, and it cannot change for the life of an instance anyway.
+        let delays = rejoinDelays
         // A fresh budget: only a teardown from outside stops this one.
         rejoinAbandoned = false
         rejoinTask = Task { [weak self] in
@@ -649,7 +672,7 @@ final class LiveKitSession: NSObject, ObservableObject {
             defer {
                 if let self, self.rejoinGeneration == generation { self.rejoinTask = nil }
             }
-            for (attempt, delay) in Self.rejoinDelays.enumerated() {
+            for (attempt, delay) in delays.enumerated() {
                 try? await Task.sleep(for: .seconds(delay))
                 // `rejoinAbandoned` means a teardown ran from outside — the user hung
                 // up, or the call ended — so there is nothing left to rejoin. This was

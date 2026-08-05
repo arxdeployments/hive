@@ -81,6 +81,16 @@ final class RealtimeClient: NSObject, ObservableObject {
     private var attempt = 0
     private var intentionallyClosed = false
 
+    /// Which socket lifecycle we are on. Bumped by everything that starts or ends
+    /// one — `connect()`, `disconnect()`, and the backgrounding teardown.
+    ///
+    /// Work that suspends captures it and re-checks on the far side, because
+    /// `intentionallyClosed` cannot answer the question on its own: `connect()`
+    /// clears that flag, so after a sign-out and a sign-in it reads exactly like a
+    /// session that was never interrupted. The same counter-not-a-flag reasoning
+    /// as `AuthStore.sessionGeneration`, for the same class of bug.
+    private var connectionGeneration = 0
+
     private let decoder: JSONDecoder
     private let encoder = JSONEncoder()
     private let log = Logger(subsystem: "ai.rhythmrx.rxhive", category: "ws")
@@ -147,11 +157,13 @@ final class RealtimeClient: NSObject, ObservableObject {
 
     func connect() {
         guard state != .connected, state != .connecting else { return }
+        connectionGeneration &+= 1
         intentionallyClosed = false
         openSocket()
     }
 
     func disconnect() {
+        connectionGeneration &+= 1
         intentionallyClosed = true
         reconnectTask?.cancel(); reconnectTask = nil
         pingTimer?.cancel(); pingTimer = nil
@@ -251,19 +263,31 @@ final class RealtimeClient: NSObject, ObservableObject {
             // in that window sent an accept the server never received.
             task = nil
             state = .connecting
+            // Captured out here, not inside the Task: the body does not begin until
+            // a later main-actor turn, so a sign-out and sign-in can both have run
+            // before its first line — and the generation read there would already be
+            // the new session's.
+            let generation = connectionGeneration
             Task { [weak self] in
                 guard let self else { return }
                 let outcome = await self.onTokenExpired?() ?? .unreachable
-                // `disconnect()` may have run while the refresh was in flight, and
-                // it does not cancel this Task. Without re-reading the flag, a
-                // sign-out mid-refresh re-opened the socket for a signed-out user
-                // — and if the cookies were already cleared, parked `state` at
-                // `.connecting` for the rest of the process. `scheduleReconnect`
-                // already re-checks this; this path did not.
-                guard !self.intentionallyClosed else {
-                    self.state = .idle
-                    return
-                }
+                // Nothing cancels this Task, so on the far side of that await it has
+                // to prove the connection it was refreshing is still the current one.
+                // `intentionallyClosed` could not: a sign-out mid-refresh sets it and
+                // the sign-in that follows clears it again, so the stale refresh read
+                // "still fine to reconnect" and acted on a session that had already
+                // been replaced. All three outcomes did damage — `.valid` opened a
+                // second socket over the new session's and orphaned the first in
+                // `task`, left to linger server-side until the 65s heartbeat timeout
+                // (the same duplicate the foreground guard below exists to prevent);
+                // `.unreachable` scheduled a reconnect on top of a live socket; and
+                // `.rejected` signed the *new* session out, having asked about the
+                // old one.
+                //
+                // Returning without touching `state` is the point: the newer
+                // lifecycle owns it now. `disconnect()` left it at `.idle` and any
+                // `connect()` since has set its own.
+                guard self.connectionIsCurrent(generation) else { return }
                 switch outcome {
                 case .valid:
                     self.attempt = 0
@@ -305,11 +329,37 @@ final class RealtimeClient: NSObject, ObservableObject {
         let ceiling: Double = hasLiveCall() ? 2 : 30
         let base = min(pow(2.0, Double(min(attempt, 5))), ceiling)
         let delay = base + Double.random(in: 0...1)
+        // Generation-checked for the same reason as the refresh above, plus one this
+        // path owns: `disconnect()` cancels this Task, but `connect()` does not.
+        // Answering a call while the socket is in backoff goes through `connect()`
+        // (CallStore does exactly that when Accept is pressed on a down socket), and
+        // the sleeping Task then woke up to open a second socket on top of the one
+        // that had already come back.
+        let generation = connectionGeneration
         reconnectTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
-            guard let self, !Task.isCancelled, !self.intentionallyClosed else { return }
+            guard let self, !Task.isCancelled, self.connectionIsCurrent(generation) else { return }
             self.openSocket()
         }
+    }
+
+    /// Whether the socket lifecycle a suspended piece of work started in is still
+    /// the one running. The generation counterpart of `isCurrent(_ socket:)`: that
+    /// one asks whether a receive loop still speaks for the live socket, this one
+    /// asks whether a reconnect still speaks for the live session.
+    ///
+    /// Static and non-private so the rule can be tested without a seam into the
+    /// private socket paths, which need a real 4001 close to reach.
+    static func connectionIsCurrent(captured: Int, current: Int, intentionallyClosed: Bool) -> Bool {
+        captured == current && !intentionallyClosed
+    }
+
+    private func connectionIsCurrent(_ captured: Int) -> Bool {
+        Self.connectionIsCurrent(
+            captured: captured,
+            current: connectionGeneration,
+            intentionallyClosed: intentionallyClosed
+        )
     }
 
     // MARK: - Sending
@@ -373,6 +423,13 @@ final class RealtimeClient: NSObject, ObservableObject {
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         state = .idle
+        // This ends a socket lifecycle as surely as `disconnect()` does, and it
+        // leaves the same two pieces of suspended work behind — a refresh in flight
+        // and a sleeping reconnect, neither of which is cancelled here. Both used to
+        // wake up in a suspended process and call `openSocket()`, and because that
+        // set `state` to `.connecting`, the real foregrounding below then returned
+        // early and left the app holding whatever the background had managed to open.
+        connectionGeneration &+= 1
     }
 
     func applicationWillEnterForeground() {

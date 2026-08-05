@@ -19,6 +19,12 @@ final class AppConfigTests: XCTestCase {
             "https://example.com",
             "http://api.example.com:8000/base",
             "https://RxHive.Example.COM",  // host comparison is case-insensitive
+            // Fully-qualified spellings of the same nowhere. Foundation reports the
+            // trailing dot as part of `host`, so these missed both comparisons and
+            // the placeholder passed the release guard.
+            "https://rxhive.example.com.",
+            "https://example.com.",
+            "https://RxHive.Example.COM.:443",
         ] {
             let url = URL(string: raw)!
             XCTAssertTrue(AppConfig.isPlaceholderHost(url), "\(raw) should be rejected as a placeholder")
@@ -33,6 +39,9 @@ final class AppConfigTests: XCTestCase {
             "https://api.example.org",       // .org, not .com
             "https://notexample.com",        // must not match on a suffix alone
             "https://example.com.rxhive.ai", // example.com as a label, not the host
+            // Dropping the FQDN dot must not turn either of those into a match.
+            "https://notexample.com.",
+            "https://example.com.rxhive.ai.",
         ] {
             let url = URL(string: raw)!
             XCTAssertFalse(AppConfig.isPlaceholderHost(url), "\(raw) is a real host and must be allowed")
