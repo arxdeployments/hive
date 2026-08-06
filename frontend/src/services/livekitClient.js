@@ -7,7 +7,12 @@ import {
   createLocalTracks,
 } from 'livekit-client';
 import client from '../api/client';
-import { notifyCameraToggleFailed } from '../utils/callErrors';
+import {
+  notifyCameraToggleFailed,
+  notifyMicToggleFailed,
+  notifyScreenShareFailed,
+  notifyScreenShareStopFailed,
+} from '../utils/callErrors';
 import useCallStore, { deviceId, LINK_OK, LINK_RECONNECTING } from '../stores/callStore';
 
 /**
@@ -297,9 +302,65 @@ class LiveKitClient {
    * won't connect".
    */
   async _publishLocalMedia(room, { audio, wantVideo }) {
-    const publish = async (tracks) => {
-      for (const track of tracks) {
-        await room.localParticipant.publishTrack(track);
+    /**
+     * Acquire the tracks for one attempt and publish them, releasing everything
+     * that attempt acquired if any part of it fails.
+     *
+     * `createLocalTracks` hands back live hardware, and a track whose
+     * `publishTrack` rejects never reaches `trackPublications` — so nothing
+     * downstream can ever stop it. `leave()` only calls `room.disconnect()`, and
+     * disconnect walks publications; `setCameraEnabled` reads publications too.
+     * The camera light therefore stayed on for the rest of the call with no
+     * control able to turn it off, and a flapping SFU could strand one per
+     * rejoin attempt.
+     *
+     * Tracks published BEFORE the failure are rolled back as well, not just the
+     * one that threw: the loop is sequential over a getUserMedia-ordered array,
+     * so the mic can already be live when the camera fails, and both callers
+     * below start over from a fresh `createLocalTracks`. Leaving the first one
+     * published meant the audio-only retry published a SECOND microphone — which
+     * `setMicEnabled` then only half-muted.
+     */
+    const acquireAndPublish = async (video) => {
+      const tracks = await createLocalTracks({ audio: audioCaptureOptions(audio), video });
+      try {
+        for (const track of tracks) {
+          await room.localParticipant.publishTrack(track);
+        }
+      } catch (err) {
+        // Release the hardware FIRST, synchronously, before anything that can
+        // block. `LocalTrack.stop()` chains to `Track.stop()`, which is
+        // `mediaStreamTrack.stop()`, so the camera indicator goes out here
+        // rather than behind a network round trip.
+        for (const track of tracks) {
+          try {
+            track.stop();
+          } catch {
+            /* already ended */
+          }
+        }
+        // Then drop the bookkeeping for whatever DID publish before the failure,
+        // so the audio-only retry cannot add a SECOND microphone publication —
+        // `setMicEnabled` resolves the source to the FIRST matching publication,
+        // so Mute would silently half-work and the far side would still hear us.
+        //
+        // `stopOnUnpublish` is false because the track is already stopped, and
+        // this is deliberately NOT awaited: in livekit-client 2.20.2
+        // `unpublishTrack` deletes from `trackPublications` and emits
+        // `LocalTrackUnpublished` BEFORE its only `yield engine.negotiate()`, so
+        // the property we need is established synchronously — while awaiting the
+        // negotiate would block for `peerConnectionTimeout` (15s) against the
+        // very SFU that just failed to answer, delaying both the camera release
+        // above and the audio-only fallback below.
+        tracks.forEach((track) => {
+          try {
+            const p = room.localParticipant.unpublishTrack(track, false);
+            if (p && typeof p.catch === 'function') p.catch(() => {});
+          } catch {
+            /* nothing left to unpublish */
+          }
+        });
+        throw err;
       }
     };
 
@@ -308,7 +369,7 @@ class LiveKitClient {
       // on a re-join, so coming back from a network drop reopens the camera the user
       // was actually using rather than the platform default.
       const video = wantVideo ? (this._cameraOptions || true) : false;
-      await publish(await createLocalTracks({ audio: audioCaptureOptions(audio), video }));
+      await acquireAndPublish(video);
       return { cameraUnavailable: false };
     } catch (err) {
       const reason = mediaErrorReason(err);
@@ -320,7 +381,7 @@ class LiveKitClient {
       // Video call, media failed — retry without the camera before giving up.
       console.warn('[LiveKit] camera+mic failed, retrying audio-only:', err);
       try {
-        await publish(await createLocalTracks({ audio: audioCaptureOptions(audio), video: false }));
+        await acquireAndPublish(false);
         return { cameraUnavailable: true, reason };
       } catch (audioErr) {
         console.error('[LiveKit] microphone unavailable:', audioErr);
@@ -720,10 +781,40 @@ class LiveKitClient {
     }
   }
 
+  /**
+   * Mute or unmute the local microphone.
+   *
+   * Returns the state actually REACHED, which is not always the state asked for:
+   * unmuting reopens the device when the browser has ended the track underneath
+   * us — permission revoked mid-call, a headset dropped, another app seizing the
+   * input — and that is exactly where it throws. It used to throw straight past
+   * every caller (all of them fire-and-forget) into an unhandled rejection,
+   * while the socket frame had already told the peer the state it never got to.
+   *
+   * The store is written only on success, so the local button can never claim a
+   * mic state the hardware is not in — see MinimizedCallBanner, which relies on
+   * exactly that.
+   */
   async setMicEnabled(enabled) {
-    if (!this.room) return;
-    await this.room.localParticipant.setMicrophoneEnabled(enabled);
-    useCallStore.setState({ isMuted: !enabled });
+    // The mute button is live throughout "Connecting", when there is no room to
+    // mute. Reporting the state we are still in — rather than the one that was
+    // asked for — is the same rule as the failure path below: `joinCall` brings
+    // the microphone up LIVE moments later, so answering `enabled` here would
+    // put exactly the lie this method exists to stop back on the wire.
+    if (!this.room) return !useCallStore.getState().isMuted;
+    try {
+      await this.room.localParticipant.setMicrophoneEnabled(enabled);
+      useCallStore.setState({ isMuted: !enabled });
+      return enabled;
+    } catch (err) {
+      console.error('[LiveKit] mic toggle failed:', err);
+      // Nothing to roll back: the store was never moved off the state the mic is
+      // still in, so a second tap already in flight cannot be clobbered either.
+      // Read at failure time rather than snapshotted before the await, so a
+      // toggle that has since landed is not undone on the wire.
+      notifyMicToggleFailed(enabled, mediaErrorReason(err));
+      return !useCallStore.getState().isMuted;
+    }
   }
 
   /**
@@ -784,14 +875,25 @@ class LiveKitClient {
       return true;
     } catch (err) {
       console.error('[LiveKit] screen share failed:', err);
+      notifyScreenShareFailed(err);
       return false;
     }
   }
 
   async stopScreenShare() {
     if (!this.room) return;
-    await this.room.localParticipant.setScreenShareEnabled(false);
-    useCallStore.setState({ isScreenSharing: false, localScreenStream: null });
+    try {
+      await this.room.localParticipant.setScreenShareEnabled(false);
+      useCallStore.setState({ isScreenSharing: false, localScreenStream: null });
+    } catch (err) {
+      // Called fire-and-forget from the Share control, so a rejection here was an
+      // unhandled rejection with nothing on screen. The share is still published
+      // when this throws, so the flag is deliberately left alone — the setState
+      // stays inside the try, and `_syncLocalMedia` corrects it if the
+      // publication does go away.
+      console.error('[LiveKit] stop screen share failed:', err);
+      notifyScreenShareStopFailed();
+    }
   }
 
   /**

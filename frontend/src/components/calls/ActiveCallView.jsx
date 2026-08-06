@@ -235,11 +235,19 @@ export const ActiveCallView = () => {
     useCallStore.getState().endCall();
   };
 
-  const handleToggleMute = () => {
+  /**
+   * Mic on/off.
+   *
+   * Awaited for the same reason `handleToggleCamera` below is: the peer is told
+   * the state actually REACHED. Sending the requested state left the roster
+   * showing an unmuted participant whose microphone had refused to open, and
+   * nobody on the call could tell that from someone who had stopped talking.
+   */
+  const handleToggleMute = async () => {
     // New mic-enabled state is `isMuted` (we're flipping the current mute flag).
-    livekitClient.setMicEnabled(isMuted);
+    const reached = await livekitClient.setMicEnabled(isMuted);
     wsClient.send({
-      type: 'call:toggle_media', call_id: callId, media_type: 'audio', enabled: isMuted,
+      type: 'call:toggle_media', call_id: callId, media_type: 'audio', enabled: reached,
     });
   };
 

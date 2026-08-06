@@ -572,6 +572,26 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
   }, [recorder.state, recorder.result, uploadVoice]);
 
   /**
+   * Release the pending-send request when the recorder abandons a take.
+   *
+   * onstop lands on 'idle' rather than 'preview' when the blob is empty or the
+   * take came in under MIN_DURATION_SECONDS — and a Send pressed while paused
+   * has already set both flags by then. Nothing cleared them on those paths, so
+   * the request outlived its recording: the bar came back with Discard dead, and
+   * the NEXT take was uploaded the instant it reached 'preview', with no review.
+   *
+   * Both writers of the flag run only while a recorder is live (hold-to-talk's
+   * onSend is gated on `wasArmed`, and the paused Send on state === 'paused'),
+   * so a transition to 'idle' always means the take was genuinely abandoned.
+   * Only ever writes false, so it is idempotent whatever the effect ordering.
+   */
+  useEffect(() => {
+    if (recorder.state !== 'idle') return;
+    sendAfterStopRef.current = false;
+    setVoiceSending(false);
+  }, [recorder.state]);
+
+  /**
    * Send from either review stage.
    *
    * From `paused`, the blob currently on screen is a PARTIAL preview assembled

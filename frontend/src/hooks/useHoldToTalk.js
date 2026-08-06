@@ -44,6 +44,11 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
   const origin = useRef(null);
   const startedAt = useRef(0);
   const armed = useRef(false);
+  // A gesture is owned by the first pointer that lands, until it is released.
+  // `held` cannot express that: it is React state, so it has not updated yet
+  // while onStart is still awaiting the microphone, and a second finger reads
+  // the same stale value.
+  const downRef = useRef(false);
   const [coarse, setCoarse] = useState(false);
 
   // Read at mount rather than at module load: a hybrid device can change
@@ -56,11 +61,20 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
     setDrag({ x: 0, y: 0 });
     origin.current = null;
     armed.current = false;
+    downRef.current = false;
   }, []);
 
   const onPointerDown = useCallback(async (e) => {
     if (!enabled || !coarse || e.button !== 0) return;
     e.preventDefault();
+    // The recorder refuses a second start while the first is still opening the
+    // device, and that refusal comes back as `{ ok: false }` — which the failure
+    // path below treats as "nothing to hold" and resets the gesture, disarming
+    // the finger that IS holding one. Claiming the gesture synchronously here
+    // keeps the second finger out of it entirely, so release-to-send still
+    // belongs to the first.
+    if (downRef.current) return;
+    downRef.current = true;
     e.currentTarget.setPointerCapture?.(e.pointerId);
 
     origin.current = { x: e.clientX, y: e.clientY };

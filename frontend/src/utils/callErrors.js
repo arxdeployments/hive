@@ -69,6 +69,82 @@ export const notifyCameraToggleFailed = (reason) => {
 };
 
 /**
+ * A microphone that would not do what it was told MID-CALL.
+ *
+ * Both directions get a toast, which is where this differs from the camera: a
+ * failed MUTE leaves a live microphone on a call the user believes they have
+ * gone quiet on, and a control quietly springing back is far too soft a way to
+ * say so. Reached when `setTrackEnabled` awaits a `republishPromise` that a
+ * mid-reconnect `restartTrack()` rejected — which fails either direction — and,
+ * for unmute, when reopening a device the browser has ended underneath us.
+ *
+ * Worded passively on purpose: the rejoin path re-mutes automatically, so this
+ * also fires without anyone having pressed anything.
+ */
+export const notifyMicToggleFailed = (enabled, reason) => {
+  if (!enabled) {
+    toast.error('Your microphone could not be muted — it is still picking up sound.', { duration: 6000 });
+    return;
+  }
+  const message =
+    reason === 'permission_denied'
+      ? 'Microphone blocked — allow microphone access in your browser settings.'
+      : reason === 'device_busy'
+        ? 'Microphone is in use by another app — close it and try again.'
+        : reason === 'device_missing'
+          ? 'No microphone found.'
+          : 'Could not turn on your microphone.';
+  toast.error(message, { duration: 6000 });
+};
+
+/**
+ * A screen share the user asked for and did not get.
+ *
+ * A DISMISSED PICKER IS NOT REPORTED. Backing out of the share picker is a
+ * normal thing to do, and an error toast on top of it would be noise — but
+ * Chromium rejects it with the same `NotAllowedError` as a real block, so the
+ * two have to be told apart by message. Chromium's two results are distinct:
+ * a cancelled picker is PERMISSION_DENIED ("Permission denied"), while an
+ * OS-level refusal — macOS Screen Recording not granted to the browser, which
+ * is the case people actually hit and the only one with an action attached —
+ * is PERMISSION_DENIED_BY_SYSTEM ("Permission denied by system").
+ *
+ * Anything we do not recognise at all is still reported, so a wording change
+ * upstream costs a spurious toast rather than another silent failure.
+ */
+export const notifyScreenShareFailed = (error) => {
+  // `getDisplayMedia` missing outright: iOS Safari, an insecure context, an old
+  // browser. livekit-client throws DeviceUnsupportedError before it ever asks
+  // for a screen, and a TypeError means navigator.mediaDevices itself is absent.
+  // The Share control renders on every layout including the phone ones, so
+  // without this branch every iPhone tap would land on the generic message and
+  // send the user looking for a setting that does not exist.
+  if (error?.name === 'DeviceUnsupportedError' || error?.name === 'TypeError') {
+    toast.error("Screen sharing isn't supported in this browser.", { duration: 6000 });
+    return;
+  }
+  if (error?.name === 'NotAllowedError') {
+    if (!/by system/i.test(error?.message || '')) return;
+    toast.error(
+      'Screen recording is blocked for your browser. Allow it in your system settings, then try again.',
+      { duration: 8000 }
+    );
+    return;
+  }
+  toast.error('Could not start screen sharing.', { duration: 6000 });
+};
+
+/**
+ * Stop failed, so the share may still be up — worth saying out loud: it is their
+ * screen. Hedged rather than stated, because `unpublishTrack` stops the capture
+ * before anything that can throw, so a rejection out of the screen-audio half
+ * can leave the video already down.
+ */
+export const notifyScreenShareStopFailed = () => {
+  toast.error('Could not stop screen sharing — your screen may still be shared.', { duration: 8000 });
+};
+
+/**
  * Handle call-related errors with user-friendly messages.
  */
 export const handleCallError = (error, context = '') => {
