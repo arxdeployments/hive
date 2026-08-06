@@ -94,7 +94,7 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # npm ci, lint and a Vite build
+    timeout-minutes: 15  # npm ci, lint, unit tests and a Vite build
     defaults:
       run:
         working-directory: frontend
@@ -108,6 +108,10 @@ jobs:
       - run: npm ci
       - name: Lint
         run: npm run lint
+      # Store logic that the E2E suite cannot reach: those tests need a live SFU
+      # and cannot land a second call inside a two-second window on purpose.
+      - name: Unit tests
+        run: npm run test:unit
       - name: Build
         run: npm run build
 
