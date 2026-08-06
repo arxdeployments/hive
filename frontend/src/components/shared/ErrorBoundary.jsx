@@ -50,11 +50,25 @@ export class ErrorBoundary extends React.Component {
 export class ChatErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
-    this.state = { hasError: false };
+    this.state = { hasError: false, lastResetKey: props.resetKey };
   }
 
   static getDerivedStateFromError() {
     return { hasError: true };
+  }
+
+  // Once caught, hasError stays set until something unmounts this boundary —
+  // so a panel that threw for one conversation kept showing its fallback after
+  // the app switched to another. Callers pass the conversation id as resetKey
+  // to clear the error whenever the subject changes.
+  //
+  // Deriving from props rather than keying the element matters: a key remounts
+  // the healthy subtree on every switch too, and ChatPanel caches per-
+  // conversation state that is meant to survive exactly that. This touches
+  // nothing while hasError is false.
+  static getDerivedStateFromProps(props, state) {
+    if (props.resetKey === state.lastResetKey) return null;
+    return { hasError: false, lastResetKey: props.resetKey };
   }
 
   componentDidCatch(error, errorInfo) {
