@@ -31,6 +31,53 @@ export const deviceId = (() => {
 export const LINK_OK = 'connected';
 export const LINK_RECONNECTING = 'reconnecting';
 
+/**
+ * Everything about one call's run that must not survive into the next one.
+ *
+ * Shared by resetCall and by BOTH ways a call starts, because a call starting
+ * inside endCall's two-second "Call ended" window cancels the teardown timer —
+ * so resetCall never runs for the call that just ended and the new call
+ * inherited its participants, its invitees, its streams and its clock. The
+ * clock was the worst of it: callConnected keeps `callStartTime` if one is
+ * already set (deliberately, for reconnects), so a brand-new call opened
+ * showing the previous call's elapsed time and counting up from it.
+ *
+ * callId/callType/conversationId/isGroupCall/incomingCaller/callState/showCallUI
+ * are deliberately absent — every caller sets those itself.
+ */
+const CLEARED_CALL_RUNTIME = {
+  localUser: null,
+  remoteParticipants: [],
+  pendingInvitees: [],
+  isMuted: false,
+  isCameraOn: true,
+  callStartTime: null,
+  callDuration: 0,
+  durationInterval: null,
+  endTimer: null,
+  isMinimized: false,
+  speakerOn: true,
+  localStream: null,
+  localScreenStream: null,
+  isScreenSharing: false,
+  activeSpeakerIds: [],
+  networkQuality: 'good',
+  mediaLinkState: LINK_OK,
+  peerStates: {},
+  // miniPosition intentionally omitted: the window's corner is a user
+  // preference, not call state, and should persist across calls.
+};
+
+/**
+ * Stop the outgoing call's timers. Both must go before CLEARED_CALL_RUNTIME
+ * nulls their handles, or the duration interval keeps ticking with nothing left
+ * holding its id — an orphaned setInterval incrementing the NEW call's counter.
+ */
+const stopCallTimers = ({ durationInterval, endTimer }) => {
+  if (durationInterval) clearInterval(durationInterval);
+  if (endTimer) clearTimeout(endTimer);
+};
+
 const useCallStore = create((set, get) => ({
   callState: 'idle',
   callId: null,
@@ -112,25 +159,26 @@ const useCallStore = create((set, get) => ({
    * literal string 'Active Call' for anything the local user placed.
    */
   initiateCall: (callId, callType, isGroup = false, conversationId = null, peer = null) => set((prev) => {
-    // A new call cancels the previous call's teardown timer.
-    if (prev.endTimer) clearTimeout(prev.endTimer);
+    // A new call cancels the previous call's teardown timer — and so has to do
+    // that teardown itself, because resetCall will now never run for it.
+    stopCallTimers(prev);
     return {
+      ...CLEARED_CALL_RUNTIME,
       callState: 'outgoing_ringing', callId, callType, isGroupCall: isGroup,
       conversationId, showCallUI: true, isCameraOn: callType === 'video',
-      incomingCaller: peer, endTimer: null,
-      mediaLinkState: LINK_OK, peerStates: {},
+      incomingCaller: peer,
     };
   }),
 
   receiveIncomingCall: (callId, caller, callType, isGroup = false, conversationId = null) => set((prev) => {
     // The case this guard exists for: a call arriving inside the previous
     // call's 2s "ended" window.
-    if (prev.endTimer) clearTimeout(prev.endTimer);
+    stopCallTimers(prev);
     return {
+      ...CLEARED_CALL_RUNTIME,
       callState: 'incoming_ringing', callId, callType,
       incomingCaller: caller, isGroupCall: isGroup,
-      conversationId, showCallUI: true, endTimer: null,
-      mediaLinkState: LINK_OK, peerStates: {},
+      conversationId, showCallUI: true,
     };
   }),
 
@@ -172,22 +220,11 @@ const useCallStore = create((set, get) => ({
   },
 
   resetCall: () => {
-    const { durationInterval, endTimer } = get();
-    if (durationInterval) clearInterval(durationInterval);
-    if (endTimer) clearTimeout(endTimer);
+    stopCallTimers(get());
     set({
+      ...CLEARED_CALL_RUNTIME,
       callState: 'idle', callId: null, callType: null, isGroupCall: false,
-      conversationId: null, localUser: null, remoteParticipants: [],
-      pendingInvitees: [],
-      incomingCaller: null, isMuted: false, isCameraOn: true,
-      callStartTime: null, callDuration: 0, durationInterval: null, endTimer: null,
-      isMinimized: false, showCallUI: false,
-      speakerOn: true,
-      localStream: null, localScreenStream: null, isScreenSharing: false,
-      activeSpeakerIds: [], networkQuality: 'good',
-      mediaLinkState: LINK_OK, peerStates: {},
-      // miniPosition intentionally omitted: the window's corner is a user
-      // preference, not call state, and should persist across calls.
+      conversationId: null, incomingCaller: null, showCallUI: false,
     });
   },
 
