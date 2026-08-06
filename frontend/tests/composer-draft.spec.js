@@ -30,6 +30,15 @@ async function openConversationWith(page, counterpartName) {
     await page.getByTestId('new-chat-button').click();
     await page.getByTestId('contact-item').filter({ hasText: counterpartName }).first().click();
   }
+  // The header, not the composer, is the synchronisation point. message-input
+  // is already visible from the conversation we are leaving, so waiting on its
+  // visibility returns immediately and a following fill() can land in the old
+  // composer — which the key={conversationId} remount then wipes. The test goes
+  // on to assert the box is empty and passes without ever having tested the
+  // draft it meant to. Waiting for the identity to name the counterpart proves
+  // the switch happened; the composer remount precedes the header, which only
+  // resolves the name once the conversation itself has loaded.
+  await expect(page.getByTestId('chat-header-identity')).toContainText(counterpartName);
   await expect(page.getByTestId('message-input')).toBeVisible();
 }
 
