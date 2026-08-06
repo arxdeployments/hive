@@ -55,6 +55,16 @@ const IN_CALL_RECONNECT_MAX_MS = 2000;
 /** How long a ping has to be answered before the socket is treated as a ghost. */
 const PONG_TIMEOUT_MS = 10000;
 
+/**
+ * How long a text send has to be acked before its bubble is marked failed.
+ *
+ * Comfortably above any normal insert and below the 30s heartbeat. The deadline
+ * is not the primary resolution — losing the socket flushes everything pending
+ * immediately — it is the backstop for a socket that stays healthy while the
+ * server never answers.
+ */
+const ACK_TIMEOUT_MS = 15000;
+
 // Auth rides in httpOnly cookies — the WS handshake carries them automatically
 // (same-origin in production behind Caddy, and via the Vite proxy in dev).
 class RxHiveWebSocket {
@@ -65,6 +75,9 @@ class RxHiveWebSocket {
     this.messageQueue = [];
     this.heartbeatInterval = null;
     this.pongTimeout = null;
+    /// Text sends that have left the socket with no message_ack yet:
+    /// temp_id -> { convId, timer }.
+    this._pendingAcks = new Map();
     this._intentionalClose = false;
     this._active = false;
     /// The call this client answered, so only the answering device joins the SFU.
@@ -377,6 +390,48 @@ class RxHiveWebSocket {
     }
   }
 
+  _clearPendingAck(tempId) {
+    const pending = this._pendingAcks.get(tempId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this._pendingAcks.delete(tempId);
+  }
+
+  /**
+   * Give up on a text send the server never acknowledged.
+   *
+   * Guarded on the row still being 'sending' rather than fired blind: an ack or
+   * an error frame may have landed between the deadline being armed and this
+   * running, and neither may be overwritten. `replaceOptimisticMessage` also
+   * no-ops when the row has gone, so this can never resurrect a bubble the
+   * reconnect refetch already replaced with the real message.
+   */
+  _failPendingAck(tempId) {
+    const pending = this._pendingAcks.get(tempId);
+    if (!pending) return;
+    this._clearPendingAck(tempId);
+    const msgs = useChatStore.getState().messages[pending.convId] || [];
+    if (!msgs.some(m => m.temp_id === tempId && m.status === 'sending')) return;
+    useChatStore.getState().replaceOptimisticMessage(pending.convId, tempId, { status: 'failed' });
+  }
+
+  /**
+   * Resolve every unacked send at once, because the socket that owed us those
+   * acks is gone.
+   *
+   * This runs before anything can reconnect, and that ordering is the whole
+   * point. ChatPanel force-refetches when `wsConnected` goes false -> true;
+   * `wsConnected` only goes true in `_onOpen`; and `connect()` early-returns
+   * while the socket is CONNECTING or OPEN — so no `_onOpen` can happen without
+   * passing through `_onClose` or `_abandonSocket` first. The bubble is
+   * therefore already 'failed' by the time the refetch's carry-over filter looks
+   * at it, however fast the reconnect is. The 15s deadline on its own would lose
+   * that race against a wake() that abandons a ghost after one pong timeout.
+   */
+  _failAllPendingAcks() {
+    for (const tempId of [...this._pendingAcks.keys()]) this._failPendingAck(tempId);
+  }
+
   _onMessage(event) {
     // Bytes arrived on this socket, so our signalling is not gone. Recorded before
     // the frame is even parsed — the proof is the delivery, not the contents.
@@ -421,6 +476,10 @@ class RxHiveWebSocket {
 
   async _onClose(event) {
     this._stopHeartbeat();
+    // Before the await on the 4001 branch below, and before anything can
+    // reconnect: an unacked send has to be resolved while the refetch that will
+    // otherwise delete it is still in the future.
+    this._failAllPendingAcks();
     useChatStore.getState().setWsConnected(false);
 
     // Losing signalling mid-call is a "Connecting…", not a hang-up. The server
@@ -479,6 +538,7 @@ class RxHiveWebSocket {
 
       case 'message_ack': {
         const { temp_id, message_id, created_at, status } = data;
+        this._clearPendingAck(temp_id);
         Object.keys(store.messages).forEach(convId => {
           const msgs = store.messages[convId] || [];
           if (msgs.find(m => m.temp_id === temp_id)) {
@@ -1023,6 +1083,7 @@ class RxHiveWebSocket {
       case 'error':
         console.error('[WS] Server error:', data.detail);
         if (data.temp_id) {
+          this._clearPendingAck(data.temp_id);
           Object.keys(store.messages).forEach(convId => {
             const msgs = store.messages[convId] || [];
             if (msgs.find(m => m.temp_id === data.temp_id)) {
@@ -1181,6 +1242,22 @@ class RxHiveWebSocket {
       temp_id: tempId,
       reply_to: replyTo
     });
+    // `ws.send()` on a socket whose network has died neither throws nor drops —
+    // it buffers into a connection nobody is reading. The frame leaving the
+    // browser is therefore no evidence that it arrived, and `message_ack` is the
+    // only thing that is: the server sends the ack, and the matching error
+    // frame, to the sender alone, and never a `new_message` for your own
+    // message. Without a deadline the bubble sat on 'sending' for ever, and the
+    // reconnect refetch — which keeps only 'failed' rows — then deleted the
+    // user's message with no toast and no way to retry.
+    //
+    // Armed here rather than at the callers so it covers both of them, and any
+    // future one, for the same reason this method refuses to queue.
+    this._clearPendingAck(tempId);
+    this._pendingAcks.set(tempId, {
+      convId: conversationId,
+      timer: setTimeout(() => this._failPendingAck(tempId), ACK_TIMEOUT_MS),
+    });
     return true;
   }
 
@@ -1219,6 +1296,7 @@ class RxHiveWebSocket {
     const zombie = this.ws;
     this.ws = null;
     this._stopHeartbeat();
+    this._failAllPendingAcks();
     console.warn('[WS] abandoning the socket:', reason);
 
     if (zombie) {
@@ -1438,7 +1516,24 @@ class RxHiveWebSocket {
     this._active = false;
     this._stopHeartbeat();
     this._clearAcceptTimeout();
+    // Not left to `_onClose`. `_abandonSocket`'s docblock records the measured
+    // behaviour this relies on: `close()` on a dead network can park in CLOSING
+    // and never fire `onclose` at all. Relying on it would leave ack deadlines
+    // armed past the end of the session, writing a 'failed' row into a store
+    // nothing clears on logout — which the next login's first fetch would then
+    // carry over into someone else's thread.
+    this._failAllPendingAcks();
     if (this.ws) {
+      // Detached before closing, for the same reason `_abandonSocket` detaches:
+      // a late `onclose` from THIS socket must not run against its successor.
+      // Everything `_onClose` would have done here is either already done above
+      // or done below, and `_scheduleReconnect` is suppressed on an intentional
+      // close anyway — so the only thing detaching removes is the chance of
+      // flushing the next socket's in-flight sends.
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onclose = null;
+      this.ws.onerror = null;
       this.ws.close(1000, 'User disconnected');
       this.ws = null;
     }

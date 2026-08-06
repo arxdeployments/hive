@@ -291,6 +291,7 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
           {replyMsg && (
             <div
               onClick={() => onReplyClick && onReplyClick(replyMsg._id)}
+              data-testid="reply-quote"
               className={`mb-1.5 p-2 rounded-[4px] border-l-2 cursor-pointer ${
                 isOwn ? 'bg-[#059669] border-white/40' : 'bg-[#2D2D2D] border-[#10B981]'
               }`}

@@ -60,6 +60,16 @@ export function useAudioRecorder() {
   // Set when the user cancels, so the recorder's onstop knows to throw the audio
   // away instead of promoting it to a preview.
   const discardRef = useRef(false);
+  // True from the moment we begin acquiring the microphone until the stream is
+  // released. `state` cannot do this job — setState('recording') only runs after
+  // the getUserMedia await — and neither can streamRef, which is not assigned
+  // until that same point. So two clicks inside the device-open window both saw
+  // an idle recorder and each opened a stream, and only the second was ever
+  // released: the first kept the mic held and the recording indicator lit until
+  // reload, kept appending into the shared chunk array, and left its 200ms tick
+  // running for the life of the page. Cleared in releaseStream(), which every
+  // exit path runs through.
+  const micHeldRef = useRef(false);
   // Why the last recording ended with nothing, so the composer can SAY so. The
   // hook used to return silently to idle on three separate paths and the bar
   // just vanished with no explanation.
@@ -96,15 +106,27 @@ export function useAudioRecorder() {
     }
     setStream(null);
     recorderRef.current = null;
+    micHeldRef.current = false;
   }, []);
 
   // Unmount mid-recording (closing the chat, navigating away) must not leave the
   // microphone open or leak the preview's object URL.
   const resultRef = useRef(result);
   resultRef.current = result;
-  useEffect(() => () => {
-    releaseStream();
-    if (resultRef.current?.url) URL.revokeObjectURL(resultRef.current.url);
+  // Unmounting DURING the getUserMedia await is the one case releaseStream
+  // cannot reach: streamRef is still null when the cleanup runs, and the stream
+  // then arrives into a dead instance that nothing will ever call again. The
+  // composer is keyed on the conversation, so switching threads mid-acquisition
+  // does exactly this. Set in the body, not just the cleanup, so a StrictMode
+  // remount comes back alive.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      releaseStream();
+      if (resultRef.current?.url) URL.revokeObjectURL(resultRef.current.url);
+    };
   }, [releaseStream]);
 
   /**
@@ -133,9 +155,12 @@ export function useAudioRecorder() {
   }, []);
 
   const start = useCallback(async () => {
-    if (state !== 'idle') return { ok: false, error: null };
+    if (micHeldRef.current || state !== 'idle') return { ok: false, error: null };
     const format = pickAudioFormat();
     if (!format) return { ok: false, error: 'Recording is not supported in this browser.' };
+    // Claimed synchronously, before the first await, which is the only way to
+    // close an async window: a second click cannot land between these lines.
+    micHeldRef.current = true;
 
     let stream;
     try {
@@ -150,7 +175,15 @@ export function useAudioRecorder() {
         },
       });
     } catch (err) {
+      micHeldRef.current = false;
       return { ok: false, error: micErrorMessage(err) };
+    }
+
+    // The hook went away while the device was opening — see mountedRef above.
+    if (!mountedRef.current) {
+      stream.getTracks().forEach((t) => t.stop());
+      micHeldRef.current = false;
+      return { ok: false, error: null };
     }
 
     try {
@@ -232,7 +265,11 @@ export function useAudioRecorder() {
       return { ok: true, error: null };
     } catch (err) {
       // MediaRecorder construction can still fail even after isTypeSupported.
+      // `recorder.start()` throwing lands here too, by which point streamRef is
+      // already assigned — so the claim has to be released explicitly or one
+      // failure would disable voice notes for the rest of the session.
       stream.getTracks().forEach((t) => t.stop());
+      micHeldRef.current = false;
       return { ok: false, error: micErrorMessage(err) };
     }
   }, [state, releaseStream]);

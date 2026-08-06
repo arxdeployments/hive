@@ -232,9 +232,12 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       //
       // These cannot be auto-reconciled: the GET carries no temp_id (the API
       // only echoes it on the send response), so they stay until the user
-      // retries or reloads. Scoped to 'failed' only, deliberately NOT
-      // 'sending' — there is no ack timeout anywhere, so a preserved 'sending'
-      // bubble would hang for ever.
+      // retries or reloads. Scoped to 'failed' only, and that is now sufficient:
+      // the ack deadline in websocket.js resolves every unacked send to 'failed'
+      // — immediately when the socket is lost, which is strictly before the
+      // reconnect that triggers this refetch — so a message the server never
+      // received arrives here already carried, rather than sitting on 'sending'
+      // and being dropped.
       const failedLocal = (useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES)
         .filter(m => m.status === 'failed');
       setMessages(conversationId, failedLocal.length ? [...fetched, ...failedLocal] : fetched);
@@ -954,12 +957,21 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         return false;
       }
       const fetched = withDerivedStatuses(data.messages, myUserId);
-      // Keep 'failed' bubbles for the same reason fetchMessages does: the server
-      // has never seen them, so a wholesale replace would delete the user's
-      // unsent message.
-      const failedLocal = (useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES)
-        .filter(m => m.status === 'failed');
-      setMessages(conversationId, failedLocal.length ? [...fetched, ...failedLocal] : fetched);
+      // Keep local-only bubbles for the same reason fetchMessages does: the
+      // server has never seen them, so a wholesale replace would delete the
+      // user's unsent message.
+      //
+      // Unlike fetchMessages this also keeps 'sending'. There is no socket loss
+      // on this path and no deadline has necessarily elapsed, so a send from a
+      // few seconds ago is still in flight — and jumping is something the user
+      // does WHILE waiting (tapping a pinned message, a reply quote, a search
+      // hit). Dropping it here deleted a message the server may never receive
+      // and left the ack deadline with no row to mark failed. An `around` window
+      // is centred on an older message and by construction cannot contain the
+      // send, so carrying it costs nothing.
+      const localOnly = (useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES)
+        .filter(m => m.status === 'failed' || m.status === 'sending');
+      setMessages(conversationId, localOnly.length ? [...fetched, ...localOnly] : fetched);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
       setHasNewerByConv(prev => ({ ...prev, [conversationId]: !!data.has_newer }));
       loadedWindowsRef.current.add(conversationId);
