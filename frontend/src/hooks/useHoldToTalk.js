@@ -44,11 +44,19 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
   const origin = useRef(null);
   const startedAt = useRef(0);
   const armed = useRef(false);
-  // A gesture is owned by the first pointer that lands, until it is released.
-  // `held` cannot express that: it is React state, so it has not updated yet
-  // while onStart is still awaiting the microphone, and a second finger reads
-  // the same stale value.
-  const downRef = useRef(false);
+  /**
+   * A gesture is owned by the first pointer that lands, until it is released.
+   * `held` cannot express that: it is React state, so it has not updated yet
+   * while onStart is still awaiting the microphone, and a second finger reads
+   * the same stale value.
+   *
+   * The owning pointer's ID rather than a bare boolean, because move and up have
+   * to be scoped to it as well. A boolean keeps a second finger from STARTING a
+   * recording, but its release still ran the owner's `onPointerUp` — `held` is
+   * true, so a non-owner lifting off sent or discarded the recording the first
+   * finger was still holding.
+   */
+  const ownerRef = useRef(null);
   const [coarse, setCoarse] = useState(false);
 
   // Read at mount rather than at module load: a hybrid device can change
@@ -61,7 +69,7 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
     setDrag({ x: 0, y: 0 });
     origin.current = null;
     armed.current = false;
-    downRef.current = false;
+    ownerRef.current = null;
   }, []);
 
   const onPointerDown = useCallback(async (e) => {
@@ -73,8 +81,19 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
     // the finger that IS holding one. Claiming the gesture synchronously here
     // keeps the second finger out of it entirely, so release-to-send still
     // belongs to the first.
-    if (downRef.current) return;
-    downRef.current = true;
+    //
+    // A stale owner must never lock the button out, and it can go stale easily: the
+    // composer swaps this button for the recorder bar the moment recording starts,
+    // so the release often reaches a button that no longer exists and `reset` never
+    // runs. `hasPointerCapture` tells the two cases apart — a finger genuinely still
+    // down is still captured, while an owner left over from a previous gesture is
+    // not. Missing capture support reads as "not held", which gives back the old
+    // free-for-all rather than a control that cannot be pressed at all.
+    const owner = ownerRef.current;
+    if (owner !== null && owner !== e.pointerId
+      && e.currentTarget.hasPointerCapture?.(owner)) return;
+
+    ownerRef.current = e.pointerId;
     e.currentTarget.setPointerCapture?.(e.pointerId);
 
     origin.current = { x: e.clientX, y: e.clientY };
@@ -91,6 +110,7 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
   }, [enabled, coarse, onStart, reset]);
 
   const onPointerMove = useCallback((e) => {
+    if (e.pointerId !== ownerRef.current) return;
     if (!held || !origin.current || locked) return;
     const dx = e.clientX - origin.current.x;
     const dy = e.clientY - origin.current.y;
@@ -104,7 +124,10 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
     }
   }, [held, locked, onLock]);
 
+  // Also the pointercancel handler — a non-owner's cancel must not tear down the
+  // owner's recording either.
   const onPointerUp = useCallback((e) => {
+    if (e.pointerId !== ownerRef.current) return;
     if (!held) return;
     e.currentTarget.releasePointerCapture?.(e.pointerId);
 

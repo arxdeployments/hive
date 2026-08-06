@@ -11,6 +11,7 @@ import uuid
 
 from fastapi import HTTPException
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -32,6 +33,11 @@ from app.utils import now_utc, sanitize_text
 
 _MEDIA_TYPES = {"image", "video", "audio", "file"}
 _UPLOAD_URL_RE = re.compile(r"/api/media/up/([0-9a-f-]{36})")
+
+# Longer than a uuid4, short enough that the unique index stays cheap. Clients
+# send uuid4; anything longer is not a key we minted and is dropped rather than
+# truncated, because a truncated key could collide with an unrelated send.
+_MAX_CLIENT_MSG_ID = 64
 
 # Pins are conversation-wide and the whole set is fetched on conversation open,
 # so they must stay bounded — otherwise one member can pin every message and
@@ -106,6 +112,69 @@ async def _claim_upload(db: AsyncSession, media_url: str, sender: User) -> Uploa
     return upload
 
 
+def _clean_client_msg_id(temp_id: str | None) -> str | None:
+    """The sender's id for this message, or None if it cannot serve as a key."""
+    if not temp_id:
+        return None
+    key = str(temp_id).strip()
+    if not key or len(key) > _MAX_CLIENT_MSG_ID:
+        return None
+    return key
+
+
+async def _find_by_client_msg_id(
+    db: AsyncSession,
+    *,
+    conversation_id: uuid.UUID,
+    sender_id: uuid.UUID,
+    client_msg_id: str,
+) -> Message | None:
+    return (
+        (
+            await db.execute(
+                select(Message).where(
+                    Message.conversation_id == conversation_id,
+                    Message.sender_id == sender_id,
+                    Message.client_msg_id == client_msg_id,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+async def _replay_doc(
+    db: AsyncSession,
+    msg: Message,
+    *,
+    participants: list[ConversationParticipant],
+    sender: User,
+    temp_id: str | None,
+) -> dict:
+    """Answer a repeat send with the message it already created.
+
+    Deliberately silent: the recipients were fanned out to, and pushed to, on the
+    first attempt. Only the sender — who never learned the outcome — is answered.
+
+    Unlike the fresh path this cannot assume the message is unstarred and
+    unpinned, because an arbitrary amount of time may have passed since it was
+    stored, so it pays the two lookups instead of passing empty sets.
+    """
+    loaded = await enrich.load_message(db, msg.id)
+    doc = await enrich.serialize_message(
+        db,
+        loaded,
+        conv_participants=participants,
+        sender=sender,
+        include_reply=True,
+        for_user=sender.id,
+    )
+    doc["temp_id"] = temp_id
+    doc["status"] = "sent"
+    return doc
+
+
 async def send_message(
     db: AsyncSession,
     *,
@@ -125,6 +194,22 @@ async def send_message(
     if conv is None:
         raise SendError(status_code=404, detail="Conversation not found")
     participants = await _require_send_access(db, conv, sender)
+
+    # Idempotency, checked AFTER the access gate so a repeat send is never a way
+    # to read a message back out of a conversation the caller has been removed
+    # from. Scoped to this sender, so one account cannot probe or block another's.
+    client_msg_id = _clean_client_msg_id(temp_id)
+    if client_msg_id is not None:
+        already = await _find_by_client_msg_id(
+            db,
+            conversation_id=conv.id,
+            sender_id=sender.id,
+            client_msg_id=client_msg_id,
+        )
+        if already is not None:
+            return await _replay_doc(
+                db, already, participants=participants, sender=sender, temp_id=temp_id
+            )
 
     if msg_type not in _MEDIA_TYPES and msg_type != "text":
         msg_type = "text"  # clients may not mint system/other types
@@ -154,6 +239,7 @@ async def send_message(
         sender_id=sender.id,
         type=MessageType(msg_type),
         content=content,
+        client_msg_id=client_msg_id,
         reply_to_id=reply_to_id,
         created_at=now,
     )
@@ -184,7 +270,38 @@ async def send_message(
         )
 
     conv.last_message_at = now
-    await db.commit()
+    # Captured before the commit: a rollback expires every instance in the
+    # session, and re-reading `sender.id` off an expired object in async
+    # SQLAlchemy would need a lazy refresh it cannot perform.
+    sender_id = sender.id
+    try:
+        await db.commit()
+    except IntegrityError:
+        # The lookup above is check-then-act, so two genuinely concurrent copies
+        # of one send — the socket and the HTTP fallback racing, or a retry that
+        # overlaps the attempt it is retrying — can both reach here. The partial
+        # unique index is what actually enforces the guarantee; this turns the
+        # loser of that race into the same replay a sequential repeat would get.
+        await db.rollback()
+        if client_msg_id is None:
+            raise
+        conv = await db.get(Conversation, conversation_id)
+        sender = await db.get(User, sender_id)
+        if conv is None or sender is None:
+            raise
+        winner = await _find_by_client_msg_id(
+            db,
+            conversation_id=conversation_id,
+            sender_id=sender_id,
+            client_msg_id=client_msg_id,
+        )
+        # Some other constraint failed — not ours to swallow.
+        if winner is None:
+            raise
+        participants = await _require_send_access(db, conv, sender)
+        return await _replay_doc(
+            db, winner, participants=participants, sender=sender, temp_id=temp_id
+        )
 
     loaded = await enrich.load_message(db, msg.id)
     doc = await enrich.serialize_message(

@@ -143,6 +143,8 @@ class LiveKitClient {
      * gives a well-defined last writer: the last tap.
      */
     this._cameraQueue = Promise.resolve();
+    /** The same, for the microphone. See `_cameraQueue` above for why. */
+    this._micQueue = Promise.resolve();
     /** Last quality grade relayed to the peer, so only changes go on the wire. */
     this._lastReportedQuality = null;
     /**
@@ -791,30 +793,52 @@ class LiveKitClient {
    * every caller (all of them fire-and-forget) into an unhandled rejection,
    * while the socket frame had already told the peer the state it never got to.
    *
-   * The store is written only on success, so the local button can never claim a
-   * mic state the hardware is not in — see MinimizedCallBanner, which relies on
-   * exactly that.
+   * Optimistic and serialised, exactly as `setCameraEnabled` is and for the same
+   * reasons — callers (ActiveCallView, MinimizedCallBanner) read their target back
+   * out of the store, so the flag has to move before the next tap reads it, and the
+   * operations have to finish in tap order for the last tap to own the final state.
+   * It is rolled back if the mic refuses, so the button cannot claim a state the
+   * hardware is not in for longer than the attempt itself.
    */
   async setMicEnabled(enabled) {
-    // The mute button is live throughout "Connecting", when there is no room to
-    // mute. Reporting the state we are still in — rather than the one that was
-    // asked for — is the same rule as the failure path below: `joinCall` brings
-    // the microphone up LIVE moments later, so answering `enabled` here would
-    // put exactly the lie this method exists to stop back on the wire.
-    if (!this.room) return !useCallStore.getState().isMuted;
-    try {
-      await this.room.localParticipant.setMicrophoneEnabled(enabled);
-      useCallStore.setState({ isMuted: !enabled });
-      return enabled;
-    } catch (err) {
-      console.error('[LiveKit] mic toggle failed:', err);
-      // Nothing to roll back: the store was never moved off the state the mic is
-      // still in, so a second tap already in flight cannot be clobbered either.
-      // Read at failure time rather than snapshotted before the await, so a
-      // toggle that has since landed is not undone on the wire.
-      notifyMicToggleFailed(enabled, mediaErrorReason(err));
-      return !useCallStore.getState().isMuted;
-    }
+    // Optimistic, and first — this is what makes a second tap inside the same
+    // animation frame ask for the OPPOSITE state. While the flag only moved once
+    // the SDK settled, two taps in a frame both computed the same target and the
+    // second silently did nothing. Rolled back below if the operation fails.
+    const previous = useCallStore.getState().isMuted;
+    useCallStore.setState({ isMuted: !enabled });
+
+    const run = async () => {
+      // The mute button is live throughout "Connecting", when there is no room to
+      // mute. Reporting the state we are still in — rather than the one that was
+      // asked for — is the same rule as the failure path below: `joinCall` brings
+      // the microphone up LIVE moments later, so answering `enabled` here would
+      // put exactly the lie this method exists to stop back on the wire.
+      if (!this.room) {
+        useCallStore.setState({ isMuted: previous });
+        return !previous;
+      }
+      try {
+        await this.room.localParticipant.setMicrophoneEnabled(enabled);
+        useCallStore.setState({ isMuted: !enabled });
+        return enabled;
+      } catch (err) {
+        console.error('[LiveKit] mic toggle failed:', err);
+        // Put the button back where it was rather than leaving it claiming a mic
+        // state the hardware never reached.
+        useCallStore.setState({ isMuted: previous });
+        notifyMicToggleFailed(enabled, mediaErrorReason(err));
+        // `previous` is a MUTE flag and the return is an ENABLED flag — the two are
+        // opposite, unlike the camera's, where both sides of this are `isCameraOn`.
+        return !previous;
+      }
+    };
+
+    // Chained, so N taps produce N operations in tap order and the LAST one owns the
+    // final state. Errors are swallowed into the chain so one failure cannot poison
+    // every later toggle.
+    this._micQueue = this._micQueue.then(run, run);
+    return this._micQueue;
   }
 
   /**

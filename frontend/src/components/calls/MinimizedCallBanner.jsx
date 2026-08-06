@@ -143,10 +143,12 @@ export const MinimizedCallBanner = () => {
 
   const toggleMute = useCallback((e) => {
     e.stopPropagation();
-    // livekitClient is the authority: it flips isMuted in the store only once the
-    // track actually changed, so the icon cannot lie about the mic.
-    livekitClient.setMicEnabled(isMuted);
-  }, [isMuted]);
+    // Target read from the STORE, not from this render's `isMuted`: two taps inside one
+    // frame would otherwise both see the same stale flag, ask for the same state, and
+    // the second would do nothing. livekitClient moves the flag optimistically and rolls
+    // it back if the mic refuses, so the icon still cannot lie beyond the attempt.
+    livekitClient.setMicEnabled(useCallStore.getState().isMuted);
+  }, []);
 
   const live = callState === 'connected'
     || callState === 'connecting'

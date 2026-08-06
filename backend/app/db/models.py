@@ -238,6 +238,17 @@ class Message(Base):
         default=MessageType.text,
     )
     content: Mapped[str] = mapped_column(Text, default="")
+    # The sender's own id for this message, carried as `temp_id` on both send
+    # transports and stored so a retry cannot create a second row.
+    #
+    # A send is persisted and committed BEFORE the sender is told anything, so a
+    # lost response, a timeout or a 502 leaves the client unable to tell "never
+    # arrived" from "arrived, answer lost". It marked the bubble failed and offered
+    # a retry, and the retry minted a fresh id, so the uncertain case duplicated the
+    # message. Nullable because system messages and every row written before this
+    # column existed have no client id; the unique index below is partial for the
+    # same reason.
+    client_msg_id: Mapped[str | None] = mapped_column(String(64))
     reply_to_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("messages.id", ondelete="SET NULL"))
     is_forwarded: Mapped[bool] = mapped_column(default=False)
     edited_at: Mapped[dt.datetime | None]
@@ -253,7 +264,27 @@ class Message(Base):
         back_populates="message", cascade="all, delete-orphan"
     )
 
-    __table_args__ = (Index("ix_messages_conversation_created", "conversation_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_messages_conversation_created", "conversation_id", "created_at"),
+        # One row per client id per sender per conversation — the actual guarantee
+        # behind retry safety. The service checks for an existing row first, but
+        # that is check-then-act and two concurrent copies of one send can both
+        # pass it; this is what makes the loser fail instead of insert.
+        #
+        # Partial because system messages and every row predating the column carry
+        # no client id. Declared here as well as in the migration, unlike the Links
+        # scan index, because uniqueness is a property of the schema rather than a
+        # shape chosen for one query.
+        Index(
+            "uq_messages_client_msg_id",
+            "conversation_id",
+            "sender_id",
+            "client_msg_id",
+            unique=True,
+            postgresql_where=text("client_msg_id IS NOT NULL"),
+            sqlite_where=text("client_msg_id IS NOT NULL"),
+        ),
+    )
 
 
 class MessageAttachment(Base):
