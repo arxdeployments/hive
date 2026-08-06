@@ -45,6 +45,13 @@ async function openConversationWith(page, counterpartName) {
   await expect(page.getByTestId('message-input')).toBeVisible();
 }
 
+// message-send-btn only exists once the composer has text — it is the voice
+// record button otherwise — so the fill has to precede the click.
+async function sendMessage(page, text) {
+  await page.getByTestId('message-input').fill(text);
+  await page.getByTestId('message-send-btn').click();
+}
+
 test('an unsent draft does not follow you into another conversation', async ({ page }) => {
   await uiLogin(page, seeded.users.alice.email, seeded.users.alice.password);
   await expect(page.getByTestId('conversation-search')).toBeVisible();
@@ -77,4 +84,76 @@ test('returning to a conversation does not resurrect a draft into a third one', 
     page.getByTestId('message-input'),
     'text typed for Carol is now in Bob’s composer'
   ).toHaveValue('');
+});
+
+/**
+ * The two tests above assert the composer is empty after a switch — the symptom.
+ * The harm named at the top of this file is the next Send reaching the wrong
+ * person, and nothing asserted that: no spec in the suite sends a message after
+ * switching conversations, so the `key={conversationId}` remount is never
+ * exercised ahead of a send.
+ *
+ * Three contexts because the claim is about routing. Alice's own view cannot
+ * tell "Carol got it" from "Bob got it too" — only Bob's and Carol's can.
+ *
+ * The 5s budget is the suite's cross-user delivery contract (see README): it is
+ * tighter than the sidebar's fallback poll, so a broken WebSocket fails here
+ * rather than quietly degrading to polling.
+ */
+test('a message sent after switching conversations reaches only that conversation', async ({ browser }) => {
+  const aliceCtx = await browser.newContext();
+  const bobCtx = await browser.newContext();
+  const carolCtx = await browser.newContext();
+
+  try {
+    const aPage = await aliceCtx.newPage();
+    const bPage = await bobCtx.newPage();
+    const cPage = await carolCtx.newPage();
+
+    await uiLogin(aPage, seeded.users.alice.email, seeded.users.alice.password);
+    await uiLogin(bPage, seeded.users.bob.email, seeded.users.bob.password);
+    await uiLogin(cPage, seeded.users.carol.email, seeded.users.carol.password);
+    await expect(aPage.getByTestId('conversation-search')).toBeVisible();
+    await expect(bPage.getByTestId('conversation-search')).toBeVisible();
+    await expect(cPage.getByTestId('conversation-search')).toBeVisible();
+
+    // Alice opens each thread first: it has to exist before the other side can
+    // find it in their sidebar.
+    await openConversationWith(aPage, 'Bob E2E');
+    const stranded = `never sent to bob ${suffix}`;
+    await aPage.getByTestId('message-input').fill(stranded);
+    await expect(aPage.getByTestId('message-input')).toHaveValue(stranded);
+    await openConversationWith(bPage, 'Alice E2E');
+
+    // Abandon Bob's draft and switch. This is the remount under test.
+    await openConversationWith(aPage, 'Carol E2E');
+    await expect(aPage.getByTestId('message-input')).toHaveValue('');
+    await openConversationWith(cPage, 'Alice E2E');
+
+    const forCarol = `for carol ${suffix} ${Math.floor(Math.random() * 1e6)}`;
+    const sentAt = Date.now();
+    await sendMessage(aPage, forCarol);
+    await expect(aPage.getByText(forCarol).first()).toBeVisible();
+
+    await expect(
+      cPage.getByText(forCarol).first(),
+      'a message sent after a conversation switch never reached its recipient'
+    ).toBeVisible({ timeout: 5000 });
+    expect(Date.now() - sentAt).toBeLessThan(5000);
+
+    // Carol has it, so delivery has completed — anything on Bob's side now is
+    // misrouted rather than still in flight.
+    await expect(
+      bPage.getByText(forCarol),
+      'a message composed for Carol was delivered to Bob'
+    ).toHaveCount(0);
+    await expect(
+      bPage.getByText(stranded),
+      'the abandoned draft was delivered to Bob'
+    ).toHaveCount(0);
+  } finally {
+    await aliceCtx.close();
+    await bobCtx.close();
+    await carolCtx.close();
+  }
 });
