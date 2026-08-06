@@ -203,7 +203,13 @@ export default function Chat() {
                     button is gone with the panel that threw. Without it, a
                     deterministic error leaves Try again as the only control,
                     showMessages stuck true, and no route back to the sidebar. */}
-                <ChatErrorBoundary onBack={handleBack}>
+                {/* resetKey because the motion.div's key is the constant
+                    "messages": the boundary survives a conversation change, so
+                    without this a stuck fallback carries over to the next chat.
+                    Reachable here without any click — the service-worker
+                    handler above sets activeConversationId from a notification
+                    while showMessages stays true. */}
+                <ChatErrorBoundary onBack={handleBack} resetKey={activeConversationId}>
                   <ChatPanel
                     conversationId={activeConversationId}
                     onBack={handleBack}
@@ -239,7 +245,11 @@ export default function Chat() {
                 />
               </ChatErrorBoundary>
             </div>
-            <ChatErrorBoundary>
+            {/* Same defect, wider trigger: this boundary is never remounted at
+                all, so every sidebar click changes activeConversationId in
+                place and a stuck fallback outlives all of them. No onBack —
+                the sidebar stays visible here, so there is already a way out. */}
+            <ChatErrorBoundary resetKey={activeConversationId}>
               <ChatPanel
                 conversationId={activeConversationId}
                 onBack={handleBack}
