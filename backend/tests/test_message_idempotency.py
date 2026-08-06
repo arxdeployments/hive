@@ -72,9 +72,7 @@ async def test_history_exposes_the_client_key_for_reconciliation(client, two_org
     assert stored["client_msg_id"] == "key-xyz"
 
 
-async def test_a_changed_body_under_the_same_key_does_not_create_a_second_row(
-    client, two_orgs_with_users
-):
+async def test_a_changed_body_under_the_same_key_does_not_create_a_second_row(client, two_orgs_with_users):
     """The key identifies the send, so a repeat is the original — not an edit."""
     users = two_orgs_with_users
     await login(client, "alice@a.com")

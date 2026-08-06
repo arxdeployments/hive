@@ -207,9 +207,7 @@ async def send_message(
             client_msg_id=client_msg_id,
         )
         if already is not None:
-            return await _replay_doc(
-                db, already, participants=participants, sender=sender, temp_id=temp_id
-            )
+            return await _replay_doc(db, already, participants=participants, sender=sender, temp_id=temp_id)
 
     if msg_type not in _MEDIA_TYPES and msg_type != "text":
         msg_type = "text"  # clients may not mint system/other types
@@ -299,9 +297,7 @@ async def send_message(
         if winner is None:
             raise
         participants = await _require_send_access(db, conv, sender)
-        return await _replay_doc(
-            db, winner, participants=participants, sender=sender, temp_id=temp_id
-        )
+        return await _replay_doc(db, winner, participants=participants, sender=sender, temp_id=temp_id)
 
     loaded = await enrich.load_message(db, msg.id)
     doc = await enrich.serialize_message(
