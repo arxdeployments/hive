@@ -238,8 +238,16 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // reconnect that triggers this refetch — so a message the server never
       // received arrives here already carried, rather than sitting on 'sending'
       // and being dropped.
+      //
+      // A failure is NOT proof the message was not stored, though — the server
+      // commits before the sender is told anything, so a lost response or a 502
+      // marks a bubble failed for a message that is already in the conversation.
+      // Every serialized message now carries `client_msg_id`, so those are
+      // identified here and dropped instead of sitting under the real message as
+      // a second copy the user is invited to send again.
+      const landed = new Set(fetched.map(m => m.client_msg_id).filter(Boolean));
       const failedLocal = (useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES)
-        .filter(m => m.status === 'failed');
+        .filter(m => m.status === 'failed' && !landed.has(m.temp_id));
       setMessages(conversationId, failedLocal.length ? [...fetched, ...failedLocal] : fetched);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
       // The default window is anchored to the newest message, so by definition
@@ -464,7 +472,13 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       (store.messages[conversationId] || EMPTY_MESSAGES).filter(m => (m.temp_id || m._id) !== removeKey)
     );
 
-    const newTempId = uuidv4();
+    // REUSE the original key rather than minting a fresh one. A failed send is
+    // not a send that provably did not happen, and a new id would present the
+    // retry to the server as a different message — which is exactly how the
+    // uncertain case ended up stored twice. Sent back unchanged, it is the same
+    // message, and the server answers with the row it already has.
+    // uuidv4 remains the fallback for a bubble that somehow carries no temp_id.
+    const newTempId = failedMsg.temp_id || uuidv4();
     const msgType = failedMsg.type || 'text';
     const replyCtx = failedMsg.reply_to_message || null;
     const replyId = replyCtx?._id || failedMsg.reply_to || null;

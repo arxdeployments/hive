@@ -398,6 +398,12 @@ async def serialize_message(
         "sender_id": str(msg.sender_id) if msg.sender_id else None,
         "type": msg.type.value,
         "content": "" if msg.deleted_at else (msg.content or ""),
+        # The sender's own id for this message, on EVERY serialization including
+        # history. Without it a client refetching a conversation cannot tell which
+        # fetched rows its own unresolved bubbles became, so a send whose outcome
+        # was never learned showed twice: once as the stored message and once as
+        # the local bubble still waiting on it.
+        "client_msg_id": msg.client_msg_id,
         "reply_to": str(msg.reply_to_id) if msg.reply_to_id else None,
         "reactions": reactions,
         "read_by": read_by,
