@@ -4,15 +4,18 @@ import { seedOrgWithUsers, uiLogin } from './helpers.js';
 /**
  * The composer must not carry an unsent draft into the next conversation.
  *
- * MessageComposer holds its text in local `useState` and is rendered from
- * ChatPanel with no `key`, so switching conversations is a prop change, not a
- * remount — the component and its state survive. `handleSend` then targets
- * whatever `conversationId` is current. So a message typed for one person and
- * left unsent is still sitting in the box when you open someone else's thread,
- * and the next Send delivers it to them.
+ * MessageComposer holds its text and staged attachments in local `useState`
+ * with no reset of their own, and it used to be rendered from ChatPanel with no
+ * `key` — so switching conversations was a prop change rather than a remount,
+ * and that state survived. `handleSend` targets whatever `conversationId` is
+ * current, so a message typed for one person and left unsent was still in the
+ * box when you opened someone else's thread, and the next Send delivered it to
+ * them. Staged images were the worse half: an image picked for one conversation
+ * stayed staged in another.
  *
- * The same holds for staged attachments, which is the worse half: an image
- * picked for one conversation is still staged in another.
+ * ChatPanel now passes `key={conversationId}` (see the comment at that prop),
+ * so the composer remounts on a switch and its state goes with it. These tests
+ * hold that line.
  */
 
 const suffix = `${process.pid}${Math.floor(Math.random() * 1000)}`;
