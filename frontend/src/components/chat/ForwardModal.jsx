@@ -4,6 +4,7 @@ import { Search, X, Forward } from 'lucide-react';
 import { toast } from 'sonner';
 import client from '../../api/client';
 import useChatStore from '../../stores/chatStore';
+import { useModalDialog } from '../../hooks/useModalDialog';
 
 /**
  * `message` forwards one message (the message context menu's path). `messages`
@@ -17,6 +18,7 @@ export const ForwardModal = ({ message, messages, isOpen, onClose }) => {
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState([]);
   const [sending, setSending] = useState(false);
+  const { titleId, dialogProps } = useModalDialog({ isOpen, onClose });
 
   // Every render below must read off `items`, never `message` directly: the
   // media/links/docs Select flow passes only `messages`, so `message` is
@@ -99,10 +101,11 @@ export const ForwardModal = ({ message, messages, isOpen, onClose }) => {
         <div className="absolute inset-0 bg-black/60 backdrop-blur-[4px]" />
         <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.95 }}
           onClick={(e) => e.stopPropagation()}
-          className="relative bg-[#141414] border border-[#1F1F1F] rounded-[12px] w-full max-w-[420px] max-h-[70vh] flex flex-col overflow-hidden">
+          {...dialogProps}
+          className="relative bg-[#141414] border border-[#1F1F1F] rounded-[12px] w-full max-w-[420px] max-h-[70vh] flex flex-col overflow-hidden outline-none">
           {/* Header */}
           <div className="flex items-center justify-between px-5 py-4 border-b border-[#1F1F1F]">
-            <h3 className="text-lg font-semibold text-[#F5F5F5]">Forward Message</h3>
+            <h3 id={titleId} className="text-lg font-semibold text-[#F5F5F5]">Forward Message</h3>
             <button onClick={onClose} className="p-1.5 text-[#A3A3A3] hover:text-[#F5F5F5] rounded-[6px] transition-colors"><X size={18} /></button>
           </div>
 

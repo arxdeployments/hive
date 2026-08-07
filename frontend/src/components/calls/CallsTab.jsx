@@ -108,8 +108,8 @@ export const ScheduleCallModal = ({
 
           <div className="px-5 py-4 space-y-4">
             <div>
-              <label className="block text-xs text-[#A3A3A3] mb-1.5">Title</label>
-              <input
+              <label htmlFor="callstab-01-title" className="block text-xs text-[#A3A3A3] mb-1.5">Title</label>
+              <input id="callstab-01-title"
                 type="text"
                 placeholder="e.g. Weekly sync"
                 value={title}
@@ -121,8 +121,8 @@ export const ScheduleCallModal = ({
             </div>
 
             <div>
-              <label className="block text-xs text-[#A3A3A3] mb-1.5">Date &amp; time</label>
-              <input
+              <label htmlFor="callstab-02-date-amp-time" className="block text-xs text-[#A3A3A3] mb-1.5">Date &amp; time</label>
+              <input id="callstab-02-date-amp-time"
                 type="datetime-local"
                 value={startTime}
                 min={defaultScheduleTime()}
@@ -133,13 +133,13 @@ export const ScheduleCallModal = ({
             </div>
 
             <div>
-              <label className="block text-xs text-[#A3A3A3] mb-1.5">Call type</label>
+              <label id="callstab-03-call-type" className="block text-xs text-[#A3A3A3] mb-1.5">Call type</label>
               <div className="flex gap-2">
                 {[
                   { key: 'voice', label: 'Voice' },
                   { key: 'video', label: 'Video' },
                 ].map(({ key, label }) => (
-                  <button
+                  <button aria-labelledby="callstab-03-call-type"
                     key={key}
                     type="button"
                     onClick={() => setCallType(key)}

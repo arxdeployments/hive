@@ -297,6 +297,38 @@ export const MessageContextMenu = ({ message, isOwn, isGroup, position, onAction
     close();
   }, [message, onAction, close]);
 
+  /**
+   * Move focus INTO the menu once it has been positioned.
+   *
+   * Without this the roving navigation below never runs at all:
+   * `handleMenuKeyDown` is bound to the menu element, so it only sees keys while
+   * focus is already inside it — and nothing ever put it there. The whole
+   * arrow-key implementation was unreachable, so a keyboard user could open the
+   * menu and then not use it.
+   *
+   * Waits for `coords`, which the layout effect above sets after measuring: the
+   * menu is rendered off-screen until then, and focusing a node the browser is
+   * about to move causes a visible jump.
+   */
+  const restoreFocusRef = useRef(null);
+  const focusedForRef = useRef(null);
+  useEffect(() => {
+    if (!position || !coords) {
+      // Closed — hand focus back to whatever opened it, if that is still around.
+      const opener = restoreFocusRef.current;
+      restoreFocusRef.current = null;
+      focusedForRef.current = null;
+      if (opener && typeof opener.focus === 'function' && document.contains(opener)) {
+        opener.focus({ preventScroll: true });
+      }
+      return;
+    }
+    if (focusedForRef.current === position) return;
+    focusedForRef.current = position;
+    restoreFocusRef.current = document.activeElement;
+    menuRef.current?.querySelector('[role="menuitem"]')?.focus({ preventScroll: true });
+  }, [position, coords]);
+
   // Roving focus so the menu is usable from the keyboard.
   const handleMenuKeyDown = (e) => {
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Home' && e.key !== 'End') return;

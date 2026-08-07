@@ -115,9 +115,9 @@ export default function Departments() {
       <div className="max-w-[1400px] mx-auto">
         {/* Org Selector */}
         <div className="mb-6">
-          <label className="text-sm text-[#A3A3A3] mb-2 block">Select Organization</label>
+          <label id="departments-01-select-organization" className="text-sm text-[#A3A3A3] mb-2 block">Select Organization</label>
           <div className="relative max-w-sm">
-            <button
+            <button aria-labelledby="departments-01-select-organization"
               onClick={() => setOrgDropdownOpen(!orgDropdownOpen)}
               data-testid="departments-org-select"
               className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all duration-200"
@@ -333,8 +333,8 @@ export default function Departments() {
                   </h3>
                   <div className="space-y-4">
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-1.5 block">Department Name *</label>
-                      <input
+                      <label htmlFor="departments-02-department-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Department Name *</label>
+                      <input id="departments-02-department-name"
                         type="text"
                         value={formName}
                         onChange={(e) => setFormName(e.target.value)}
@@ -344,8 +344,8 @@ export default function Departments() {
                       />
                     </div>
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-1.5 block">Description</label>
-                      <textarea
+                      <label htmlFor="departments-03-description" className="text-sm text-[#A3A3A3] mb-1.5 block">Description</label>
+                      <textarea id="departments-03-description"
                         value={formDesc}
                         onChange={(e) => setFormDesc(e.target.value)}
                         placeholder="Optional description..."

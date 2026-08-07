@@ -4,6 +4,7 @@ import { Check, Search, UserPlus, X } from 'lucide-react';
 import { toast } from 'sonner';
 import client from '../../api/client';
 import useCallStore from '../../stores/callStore';
+import { useModalDialog } from '../../hooks/useModalDialog';
 
 /**
  * Pull more people into a group call that is already running.
@@ -32,6 +33,7 @@ const OUTCOME_LABEL = {
 export const AddParticipantsModal = ({ isOpen, onClose, callId }) => {
   const remoteParticipants = useCallStore((s) => s.remoteParticipants);
   const pendingInvitees = useCallStore((s) => s.pendingInvitees);
+  const { titleId, dialogProps } = useModalDialog({ isOpen, onClose });
 
   const [contacts, setContacts] = useState([]);
   const [search, setSearch] = useState('');
@@ -149,10 +151,11 @@ export const AddParticipantsModal = ({ isOpen, onClose, callId }) => {
           transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
           onClick={(e) => e.stopPropagation()}
           data-testid="add-participants-modal"
-          className="relative bg-[#141414] border border-[#1F1F1F] rounded-[12px] w-full max-w-[420px] max-h-[70vh] shadow-[0_18px_60px_rgba(0,0,0,0.6)] flex flex-col overflow-hidden"
+          {...dialogProps}
+          className="relative bg-[#141414] border border-[#1F1F1F] rounded-[12px] w-full max-w-[420px] max-h-[70vh] shadow-[0_18px_60px_rgba(0,0,0,0.6)] flex flex-col overflow-hidden outline-none"
         >
           <div className="flex items-center justify-between px-5 py-4 border-b border-[#1F1F1F]">
-            <h3 className="text-base font-semibold text-[#F5F5F5]">Add to call</h3>
+            <h3 id={titleId} className="text-base font-semibold text-[#F5F5F5]">Add to call</h3>
             <button
               onClick={onClose}
               aria-label="Close"
