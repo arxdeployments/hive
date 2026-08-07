@@ -117,7 +117,14 @@ test('a retry after an uncertain send does not deliver the message twice', async
   // Retry, this time letting the answer through.
   socket.swallowAcks = false;
   await page.getByTestId('message-retry').click();
-  await expect(page.locator('[data-testid="message-status"][data-status="sent"]').first())
+  // Scoped to the row for `body`, not `.first()` in the thread. Both tests here run
+  // against the same seeded conversation, so by the second one the thread already
+  // holds an own message carrying data-status="sent" — and `StatusIcon` defaults to
+  // "sent" for any own row without an explicit status, which is every row that came
+  // back from history. An unscoped match would be satisfied by that row and prove
+  // nothing about this retry.
+  await expect(page.getByTestId('message-row').filter({ hasText: body })
+    .locator('[data-testid="message-status"][data-status="sent"]'))
     .toBeVisible({ timeout: 15000 });
   await expect(page.getByTestId('message-retry')).toHaveCount(0);
 
@@ -140,7 +147,11 @@ test('a failed bubble whose message actually landed is not shown beside it', asy
   const body = `landed anyway ${suffix}`;
   await page.getByTestId('message-input').fill(body);
   await page.getByTestId('message-send-btn').click();
-  await expect(page.locator('[data-testid="message-status"][data-status="sending"]').first())
+  // Scoped for the same reason as the retry assertion above. This one filters on
+  // "sending" so the inherited row could not have satisfied it, but the thread it
+  // runs against is exactly the one that carries that row.
+  await expect(page.getByTestId('message-row').filter({ hasText: body })
+    .locator('[data-testid="message-status"][data-status="sending"]'))
     .toBeVisible();
 
   // Losing the socket resolves the pending send immediately, then reconnecting

@@ -75,6 +75,9 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
   const onPointerDown = useCallback(async (e) => {
     if (!enabled || !coarse || e.button !== 0) return;
     e.preventDefault();
+    // Read once, up front: everything below the await has to compare against the
+    // pointer that started THIS gesture, and `e` is the wrong place to keep that.
+    const pointerId = e.pointerId;
     // The recorder refuses a second start while the first is still opening the
     // device, and that refusal comes back as `{ ok: false }` — which the failure
     // path below treats as "nothing to hold" and resets the gesture, disarming
@@ -90,11 +93,11 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
     // not. Missing capture support reads as "not held", which gives back the old
     // free-for-all rather than a control that cannot be pressed at all.
     const owner = ownerRef.current;
-    if (owner !== null && owner !== e.pointerId
+    if (owner !== null && owner !== pointerId
       && e.currentTarget.hasPointerCapture?.(owner)) return;
 
-    ownerRef.current = e.pointerId;
-    e.currentTarget.setPointerCapture?.(e.pointerId);
+    ownerRef.current = pointerId;
+    e.currentTarget.setPointerCapture?.(pointerId);
 
     origin.current = { x: e.clientX, y: e.clientY };
     startedAt.current = Date.now();
@@ -102,6 +105,13 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
     setDrag({ x: 0, y: 0 });
 
     const res = await onStart?.();
+    // The device can take long enough to open that this finger is gone and the
+    // NEXT one already owns the gesture — a quick double-tap is all it takes. Both
+    // lines below write refs that are no longer this gesture's to write: `reset`
+    // would tear down whoever owns it now, and `armed` is worse for being
+    // survivable. It outlives the release that should have consumed it, so a later
+    // hold reads wasArmed=true and sends a recording that was never started.
+    if (ownerRef.current !== pointerId) return;
     // Permission was refused, or the device is unavailable. Nothing to hold.
     if (res && res.ok === false) { reset(); return; }
     // Only arm once the recorder is genuinely running. If the prompt ate the

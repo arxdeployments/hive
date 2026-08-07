@@ -246,4 +246,69 @@ test.describe('livekitClient local media', () => {
       localTracks: 2,
     });
   });
+
+  /**
+   * Both toggle queues are chained for the life of the client and nothing clears
+   * them on `leave()`, so an operation can start — or resolve — after the call it
+   * was made in has gone. Read inside the queued task, `this.room` would by then be
+   * the NEXT call's room.
+   *
+   * Timing is made deterministic by the fake device call, not by luck: call A's
+   * `setMicrophoneEnabled` takes 200ms and the leave/join happens 40ms in, so tap 1
+   * is still in flight and tap 2 has not started when the call changes. That is the
+   * real window — unmuting reopens the device, which is exactly the slow case.
+   */
+  test('a toggle queued in one call cannot reach the next call', async ({ page }) => {
+    const seen = await page.evaluate(async () => {
+      const { default: livekitClient } = await import('/src/services/livekitClient.js');
+      const { default: useCallStore } = await import('/src/stores/callStore.js');
+      const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
+
+      // Records what each call's room was actually asked to do.
+      const room = (log, ms) => ({
+        localParticipant: {
+          setMicrophoneEnabled: async (on) => { await sleep(ms); log.push(`mic:${on}`); },
+          setCameraEnabled: async (on) => { await sleep(ms); log.push(`cam:${on}`); },
+        },
+      });
+      const callA = [];
+      const callB = [];
+
+      livekitClient.room = room(callA, 200);
+      livekitClient.callId = 'call-A';
+      useCallStore.setState({ isMuted: false, isCameraOn: true });
+
+      // Two taps of each, in call A. Fire-and-forget, as the composer's own callers are.
+      livekitClient.setMicEnabled(false);
+      livekitClient.setMicEnabled(true);
+      livekitClient.setCameraEnabled(false);
+      livekitClient.setCameraEnabled(true);
+
+      await sleep(40);
+      // The user hangs up and answers another call, both inside tap 1's device call.
+      livekitClient.room = null;
+      livekitClient.callId = null;
+      await sleep(10);
+      livekitClient.room = room(callB, 5);
+      livekitClient.callId = 'call-B';
+      // A new call sets these itself (CLEARED_CALL_RUNTIME): joined unmuted, camera on.
+      useCallStore.setState({ isMuted: false, isCameraOn: true });
+
+      await sleep(600);
+      return {
+        callA,
+        callB,
+        isMuted: useCallStore.getState().isMuted,
+        isCameraOn: useCallStore.getState().isCameraOn,
+      };
+    });
+
+    // Positive control first: without this the assertions below could pass simply
+    // because nothing ever ran.
+    expect(seen.callA.length, 'no toggle reached the call that was actually being held').toBeGreaterThan(0);
+
+    expect(seen.callB, "a toggle from the previous call reached the new call's devices").toEqual([]);
+    expect(seen.isMuted, "a toggle from the previous call muted the new call's UI").toBe(false);
+    expect(seen.isCameraOn, "a toggle from the previous call turned off the new call's camera").toBe(true);
+  });
 });
