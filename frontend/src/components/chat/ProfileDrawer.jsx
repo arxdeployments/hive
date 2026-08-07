@@ -6,6 +6,7 @@ import { useNavigate } from 'react-router-dom';
 import client from '../../api/client';
 import { transcodeImage } from '../../utils/mediaQuality';
 import { toast } from 'sonner';
+import { useModalDialog } from '../../hooks/useModalDialog';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 
@@ -13,6 +14,7 @@ export const ProfileDrawer = ({ isOpen, onClose }) => {
   const { user, checkAuth, logout } = useAuth();
   const navigate = useNavigate();
   const [signingOut, setSigningOut] = useState(false);
+  const { titleId, dialogProps } = useModalDialog({ isOpen, onClose });
 
   const handleSignOut = async () => {
     if (signingOut) return;
@@ -93,11 +95,12 @@ export const ProfileDrawer = ({ isOpen, onClose }) => {
           initial={{ x: '-100%' }} animate={{ x: 0 }} exit={{ x: '-100%' }}
           transition={{ duration: 0.3, ease: [0.2, 0.8, 0.2, 1] }}
           onClick={(e) => e.stopPropagation()}
-          className="absolute left-0 top-0 h-full w-full sm:w-[360px] bg-[#0F0F0F] border-r border-[#1F1F1F] shadow-2xl overflow-y-auto"
+          {...dialogProps}
+          className="absolute left-0 top-0 h-full w-full sm:w-[360px] bg-[#0F0F0F] border-r border-[#1F1F1F] shadow-2xl overflow-y-auto outline-none"
           data-testid="profile-drawer"
         >
           <div className="flex items-center justify-between px-4 py-3 border-b border-[#1F1F1F]">
-            <h3 className="text-base font-semibold text-[#F5F5F5]">Profile</h3>
+            <h3 id={titleId} className="text-base font-semibold text-[#F5F5F5]">Profile</h3>
             <button onClick={onClose} className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] rounded-[6px] transition-colors">
               <X size={18} />
             </button>
@@ -124,9 +127,9 @@ export const ProfileDrawer = ({ isOpen, onClose }) => {
 
             {/* Name */}
             <div>
-              <label className="text-xs text-[#A3A3A3] mb-1.5 block">Display Name</label>
+              <label htmlFor="profiledrawer-01-display-name" className="text-xs text-[#A3A3A3] mb-1.5 block">Display Name</label>
               {editingName ? (
-                <input type="text" value={newName} onChange={(e) => setNewName(e.target.value)}
+                <input id="profiledrawer-01-display-name" type="text" value={newName} onChange={(e) => setNewName(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter') handleSaveName(); if (e.key === 'Escape') setEditingName(false); }}
                   autoFocus maxLength={50}
                   className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none" />
@@ -143,9 +146,9 @@ export const ProfileDrawer = ({ isOpen, onClose }) => {
 
             {/* About */}
             <div>
-              <label className="text-xs text-[#A3A3A3] mb-1.5 block">About</label>
+              <label htmlFor="profiledrawer-02-about" className="text-xs text-[#A3A3A3] mb-1.5 block">About</label>
               {editingAbout ? (
-                <textarea value={newAbout} onChange={(e) => setNewAbout(e.target.value)}
+                <textarea id="profiledrawer-02-about" value={newAbout} onChange={(e) => setNewAbout(e.target.value)}
                   onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSaveAbout(); } if (e.key === 'Escape') setEditingAbout(false); }}
                   autoFocus maxLength={140} rows={2}
                   className="w-full px-4 py-2 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none resize-none" />

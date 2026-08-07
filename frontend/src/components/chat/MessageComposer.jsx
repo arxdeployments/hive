@@ -1029,7 +1029,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                 onChange={(e) => setPreviewCaption(e.target.value)}
                 placeholder="Add a caption..."
                 disabled={uploading}
-                className="flex-1 h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#525252] focus:border-[#10B981] focus:outline-none disabled:opacity-60"
+                className="flex-1 h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#828282] focus:border-[#10B981] focus:outline-none disabled:opacity-60"
                 onKeyDown={(e) => { if (e.key === 'Enter' && !uploading) handleConfirmSend(); }}
               />
               <button
@@ -1126,6 +1126,16 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
           <button
             onClick={() => { setShowEmoji(!showEmoji); setShowAttachMenu(false); }}
             data-testid="composer-emoji-btn"
+            // Icon-only, and a lucide <svg> has no <title> and no text child, so
+            // it contributes nothing to the accessible name: this and the
+            // paperclip beside it both announced as "button", one after the
+            // other, with nothing to tell them apart. The send/mic button at the
+            // far end of the same row was labelled for exactly this reason and
+            // these two were missed. aria-expanded is the other half — the
+            // picker opens in place above the bar, so without it a press
+            // produces no announced change and the control reads as inert.
+            aria-label="Emoji"
+            aria-expanded={showEmoji}
             className={`p-2 transition-colors flex-shrink-0 mb-0.5 ${showEmoji ? 'text-[#10B981]' : 'text-[#A3A3A3] hover:text-[#F5F5F5]'}`}
           >
             <Smile size={20} />
@@ -1136,6 +1146,9 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
             <button
               onClick={() => { setShowAttachMenu(!showAttachMenu); setShowEmoji(false); }}
               data-testid="composer-attach-btn"
+              // Same reasoning as the emoji button above.
+              aria-label="Attach"
+              aria-expanded={showAttachMenu}
               className={`p-2 transition-colors flex-shrink-0 mb-0.5 ${showAttachMenu ? 'text-[#10B981]' : 'text-[#A3A3A3] hover:text-[#F5F5F5]'}`}
             >
               <Paperclip size={20} />
@@ -1206,7 +1219,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
             rows={1}
             disabled={disabled}
             data-testid="message-input"
-            className="flex-1 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[8px] px-4 py-2.5 text-sm text-[#F5F5F5] placeholder:text-[#525252] resize-none focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all overflow-y-auto"
+            className="flex-1 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[8px] px-4 py-2.5 text-sm text-[#F5F5F5] placeholder:text-[#828282] resize-none focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all overflow-y-auto"
             style={{ maxHeight: 120, minHeight: 40 }}
           />
 

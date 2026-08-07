@@ -117,10 +117,27 @@ export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
     <div className="h-full flex flex-col bg-[#0F0F0F] border-r border-[#1F1F1F] overflow-hidden" data-testid="chat-sidebar">
       {/* Header */}
       <div className="h-[60px] flex items-center justify-between px-4 border-b border-[#1F1F1F] flex-shrink-0">
-        <div className="flex items-center gap-3 cursor-pointer min-w-0" onClick={() => setShowProfile(true)}>
-          <div className="w-9 h-9 shrink-0 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-sm font-medium">
+        {/* A real <button>, matching the identity control in the ChatPanel header.
+            This is the only route to the profile drawer anywhere in the app — the
+            overflow menu no longer offers "Profile" and the settings page has no
+            name/About/avatar editing — so a bare div with an onClick left a
+            keyboard-only user unable to reach their own profile at all.
+
+            The avatar becomes a <span> because a <button> may only contain
+            phrasing content; the classes on it already set display:flex, so
+            nothing moves. `flex` likewise overrides the button's inline-block
+            default and `text-left` cancels the UA's centring, so the pointer
+            experience is byte-for-byte what it was. */}
+        <button
+          type="button"
+          onClick={() => setShowProfile(true)}
+          aria-label={user?.name ? `Open profile for ${user.name}` : 'Open your profile'}
+          data-testid="sidebar-profile-button"
+          className="flex items-center gap-3 cursor-pointer min-w-0 text-left rounded-[6px] focus:outline-none focus-visible:ring-1 focus-visible:ring-[#10B981]"
+        >
+          <span className="w-9 h-9 shrink-0 rounded-full bg-[#10B981]/10 flex items-center justify-center text-[#10B981] text-sm font-medium">
             {user?.name?.charAt(0)?.toUpperCase() || 'U'}
-          </div>
+          </span>
           {!isMobile && (
             // truncate + the min-w-0 above: this span had no way to shrink, so
             // the header's min-content was avatar + full name + every control.
@@ -130,7 +147,7 @@ export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
             // scrolling. The name is the one thing here that can safely give.
             <span className="text-sm font-medium text-[#F5F5F5] truncate">{user?.name}</span>
           )}
-        </div>
+        </button>
         <div className="flex items-center gap-1 shrink-0">
           {/* Renders only for org admins; returns null for everyone else, so the
               header is unchanged for ordinary users.

@@ -349,8 +349,8 @@ export default function Organizations() {
 
                   <div className="space-y-4">
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-1.5 block">Organization Name *</label>
-                      <input
+                      <label htmlFor="organizations-01-organization-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Organization Name *</label>
+                      <input id="organizations-01-organization-name"
                         type="text"
                         value={formName}
                         onChange={(e) => setFormName(e.target.value)}
@@ -424,10 +424,11 @@ export default function Organizations() {
                       This will deactivate all users and departments in this organization.
                     </p>
                   </div>
-                  <label className="text-sm text-[#A3A3A3] mb-1.5 block">
+                  <label htmlFor="organizations-delete-confirm" className="text-sm text-[#A3A3A3] mb-1.5 block">
                     Type <span className="font-mono text-[#F5F5F5]">{deleteOrg.name}</span> to confirm
                   </label>
                   <input
+                    id="organizations-delete-confirm"
                     type="text"
                     value={deleteConfirmName}
                     onChange={(e) => setDeleteConfirmName(e.target.value)}

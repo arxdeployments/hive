@@ -150,6 +150,11 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   const pendingJumpRef = useRef(null);
   const [, setJumpLoading] = useState(false);
 
+  // Text a screen reader is asked to speak when a message arrives, plus the
+  // baseline that decides whether anything actually arrived. See the announce
+  // effect below the `items` memo.
+  const [announcement, setAnnouncement] = useState('');
+  const lastSpokenRef = useRef(null);
   const virtuosoRef = useRef(null);
 
   const myUserId = user?.id;
@@ -242,9 +247,12 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // A failure is NOT proof the message was not stored, though — the server
       // commits before the sender is told anything, so a lost response or a 502
       // marks a bubble failed for a message that is already in the conversation.
-      // Every serialized message now carries `client_msg_id`, so those are
+      // Every fetched message OF OUR OWN carries `client_msg_id`, so those are
       // identified here and dropped instead of sitting under the real message as
-      // a second copy the user is invited to send again.
+      // a second copy the user is invited to send again. The API withholds other
+      // senders' keys — they describe someone else's device and could only ever
+      // match one of ours by collision — so filter(Boolean) is also what keeps
+      // this set to our own sends.
       const landed = new Set(fetched.map(m => m.client_msg_id).filter(Boolean));
       const failedLocal = (useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES)
         .filter(m => m.status === 'failed' && !landed.has(m.temp_id));
@@ -323,6 +331,12 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     // A jump parked for the previous thread must not fire against this one.
     pendingJumpRef.current = null;
     setHighlightedId(null);
+    // Clearing the baseline is what stops a newly opened thread's last line
+    // being read out as if it had just come in: with none recorded, the
+    // announce effect's first pass only records. Effects run in declaration
+    // order and this reset is declared above it, so it always wins the switch.
+    lastSpokenRef.current = null;
+    setAnnouncement('');
     if (highlightTimerRef.current) clearTimeout(highlightTimerRef.current);
     setDraft(pendingDraftRef.current);
     pendingDraftRef.current = null;
@@ -895,6 +909,57 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     return built;
   }, [convMessages, myUserId]);
 
+  /**
+   * Speak the newest incoming message.
+   *
+   * Nothing else does. react-virtuoso renders a plain scrolling div with no
+   * live semantics, and the socket handler goes out of its way to stay quiet
+   * here: websocket.js's `looking` branch skips the sound, the desktop
+   * notification and the unread bump whenever the thread is open and visible,
+   * because a sighted user simply watches the bubble appear. The one user who
+   * cannot watch it is therefore the one user nothing tells. WCAG 2.2 4.1.3.
+   *
+   * `lastSpokenRef` holds the id AND the created_at of the newest message
+   * already accounted for, and the timestamp is the load-bearing half: an
+   * id-only check would read out a message that did not arrive, because
+   * handleJumpToMessage swaps the whole window for one centred on an OLD
+   * message and the last row then legitimately becomes one never announced.
+   * Requiring the newest row to be strictly newer keeps the jump silent.
+   *
+   * Own messages are skipped — the user knows what they just sent.
+   */
+  useEffect(() => {
+    // Wait for the window, so the baseline below is taken from loaded history
+    // rather than from the empty array that precedes it.
+    if (loading) return;
+    const newest = convMessages[convMessages.length - 1];
+    const stamp = newest?.created_at || '';
+    const prev = lastSpokenRef.current;
+    // First pass on a thread records the baseline and says nothing, so opening
+    // a conversation never reads its last line out as if it had just arrived.
+    // Recorded even when the thread is EMPTY — '' is a real baseline, and
+    // without it the very first message into a new conversation was swallowed
+    // as though it were pre-existing history.
+    if (prev === null) {
+      lastSpokenRef.current = stamp;
+      return;
+    }
+    if (!newest || stamp <= prev) return;
+    // Only ever forward. A jump replaces the window with one centred on an OLD
+    // message, so letting the mark regress to that row would make the next
+    // "Jump to latest" re-announce something the user already heard.
+    lastSpokenRef.current = stamp;
+    if (newest.sender_id === myUserId) return;
+    // System rows (call ended, someone left the group) have sender_id null and
+    // no sender_name, so the person-prefixed form would announce them as though
+    // a stranger had spoken. Their content is already a full sentence.
+    if (newest.type === 'system') {
+      setAnnouncement(newest.content || '');
+      return;
+    }
+    setAnnouncement(`${newest.sender_name || 'New message'}: ${newest.content || 'sent an attachment'}`);
+  }, [convMessages, myUserId, loading]);
+
   // Read through a ref so the scroll-to-reply handler stays stable for the
   // memoised bubbles instead of changing identity with every new message.
   const itemsRef = useRef(items);
@@ -1287,6 +1352,16 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
           </button>
         </div>
       )}
+
+      {/* The message list is a virtualised scroller with no live semantics, so
+          arrivals are announced from here instead. Always mounted, never
+          conditionally rendered: a live region has to exist before the text is
+          put into it, or assistive technology has nothing subscribed to change.
+          `polite` rather than `assertive` so a message waits for the user to
+          finish what they are reading rather than interrupting them. */}
+      <div className="sr-only" role="status" aria-live="polite" data-testid="message-announcer">
+        {announcement}
+      </div>
 
       {/* Message Area */}
       <div className="flex-1 relative overflow-hidden min-h-0 scrollable-area">

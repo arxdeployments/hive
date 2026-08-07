@@ -1,7 +1,12 @@
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, CheckCheck, Clock } from 'lucide-react';
+import { useModalDialog } from '../../hooks/useModalDialog';
 
 export const MessageInfoModal = ({ info, isOpen, onClose }) => {
+  // Above the early return, or the hook order would change between renders.
+  // It is inert while closed, so calling it unconditionally costs nothing.
+  const { titleId, dialogProps } = useModalDialog({ isOpen, onClose });
+
   if (!isOpen || !info) return null;
 
   return (
@@ -11,10 +16,11 @@ export const MessageInfoModal = ({ info, isOpen, onClose }) => {
         <div className="absolute inset-0 bg-black/60 backdrop-blur-[4px]" />
         <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }}
           onClick={(e) => e.stopPropagation()}
-          className="relative bg-[#141414] border border-[#1F1F1F] rounded-[12px] w-full max-w-[360px] p-6"
+          {...dialogProps}
+          className="relative bg-[#141414] border border-[#1F1F1F] rounded-[12px] w-full max-w-[360px] p-6 outline-none"
           data-testid="message-info-modal">
           <div className="flex items-center justify-between mb-4">
-            <h3 className="text-base font-semibold text-[#F5F5F5]">Message Info</h3>
+            <h3 id={titleId} className="text-base font-semibold text-[#F5F5F5]">Message Info</h3>
             <button onClick={onClose} className="p-1.5 text-[#A3A3A3] hover:text-[#F5F5F5] rounded transition-colors"><X size={16} /></button>
           </div>
 

@@ -113,11 +113,11 @@ export default function OrgAdminDepartments() {
             <div className="relative bg-[#141414] border border-[#1F1F1F] rounded-[8px] w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
               <h3 className="text-lg font-semibold text-[#F5F5F5] mb-4">{editDept ? 'Edit Department' : 'Create Department'}</h3>
               <div className="space-y-4">
-                <div><label className="text-sm text-[#A3A3A3] mb-1.5 block">Name *</label>
-                  <input value={formName} onChange={e => setFormName(e.target.value)}
+                <div><label htmlFor="orgadmindepartments-01-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Name *</label>
+                  <input id="orgadmindepartments-01-name" value={formName} onChange={e => setFormName(e.target.value)}
                     className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none" /></div>
-                <div><label className="text-sm text-[#A3A3A3] mb-1.5 block">Description</label>
-                  <textarea value={formDesc} onChange={e => setFormDesc(e.target.value)} rows={2}
+                <div><label htmlFor="orgadmindepartments-02-description" className="text-sm text-[#A3A3A3] mb-1.5 block">Description</label>
+                  <textarea id="orgadmindepartments-02-description" value={formDesc} onChange={e => setFormDesc(e.target.value)} rows={2}
                     className="w-full px-4 py-2 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none resize-none" /></div>
               </div>
               <div className="flex justify-end gap-3 mt-6">

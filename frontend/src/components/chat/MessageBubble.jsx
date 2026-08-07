@@ -239,6 +239,10 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
     } mb-px px-3 sm:px-8 md:px-16 transition-colors duration-500 ${
       highlighted ? 'bg-[#10B981]/15 rounded-[6px]' : ''
     }`}
+      // One row per message, so a test can scope to the message it is about rather
+      // than to the first match in the thread. `data-highlighted` cannot serve: it is
+      // `highlighted || undefined`, so it is absent on every row that is not flashing.
+      data-testid="message-row"
       data-highlighted={highlighted || undefined}
       onContextMenu={handleContextMenu}
       onTouchStart={handleTouchStart}
@@ -261,12 +265,12 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
           onDoubleClick={handleDoubleClick}
           className={`relative group ${
             isImage || isVideo
-              ? `px-1 py-1 ${isOwn ? 'bg-[#10B981] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
+              ? `px-1 py-1 ${isOwn ? 'bg-[#047857] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
               : isFile || isAudio
-                ? `p-1 ${isOwn ? 'bg-[#10B981] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
+                ? `p-1 ${isOwn ? 'bg-[#047857] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
                 // pr-8 permanently reserves the chevron's corner, so revealing it on
                 // hover never reflows the bubble or lets it sit on top of the text.
-                : `pl-3 pr-8 py-2 ${isOwn ? 'bg-[#10B981] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
+                : `pl-3 pr-8 py-2 ${isOwn ? 'bg-[#047857] rounded-[8px_8px_0px_8px]' : 'bg-[#1F1F1F] rounded-[8px_8px_8px_0px]'}`
           }`}
         >
           {/* Hover / focus / touch menu trigger */}
@@ -289,10 +293,25 @@ const MessageBubbleInner = ({ message, isOwn, showSenderName, isGroup, currentUs
 
           {/* Reply block */}
           {replyMsg && (
+            // role="button" rather than a real <button>: this sits inside the
+            // bubble's text flow as a block, and a button's shrink-to-fit
+            // inline-block box would collapse the quote to its content width
+            // instead of filling the bubble. Same trade DocumentBubble already
+            // makes. The name is built here rather than left to the nested <p>s,
+            // which would otherwise be read as two loose fragments.
             <div
+              role="button"
+              tabIndex={0}
               onClick={() => onReplyClick && onReplyClick(replyMsg._id)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  onReplyClick && onReplyClick(replyMsg._id);
+                }
+              }}
+              aria-label={`Go to replied message from ${replyMsg.sender_name}`}
               data-testid="reply-quote"
-              className={`mb-1.5 p-2 rounded-[4px] border-l-2 cursor-pointer ${
+              className={`mb-1.5 p-2 rounded-[4px] border-l-2 cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white ${
                 isOwn ? 'bg-[#059669] border-white/40' : 'bg-[#2D2D2D] border-[#10B981]'
               }`}
             >

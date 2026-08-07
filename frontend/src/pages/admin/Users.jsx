@@ -310,9 +310,9 @@ export default function UsersPage() {
         <div className="flex flex-wrap items-end gap-4 mb-6">
           {/* Org filter */}
           <div>
-            <label className="text-xs text-[#A3A3A3] mb-1.5 block">Organization</label>
+            <label id="users-01-organization" className="text-xs text-[#A3A3A3] mb-1.5 block">Organization</label>
             <div className="relative">
-              <button
+              <button aria-labelledby="users-01-organization"
                 onClick={() => { setOrgDropdownOpen(!orgDropdownOpen); setDeptDropdownOpen(false); }}
                 data-testid="users-org-filter"
                 className="w-48 h-10 px-3 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between focus:border-[#10B981] focus:outline-none transition-all duration-200"
@@ -344,9 +344,9 @@ export default function UsersPage() {
 
           {/* Dept filter */}
           <div>
-            <label className="text-xs text-[#A3A3A3] mb-1.5 block">Department</label>
+            <label id="users-02-department" className="text-xs text-[#A3A3A3] mb-1.5 block">Department</label>
             <div className="relative">
-              <button
+              <button aria-labelledby="users-02-department"
                 onClick={() => { if (selectedOrg) { setDeptDropdownOpen(!deptDropdownOpen); setOrgDropdownOpen(false); } }}
                 data-testid="users-dept-filter"
                 className={`w-48 h-10 px-3 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between transition-all duration-200 ${!selectedOrg ? 'opacity-50 cursor-not-allowed' : 'focus:border-[#10B981] focus:outline-none'}`}
@@ -378,10 +378,10 @@ export default function UsersPage() {
 
           {/* Search */}
           <div>
-            <label className="text-xs text-[#A3A3A3] mb-1.5 block">Search</label>
+            <label htmlFor="users-03-search" className="text-xs text-[#A3A3A3] mb-1.5 block">Search</label>
             <div className="relative">
               <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#A3A3A3]" />
-              <input
+              <input id="users-03-search"
                 type="text" placeholder="Name or email..."
                 value={search} onChange={(e) => { setSearch(e.target.value); setPage(1); }}
                 data-testid="users-search-input"
@@ -392,10 +392,10 @@ export default function UsersPage() {
 
           {/* Status filter */}
           <div>
-            <label className="text-xs text-[#A3A3A3] mb-1.5 block">Status</label>
+            <label id="users-04-status" className="text-xs text-[#A3A3A3] mb-1.5 block">Status</label>
             <div className="flex gap-1">
               {[null, 'active', 'inactive'].map(s => (
-                <button key={s || 'all'} onClick={() => { setStatusFilter(s); setPage(1); }}
+                <button aria-labelledby="users-04-status" key={s || 'all'} onClick={() => { setStatusFilter(s); setPage(1); }}
                   className={`px-3 h-10 rounded-[6px] text-xs font-medium transition-colors ${statusFilter === s ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30' : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] hover:text-[#F5F5F5]'}`}>
                   {s ? s.charAt(0).toUpperCase() + s.slice(1) : 'All'}
                 </button>
@@ -405,8 +405,8 @@ export default function UsersPage() {
 
           {/* Mobile-access filter */}
           <div>
-            <label className="text-xs text-[#A3A3A3] mb-1.5 block">Mobile App</label>
-            <div className="flex gap-1">
+            <span id="users-filter-mobile-app" className="text-xs text-[#A3A3A3] mb-1.5 block">Mobile App</span>
+            <div role="group" aria-labelledby="users-filter-mobile-app" className="flex gap-1">
               {[
                 { value: null, label: 'All' },
                 { value: 'granted', label: 'Approved' },
@@ -621,9 +621,9 @@ export default function UsersPage() {
                   <div className="space-y-4">
                     {/* Org select */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-1.5 block">Organization *</label>
+                      <label id="users-06-organization" className="text-sm text-[#A3A3A3] mb-1.5 block">Organization *</label>
                       <div className="relative">
-                        <button onClick={() => { setCreateOrgOpen(!createOrgOpen); setCreateDeptOpen(false); }}
+                        <button aria-labelledby="users-06-organization" onClick={() => { setCreateOrgOpen(!createOrgOpen); setCreateDeptOpen(false); }}
                           className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between focus:border-[#10B981] focus:outline-none transition-all">
                           <span className={createOrg ? 'text-[#F5F5F5]' : 'text-[#A3A3A3]'}>{createOrg?.name || 'Select organization'}</span>
                           <ChevronDown size={14} className="text-[#A3A3A3]" />
@@ -644,9 +644,9 @@ export default function UsersPage() {
 
                     {/* Dept select */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-1.5 block">Department *</label>
+                      <label id="users-07-department" className="text-sm text-[#A3A3A3] mb-1.5 block">Department *</label>
                       <div className="relative">
-                        <button onClick={() => { if (createOrg) { setCreateDeptOpen(!createDeptOpen); setCreateOrgOpen(false); } }}
+                        <button aria-labelledby="users-07-department" onClick={() => { if (createOrg) { setCreateDeptOpen(!createDeptOpen); setCreateOrgOpen(false); } }}
                           className={`w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between transition-all ${!createOrg ? 'opacity-50 cursor-not-allowed' : 'focus:border-[#10B981] focus:outline-none'}`}>
                           <span className={createDept ? 'text-[#F5F5F5]' : 'text-[#A3A3A3]'}>{createDept?.name || 'Select department'}</span>
                           <ChevronDown size={14} className="text-[#A3A3A3]" />
@@ -669,8 +669,8 @@ export default function UsersPage() {
 
                     {/* Email */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-1.5 block">Email *</label>
-                      <input type="email" value={createEmail} onChange={(e) => setCreateEmail(e.target.value)}
+                      <label htmlFor="users-08-email" className="text-sm text-[#A3A3A3] mb-1.5 block">Email *</label>
+                      <input id="users-08-email" type="email" value={createEmail} onChange={(e) => setCreateEmail(e.target.value)}
                         placeholder="user@company.com" data-testid="user-email-input"
                         className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#A3A3A3]/50 focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all" />
                       {emailAvailable === false && <p className="mt-1 text-xs text-[#EF4444]">Email already in use</p>}
@@ -679,8 +679,8 @@ export default function UsersPage() {
 
                     {/* Name */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-1.5 block">Display Name *</label>
-                      <input type="text" value={createName} onChange={(e) => setCreateName(e.target.value)}
+                      <label htmlFor="users-09-display-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Display Name *</label>
+                      <input id="users-09-display-name" type="text" value={createName} onChange={(e) => setCreateName(e.target.value)}
                         placeholder="John Doe" data-testid="user-name-input"
                         className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#A3A3A3]/50 focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all" />
                     </div>
@@ -688,8 +688,8 @@ export default function UsersPage() {
                     {/* Password section */}
                     <div>
                       <div className="flex items-center justify-between mb-1.5">
-                        <label className="text-sm text-[#A3A3A3]">Password</label>
-                        <button onClick={() => setAutoPassword(!autoPassword)} data-testid="users-auto-password-toggle"
+                        <label id="users-10-password" className="text-sm text-[#A3A3A3]">Password</label>
+                        <button aria-labelledby="users-10-password" onClick={() => setAutoPassword(!autoPassword)} data-testid="users-auto-password-toggle"
                           className="flex items-center gap-2 text-xs text-[#A3A3A3] hover:text-[#F5F5F5] transition-colors">
                           <div className={`w-8 h-4.5 rounded-full transition-colors ${autoPassword ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
                             <div className={`absolute top-0.5 w-3.5 h-3.5 rounded-full bg-white transition-transform ${autoPassword ? 'left-4' : 'left-0.5'}`} />
@@ -721,8 +721,11 @@ export default function UsersPage() {
 
                     {/* Role */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-2 block">Role</label>
-                      <div className="space-y-2">
+                      {/* A caption for a set of radios, not a control of its own:
+                          the inner <label>s wrap their inputs, so those are already
+                          associated. A second <label> around the group named nothing. */}
+                      <span id="users-create-role" className="text-sm text-[#A3A3A3] mb-2 block">Role</span>
+                      <div role="radiogroup" aria-labelledby="users-create-role" className="space-y-2">
                         {['member', 'admin'].map(role => (
                           <label key={role}
                             className={`flex items-start gap-3 p-3 rounded-[6px] border cursor-pointer transition-colors ${
@@ -744,8 +747,8 @@ export default function UsersPage() {
 
                     {/* Mobile app access */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</label>
-                      <button onClick={() => setCreateMobileAccess(!createMobileAccess)}
+                      <label id="users-12-mobile-app-access" className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</label>
+                      <button aria-labelledby="users-12-mobile-app-access" onClick={() => setCreateMobileAccess(!createMobileAccess)}
                         data-testid="users-create-mobile-access-toggle"
                         className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D] hover:border-[#10B981]/20 transition-colors text-left">
                         <div className={`w-10 h-5 rounded-full transition-colors flex-shrink-0 ${createMobileAccess ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
@@ -816,23 +819,23 @@ export default function UsersPage() {
                   <div className="space-y-5">
                     {/* Display name */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-1.5 block">Display Name</label>
-                      <input type="text" value={editName} onChange={(e) => setEditName(e.target.value)}
+                      <label htmlFor="users-13-display-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Display Name</label>
+                      <input id="users-13-display-name" type="text" value={editName} onChange={(e) => setEditName(e.target.value)}
                         className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none transition-all" />
                     </div>
 
                     {/* Email (read-only) */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-1.5 block">Email</label>
-                      <input type="email" value={editUser.email} readOnly
+                      <label htmlFor="users-14-email" className="text-sm text-[#A3A3A3] mb-1.5 block">Email</label>
+                      <input id="users-14-email" type="email" value={editUser.email} readOnly
                         className="w-full h-10 px-4 bg-[#0F0F0F] border border-[#1F1F1F] rounded-[6px] text-sm text-[#A3A3A3] cursor-not-allowed" />
                     </div>
 
                     {/* Department */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-1.5 block">Department</label>
+                      <label id="users-15-department" className="text-sm text-[#A3A3A3] mb-1.5 block">Department</label>
                       <div className="relative">
-                        <button onClick={() => setEditDeptOpen(!editDeptOpen)}
+                        <button aria-labelledby="users-15-department" onClick={() => setEditDeptOpen(!editDeptOpen)}
                           className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between focus:border-[#10B981] focus:outline-none transition-all">
                           <span className="text-[#F5F5F5]">{editDepts.find(d => d._id === editDeptId)?.name || editUser.dept_name}</span>
                           <ChevronDown size={14} className="text-[#A3A3A3]" />
@@ -853,10 +856,10 @@ export default function UsersPage() {
 
                     {/* Role */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-2 block">Role</label>
+                      <label id="users-16-role" className="text-sm text-[#A3A3A3] mb-2 block">Role</label>
                       <div className="flex gap-2">
                         {['member', 'admin'].map(role => (
-                          <button key={role} onClick={() => setEditRole(role)}
+                          <button aria-labelledby="users-16-role" key={role} onClick={() => setEditRole(role)}
                             className={`flex-1 h-10 rounded-[6px] text-sm font-medium capitalize transition-colors ${
                               editRole === role ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30' : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] hover:text-[#F5F5F5]'
                             }`}>
@@ -868,8 +871,8 @@ export default function UsersPage() {
 
                     {/* Status */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-2 block">Status</label>
-                      <button onClick={() => setEditActive(!editActive)}
+                      <label id="users-17-status" className="text-sm text-[#A3A3A3] mb-2 block">Status</label>
+                      <button aria-labelledby="users-17-status" onClick={() => setEditActive(!editActive)}
                         className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D] hover:border-[#10B981]/20 transition-colors">
                         <div className={`w-10 h-5 rounded-full transition-colors ${editActive ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
                           <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${editActive ? 'left-5.5' : 'left-0.5'}`}
@@ -885,8 +888,8 @@ export default function UsersPage() {
                         rather than labelled with a bare toggle, because "off" here
                         is the reason a user's app says it cannot sign them in. */}
                     <div>
-                      <label className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</label>
-                      <button onClick={() => setEditMobileAccess(!editMobileAccess)}
+                      <label id="users-18-mobile-app-access" className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</label>
+                      <button aria-labelledby="users-18-mobile-app-access" onClick={() => setEditMobileAccess(!editMobileAccess)}
                         data-testid="users-edit-mobile-access-toggle"
                         className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D] hover:border-[#10B981]/20 transition-colors text-left">
                         <div className={`w-10 h-5 rounded-full transition-colors flex-shrink-0 ${editMobileAccess ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>

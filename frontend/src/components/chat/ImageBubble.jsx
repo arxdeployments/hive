@@ -39,14 +39,51 @@ const collectImages = (message) => {
 
 // Grid layouts for 1-5 images. `items` is [{ full, thumb }]; the grid renders
 // the thumbnail, the fullscreen viewer opens the full-size media.
+/**
+ * One clickable cell, shared by all five layouts below.
+ *
+ * Photos were the only message type with no keyboard route at all: seven bare
+ * divs with onClick, so a keyboard user could not open a picture and a screen
+ * reader announced nothing — the <img> carries alt="" because the thumbnail is
+ * decoration for a control, which left the control itself unnamed.
+ *
+ * role="button" rather than a real <button>: four of these are grid items,
+ * where blockification would hide the difference, but the single-image wrapper
+ * and the wide third tile are plain block children, and a button's
+ * shrink-to-fit inline-block box would then size the `w-full` image inside it.
+ * Same trade DocumentBubble already makes.
+ *
+ * The ring is inset because the grid wrappers are overflow-hidden, so an outset
+ * one is clipped away exactly where it is needed. alt="" stays on the images:
+ * the name belongs on the control, and repeating it on the child would have a
+ * screen reader announce every photo twice.
+ */
+const PhotoTile = ({ index, count, className, onImageClick, children }) => (
+  <div
+    role="button"
+    tabIndex={0}
+    onClick={() => onImageClick(index)}
+    onKeyDown={(e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        onImageClick(index);
+      }
+    }}
+    aria-label={count === 1 ? 'Open photo' : `Open photo ${index + 1} of ${count}`}
+    className={`cursor-pointer outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-[#10B981] ${className}`}
+  >
+    {children}
+  </div>
+);
+
 const ImageGrid = ({ items, onImageClick }) => {
   const count = items.length;
 
   if (count === 1) {
     return (
-      <div className="max-w-[330px] cursor-pointer" onClick={() => onImageClick(0)}>
+      <PhotoTile index={0} count={1} className="max-w-[330px]" onImageClick={onImageClick}>
         <img src={resolveUrl(items[0].thumb)} alt="" className="w-full rounded-[6px] object-cover max-h-[300px]" loading="lazy" />
-      </div>
+      </PhotoTile>
     );
   }
 
@@ -54,9 +91,9 @@ const ImageGrid = ({ items, onImageClick }) => {
     return (
       <div className="max-w-[330px] grid grid-cols-2 gap-0.5 rounded-[6px] overflow-hidden">
         {items.map((img, i) => (
-          <div key={i} className="cursor-pointer aspect-square" onClick={() => onImageClick(i)}>
+          <PhotoTile key={i} index={i} count={count} className="aspect-square" onImageClick={onImageClick}>
             <img src={resolveUrl(img.thumb)} alt="" className="w-full h-full object-cover" loading="lazy" />
-          </div>
+          </PhotoTile>
         ))}
       </div>
     );
@@ -67,14 +104,14 @@ const ImageGrid = ({ items, onImageClick }) => {
       <div className="max-w-[330px] rounded-[6px] overflow-hidden">
         <div className="grid grid-cols-2 gap-0.5">
           {items.slice(0, 2).map((img, i) => (
-            <div key={i} className="cursor-pointer aspect-square" onClick={() => onImageClick(i)}>
+            <PhotoTile key={i} index={i} count={count} className="aspect-square" onImageClick={onImageClick}>
               <img src={resolveUrl(img.thumb)} alt="" className="w-full h-full object-cover" loading="lazy" />
-            </div>
+            </PhotoTile>
           ))}
         </div>
-        <div className="mt-0.5 cursor-pointer" onClick={() => onImageClick(2)}>
+        <PhotoTile index={2} count={count} className="mt-0.5" onImageClick={onImageClick}>
           <img src={resolveUrl(items[2].thumb)} alt="" className="w-full h-[140px] object-cover" loading="lazy" />
-        </div>
+        </PhotoTile>
       </div>
     );
   }
@@ -83,9 +120,9 @@ const ImageGrid = ({ items, onImageClick }) => {
     return (
       <div className="max-w-[330px] grid grid-cols-2 gap-0.5 rounded-[6px] overflow-hidden">
         {items.map((img, i) => (
-          <div key={i} className="cursor-pointer aspect-square" onClick={() => onImageClick(i)}>
+          <PhotoTile key={i} index={i} count={count} className="aspect-square" onImageClick={onImageClick}>
             <img src={resolveUrl(img.thumb)} alt="" className="w-full h-full object-cover" loading="lazy" />
-          </div>
+          </PhotoTile>
         ))}
       </div>
     );
@@ -96,16 +133,16 @@ const ImageGrid = ({ items, onImageClick }) => {
     <div className="max-w-[330px] rounded-[6px] overflow-hidden">
       <div className="grid grid-cols-2 gap-0.5">
         {items.slice(0, 2).map((img, i) => (
-          <div key={i} className="cursor-pointer aspect-square" onClick={() => onImageClick(i)}>
+          <PhotoTile key={i} index={i} count={count} className="aspect-square" onImageClick={onImageClick}>
             <img src={resolveUrl(img.thumb)} alt="" className="w-full h-full object-cover" loading="lazy" />
-          </div>
+          </PhotoTile>
         ))}
       </div>
       <div className="grid grid-cols-3 gap-0.5 mt-0.5">
         {items.slice(2, 5).map((img, i) => (
-          <div key={i + 2} className="cursor-pointer aspect-square" onClick={() => onImageClick(i + 2)}>
+          <PhotoTile key={i + 2} index={i + 2} count={count} className="aspect-square" onImageClick={onImageClick}>
             <img src={resolveUrl(img.thumb)} alt="" className="w-full h-full object-cover" loading="lazy" />
-          </div>
+          </PhotoTile>
         ))}
       </div>
     </div>
