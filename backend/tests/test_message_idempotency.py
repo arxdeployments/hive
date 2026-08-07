@@ -72,6 +72,25 @@ async def test_history_exposes_the_client_key_for_reconciliation(client, two_org
     assert stored["client_msg_id"] == "key-xyz"
 
 
+async def test_the_client_key_is_not_shown_to_the_other_participant(client, two_orgs_with_users):
+    """It is one device's local state, so only that device is told it.
+
+    Bob has nothing to reconcile alice's key against — his own unresolved bubbles
+    carry keys he generated — and it is the one field on a message that is
+    client-supplied text with no sanitising beyond a length cap.
+    """
+    users = two_orgs_with_users
+    await login(client, "alice@a.com")
+    conv = await _direct(client, users["bob"].id)
+    await _send(client, conv, "not bob's business", temp_id="key-private")
+
+    async with _client_for("bob@a.com") as bob:
+        seen = [m for m in await _history(bob, conv) if m["content"] == "not bob's business"][0]
+
+    assert seen["client_msg_id"] is None, "alice's key must not reach bob"
+    assert seen["_id"], "the message itself is still served to him"
+
+
 async def test_a_changed_body_under_the_same_key_does_not_create_a_second_row(client, two_orgs_with_users):
     """The key identifies the send, so a repeat is the original — not an edit."""
     users = two_orgs_with_users
@@ -137,6 +156,50 @@ async def test_one_users_key_does_not_block_another(client, two_orgs_with_users)
 
     assert theirs["_id"] != mine["_id"], "bob's send must not resolve to alice's message"
     assert len(await _history(client, conv)) == 2
+
+
+async def test_a_known_key_is_not_a_cross_tenant_path(client, two_orgs_with_users):
+    """Carol is in the other org, so knowing the key and the conversation id
+    buys her nothing.
+
+    Two independent things have to hold for that, and this pins the pair: the
+    access gate refuses her at all, and the refusal does not come back carrying
+    the message she aimed the key at.
+
+    Asserted as 404, not 403: the membership check in _require_send_access fires
+    before the org check, so a non-participant never reaches the "Access denied"
+    branch. That ordering is the right way round and is the part worth pinning —
+    403 would confirm to an outsider that this conversation exists. Neutering the
+    membership check turns this into a 403 and fails here, which is the regression
+    this test is for.
+
+    What it does NOT pin is the gate-before-idempotency ordering, despite that
+    being the same feature's other cross-tenant concern: the lookup is scoped to
+    sender_id, so carol misses alice's row whichever side of the gate it runs on
+    (verified — hoisting the lookup above the gate leaves this test green). That
+    ordering protects a REMOVED PARTICIPANT, who does share the sender_id, and
+    proving it needs a test that removes someone from a conversation.
+    """
+    users = two_orgs_with_users
+    await login(client, "alice@a.com")
+    conv = await _direct(client, users["bob"].id)
+    mine = await _send(client, conv, "org A only", temp_id="shared-key")
+
+    async with _client_for("carol@b.com") as carol:
+        resp = await carol.post(
+            f"/api/conversations/{conv}/messages",
+            json={"content": "intrusion", "type": "text", "temp_id": "shared-key"},
+        )
+        assert resp.status_code == 404, resp.text
+        # Refused, and not refused with a copy of what she was reaching for: a
+        # replay answers with the stored message, which here would hand a foreign
+        # tenant both the id and the body.
+        assert mine["_id"] not in resp.text, "the refusal must not replay alice's message"
+        assert "org A only" not in resp.text
+        assert (await carol.get(f"/api/conversations/{conv}/messages")).status_code == 404
+
+    after = await _history(client, conv)
+    assert [m["_id"] for m in after] == [mine["_id"]], "nothing created, nothing replaced"
 
 
 async def test_concurrent_identical_sends_store_one_message(client, two_orgs_with_users):
