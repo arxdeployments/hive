@@ -793,6 +793,12 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
+      // The hold-to-talk gesture lives here rather than on the mic button: the
+      // button is swapped for the recorder bar as soon as the recording opens,
+      // and a gesture anchored to it loses the finger it is tracking. This
+      // wrapper spans both, so the release still lands.
+      ref={hold.surfaceRef}
+      {...hold.surfaceHandlers}
     >
       {/* Drag overlay */}
       <AnimatePresence>
