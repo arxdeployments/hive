@@ -784,6 +784,28 @@ class LiveKitClient {
   }
 
   /**
+   * Pin an operation to the call that asked for it.
+   *
+   * Both toggle queues are chained for the life of the CLIENT, not the life of a
+   * call, and nothing clears them on `leave()` — so an operation can still be
+   * waiting its turn, or still in flight, across a leave and a join. Read inside
+   * the task, `this.room` and `this.callId` are by then the NEW call's, and a tap
+   * meant for a call the user has already left drives another call's device or
+   * writes another call's store entry.
+   *
+   * Re-checked before every SDK call and before every store write, because the
+   * await in between is exactly where the call can change. A stale operation must
+   * write NOTHING — not its target and not its rollback. Rolling back would restore
+   * a flag belonging to the old call, and the new call has already set its own
+   * (`CLEARED_CALL_RUNTIME`, plus `isCameraOn` per call type).
+   */
+  _callScope() {
+    const room = this.room;
+    const callId = this.callId;
+    return { room, isCurrent: () => this.room === room && this.callId === callId };
+  }
+
+  /**
    * Mute or unmute the local microphone.
    *
    * Returns the state actually REACHED, which is not always the state asked for:
@@ -808,22 +830,31 @@ class LiveKitClient {
     const previous = useCallStore.getState().isMuted;
     useCallStore.setState({ isMuted: !enabled });
 
+    // Captured HERE, while this tap's call is still the live one. See `_callScope`.
+    const { room, isCurrent } = this._callScope();
+
     const run = async () => {
+      // Queued behind a toggle that outlasted the call this one was aimed at.
+      if (!isCurrent()) return !previous;
       // The mute button is live throughout "Connecting", when there is no room to
       // mute. Reporting the state we are still in — rather than the one that was
       // asked for — is the same rule as the failure path below: `joinCall` brings
       // the microphone up LIVE moments later, so answering `enabled` here would
       // put exactly the lie this method exists to stop back on the wire.
-      if (!this.room) {
+      if (!room) {
         useCallStore.setState({ isMuted: previous });
         return !previous;
       }
       try {
-        await this.room.localParticipant.setMicrophoneEnabled(enabled);
+        await room.localParticipant.setMicrophoneEnabled(enabled);
+        if (!isCurrent()) return enabled;
         useCallStore.setState({ isMuted: !enabled });
         return enabled;
       } catch (err) {
         console.error('[LiveKit] mic toggle failed:', err);
+        // A mic that refused for a call we have since left is not worth a toast, and
+        // the rollback would land on the call now on screen.
+        if (!isCurrent()) return !previous;
         // Put the button back where it was rather than leaving it claiming a mic
         // state the hardware never reached.
         useCallStore.setState({ isMuted: previous });
@@ -862,19 +893,27 @@ class LiveKitClient {
     const previous = useCallStore.getState().isCameraOn;
     useCallStore.setState({ isCameraOn: enabled });
 
+    // The same capture as `setMicEnabled`, for the same reason and against the same
+    // window: this queue outlives a call too, so a tap aimed at one call must not
+    // reach the next call's camera. See `_callScope`.
+    const { room, isCurrent } = this._callScope();
+
     const run = async () => {
-      if (!this.room) return enabled;
+      if (!isCurrent()) return previous;
+      if (!room) return enabled;
       try {
         // Pass the remembered camera when one has to be created from scratch. Ignored
         // by the SDK on the ordinary unmute path, which already has a track.
-        await this.room.localParticipant.setCameraEnabled(
+        await room.localParticipant.setCameraEnabled(
           enabled,
           enabled ? (this._cameraOptions || undefined) : undefined
         );
+        if (!isCurrent()) return enabled;
         useCallStore.setState({ isCameraOn: enabled, localStream: this._localStream() });
         return enabled;
       } catch (err) {
         console.error('[LiveKit] camera toggle failed:', err);
+        if (!isCurrent()) return previous;
         // Put the button back where it was rather than leaving it lying about the
         // state of the hardware. `_localStream()` is re-read too: a failed enable can
         // still have replaced the publication.

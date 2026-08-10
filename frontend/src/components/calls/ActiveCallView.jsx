@@ -252,6 +252,11 @@ export const ActiveCallView = () => {
   const handleToggleMute = async () => {
     // The new mic-enabled state is the current mute flag: we are flipping it.
     const reached = await livekitClient.setMicEnabled(useCallStore.getState().isMuted);
+    // `callId` is this render's, and the await is long enough to outlive the call —
+    // unmuting reopens the device. Ending one call and answering another inside that
+    // window would otherwise report a microphone state against the call just left,
+    // told to peers who have moved on, about a device now serving someone else.
+    if (useCallStore.getState().callId !== callId) return;
     wsClient.send({
       type: 'call:toggle_media', call_id: callId, media_type: 'audio', enabled: reached,
     });
@@ -276,6 +281,9 @@ export const ActiveCallView = () => {
   const handleToggleCamera = async () => {
     const target = !useCallStore.getState().isCameraOn;
     const reached = await livekitClient.setCameraEnabled(target);
+    // Same guard as the mic above, and the window here is wider: re-acquiring a
+    // camera is the slow case this method's own comment is written around.
+    if (useCallStore.getState().callId !== callId) return;
     wsClient.send({
       type: 'call:toggle_media', call_id: callId, media_type: 'video', enabled: reached,
     });

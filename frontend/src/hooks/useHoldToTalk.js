@@ -104,6 +104,9 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
   const onPointerDown = useCallback(async (e) => {
     if (!enabled || !coarse || e.button !== 0) return;
     e.preventDefault();
+    // Read once, up front: everything below the await has to compare against the
+    // pointer that started THIS gesture, and `e` is the wrong place to keep that.
+    const pointerId = e.pointerId;
     // The recorder refuses a second start while the first is still opening the
     // device, and that refusal comes back as `{ ok: false }` — which the failure
     // path below treats as "nothing to hold" and resets the gesture, disarming
@@ -118,12 +121,12 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
     // control that cannot be pressed at all.
     const surface = surfaceRef.current ?? e.currentTarget;
     const owner = ownerRef.current;
-    if (owner !== null && owner !== e.pointerId
+    if (owner !== null && owner !== pointerId
       && surface.hasPointerCapture?.(owner)) return;
 
-    ownerRef.current = e.pointerId;
+    ownerRef.current = pointerId;
     const gesture = ++gestureRef.current;
-    surface.setPointerCapture?.(e.pointerId);
+    surface.setPointerCapture?.(pointerId);
 
     origin.current = { x: e.clientX, y: e.clientY };
     startedAt.current = Date.now();
@@ -132,9 +135,16 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
 
     const res = await onStart?.();
     // The press this belongs to is already over — released, cancelled, or reset
-    // out from under us while the device was opening. Neither branch below may
-    // run: arming would hand a finished gesture's permission to whatever is
-    // holding the button now, and resetting would disarm it.
+    // out from under us while the device was opening, and a quick double-tap is
+    // all that takes. Neither branch below may run: `reset` would tear down
+    // whoever owns the gesture now, and arming is the more dangerous of the two
+    // for being survivable — `armed` outlives the release that should have
+    // consumed it, so a later hold reads wasArmed=true and sends a recording
+    // that was never started.
+    //
+    // Compared by gesture TOKEN rather than by pointerId: the browser may hand
+    // the same id to the next finger, and `ownerRef` is null between gestures,
+    // so neither answers "is this still my press".
     if (gesture !== gestureRef.current) return;
     // Permission was refused, or the device is unavailable. Nothing to hold.
     if (res && res.ok === false) { reset(); return; }

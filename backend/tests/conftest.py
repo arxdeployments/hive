@@ -137,7 +137,15 @@ async def _create_schema() -> None:
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS citext WITH SCHEMA public"))
             await conn.execute(text(f'DROP SCHEMA IF EXISTS "{SCHEMA}" CASCADE'))
             await conn.execute(text(f'CREATE SCHEMA "{SCHEMA}"'))
-        async with ddl.begin() as conn:
+        # connect(), not begin(): Alembic has to open the transaction itself.
+        # Handed a connection that is already in one it marks the transaction
+        # external, context.begin_transaction() degrades to a nullcontext, and
+        # autocommit_block() then trips a bare `assert self._transaction is not
+        # None` — so a migration that has to leave the transaction (c5d81e37a204
+        # builds its unique index CONCURRENTLY) would fail the whole session here
+        # with no message. Alembic commits its own work, so the schema still
+        # outlives this block.
+        async with ddl.connect() as conn:
             await conn.run_sync(_upgrade_to_head)
         async with ddl.connect() as conn:
             rows = await conn.execute(
