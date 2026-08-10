@@ -29,6 +29,14 @@ export const ReactionPicker = ({ position, onReact, onClose }) => {
    * this is a small popover anchored to a message, and Tab moving on is the
    * expected way to leave a popover once Escape exists.
    */
+  /**
+   * Read through a ref so a changing `onClose` cannot restart the effect below.
+   * ChatPanel passes it as an inline arrow, so its identity changes on every
+   * parent render — and the thread re-renders on every inbound message.
+   */
+  const onCloseRef = useRef(onClose);
+  useEffect(() => { onCloseRef.current = onClose; });
+
   useEffect(() => {
     if (!position) return undefined;
     restoreRef.current = document.activeElement;
@@ -36,7 +44,7 @@ export const ReactionPicker = ({ position, onReact, onClose }) => {
     const onKeyDown = (e) => {
       if (e.key !== 'Escape') return;
       e.stopPropagation();
-      onClose?.();
+      onCloseRef.current?.();
     };
     document.addEventListener('keydown', onKeyDown);
     return () => {
@@ -47,7 +55,12 @@ export const ReactionPicker = ({ position, onReact, onClose }) => {
         opener.focus({ preventScroll: true });
       }
     };
-  }, [position, onClose]);
+    // `position` only — it is what actually means "a different picker opened".
+    // With `onClose` here too, every message arriving in the thread tore this
+    // down and re-ran it: the cleanup handed focus back to the opener and the
+    // body then pulled it to the first quick reaction, so someone who had moved
+    // to "Crying" was yanked back to "Thumbs up" whenever anyone sent anything.
+  }, [position]);
 
   if (!position) return null;
 

@@ -145,7 +145,12 @@ test('composer icon buttons are named, and arrivals are announced', async ({ bro
   // Nothing else tells a non-sighted user this arrived: the socket handler
   // deliberately skips the sound, the notification and the unread bump while the
   // thread is open and visible, on the reasoning that you watch it appear.
-  await expect(announcer).toHaveText(new RegExp(body));
+  //
+  // Same 5s socket budget messaging.spec.js and composer-draft.spec.js hold
+  // delivery to. On the default 10s this would still pass with the announcement
+  // arriving twice as late as delivery is allowed to be — and an announcement
+  // that trails the message it is announcing is the failure worth catching.
+  await expect(announcer).toHaveText(new RegExp(body), { timeout: 5000 });
 
   await aliceCtx.close();
   await bobCtx.close();

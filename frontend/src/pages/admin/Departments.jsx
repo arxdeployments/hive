@@ -115,14 +115,19 @@ export default function Departments() {
       <div className="max-w-[1400px] mx-auto">
         {/* Org Selector */}
         <div className="mb-6">
-          <label id="departments-01-select-organization" className="text-sm text-[#A3A3A3] mb-2 block">Select Organization</label>
+          <span id="departments-01-select-organization" className="text-sm text-[#A3A3A3] mb-2 block">Select Organization</span>
           <div className="relative max-w-sm">
-            <button aria-labelledby="departments-01-select-organization"
+            {/* Naming the button from the caption alone replaced the chosen
+                organization with the word "Select Organization", so the one
+                thing a listener needs — which org is loaded — went missing.
+                Caption plus current value, and whether the list is open. */}
+            <button aria-labelledby="departments-01-select-organization departments-01-select-organization-value"
+              aria-expanded={orgDropdownOpen}
               onClick={() => setOrgDropdownOpen(!orgDropdownOpen)}
               data-testid="departments-org-select"
               className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all duration-200"
             >
-              <span className={selectedOrg ? 'text-[#F5F5F5]' : 'text-[#A3A3A3]'}>
+              <span id="departments-01-select-organization-value" className={selectedOrg ? 'text-[#F5F5F5]' : 'text-[#A3A3A3]'}>
                 {selectedOrg?.name || 'Choose an organization...'}
               </span>
               <ChevronDown size={16} className={`text-[#A3A3A3] transition-transform ${orgDropdownOpen ? 'rotate-180' : ''}`} />

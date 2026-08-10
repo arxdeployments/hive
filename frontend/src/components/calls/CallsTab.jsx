@@ -133,15 +133,21 @@ export const ScheduleCallModal = ({
             </div>
 
             <div>
-              <label id="callstab-03-call-type" className="block text-xs text-[#A3A3A3] mb-1.5">Call type</label>
-              <div className="flex gap-2">
+              {/* A caption for the pair, not a label for either button: pointing
+                  each button at it would name both of them "Call type" and lose
+                  "Voice" and "Video", which is the only thing that tells them
+                  apart. The group carries the caption; each button keeps its own
+                  name and reports whether it is the chosen one. */}
+              <span id="callstab-03-call-type" className="block text-xs text-[#A3A3A3] mb-1.5">Call type</span>
+              <div role="group" aria-labelledby="callstab-03-call-type" className="flex gap-2">
                 {[
                   { key: 'voice', label: 'Voice' },
                   { key: 'video', label: 'Video' },
                 ].map(({ key, label }) => (
-                  <button aria-labelledby="callstab-03-call-type"
+                  <button
                     key={key}
                     type="button"
+                    aria-pressed={callType === key}
                     onClick={() => setCallType(key)}
                     data-testid={`schedule-type-${key}`}
                     className={`flex-1 py-2 rounded-[6px] text-sm flex items-center justify-center gap-2 transition-colors ${

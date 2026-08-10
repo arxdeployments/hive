@@ -318,10 +318,13 @@ export default function CrossOrgGroups() {
                           className="w-full px-4 py-2 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none resize-none transition-all" />
                       </div>
                       <div>
-                        <label id="crossorggroups-03-purpose" className="text-sm text-[#A3A3A3] mb-1.5 block">Purpose</label>
-                        <div className="flex gap-2 flex-wrap">
+                        {/* Caption for the set. Naming each option "Purpose"
+                            made four buttons that sound the same and hid which
+                            one is chosen. */}
+                        <span id="crossorggroups-03-purpose" className="text-sm text-[#A3A3A3] mb-1.5 block">Purpose</span>
+                        <div role="group" aria-labelledby="crossorggroups-03-purpose" className="flex gap-2 flex-wrap">
                           {['Project', 'Task Force', 'Committee', 'Custom'].map(tag => (
-                            <button aria-labelledby="crossorggroups-03-purpose" key={tag} onClick={() => setPurposeTag(tag)}
+                            <button key={tag} aria-pressed={purposeTag === tag} onClick={() => setPurposeTag(tag)}
                               className={`px-3 py-1.5 rounded-[6px] text-xs font-medium transition-colors ${
                                 purposeTag === tag
                                   ? `border text-white` : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3]'

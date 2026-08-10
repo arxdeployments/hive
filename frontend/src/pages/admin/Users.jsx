@@ -310,14 +310,18 @@ export default function UsersPage() {
         <div className="flex flex-wrap items-end gap-4 mb-6">
           {/* Org filter */}
           <div>
-            <label id="users-01-organization" className="text-xs text-[#A3A3A3] mb-1.5 block">Organization</label>
+            <span id="users-01-organization" className="text-xs text-[#A3A3A3] mb-1.5 block">Organization</span>
             <div className="relative">
-              <button aria-labelledby="users-01-organization"
+              {/* Caption plus the value it currently holds. Pointing the button
+                  at the caption alone announced "Organization" and swallowed
+                  the filter that is actually applied. */}
+              <button aria-labelledby="users-01-organization users-01-organization-value"
+                aria-expanded={orgDropdownOpen}
                 onClick={() => { setOrgDropdownOpen(!orgDropdownOpen); setDeptDropdownOpen(false); }}
                 data-testid="users-org-filter"
                 className="w-48 h-10 px-3 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between focus:border-[#10B981] focus:outline-none transition-all duration-200"
               >
-                <span className={selectedOrg ? 'text-[#F5F5F5] truncate' : 'text-[#A3A3A3]'}>
+                <span id="users-01-organization-value" className={selectedOrg ? 'text-[#F5F5F5] truncate' : 'text-[#A3A3A3]'}>
                   {selectedOrg?.name || 'All'}
                 </span>
                 <ChevronDown size={14} className="text-[#A3A3A3] flex-shrink-0" />
@@ -344,14 +348,15 @@ export default function UsersPage() {
 
           {/* Dept filter */}
           <div>
-            <label id="users-02-department" className="text-xs text-[#A3A3A3] mb-1.5 block">Department</label>
+            <span id="users-02-department" className="text-xs text-[#A3A3A3] mb-1.5 block">Department</span>
             <div className="relative">
-              <button aria-labelledby="users-02-department"
+              <button aria-labelledby="users-02-department users-02-department-value"
+                aria-expanded={deptDropdownOpen}
                 onClick={() => { if (selectedOrg) { setDeptDropdownOpen(!deptDropdownOpen); setOrgDropdownOpen(false); } }}
                 data-testid="users-dept-filter"
                 className={`w-48 h-10 px-3 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between transition-all duration-200 ${!selectedOrg ? 'opacity-50 cursor-not-allowed' : 'focus:border-[#10B981] focus:outline-none'}`}
               >
-                <span className={selectedDept ? 'text-[#F5F5F5] truncate' : 'text-[#A3A3A3]'}>
+                <span id="users-02-department-value" className={selectedDept ? 'text-[#F5F5F5] truncate' : 'text-[#A3A3A3]'}>
                   {selectedDept?.name || 'All'}
                 </span>
                 <ChevronDown size={14} className="text-[#A3A3A3] flex-shrink-0" />
@@ -392,10 +397,10 @@ export default function UsersPage() {
 
           {/* Status filter */}
           <div>
-            <label id="users-04-status" className="text-xs text-[#A3A3A3] mb-1.5 block">Status</label>
-            <div className="flex gap-1">
+            <span id="users-04-status" className="text-xs text-[#A3A3A3] mb-1.5 block">Status</span>
+            <div role="group" aria-labelledby="users-04-status" className="flex gap-1">
               {[null, 'active', 'inactive'].map(s => (
-                <button aria-labelledby="users-04-status" key={s || 'all'} onClick={() => { setStatusFilter(s); setPage(1); }}
+                <button key={s || 'all'} aria-pressed={statusFilter === s} onClick={() => { setStatusFilter(s); setPage(1); }}
                   className={`px-3 h-10 rounded-[6px] text-xs font-medium transition-colors ${statusFilter === s ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30' : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] hover:text-[#F5F5F5]'}`}>
                   {s ? s.charAt(0).toUpperCase() + s.slice(1) : 'All'}
                 </button>
@@ -413,6 +418,7 @@ export default function UsersPage() {
                 { value: 'denied', label: 'Not approved' },
               ].map(opt => (
                 <button key={opt.value || 'all'}
+                  aria-pressed={mobileFilter === opt.value}
                   onClick={() => { setMobileFilter(opt.value); setPage(1); }}
                   data-testid={`users-mobile-filter-${opt.value || 'all'}`}
                   className={`px-3 h-10 rounded-[6px] text-xs font-medium transition-colors whitespace-nowrap ${mobileFilter === opt.value ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30' : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] hover:text-[#F5F5F5]'}`}>
@@ -621,11 +627,12 @@ export default function UsersPage() {
                   <div className="space-y-4">
                     {/* Org select */}
                     <div>
-                      <label id="users-06-organization" className="text-sm text-[#A3A3A3] mb-1.5 block">Organization *</label>
+                      <span id="users-06-organization" className="text-sm text-[#A3A3A3] mb-1.5 block">Organization *</span>
                       <div className="relative">
-                        <button aria-labelledby="users-06-organization" onClick={() => { setCreateOrgOpen(!createOrgOpen); setCreateDeptOpen(false); }}
+                        <button aria-labelledby="users-06-organization users-06-organization-value"
+                          aria-expanded={createOrgOpen} onClick={() => { setCreateOrgOpen(!createOrgOpen); setCreateDeptOpen(false); }}
                           className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between focus:border-[#10B981] focus:outline-none transition-all">
-                          <span className={createOrg ? 'text-[#F5F5F5]' : 'text-[#A3A3A3]'}>{createOrg?.name || 'Select organization'}</span>
+                          <span id="users-06-organization-value" className={createOrg ? 'text-[#F5F5F5]' : 'text-[#A3A3A3]'}>{createOrg?.name || 'Select organization'}</span>
                           <ChevronDown size={14} className="text-[#A3A3A3]" />
                         </button>
                         <AnimatePresence>
@@ -644,11 +651,12 @@ export default function UsersPage() {
 
                     {/* Dept select */}
                     <div>
-                      <label id="users-07-department" className="text-sm text-[#A3A3A3] mb-1.5 block">Department *</label>
+                      <span id="users-07-department" className="text-sm text-[#A3A3A3] mb-1.5 block">Department *</span>
                       <div className="relative">
-                        <button aria-labelledby="users-07-department" onClick={() => { if (createOrg) { setCreateDeptOpen(!createDeptOpen); setCreateOrgOpen(false); } }}
+                        <button aria-labelledby="users-07-department users-07-department-value"
+                          aria-expanded={createDeptOpen} onClick={() => { if (createOrg) { setCreateDeptOpen(!createDeptOpen); setCreateOrgOpen(false); } }}
                           className={`w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between transition-all ${!createOrg ? 'opacity-50 cursor-not-allowed' : 'focus:border-[#10B981] focus:outline-none'}`}>
-                          <span className={createDept ? 'text-[#F5F5F5]' : 'text-[#A3A3A3]'}>{createDept?.name || 'Select department'}</span>
+                          <span id="users-07-department-value" className={createDept ? 'text-[#F5F5F5]' : 'text-[#A3A3A3]'}>{createDept?.name || 'Select department'}</span>
                           <ChevronDown size={14} className="text-[#A3A3A3]" />
                         </button>
                         <AnimatePresence>
@@ -688,8 +696,12 @@ export default function UsersPage() {
                     {/* Password section */}
                     <div>
                       <div className="flex items-center justify-between mb-1.5">
-                        <label id="users-10-password" className="text-sm text-[#A3A3A3]">Password</label>
-                        <button aria-labelledby="users-10-password" onClick={() => setAutoPassword(!autoPassword)} data-testid="users-auto-password-toggle"
+                        {/* Caption for the field, which is what labels the manual
+                            input below. Borrowing it for the switch renamed the
+                            switch "Password" and lost both "Auto-generate" and
+                            whether it is currently on. */}
+                        <span id="users-10-password" className="text-sm text-[#A3A3A3]">Password</span>
+                        <button aria-pressed={autoPassword} onClick={() => setAutoPassword(!autoPassword)} data-testid="users-auto-password-toggle"
                           className="flex items-center gap-2 text-xs text-[#A3A3A3] hover:text-[#F5F5F5] transition-colors">
                           <div className={`w-8 h-4.5 rounded-full transition-colors ${autoPassword ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
                             <div className={`absolute top-0.5 w-3.5 h-3.5 rounded-full bg-white transition-transform ${autoPassword ? 'left-4' : 'left-0.5'}`} />
@@ -714,7 +726,7 @@ export default function UsersPage() {
                         </div>
                       ) : (
                         <input type="text" value={createPassword} onChange={(e) => setCreatePassword(e.target.value)}
-                          placeholder="Min 6 characters"
+                          placeholder="Min 6 characters" aria-labelledby="users-10-password"
                           className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#A3A3A3]/50 focus:border-[#10B981] focus:outline-none transition-all" />
                       )}
                     </div>
@@ -747,8 +759,9 @@ export default function UsersPage() {
 
                     {/* Mobile app access */}
                     <div>
-                      <label id="users-12-mobile-app-access" className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</label>
-                      <button aria-labelledby="users-12-mobile-app-access" onClick={() => setCreateMobileAccess(!createMobileAccess)}
+                      <span id="users-12-mobile-app-access" className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</span>
+                      <button aria-labelledby="users-12-mobile-app-access users-12-mobile-app-access-state"
+                        aria-pressed={createMobileAccess} onClick={() => setCreateMobileAccess(!createMobileAccess)}
                         data-testid="users-create-mobile-access-toggle"
                         className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D] hover:border-[#10B981]/20 transition-colors text-left">
                         <div className={`w-10 h-5 rounded-full transition-colors flex-shrink-0 ${createMobileAccess ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
@@ -756,7 +769,9 @@ export default function UsersPage() {
                             style={{ left: createMobileAccess ? '22px' : '2px' }} />
                         </div>
                         <div className="min-w-0">
-                          <span className={`text-sm flex items-center gap-1.5 ${createMobileAccess ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}>
+                          {/* The state line is the name: a toggle called only
+                              "Mobile App Access" sounds the same granted or not. */}
+                          <span id="users-12-mobile-app-access-state" className={`text-sm flex items-center gap-1.5 ${createMobileAccess ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}>
                             <Smartphone size={13} />
                             {createMobileAccess ? 'Allow mobile sign-in' : 'Web only'}
                           </span>
@@ -833,11 +848,12 @@ export default function UsersPage() {
 
                     {/* Department */}
                     <div>
-                      <label id="users-15-department" className="text-sm text-[#A3A3A3] mb-1.5 block">Department</label>
+                      <span id="users-15-department" className="text-sm text-[#A3A3A3] mb-1.5 block">Department</span>
                       <div className="relative">
-                        <button aria-labelledby="users-15-department" onClick={() => setEditDeptOpen(!editDeptOpen)}
+                        <button aria-labelledby="users-15-department users-15-department-value"
+                          aria-expanded={editDeptOpen} onClick={() => setEditDeptOpen(!editDeptOpen)}
                           className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-left flex items-center justify-between focus:border-[#10B981] focus:outline-none transition-all">
-                          <span className="text-[#F5F5F5]">{editDepts.find(d => d._id === editDeptId)?.name || editUser.dept_name}</span>
+                          <span id="users-15-department-value" className="text-[#F5F5F5]">{editDepts.find(d => d._id === editDeptId)?.name || editUser.dept_name}</span>
                           <ChevronDown size={14} className="text-[#A3A3A3]" />
                         </button>
                         <AnimatePresence>
@@ -856,10 +872,10 @@ export default function UsersPage() {
 
                     {/* Role */}
                     <div>
-                      <label id="users-16-role" className="text-sm text-[#A3A3A3] mb-2 block">Role</label>
-                      <div className="flex gap-2">
+                      <span id="users-16-role" className="text-sm text-[#A3A3A3] mb-2 block">Role</span>
+                      <div role="group" aria-labelledby="users-16-role" className="flex gap-2">
                         {['member', 'admin'].map(role => (
-                          <button aria-labelledby="users-16-role" key={role} onClick={() => setEditRole(role)}
+                          <button key={role} aria-pressed={editRole === role} onClick={() => setEditRole(role)}
                             className={`flex-1 h-10 rounded-[6px] text-sm font-medium capitalize transition-colors ${
                               editRole === role ? 'bg-[#10B981]/10 text-[#10B981] border border-[#10B981]/30' : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] hover:text-[#F5F5F5]'
                             }`}>
@@ -871,14 +887,15 @@ export default function UsersPage() {
 
                     {/* Status */}
                     <div>
-                      <label id="users-17-status" className="text-sm text-[#A3A3A3] mb-2 block">Status</label>
-                      <button aria-labelledby="users-17-status" onClick={() => setEditActive(!editActive)}
+                      <span id="users-17-status" className="text-sm text-[#A3A3A3] mb-2 block">Status</span>
+                      <button aria-labelledby="users-17-status users-17-status-state"
+                        aria-pressed={editActive} onClick={() => setEditActive(!editActive)}
                         className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D] hover:border-[#10B981]/20 transition-colors">
                         <div className={`w-10 h-5 rounded-full transition-colors ${editActive ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
                           <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${editActive ? 'left-5.5' : 'left-0.5'}`}
                             style={{ left: editActive ? '22px' : '2px' }} />
                         </div>
-                        <span className={`text-sm ${editActive ? 'text-[#10B981]' : 'text-[#EF4444]'}`}>
+                        <span id="users-17-status-state" className={`text-sm ${editActive ? 'text-[#10B981]' : 'text-[#EF4444]'}`}>
                           {editActive ? 'Active' : 'Inactive'}
                         </span>
                       </button>
@@ -888,8 +905,9 @@ export default function UsersPage() {
                         rather than labelled with a bare toggle, because "off" here
                         is the reason a user's app says it cannot sign them in. */}
                     <div>
-                      <label id="users-18-mobile-app-access" className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</label>
-                      <button aria-labelledby="users-18-mobile-app-access" onClick={() => setEditMobileAccess(!editMobileAccess)}
+                      <span id="users-18-mobile-app-access" className="text-sm text-[#A3A3A3] mb-2 block">Mobile App Access</span>
+                      <button aria-labelledby="users-18-mobile-app-access users-18-mobile-app-access-state"
+                        aria-pressed={editMobileAccess} onClick={() => setEditMobileAccess(!editMobileAccess)}
                         data-testid="users-edit-mobile-access-toggle"
                         className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D] hover:border-[#10B981]/20 transition-colors text-left">
                         <div className={`w-10 h-5 rounded-full transition-colors flex-shrink-0 ${editMobileAccess ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
@@ -897,7 +915,7 @@ export default function UsersPage() {
                             style={{ left: editMobileAccess ? '22px' : '2px' }} />
                         </div>
                         <div className="min-w-0">
-                          <span className={`text-sm flex items-center gap-1.5 ${editMobileAccess ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}>
+                          <span id="users-18-mobile-app-access-state" className={`text-sm flex items-center gap-1.5 ${editMobileAccess ? 'text-[#10B981]' : 'text-[#A3A3A3]'}`}>
                             <Smartphone size={13} />
                             {editMobileAccess ? 'Approved for mobile' : 'Web only'}
                           </span>
