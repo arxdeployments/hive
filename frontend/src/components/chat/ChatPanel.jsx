@@ -153,6 +153,17 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   // Text a screen reader is asked to speak when a message arrives, plus the
   // baseline that decides whether anything actually arrived. See the announce
   // effect below the `items` memo.
+  // Whether the LAST window fetch for a conversation failed, keyed by
+  // conversation so switching threads cannot carry one thread's failure onto
+  // another. A failed fetch used to render an empty message list, which is
+  // indistinguishable from a conversation that genuinely has no history — the
+  // app confidently showing "nothing here" about a thread it never loaded.
+  const [loadErrorByConv, setLoadErrorByConv] = useState({});
+  // Only the newest fetch may write the flag. The mount fetch, the reconnect
+  // force-fetch and StrictMode's double mount can all be in flight together, so
+  // without this a slow FAILURE could land after a fast success and put the
+  // strip back up over a thread that had loaded fine.
+  const fetchSeqRef = useRef(0);
   const [announcement, setAnnouncement] = useState('');
   const lastSpokenRef = useRef(null);
   const virtuosoRef = useRef(null);
@@ -212,8 +223,10 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     const cached = useChatStore.getState().messages[conversationId];
     const hasWindow = loadedWindowsRef.current.has(conversationId)
       && Array.isArray(cached) && cached.length > 0;
+    const seq = ++fetchSeqRef.current;
     if (hasWindow && !force) {
       setLoading(false);
+      setLoadErrorByConv(prev => (prev[conversationId] ? { ...prev, [conversationId]: false } : prev));
       return;
     }
     setLoading(true);
@@ -263,8 +276,14 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // latest" from an around-window.
       setHasNewerByConv(prev => ({ ...prev, [conversationId]: false }));
       loadedWindowsRef.current.add(conversationId);
+      if (seq === fetchSeqRef.current) {
+        setLoadErrorByConv(prev => (prev[conversationId] ? { ...prev, [conversationId]: false } : prev));
+      }
     } catch (err) {
       console.error('Failed to fetch messages', err);
+      if (seq === fetchSeqRef.current) {
+        setLoadErrorByConv(prev => ({ ...prev, [conversationId]: true }));
+      }
     } finally {
       setLoading(false);
     }
@@ -1365,6 +1384,29 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
 
       {/* Message Area */}
       <div className="flex-1 relative overflow-hidden min-h-0 scrollable-area">
+        {/* Layered OVER the list rather than replacing it, and deliberately not
+            gated on the list being empty. The lie is "the thread you are looking
+            at is complete", and that is just as wrong for a partially-cached
+            thread as for a blank one — a failed refetch on a thread showing ten
+            cached messages still hides everything since. Replacing the list
+            instead would also let a single incoming socket message, or the
+            user's own optimistic send, silently dismiss the warning. */}
+        {loadErrorByConv[conversationId] && !loading && (
+          <div
+            data-testid="messages-load-error"
+            className="absolute top-0 left-0 right-0 z-[6] flex flex-col items-center gap-2 py-4 bg-[#0A0A0A]/95 border-b border-[#1F1F1F]"
+          >
+            <p className="text-sm text-[#A3A3A3]">Couldn&apos;t load messages.</p>
+            <button
+              type="button"
+              onClick={() => fetchMessages({ force: true })}
+              data-testid="messages-retry"
+              className="px-3 py-1.5 text-xs text-[#10B981] border border-[#10B981]/40 rounded-[6px] hover:bg-[#10B981]/10 transition-colors"
+            >
+              Try again
+            </button>
+          </div>
+        )}
         {loading ? (
           <div className="flex items-center justify-center h-full">
             <div className="text-center">

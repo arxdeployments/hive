@@ -86,8 +86,25 @@ export default function UsersPage() {
     })();
   }, [selectedOrg]);
 
-  // Fetch users
-  const fetchUsers = useCallback(async () => {
+  /**
+   * One list load. `isCurrent` lets the caller disown a response that is no
+   * longer the one the screen is waiting for.
+   *
+   * Every keystroke in the search box rewrites `search`, which rebuilds this
+   * callback and re-runs the effect below, so several loads are in flight at
+   * once — and nothing makes them come back in the order they were sent. A
+   * two-character prefix matching thousands of rows is slower to answer than
+   * the five-character one typed after it, so without this guard whichever
+   * response lands LAST wins: the table and the "of N" total settle on a query
+   * the search box no longer contains, and stay wrong until the next keystroke.
+   *
+   * Same shape and same reasoning as the pinned-messages fetch in ChatPanel.
+   * Threaded as an optional predicate rather than hard-wired, because the
+   * refreshes fired after create, edit and bulk actions call this imperatively
+   * with nothing to supersede them — they pass no argument and are always
+   * current.
+   */
+  const fetchUsers = useCallback(async (isCurrent = () => true) => {
     setLoading(true);
     try {
       const params = { page, limit, search };
@@ -96,16 +113,25 @@ export default function UsersPage() {
       if (statusFilter) params.status = statusFilter;
       if (mobileFilter) params.mobile = mobileFilter;
       const { data } = await client.get('/api/admin/users', { params });
+      if (!isCurrent()) return;
       setUsers(data.data);
       setTotal(data.total);
     } catch {
-      toast.error('Failed to load users');
+      // A superseded load's failure is not this screen's failure any more:
+      // toasting it would report an error against a query nobody is looking at.
+      if (isCurrent()) toast.error('Failed to load users');
     } finally {
-      setLoading(false);
+      // Guarded too, or a slow superseded response would clear the spinner
+      // while the load the user IS waiting for is still in flight.
+      if (isCurrent()) setLoading(false);
     }
   }, [selectedOrg, selectedDept, statusFilter, mobileFilter, page, search]);
 
-  useEffect(() => { fetchUsers(); }, [fetchUsers]);
+  useEffect(() => {
+    let current = true;
+    fetchUsers(() => current);
+    return () => { current = false; };
+  }, [fetchUsers]);
 
   // Load create depts when org changes
   useEffect(() => {

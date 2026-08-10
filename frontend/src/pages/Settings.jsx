@@ -7,17 +7,28 @@ import client from '../api/client';
 import { enablePushNotifications, disablePushNotifications } from '../lib/pwa';
 
 const FONT_PX = { small: '14px', medium: '16px', large: '18px' };
-const FONT_SCALE = { small: 0.9, medium: 1, large: 1.12 };
 
-// Apply the chosen font size app-wide by scaling the root <html> font-size
-// (drives rem-based Tailwind sizing) plus a CSS var / body class hook.
+// Apply the chosen font size app-wide by scaling the root <html> font-size,
+// which is what every rem-based Tailwind size (text-sm, text-xs, gap-*, …)
+// resolves against. That one line is the whole mechanism, and it matches what
+// index.jsx applies pre-paint from the same localStorage key.
+//
+// This used to also stamp `font-${key}` onto <body> and set a --rx-font-scale
+// custom property. Both were dead ends, and one was actively harmful.
+// `font-medium` is not a private token of ours — it is Tailwind's own
+// font-weight utility, generated into the bundle because dozens of components
+// use it in className, and it compiles to `.font-medium{font-weight:500}`.
+// Nothing in index.css sets a weight on body and preflight makes headings
+// inherit theirs, so putting that class on <body> pushed every element without
+// an explicit weight from 400 to 500: merely opening Settings thickened the
+// entire app, and nothing removed it on unmount, so it stayed that way until a
+// full reload. The siblings made it worse rather than better — `.font-small`
+// and `.font-large` are defined nowhere, so picking Small or Large silently
+// un-bolded the app again, leaving text weight hostage to an unrelated setting.
+// --rx-font-scale had no reader anywhere in the repo.
 export function applyFontSize(size) {
   const key = FONT_PX[size] ? size : 'medium';
-  const root = document.documentElement;
-  root.style.fontSize = FONT_PX[key];
-  root.style.setProperty('--rx-font-scale', String(FONT_SCALE[key]));
-  document.body.classList.remove('font-small', 'font-medium', 'font-large');
-  document.body.classList.add(`font-${key}`);
+  document.documentElement.style.fontSize = FONT_PX[key];
 }
 
 const extractError = (err, fallback) => {

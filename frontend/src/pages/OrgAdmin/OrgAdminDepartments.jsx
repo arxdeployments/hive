@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { Plus, Pencil, Trash2, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -22,13 +22,25 @@ export default function OrgAdminDepartments() {
   const [formName, setFormName] = useState('');
   const [formDesc, setFormDesc] = useState('');
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(false);
 
-  const fetchDepts = async () => {
+  // Same defect and same fix as the dashboard beside it: a swallowed failure
+  // rendered as "No departments yet", which is a statement about the org made
+  // on the strength of a request that never came back. Fixed here in the same
+  // change, or the portal would be honest on one page and lying on the next.
+  const fetchDepts = useCallback(async () => {
     setLoading(true);
-    try { const { data } = await client.get('/api/org-admin/departments'); setDepts(data); }
-    catch {} finally { setLoading(false); }
-  };
-  useEffect(() => { fetchDepts(); }, []);
+    try {
+      const { data } = await client.get('/api/org-admin/departments');
+      setDepts(data);
+      setError(false);
+    } catch {
+      setError(true);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+  useEffect(() => { fetchDepts(); }, [fetchDepts]);
 
   const openCreate = () => { setEditDept(null); setFormName(''); setFormDesc(''); setShowModal(true); };
   const openEdit = (d) => { setEditDept(d); setFormName(d.name); setFormDesc(d.description || ''); setShowModal(true); };
@@ -87,7 +99,15 @@ export default function OrgAdminDepartments() {
             <tbody>
               {loading ? [...Array(3)].map((_, i) => (
                 <tr key={i} className="border-t border-[#1F1F1F]"><td colSpan={4} className="px-6 py-4"><div className="h-4 bg-[#1A1A1A] rounded animate-pulse" /></td></tr>
-              )) : depts.length === 0 ? (
+              )) : depts.length === 0 && error ? (
+                <tr><td colSpan={4} className="px-6 py-12 text-center" data-testid="departments-load-error">
+                  <p className="text-sm text-[#A3A3A3] mb-3">Couldn&apos;t load departments.</p>
+                  <button type="button" onClick={fetchDepts} data-testid="departments-retry"
+                    className="px-3 py-1.5 text-xs text-[#10B981] border border-[#10B981]/40 rounded-[6px] hover:bg-[#10B981]/10 transition-colors">
+                    Try again
+                  </button>
+                </td></tr>
+              ) : depts.length === 0 ? (
                 <tr><td colSpan={4} className="px-6 py-12 text-center text-sm text-[#A3A3A3]">No departments yet</td></tr>
               ) : depts.map((dept, idx) => (
                 <motion.tr key={dept._id} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: idx * 0.03 }}

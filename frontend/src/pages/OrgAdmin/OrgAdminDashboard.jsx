@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { Users, Activity, FolderTree, MessageSquare } from 'lucide-react';
 import { PageTransition } from '../../components/common/PageTransition';
@@ -15,20 +15,46 @@ export default function OrgAdminDashboard() {
   const [stats, setStats] = useState(null);
   const [activity, setActivity] = useState([]);
   const [loading, setLoading] = useState(true);
+  // The load failed and we have nothing true to show. `.catch(() => {})` used to
+  // swallow it outright, and because every card falls back to `?? 0`, a dead API
+  // rendered as a fully-populated dashboard reporting zero users, zero
+  // departments and zero conversations — a confident, wrong answer that an
+  // org admin has no way to tell from the real thing.
+  const [error, setError] = useState(false);
 
-  useEffect(() => {
-    Promise.all([
+  const load = useCallback(() => {
+    setLoading(true);
+    return Promise.all([
       client.get('/api/org-admin/stats'),
       client.get('/api/org-admin/activity')
     ]).then(([s, a]) => {
       setStats(s.data);
       setActivity(a.data || []);
-    }).catch(() => {}).finally(() => setLoading(false));
+      setError(false);
+    }).catch(() => setError(true)).finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => { load(); }, [load]);
 
   return (
     <PageTransition>
       <div className="max-w-[1200px]">
+        {error && (
+          <div
+            data-testid="org-dashboard-error"
+            className="mb-6 flex items-center justify-between gap-4 px-4 py-3 bg-[#141414] border border-[#EF4444]/40 rounded-[8px]"
+          >
+            <p className="text-sm text-[#A3A3A3]">Couldn&apos;t load your organisation&apos;s figures.</p>
+            <button
+              type="button"
+              onClick={load}
+              data-testid="org-dashboard-retry"
+              className="px-3 py-1.5 text-xs text-[#10B981] border border-[#10B981]/40 rounded-[6px] hover:bg-[#10B981]/10 transition-colors shrink-0"
+            >
+              Try again
+            </button>
+          </div>
+        )}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
           {statCards.map((card, i) => {
             const Icon = card.icon;
@@ -45,7 +71,12 @@ export default function OrgAdminDashboard() {
                     </div>
                   </div>
                   {loading ? <div className="h-8 w-20 bg-[#1A1A1A] rounded animate-pulse" /> :
-                    <p className="text-3xl font-semibold text-[#F5F5F5] tracking-tight">{stats?.[card.key] ?? 0}</p>}
+                    <p className="text-3xl font-semibold text-[#F5F5F5] tracking-tight" data-testid={`stat-${card.key}`}>
+                      {/* An em dash, not 0. `?? 0` turned "we do not know" into a
+                          measurement. Kept as `?? 0` would be a lie only on the
+                          error path, which is exactly the path that matters. */}
+                      {stats?.[card.key] ?? '—'}
+                    </p>}
                 </div>
               </motion.div>
             );

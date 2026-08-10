@@ -44,6 +44,9 @@ export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
   const [showProfile, setShowProfile] = useState(false);
   const [showGlobalSearch, setShowGlobalSearch] = useState(false);
   const [loading, setLoading] = useState(true);
+  // Whether the LAST load failed. Distinguishes "this account has no
+  // conversations" from "we never found out", which rendered identically.
+  const [loadFailed, setLoadFailed] = useState(false);
 
   const fetchConversations = useCallback(async () => {
     try {
@@ -51,8 +54,15 @@ export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
         params: { search, filter }
       });
       setConversations(data.data);
+      setLoadFailed(false);
     } catch (err) {
       console.error('Failed to fetch conversations', err);
+      // The list is left exactly as it was — a failed refresh must not blank a
+      // sidebar that is already showing good data. The flag only decides
+      // whether the EMPTY state is allowed to claim "No conversations yet",
+      // which is a statement about the account and was being made on the
+      // strength of a request that never came back.
+      setLoadFailed(true);
     } finally {
       setLoading(false);
     }
@@ -274,6 +284,20 @@ export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
                 </div>
               </div>
             ))}
+          </div>
+        ) : conversations.length === 0 && loadFailed ? (
+          /* An empty list we could not verify. "No conversations yet" is a claim
+             about the account; making it off the back of a request that failed
+             tells the user their history is gone. */
+          <div className="text-center py-16 px-4" data-testid="conversations-load-error">
+            <p className="text-sm text-[#A3A3A3] mb-3">Couldn&apos;t load your conversations.</p>
+            <button
+              onClick={fetchConversations}
+              data-testid="conversations-retry"
+              className="px-4 py-2 rounded-[6px] text-sm font-medium border border-[#10B981]/40 text-[#10B981] hover:bg-[#10B981]/10 transition-colors"
+            >
+              Try again
+            </button>
           </div>
         ) : conversations.length === 0 ? (
           <div className="text-center py-16 px-4">
