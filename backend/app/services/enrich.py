@@ -346,7 +346,9 @@ async def serialize_message(
     """Serialize one message.
 
     `is_starred` is the REQUESTING user's star, so it needs `for_user`; with no
-    user context it is False. List endpoints pass pre-computed `starred_ids` /
+    user context it is False. `client_msg_id` is likewise scoped to `for_user` —
+    a caller that omits it gets a document safe to fan out to anyone, which is
+    what the send path wants. List endpoints pass pre-computed `starred_ids` /
     `pinned_ids` sets so a page costs two queries instead of two per message.
     """
     if sender is None and msg.sender_id:
@@ -398,12 +400,19 @@ async def serialize_message(
         "sender_id": str(msg.sender_id) if msg.sender_id else None,
         "type": msg.type.value,
         "content": "" if msg.deleted_at else (msg.content or ""),
-        # The sender's own id for this message, on EVERY serialization including
-        # history. Without it a client refetching a conversation cannot tell which
-        # fetched rows its own unresolved bubbles became, so a send whose outcome
-        # was never learned showed twice: once as the stored message and once as
-        # the local bubble still waiting on it.
-        "client_msg_id": msg.client_msg_id,
+        # The sender's own id for this message, on every serialization of it TO
+        # THAT SENDER — history included. Without it a client refetching a
+        # conversation cannot tell which fetched rows its own unresolved bubbles
+        # became, so a send whose outcome was never learned showed twice: once as
+        # the stored message and once as the local bubble still waiting on it.
+        #
+        # Withheld from everyone else, who have nothing to reconcile it against:
+        # it describes one device's local state, and it is the only field here
+        # that is client-supplied text never passed through sanitize_text
+        # (_clean_client_msg_id trims and caps the length, nothing more).
+        # for_user is None on the send path, so a recipient's fanned-out copy is
+        # covered too; the sender's own response reconciles on temp_id instead.
+        "client_msg_id": msg.client_msg_id if for_user is not None and msg.sender_id == for_user else None,
         "reply_to": str(msg.reply_to_id) if msg.reply_to_id else None,
         "reactions": reactions,
         "read_by": read_by,
