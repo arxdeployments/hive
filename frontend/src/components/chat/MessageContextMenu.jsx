@@ -297,6 +297,74 @@ export const MessageContextMenu = ({ message, isOwn, isGroup, position, onAction
     close();
   }, [message, onAction, close]);
 
+  /**
+   * Move focus INTO the menu once it has been positioned.
+   *
+   * Without this the roving navigation below never runs at all:
+   * `handleMenuKeyDown` is bound to the menu element, so it only sees keys while
+   * focus is already inside it — and nothing ever put it there. The whole
+   * arrow-key implementation was unreachable, so a keyboard user could open the
+   * menu and then not use it.
+   *
+   * Waits for `coords`, which the layout effect above sets after measuring: the
+   * menu is rendered off-screen until then, and focusing a node the browser is
+   * about to move causes a visible jump.
+   */
+  const restoreFocusRef = useRef(null);
+  const focusedForRef = useRef(null);
+  useEffect(() => {
+    if (!position || !coords) {
+      // Closed — hand focus back to whatever opened it, if that is still around.
+      const opener = restoreFocusRef.current;
+      restoreFocusRef.current = null;
+      focusedForRef.current = null;
+      if (opener && typeof opener.focus === 'function' && document.contains(opener)) {
+        opener.focus({ preventScroll: true });
+      }
+      return;
+    }
+    if (focusedForRef.current === position) return;
+    focusedForRef.current = position;
+    restoreFocusRef.current = document.activeElement;
+    menuRef.current?.querySelector('[role="menuitem"]')?.focus({ preventScroll: true });
+  }, [position, coords]);
+
+  /**
+   * Hand focus back on unmount, not on a "closed" render.
+   *
+   * ChatPanel mounts this conditionally (`{contextMenu && <MessageContextMenu …/>}`),
+   * so closing the menu destroys the element outright and the closed branch above
+   * never runs for a real close — it only ever fires on the first pass, before
+   * `coords` is measured. Focus was therefore left on <body>: a keyboard user who
+   * opened the menu and picked a row, or pressed Escape, was dropped back to the
+   * top of the document and had to tab through the whole thread to return.
+   *
+   * Safe against the actions that open something else (forward, info, react):
+   * React runs an unmounting subtree's cleanup before the incoming subtree's
+   * effects, so a modal that traps focus on mount still wins.
+   */
+  useEffect(() => () => {
+    const opener = restoreFocusRef.current;
+    restoreFocusRef.current = null;
+    if (opener && typeof opener.focus === 'function' && document.contains(opener)) {
+      opener.focus({ preventScroll: true });
+    }
+  }, []);
+
+  /**
+   * The confirm view replaces the row that had focus, which drops focus to <body>
+   * mid-dialog. The effect above cannot cover this: it is keyed on `position`,
+   * and choosing Report changes only `view`, so it bails at the identity check.
+   *
+   * Cancel rather than Report — the destructive control should not be one blind
+   * Enter away for someone who cannot see which view they just landed in.
+   */
+  const reportCancelRef = useRef(null);
+  useEffect(() => {
+    if (view !== 'report') return;
+    reportCancelRef.current?.focus({ preventScroll: true });
+  }, [view]);
+
   // Roving focus so the menu is usable from the keyboard.
   const handleMenuKeyDown = (e) => {
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Home' && e.key !== 'End') return;
@@ -352,6 +420,7 @@ export const MessageContextMenu = ({ message, isOwn, isGroup, position, onAction
             </p>
             <div className="flex justify-end gap-2">
               <button
+                ref={reportCancelRef}
                 type="button"
                 onClick={close}
                 data-testid="message-menu-report-cancel"

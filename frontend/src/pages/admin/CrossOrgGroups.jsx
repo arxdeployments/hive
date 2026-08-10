@@ -308,20 +308,23 @@ export default function CrossOrgGroups() {
                     <div className="space-y-4">
                       <h3 className="text-lg font-semibold text-[#F5F5F5]">Step 1: Group Details</h3>
                       <div>
-                        <label className="text-sm text-[#A3A3A3] mb-1.5 block">Group Name *</label>
-                        <input type="text" value={groupName} onChange={(e) => setGroupName(e.target.value)} maxLength={100}
+                        <label htmlFor="crossorggroups-01-group-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Group Name *</label>
+                        <input id="crossorggroups-01-group-name" type="text" value={groupName} onChange={(e) => setGroupName(e.target.value)} maxLength={100}
                           className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none transition-all" />
                       </div>
                       <div>
-                        <label className="text-sm text-[#A3A3A3] mb-1.5 block">Description</label>
-                        <textarea value={groupDesc} onChange={(e) => setGroupDesc(e.target.value)} rows={2} maxLength={500}
+                        <label htmlFor="crossorggroups-02-description" className="text-sm text-[#A3A3A3] mb-1.5 block">Description</label>
+                        <textarea id="crossorggroups-02-description" value={groupDesc} onChange={(e) => setGroupDesc(e.target.value)} rows={2} maxLength={500}
                           className="w-full px-4 py-2 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none resize-none transition-all" />
                       </div>
                       <div>
-                        <label className="text-sm text-[#A3A3A3] mb-1.5 block">Purpose</label>
-                        <div className="flex gap-2 flex-wrap">
+                        {/* Caption for the set. Naming each option "Purpose"
+                            made four buttons that sound the same and hid which
+                            one is chosen. */}
+                        <span id="crossorggroups-03-purpose" className="text-sm text-[#A3A3A3] mb-1.5 block">Purpose</span>
+                        <div role="group" aria-labelledby="crossorggroups-03-purpose" className="flex gap-2 flex-wrap">
                           {['Project', 'Task Force', 'Committee', 'Custom'].map(tag => (
-                            <button key={tag} onClick={() => setPurposeTag(tag)}
+                            <button key={tag} aria-pressed={purposeTag === tag} onClick={() => setPurposeTag(tag)}
                               className={`px-3 py-1.5 rounded-[6px] text-xs font-medium transition-colors ${
                                 purposeTag === tag
                                   ? `border text-white` : 'bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3]'

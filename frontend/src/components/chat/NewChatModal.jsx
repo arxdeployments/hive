@@ -2,11 +2,13 @@ import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Search, X, Users } from 'lucide-react';
 import client from '../../api/client';
+import { useModalDialog } from '../../hooks/useModalDialog';
 
 export const NewChatModal = ({ isOpen, onClose, onSelectContact }) => {
   const [contacts, setContacts] = useState([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(false);
+  const { titleId, dialogProps } = useModalDialog({ isOpen, onClose });
 
   const fetchContacts = useCallback(async () => {
     setLoading(true);
@@ -44,13 +46,15 @@ export const NewChatModal = ({ isOpen, onClose, onSelectContact }) => {
           exit={{ opacity: 0, scale: 0.95 }}
           transition={{ duration: 0.24, ease: [0.2, 0.8, 0.2, 1] }}
           onClick={(e) => e.stopPropagation()}
-          className="relative bg-[#141414] border border-[#1F1F1F] rounded-[12px] w-full max-w-[420px] max-h-[70vh] shadow-[0_0_0_1px_rgba(31,31,31,1),0_18px_60px_rgba(0,0,0,0.55)] flex flex-col overflow-hidden"
+          {...dialogProps}
+          className="relative bg-[#141414] border border-[#1F1F1F] rounded-[12px] w-full max-w-[420px] max-h-[70vh] shadow-[0_0_0_1px_rgba(31,31,31,1),0_18px_60px_rgba(0,0,0,0.55)] flex flex-col overflow-hidden outline-none"
         >
           {/* Header */}
           <div className="flex items-center justify-between px-5 py-4 border-b border-[#1F1F1F]">
-            <h3 className="text-lg font-semibold text-[#F5F5F5]">New Conversation</h3>
+            <h3 id={titleId} className="text-lg font-semibold text-[#F5F5F5]">New Conversation</h3>
             <button
               onClick={onClose}
+              aria-label="Close"
               className="p-1.5 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors"
             >
               <X size={18} />

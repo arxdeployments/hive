@@ -199,26 +199,31 @@ export default function OrgAdminUsers() {
               <h3 className="text-lg font-semibold text-[#F5F5F5] mb-6">Create User</h3>
               <div className="space-y-4">
                 <div>
-                  <label className="text-sm text-[#A3A3A3] mb-1.5 block">Department *</label>
-                  <select value={formDept} onChange={(e) => setFormDept(e.target.value)}
+                  <label htmlFor="orgadminusers-01-department" className="text-sm text-[#A3A3A3] mb-1.5 block">Department *</label>
+                  <select id="orgadminusers-01-department" value={formDept} onChange={(e) => setFormDept(e.target.value)}
                     className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none">
                     {depts.map(d => <option key={d._id} value={d._id}>{d.name}</option>)}
                   </select>
                 </div>
                 <div>
-                  <label className="text-sm text-[#A3A3A3] mb-1.5 block">Email *</label>
-                  <input type="email" value={formEmail} onChange={(e) => setFormEmail(e.target.value)}
+                  <label htmlFor="orgadminusers-02-email" className="text-sm text-[#A3A3A3] mb-1.5 block">Email *</label>
+                  <input id="orgadminusers-02-email" type="email" value={formEmail} onChange={(e) => setFormEmail(e.target.value)}
                     className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none" />
                 </div>
                 <div>
-                  <label className="text-sm text-[#A3A3A3] mb-1.5 block">Display Name *</label>
-                  <input type="text" value={formName} onChange={(e) => setFormName(e.target.value)}
+                  <label htmlFor="orgadminusers-03-display-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Display Name *</label>
+                  <input id="orgadminusers-03-display-name" type="text" value={formName} onChange={(e) => setFormName(e.target.value)}
                     className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none" />
                 </div>
                 <div>
                   <div className="flex justify-between mb-1.5">
-                    <label className="text-sm text-[#A3A3A3]">Password</label>
-                    <button onClick={() => { setAutoPassword(!autoPassword); if (!autoPassword) setFormPassword(genPassword()); }}
+                    {/* Caption for the field, not a name for the switch beside it:
+                        as a label it named the button "Password" and dropped the
+                        one word — "Manual" or "Auto-generate" — that says what
+                        pressing it does. It labels the manual input instead. */}
+                    <span id="orgadminusers-04-password" className="text-sm text-[#A3A3A3]">Password</span>
+                    <button aria-label={autoPassword ? 'Enter password manually' : 'Auto-generate password'}
+                      onClick={() => { setAutoPassword(!autoPassword); if (!autoPassword) setFormPassword(genPassword()); }}
                       className="text-xs text-[#A3A3A3]">{autoPassword ? 'Manual' : 'Auto-generate'}</button>
                   </div>
                   {autoPassword ? (
@@ -229,6 +234,7 @@ export default function OrgAdminUsers() {
                     </div>
                   ) : (
                     <input type="text" value={formPassword} onChange={(e) => setFormPassword(e.target.value)}
+                      aria-labelledby="orgadminusers-04-password"
                       className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none" />
                   )}
                 </div>
@@ -268,18 +274,18 @@ export default function OrgAdminUsers() {
                 <button onClick={() => setEditUser(null)} className="p-2 text-[#A3A3A3] hover:text-[#F5F5F5] rounded"><X size={18} /></button>
               </div>
               <div className="space-y-5">
-                <div><label className="text-sm text-[#A3A3A3] mb-1.5 block">Name</label>
-                  <input value={editName} onChange={e => setEditName(e.target.value)}
+                <div><label htmlFor="orgadminusers-05-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Name</label>
+                  <input id="orgadminusers-05-name" value={editName} onChange={e => setEditName(e.target.value)}
                     className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none" /></div>
-                <div><label className="text-sm text-[#A3A3A3] mb-1.5 block">Email</label>
-                  <input value={editUser.email} readOnly className="w-full h-10 px-4 bg-[#0F0F0F] border border-[#1F1F1F] rounded-[6px] text-sm text-[#A3A3A3]" /></div>
-                <div><label className="text-sm text-[#A3A3A3] mb-1.5 block">Department</label>
-                  <select value={editDept} onChange={e => setEditDept(e.target.value)}
+                <div><label htmlFor="orgadminusers-06-email" className="text-sm text-[#A3A3A3] mb-1.5 block">Email</label>
+                  <input id="orgadminusers-06-email" value={editUser.email} readOnly className="w-full h-10 px-4 bg-[#0F0F0F] border border-[#1F1F1F] rounded-[6px] text-sm text-[#A3A3A3]" /></div>
+                <div><label htmlFor="orgadminusers-07-department" className="text-sm text-[#A3A3A3] mb-1.5 block">Department</label>
+                  <select id="orgadminusers-07-department" value={editDept} onChange={e => setEditDept(e.target.value)}
                     className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none">
                     {depts.map(d => <option key={d._id} value={d._id}>{d.name}</option>)}
                   </select></div>
-                <div><label className="text-sm text-[#A3A3A3] mb-2 block">Role</label>
-                  <div className="flex gap-2">
+                <div><span id="orgadminusers-role" className="text-sm text-[#A3A3A3] mb-2 block">Role</span>
+                  <div role="group" aria-labelledby="orgadminusers-role" className="flex gap-2">
                     {['member', 'admin'].map(r => {
                       // Promotion is the same grant the create form refuses,
                       // reached through a member who already exists, so the
@@ -292,6 +298,10 @@ export default function OrgAdminUsers() {
                       return (
                         <button key={r} onClick={() => !blocked && setEditRole(r)}
                           disabled={blocked}
+                          // The group is named, but naming it said nothing about
+                          // which of the two is in force — the selected role was
+                          // carried by colour alone.
+                          aria-pressed={editRole === r}
                           title={blocked ? 'Only a super admin can grant admin access' : undefined}
                           className={`flex-1 h-10 rounded-[6px] text-sm font-medium capitalize transition-colors ${
                             blocked ? 'bg-[#1A1A1A] border border-[#1F1F1F] text-[#5A5A5A] cursor-not-allowed'
@@ -303,13 +313,17 @@ export default function OrgAdminUsers() {
                   {editUser.role !== 'admin' && (
                     <p className="text-xs text-[#5A5A5A] mt-1.5">Only a super admin can grant admin access.</p>
                   )}</div>
-                <div><label className="text-sm text-[#A3A3A3] mb-2 block">Status</label>
-                  <button onClick={() => setEditActive(!editActive)}
+                <div><span id="orgadminusers-09-status" className="text-sm text-[#A3A3A3] mb-2 block">Status</span>
+                  <button aria-labelledby="orgadminusers-09-status orgadminusers-09-status-state"
+                    aria-pressed={editActive} onClick={() => setEditActive(!editActive)}
                     className="flex items-center gap-3 w-full p-3 rounded-[6px] bg-[#1A1A1A] border border-[#2D2D2D]">
                     <div className={`w-10 h-5 rounded-full ${editActive ? 'bg-[#10B981]' : 'bg-[#2D2D2D]'} relative`}>
                       <div className="absolute top-0.5 w-4 h-4 rounded-full bg-white" style={{ left: editActive ? '22px' : '2px' }} />
                     </div>
-                    <span className={`text-sm ${editActive ? 'text-[#10B981]' : 'text-[#EF4444]'}`}>{editActive ? 'Active' : 'Inactive'}</span>
+                    {/* The caption alone said "Status" and stopped there, so the
+                        toggle sounded identical whether the user was active or
+                        not. The word is the state; it belongs in the name. */}
+                    <span id="orgadminusers-09-status-state" className={`text-sm ${editActive ? 'text-[#10B981]' : 'text-[#EF4444]'}`}>{editActive ? 'Active' : 'Inactive'}</span>
                   </button></div>
                 <button onClick={handleResetPw}
                   className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-[6px] text-sm font-medium bg-[#1A1A1A] border border-[#2D2D2D] text-[#F59E0B] hover:bg-[#F59E0B]/10 transition-colors">

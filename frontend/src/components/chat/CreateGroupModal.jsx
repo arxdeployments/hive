@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Search, X, ArrowLeft, Camera, Users, Loader2 } from 'lucide-react';
 import client from '../../api/client';
 import { toast } from 'sonner';
+import { useModalDialog } from '../../hooks/useModalDialog';
 
 /**
  * `prefillMembers` / `prefillName` / `prefillDescription` back GroupInfoPanel's
@@ -19,6 +20,7 @@ export const CreateGroupModal = ({
   prefillDescription,
 }) => {
   const [step, setStep] = useState(1);
+  const { titleId, dialogProps } = useModalDialog({ isOpen, onClose });
   const [contacts, setContacts] = useState([]);
   const [search, setSearch] = useState('');
   const [selectedIds, setSelectedIds] = useState([]);
@@ -122,7 +124,8 @@ export const CreateGroupModal = ({
           exit={{ opacity: 0, scale: 0.95 }}
           transition={{ duration: 0.24, ease: [0.2, 0.8, 0.2, 1] }}
           onClick={(e) => e.stopPropagation()}
-          className="relative bg-[#141414] border border-[#1F1F1F] rounded-[12px] w-full max-w-[480px] max-h-[75vh] shadow-[0_0_0_1px_rgba(31,31,31,1),0_18px_60px_rgba(0,0,0,0.55)] flex flex-col overflow-hidden"
+          {...dialogProps}
+          className="relative bg-[#141414] border border-[#1F1F1F] rounded-[12px] w-full max-w-[480px] max-h-[75vh] shadow-[0_0_0_1px_rgba(31,31,31,1),0_18px_60px_rgba(0,0,0,0.55)] flex flex-col overflow-hidden outline-none"
         >
           <AnimatePresence mode="wait">
             {step === 1 ? (
@@ -135,7 +138,7 @@ export const CreateGroupModal = ({
                 {/* Header */}
                 <div className="flex items-center justify-between px-5 py-4 border-b border-[#1F1F1F] flex-shrink-0">
                   <div>
-                    <h3 className="text-lg font-semibold text-[#F5F5F5]">New Group</h3>
+                    <h3 id={titleId} className="text-lg font-semibold text-[#F5F5F5]">New Group</h3>
                     <p className="text-xs text-[#A3A3A3]">Step 1 of 2 — Select members</p>
                   </div>
                   <button onClick={onClose} className="p-1.5 text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors">
@@ -243,7 +246,7 @@ export const CreateGroupModal = ({
                     <ArrowLeft size={18} />
                   </button>
                   <div>
-                    <h3 className="text-lg font-semibold text-[#F5F5F5]">New Group</h3>
+                    <h3 id={titleId} className="text-lg font-semibold text-[#F5F5F5]">New Group</h3>
                     <p className="text-xs text-[#A3A3A3]">Step 2 of 2 — Group details</p>
                   </div>
                 </div>
@@ -258,8 +261,8 @@ export const CreateGroupModal = ({
 
                   {/* Group name */}
                   <div>
-                    <label className="text-sm text-[#A3A3A3] mb-1.5 block">Group Name *</label>
-                    <input
+                    <label htmlFor="creategroupmodal-01-group-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Group Name *</label>
+                    <input id="creategroupmodal-01-group-name"
                       type="text"
                       value={groupName}
                       onChange={(e) => setGroupName(e.target.value)}
@@ -273,8 +276,8 @@ export const CreateGroupModal = ({
 
                   {/* Description */}
                   <div>
-                    <label className="text-sm text-[#A3A3A3] mb-1.5 block">Description</label>
-                    <textarea
+                    <label htmlFor="creategroupmodal-02-description" className="text-sm text-[#A3A3A3] mb-1.5 block">Description</label>
+                    <textarea id="creategroupmodal-02-description"
                       value={groupDesc}
                       onChange={(e) => setGroupDesc(e.target.value)}
                       maxLength={500}
