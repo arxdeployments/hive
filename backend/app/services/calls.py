@@ -618,6 +618,12 @@ async def invite_to_call(user: User, call_id: uuid.UUID, invitee_ids: list[uuid.
             .all()
         )
 
+        # Loaded before the loop because the org rule below turns on the
+        # conversation's type, not only on the two users. Same string comparison
+        # initiate_group_call uses, so no new import.
+        conv = await db.get(Conversation, call.conversation_id) if call.conversation_id else None
+        is_cross_org = conv is not None and conv.type.value == "cross_org"
+
         added: list[User] = []
         for invitee_id in invitee_ids:
             row = await db.get(CallParticipant, (call_id, invitee_id))
@@ -630,7 +636,20 @@ async def invite_to_call(user: User, call_id: uuid.UUID, invitee_ids: list[uuid.
             if invitee is None or not invitee.is_active:
                 outcome[str(invitee_id)] = "unavailable"
                 continue
-            if invitee.org_id != inviter.org_id:
+            # Same org — except in a cross-org conversation, where the roster already
+            # spans organizations: initiate_group_call builds it from every
+            # conversation member and exempts cross_org from this very check, exactly
+            # as deps.require_membership does. A flat comparison here refused to
+            # (re-)invite a participant from the other org who had not answered or had
+            # left — the single case this function exists to serve, and one whose only
+            # other way back is a Join chip in a conversation an outside invitee does
+            # not have. Conversation membership stands in for the org check, so this
+            # still cannot ring anyone who was never in the conversation.
+            if is_cross_org:
+                if await db.get(ConversationParticipant, (conv.id, invitee_id)) is None:
+                    outcome[str(invitee_id)] = "different_org"
+                    continue
+            elif invitee.org_id != inviter.org_id:
                 outcome[str(invitee_id)] = "different_org"
                 continue
             # The cap counts people IN the call, plus the ones being added — an invite
@@ -658,7 +677,6 @@ async def invite_to_call(user: User, call_id: uuid.UUID, invitee_ids: list[uuid.
             return {"invited": [], "outcome": outcome}
         await db.commit()
 
-        conv = await db.get(Conversation, call.conversation_id) if call.conversation_id else None
         group_name = (conv.name if conv else None) or "Group call"
         roster = [
             _brief(u)
