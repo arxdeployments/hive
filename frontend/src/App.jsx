@@ -5,12 +5,23 @@ import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { AnimatePresence } from 'framer-motion';
 import { Loader2 } from 'lucide-react';
 
-// Eager: the two hot entry screens.
+// Eager: the login screen, which is what an unauthenticated visitor is here for.
 import Login from './pages/Login';
-import Chat from './pages/Chat';
 
 // Lazy: the admin & org-admin portals load only when their routes are hit,
-// keeping the messenger's initial bundle lean.
+// keeping the messenger's initial bundle lean. Chat joined them for a sharper
+// reason: it is the whole messenger, and a visitor sitting on the login form has
+// not asked for any of it. Imported eagerly it put 687 kB — the virtualised
+// thread, the media editor, the emoji dataset — in front of a two-field form.
+// The route below already renders inside the Suspense boundary at the top of
+// <Routes>, so this needs nothing else.
+//
+// Note for anyone tempted by build.rollupOptions.output.manualChunks instead:
+// it was measured and it moves 0.92 kB of gzip. Splitting a STATIC import into
+// its own file makes Vite emit <link rel="modulepreload"> for it, so the bytes
+// are still fetched before first paint — the entry chunk shrinks and the login
+// path does not. Only making the import dynamic removes it.
+const Chat = lazy(() => import('./pages/Chat'));
 const Dashboard = lazy(() => import('./pages/admin/Dashboard'));
 const Organizations = lazy(() => import('./pages/admin/Organizations'));
 const Departments = lazy(() => import('./pages/admin/Departments'));

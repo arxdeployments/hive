@@ -10,6 +10,10 @@
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!-- Loaded here rather than by an @import in src/index.css so the preload
+         scanner can start it immediately; see the comment at the top of that
+         file for why the @import could not be. -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" />
     <title>RX HIVE</title>
   </head>
   <body>

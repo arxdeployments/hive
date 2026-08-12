@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, memo } from 'react';
+import { useState, useRef, useEffect, useCallback, lazy, memo, Suspense } from 'react';
 import { Send, Smile, Paperclip, Mic, Image, FileText, Film, Pencil, X, Loader2, Upload } from 'lucide-react';
 import { v4 as uuidv4 } from 'uuid';
 import {
@@ -6,14 +6,26 @@ import {
   loadQualityTier,
   measureBatchSize,
   saveQualityTier,
-  transcodeImage,
+  transcodeImageCached,
 } from '../../utils/mediaQuality';
 import { describeEdits, hasEdits } from '../../utils/mediaEdit';
-import { extractVideoPoster } from '../../utils/videoPoster';
+import { extractVideoPoster, releasePoster } from '../../utils/videoPoster';
 import { useHoldToTalk } from '../../hooks/useHoldToTalk';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from 'sonner';
-import EmojiPicker from 'emoji-picker-react';
+/**
+ * Lazy, because the dataset is not the picker.
+ *
+ * `emoji-picker-react` carries a 309 kB emoji dataset, and a static import put
+ * every byte of it in the chunk that has to arrive before anything renders —
+ * for a control that opens only when someone presses the smiley. Measured:
+ * splitting it takes the entry chunk from 1,764.46 kB to 1,454.74 kB raw
+ * (490.09 -> 414.46 kB gzip) on its own.
+ *
+ * The Suspense fallback is sized to the picker's own box so opening it does not
+ * shift the layout while the chunk arrives.
+ */
+const EmojiPicker = lazy(() => import('emoji-picker-react'));
 import wsClient from '../../services/websocket';
 import client from '../../api/client';
 import useChatStore from '../../stores/chatStore';
@@ -672,11 +684,13 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
         if (!controller) { URL.revokeObjectURL(item.url); continue; }
 
         try {
-          // Re-encoded HERE rather than at stage time, so the tier can still be
-          // changed in the tray and so a cancelled batch costs no CPU. Returns
-          // the original untouched for anything that is not a re-encodable
-          // image, so this is safe for every category.
-          const outgoing = await transcodeImage(item.file, qualityTier);
+          // Re-encoded at the CURRENT tier, so changing it in the tray still
+          // decides what goes out. Almost always free: the tray measured this
+          // batch by running the same encode, and this collects that result
+          // rather than repeating it — see transcodeImageCached. Returns the
+          // original untouched for anything that is not a re-encodable image,
+          // so this is safe for every category.
+          const outgoing = await transcodeImageCached(item.file, qualityTier);
           // Measure a video's length before sending it. duration is
           // CLIENT-supplied on message create — the server never probes the file
           // — and the web only ever passed it for voice notes, so every video
@@ -698,7 +712,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
               // for a File source it is not cached — this call site is its only owner
               // and only wants the duration, so without this every video ever sent
               // pins a 720px JPEG for the lifetime of the tab.
-              if (probed.posterUrl) URL.revokeObjectURL(probed.posterUrl);
+              if (probed.posterUrl) releasePoster(probed.posterUrl);
             }
           }
           await sendMediaFile(
@@ -1094,6 +1108,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
           >
             <div className="relative">
               <div className="fixed inset-0 z-[-1]" onClick={() => setShowEmoji(false)} />
+              <Suspense fallback={<div className="w-[350px] h-[400px] rounded-[8px] bg-[#1A1A1A] border border-[#2D2D2D]" />}>
               <EmojiPicker
                 onEmojiClick={handleEmojiClick}
                 theme="dark"
@@ -1103,6 +1118,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
                 skinTonesDisabled
                 previewConfig={{ showPreview: false }}
               />
+              </Suspense>
             </div>
           </motion.div>
         )}

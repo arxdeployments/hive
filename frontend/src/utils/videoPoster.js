@@ -30,26 +30,66 @@ const POSTER_MAX_EDGE = 720;
 // backgrounded, and without a timeout that leaves a promise pending forever.
 const LOAD_TIMEOUT_MS = 8000;
 
-/** In-memory, keyed by source URL. Scrolling back through a thread is free. */
+/**
+ * In-memory, keyed by source URL. Scrolling back through a thread is free.
+ *
+ * What is stored is the JPEG *Blob*, not an object URL, and the cap is the point
+ * rather than housekeeping. An object URL is a document-lifetime registration:
+ * it pins its blob until something revokes it, and nothing ever revoked these,
+ * so every distinct clip a user scrolled past stayed resident until the tab was
+ * closed. Holding Blobs makes an entry droppable — the bytes go when no cache
+ * entry and no live URL reference them any more — and each CALLER now mints and
+ * frees its own URL, so dropping an entry can never pull the image out from
+ * under a bubble still on screen. The thread is virtualised, so bubbles
+ * genuinely do unmount and remount as the user scrolls.
+ *
+ * 50 is deep enough that ordinary scroll-back through a media-heavy thread never
+ * re-decodes, and shallow enough that the ceiling is a few megabytes instead of
+ * however many videos the session happened to contain.
+ */
+const POSTER_CACHE_MAX = 50;
 const posterCache = new Map();
 const inflight = new Map();
 
 /**
+ * One object URL per call, minted from the cached bytes. Two bubbles showing the
+ * same clip each get — and each revoke — their own handle to the same Blob,
+ * which is what makes ownership unambiguous at the call site.
+ */
+const mintPoster = ({ posterBlob, duration }) => ({
+  posterUrl: posterBlob ? URL.createObjectURL(posterBlob) : null,
+  duration,
+});
+
+/**
+ * Free a URL that extractVideoPoster handed out. Callers own what they are
+ * given; this exists so they do not have to know it is an object URL.
+ */
+export function releasePoster(url) {
+  if (url) URL.revokeObjectURL(url);
+}
+
+/**
  * Grab a frame and the duration from a video URL or File/Blob.
+ *
+ * The caller OWNS `posterUrl` and must hand it back to releasePoster when it
+ * stops rendering it — the cache keeps the bytes, not the handle.
  * @returns {Promise<{posterUrl: string|null, duration: number|null}>}
  */
 export async function extractVideoPoster(source) {
   const isBlobSource = typeof source !== 'string';
   const key = isBlobSource ? null : source;
 
-  if (key && posterCache.has(key)) return posterCache.get(key);
-  // Two bubbles showing the same clip must not each decode it.
-  if (key && inflight.has(key)) return inflight.get(key);
+  if (key && posterCache.has(key)) return mintPoster(posterCache.get(key));
+  // Two bubbles showing the same clip must not each decode it. They do not share
+  // the resulting URL, though — the shared promise carries the Blob, and each
+  // caller mints its own handle from it.
+  if (key && inflight.has(key)) return inflight.get(key).then(mintPoster);
 
   const run = (async () => {
     const objectUrl = isBlobSource ? URL.createObjectURL(source) : null;
     const video = document.createElement('video');
-    let result = { posterUrl: null, duration: null };
+    let result = { posterBlob: null, duration: null };
 
     try {
       video.preload = 'metadata';
@@ -96,7 +136,7 @@ export async function extractVideoPoster(source) {
       const blob = await new Promise((resolve) => {
         try { canvas.toBlob(resolve, 'image/jpeg', 0.8); } catch { resolve(null); }
       });
-      if (blob) result.posterUrl = URL.createObjectURL(blob);
+      if (blob) result.posterBlob = blob;
       return result;
     } catch {
       return result;
@@ -106,6 +146,13 @@ export async function extractVideoPoster(source) {
       video.load();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
       if (key) {
+        // Insertion-order FIFO: Map iterates in insertion order, so the oldest
+        // key is the first one out. Evicting the ENTRY only drops our reference
+        // to the Blob; any URL a live bubble already minted from it keeps the
+        // bytes alive until that bubble releases them.
+        if (posterCache.size >= POSTER_CACHE_MAX) {
+          posterCache.delete(posterCache.keys().next().value);
+        }
         posterCache.set(key, result);
         inflight.delete(key);
       }
@@ -113,7 +160,7 @@ export async function extractVideoPoster(source) {
   })();
 
   if (key) inflight.set(key, run);
-  return run;
+  return run.then(mintPoster);
 }
 
 /** m:ss, matching utils/audioFormat.formatDuration and the iOS clockLabel. */

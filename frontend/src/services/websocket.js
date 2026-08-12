@@ -752,10 +752,17 @@ class RxHiveWebSocket {
       case 'reaction_update': {
         const { message_id: rMsgId, conversation_id: rConvId, reactions } = data;
         if (rConvId && rMsgId) {
-          const msgs = store.messages[rConvId] || [];
-          store.setMessages(rConvId, msgs.map(m =>
-            m._id === rMsgId ? { ...m, reactions } : m
-          ));
+          const msgs = store.messages[rConvId];
+          // No window loaded for this thread, so there is nothing to patch — and
+          // `|| []` is not harmless here: setMessages would write the empty array
+          // into the store, which is exactly the array addMessage now tests for
+          // before it will extend a thread. One reaction in a conversation this tab
+          // has never opened would re-arm the accumulation that guard exists to stop.
+          if (msgs?.length) {
+            store.setMessages(rConvId, msgs.map(m =>
+              m._id === rMsgId ? { ...m, reactions } : m
+            ));
+          }
         }
         break;
       }
@@ -766,10 +773,17 @@ class RxHiveWebSocket {
       case 'message_pin_update': {
         const { message_id: pMsgId, conversation_id: pConvId, is_pinned: pinned } = data;
         if (pConvId && pMsgId) {
-          const msgs = store.messages[pConvId] || [];
-          store.setMessages(pConvId, msgs.map(m =>
-            m._id === pMsgId ? { ...m, is_pinned: pinned } : m
-          ));
+          const msgs = store.messages[pConvId];
+          // No window loaded for this thread, so there is nothing to patch — and
+          // `|| []` is not harmless here: setMessages would write the empty array
+          // into the store, which is exactly the array addMessage now tests for
+          // before it will extend a thread. One reaction in a conversation this tab
+          // has never opened would re-arm the accumulation that guard exists to stop.
+          if (msgs?.length) {
+            store.setMessages(pConvId, msgs.map(m =>
+              m._id === pMsgId ? { ...m, is_pinned: pinned } : m
+            ));
+          }
         }
         // Also nudge the open thread to re-fetch /pinned. The patch above only
         // reaches messages already loaded, so without this a pin (or unpin) of a
@@ -802,10 +816,17 @@ class RxHiveWebSocket {
       case 'message_deleted': {
         const { message_id: dMsgId, conversation_id: dConvId } = data;
         if (dConvId && dMsgId) {
-          const msgs = store.messages[dConvId] || [];
-          store.setMessages(dConvId, msgs.map(m =>
-            m._id === dMsgId ? { ...m, is_deleted: true, content: '', media_url: null } : m
-          ));
+          const msgs = store.messages[dConvId];
+          // No window loaded for this thread, so there is nothing to patch — and
+          // `|| []` is not harmless here: setMessages would write the empty array
+          // into the store, which is exactly the array addMessage now tests for
+          // before it will extend a thread. One reaction in a conversation this tab
+          // has never opened would re-arm the accumulation that guard exists to stop.
+          if (msgs?.length) {
+            store.setMessages(dConvId, msgs.map(m =>
+              m._id === dMsgId ? { ...m, is_deleted: true, content: '', media_url: null } : m
+            ));
+          }
         }
         break;
       }
@@ -813,10 +834,17 @@ class RxHiveWebSocket {
       case 'message_edited': {
         const { message_id: eMsgId, conversation_id: eConvId, content, edited_at } = data;
         if (eConvId && eMsgId) {
-          const msgs = store.messages[eConvId] || [];
-          store.setMessages(eConvId, msgs.map(m =>
-            m._id === eMsgId ? { ...m, content, edited_at } : m
-          ));
+          const msgs = store.messages[eConvId];
+          // No window loaded for this thread, so there is nothing to patch — and
+          // `|| []` is not harmless here: setMessages would write the empty array
+          // into the store, which is exactly the array addMessage now tests for
+          // before it will extend a thread. One reaction in a conversation this tab
+          // has never opened would re-arm the accumulation that guard exists to stop.
+          if (msgs?.length) {
+            store.setMessages(eConvId, msgs.map(m =>
+              m._id === eMsgId ? { ...m, content, edited_at } : m
+            ));
+          }
         }
         break;
       }

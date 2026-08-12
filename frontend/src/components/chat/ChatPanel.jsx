@@ -33,6 +33,16 @@ import { toast } from 'sonner';
 
 const EMPTY_PINNED = [];
 
+/**
+ * The index Virtuoso gives the first row of a freshly opened thread.
+ *
+ * Every "load older" page counts down from here, so it only has to be high
+ * enough that a session cannot page past it — react-virtuoso's own guidance for
+ * a list whose true length is unknown is "just use a very high value", and at a
+ * page of 50 messages this is around two thousand pages deep in one sitting.
+ */
+const VIRTUOSO_FIRST_ITEM_INDEX = 100000;
+
 const formatStatus = (participant) => {
   if (!participant) return '';
   if (participant.status === 'online') return 'online';
@@ -962,6 +972,59 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     return built;
   }, [convMessages, myUserId]);
 
+  // Hold the reader's place when a page of older messages is spliced onto the
+  // front of the window.
+  //
+  // Virtuoso addresses rows by index, and a prepend shifts every index by the
+  // size of the page. Left to itself it keeps the pixel offset rather than the
+  // row, so the reader who scrolled to the top to ASK for more history is
+  // dropped a whole page further back than the message they were reading.
+  // `firstItemIndex` is the library's mechanism for exactly this: decrease it by
+  // the number of rows added at the FRONT and every existing row keeps the index
+  // it had, so the list scrolls itself down by the height of the new page and
+  // the anchor row stays where it was.
+  //
+  // It is also what lets the SECOND page load at all. `startReached` publishes
+  // the index of the topmost row through a distinct-until-changed filter, and
+  // without firstItemIndex that index is 0 for every page — so the event fires
+  // once per mount and is swallowed for ever after. Today a thread pages back
+  // exactly once per open, however far the reader scrolls.
+  //
+  // Written during render rather than from an effect because the smaller index
+  // has to be committed in the SAME render as the longer `items`. An effect
+  // would paint one frame with the new rows under the old index base — the jump
+  // this exists to prevent — and then apply the shift a second time on top of
+  // it. Adjusting state during render is React's documented alternative; the
+  // intermediate render is discarded rather than committed.
+  //
+  // Assigned a value, never an updater, for the same reason MessageComposer.jsx
+  // records at its object-URL mint: StrictMode invokes this twice, and
+  // `i => i - delta` would subtract the page twice, where two passes computing
+  // the same target from the same state land on the same number.
+  //
+  // The delta is counted in ROWS, not messages: a page brings its own date
+  // separators and can absorb the one that used to lead the window, so the
+  // message count is the wrong number. Locating the previously-first message in
+  // the new array counts both effects at once. When it is not there the window
+  // was replaced rather than extended — a force refetch, an `around` jump, a
+  // thread switch — and there is no anchor to hold, so the index base is left
+  // alone: only ever lowering it means Virtuoso is never told rows were removed
+  // from the front, which it would answer with a scroll of its own.
+  const [firstItemIndex, setFirstItemIndex] = useState(VIRTUOSO_FIRST_ITEM_INDEX);
+  const [anchoredItems, setAnchoredItems] = useState(items);
+  if (items !== anchoredItems) {
+    setAnchoredItems(items);
+    const wasAt = anchoredItems.findIndex(i => i.type === 'message');
+    const anchorKey = wasAt < 0 ? null : anchoredItems[wasAt].key;
+    // Nothing can have been spliced in above a row that has not moved, so the
+    // case every inbound message and every reaction takes costs one comparison
+    // rather than a scan of the whole thread.
+    if (anchorKey && items[wasAt]?.key !== anchorKey) {
+      const isAt = items.findIndex(i => i.type === 'message' && i.key === anchorKey);
+      if (isAt > wasAt) setFirstItemIndex(firstItemIndex - (isAt - wasAt));
+    }
+  }
+
   /**
    * Speak the newest incoming message.
    *
@@ -1470,6 +1533,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
             ref={virtuosoRef}
             style={{ height: '100%' }}
             data={items}
+            firstItemIndex={firstItemIndex}
             initialTopMostItemIndex={items.length - 1}
             /* Do not auto-follow while the loaded window is mid-history: a
                newly arrived message is appended to a window that is not adjacent
