@@ -44,8 +44,16 @@ const ConversationItemInner = ({ conversation, currentUserId, isActive, onClick 
   const lastMsg = conversation.last_message;
   let preview = '';
   if (lastMsg) {
+    // Every media type needs a case, not just two. `content` for a video or a
+    // voice note is the storage URL or empty, so the two missing branches
+    // rendered a blank preview or a raw `/api/media/...` path in the sidebar \u2014
+    // and a voice note, which has no text by definition, showed nothing at all
+    // where the newest message should be. The glyphs match MessageBubble's own
+    // reply-preview vocabulary so the same message reads the same in both places.
     let msgText = lastMsg.content;
     if (lastMsg.type === 'image') msgText = '\ud83d\udcf7 Photo';
+    else if (lastMsg.type === 'video') msgText = '\ud83c\udfa5 Video';
+    else if (lastMsg.type === 'audio') msgText = '\ud83c\udfa4 Voice message';
     else if (lastMsg.type === 'file') msgText = `\ud83d\udcc4 ${lastMsg.content || 'Document'}`;
 
     if (lastMsg.type === 'system') {

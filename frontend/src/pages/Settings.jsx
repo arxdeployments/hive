@@ -7,17 +7,38 @@ import client from '../api/client';
 import { enablePushNotifications, disablePushNotifications } from '../lib/pwa';
 
 const FONT_PX = { small: '14px', medium: '16px', large: '18px' };
-const FONT_SCALE = { small: 0.9, medium: 1, large: 1.12 };
 
-// Apply the chosen font size app-wide by scaling the root <html> font-size
-// (drives rem-based Tailwind sizing) plus a CSS var / body class hook.
+// An own-key check, not `FONT_PX[size]` truthiness. Every object inherits
+// `toString`, `constructor`, `valueOf`, `__proto__` and friends, so those names
+// read back as truthy — a stored value of `toString` selected ITSELF as the key,
+// and `style.fontSize = <function>` is not a parseable CSS value, so CSSOM
+// discarded it and the root size silently stayed wherever it already was.
+// hasOwnProperty.call rather than Object.hasOwn: there is no browserslist or
+// build.target here, so esbuild's default `modules` target applies and would not
+// polyfill hasOwn (Safari 15.4+), quietly raising the app's floor.
+// Also normalises away null, so callers need no `|| 'medium'` of their own.
+const fontKey = (size) => (Object.prototype.hasOwnProperty.call(FONT_PX, size) ? size : 'medium');
+
+// Apply the chosen font size app-wide by scaling the root <html> font-size,
+// which is what every rem-based Tailwind size (text-sm, text-xs, gap-*, …)
+// resolves against. That one line is the whole mechanism, and it matches what
+// index.jsx applies pre-paint from the same localStorage key.
+//
+// This used to also stamp `font-${key}` onto <body> and set a --rx-font-scale
+// custom property. Both were dead ends, and one was actively harmful.
+// `font-medium` is not a private token of ours — it is Tailwind's own
+// font-weight utility, generated into the bundle because dozens of components
+// use it in className, and it compiles to `.font-medium{font-weight:500}`.
+// Nothing in index.css sets a weight on body and preflight makes headings
+// inherit theirs, so putting that class on <body> pushed every element without
+// an explicit weight from 400 to 500: merely opening Settings thickened the
+// entire app, and nothing removed it on unmount, so it stayed that way until a
+// full reload. The siblings made it worse rather than better — `.font-small`
+// and `.font-large` are defined nowhere, so picking Small or Large silently
+// un-bolded the app again, leaving text weight hostage to an unrelated setting.
+// --rx-font-scale had no reader anywhere in the repo.
 export function applyFontSize(size) {
-  const key = FONT_PX[size] ? size : 'medium';
-  const root = document.documentElement;
-  root.style.fontSize = FONT_PX[key];
-  root.style.setProperty('--rx-font-scale', String(FONT_SCALE[key]));
-  document.body.classList.remove('font-small', 'font-medium', 'font-large');
-  document.body.classList.add(`font-${key}`);
+  document.documentElement.style.fontSize = FONT_PX[fontKey(size)];
 }
 
 const extractError = (err, fallback) => {
@@ -79,7 +100,12 @@ export default function SettingsPage() {
   const [desktopNotif, setDesktopNotif] = useState(() => localStorage.getItem('rxhive_desktop_notif') !== 'false');
   const [notifBusy, setNotifBusy] = useState(false);
   const [enterSends, setEnterSends] = useState(() => localStorage.getItem('rxhive_enter_sends') !== 'false');
-  const [fontSize, setFontSize] = useState(() => localStorage.getItem('rxhive_font_size') || 'medium');
+  // Normalised on read as well as on apply. Without this a junk stored value
+  // stayed in state, so no radio below rendered as selected and the effect at
+  // the bottom wrote it straight back to localStorage — leaving the setting
+  // permanently stuck and unselectable even though applyFontSize now coerces the
+  // px value to medium.
+  const [fontSize, setFontSize] = useState(() => fontKey(localStorage.getItem('rxhive_font_size')));
 
   // Change password
   const [currentPassword, setCurrentPassword] = useState('');

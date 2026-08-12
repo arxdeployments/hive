@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 import { Building2, FolderTree, Users, Activity } from 'lucide-react';
 import { PageTransition } from '../../components/common/PageTransition';
@@ -14,24 +14,59 @@ const statCards = [
 export default function Dashboard() {
   const [stats, setStats] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+
+  // Same defect as the org-admin dashboard, on the super-admin's copy of the
+  // same screen. Fixed identically and in the same change: fixing one and not
+  // the other would leave the two portals disagreeing about what a failed load
+  // looks like.
+  // Only the newest load may write — see the org-admin copy for the full
+  // reasoning. Same retry button reachable as fast as an admin can click it,
+  // same out-of-order replies, same stale figures and phantom error strip.
+  const reqSeqRef = useRef(0);
+
+  const fetchStats = useCallback(async () => {
+    const seq = ++reqSeqRef.current;
+    setLoading(true);
+    try {
+      const { data } = await client.get('/api/admin/stats');
+      if (seq !== reqSeqRef.current) return;
+      setStats(data);
+      setError(false);
+    } catch (err) {
+      // Logged either way: a superseded request still failed, and swallowing it
+      // hides a half-broken endpoint that only ever loses the race.
+      console.error('Failed to fetch stats', err);
+      if (seq === reqSeqRef.current) setError(true);
+    } finally {
+      if (seq === reqSeqRef.current) setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    const fetchStats = async () => {
-      try {
-        const { data } = await client.get('/api/admin/stats');
-        setStats(data);
-      } catch (err) {
-        console.error('Failed to fetch stats', err);
-      } finally {
-        setLoading(false);
-      }
-    };
     fetchStats();
-  }, []);
+    return () => { reqSeqRef.current++; };
+  }, [fetchStats]);
 
   return (
     <PageTransition>
       <div className="max-w-[1400px] mx-auto">
+        {error && (
+          <div
+            data-testid="admin-dashboard-error"
+            className="mb-6 flex items-center justify-between gap-4 px-4 py-3 bg-[#141414] border border-[#EF4444]/40 rounded-[8px]"
+          >
+            <p className="text-sm text-[#A3A3A3]">Couldn&apos;t load the platform figures.</p>
+            <button
+              type="button"
+              onClick={fetchStats}
+              data-testid="admin-dashboard-retry"
+              className="px-3 py-1.5 text-xs text-[#10B981] border border-[#10B981]/40 rounded-[6px] hover:bg-[#10B981]/10 transition-colors shrink-0"
+            >
+              Try again
+            </button>
+          </div>
+        )}
         {/* Stat Cards */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
           {statCards.map((card, index) => {
@@ -58,7 +93,8 @@ export default function Dashboard() {
                     <div className="h-8 w-20 bg-[#1A1A1A] rounded animate-pulse" />
                   ) : (
                     <p className="text-3xl font-semibold text-[#F5F5F5] tracking-tight">
-                      {stats?.[card.key] ?? 0}
+                      {/* Em dash, not 0: `?? 0` turned "we do not know" into a measurement. */}
+                      {stats?.[card.key] ?? '—'}
                     </p>
                   )}
                 </div>
@@ -87,7 +123,20 @@ export default function Dashboard() {
                 </div>
               ))}
             </div>
-          ) : stats?.recent_activity?.length > 0 ? (
+          ) : !stats ? (
+            /* No payload has ever landed, so there is nothing to be empty. The
+               rich "No recent activity yet / Activity will appear here as you
+               manage the platform" state below is an onboarding message for a
+               working platform with nothing on it yet, and rendering it under a
+               banner that says the figures failed to load told a super-admin the
+               platform was idle when the truth was that we never found out.
+               `stats` is only assigned on success, so a later failure keeps the
+               last good payload and this branch is not reached. */
+            <div className="text-center py-8" data-testid="admin-activity-unavailable">
+              <Activity size={32} className="text-[#A3A3A3]/30 mx-auto mb-3" />
+              <p className="text-sm text-[#A3A3A3]">Activity couldn&apos;t be loaded.</p>
+            </div>
+          ) : stats.recent_activity?.length > 0 ? (
             <div className="space-y-3">
               {stats.recent_activity.map((activity, index) => (
                 <motion.div

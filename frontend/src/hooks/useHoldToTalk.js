@@ -57,6 +57,34 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
    * finger was still holding.
    */
   const ownerRef = useRef(null);
+  /**
+   * Which gesture, as opposed to which pointer. A pointerId identifies a pointer
+   * and the browser may hand the same one to the next finger that lands, so it
+   * cannot tell "still my press" from "a later press that reused my id" — and
+   * `ownerRef` is null between gestures anyway, which answers neither. Every
+   * press takes the next token; `reset` burns it. An `onStart` that resolves
+   * after its own gesture ended finds the token moved on and stops there.
+   */
+  const gestureRef = useRef(0);
+  /**
+   * The element that holds pointer capture and hears move/up/cancel —
+   * deliberately NOT the button the finger came down on.
+   *
+   * Starting a recording swaps the whole composer row for the recorder bar, so
+   * the mic button is unmounted a few hundred ms into the gesture — before the
+   * finger lifts, every time, because opening the device is what triggers the
+   * swap. Capture dies with the element and the release lands on whatever is
+   * under the finger by then, which carries no handler of ours: pointerup never
+   * arrived, so release-to-send, slide-to-cancel and the too-short coaching all
+   * stopped happening at exactly the point they became reachable, and the
+   * recording ran on until the user found the bar's own stop button.
+   *
+   * Capturing on a surface that outlives the swap keeps the rest of the gesture
+   * addressed to us however far the finger travels. The caller attaches this to
+   * an element enclosing BOTH the composer row and the recorder bar; without it
+   * the hook falls back to the button and behaves as it did before.
+   */
+  const surfaceRef = useRef(null);
   const [coarse, setCoarse] = useState(false);
 
   // Read at mount rather than at module load: a hybrid device can change
@@ -70,6 +98,7 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
     origin.current = null;
     armed.current = false;
     ownerRef.current = null;
+    gestureRef.current += 1;
   }, []);
 
   const onPointerDown = useCallback(async (e) => {
@@ -85,19 +114,19 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
     // keeps the second finger out of it entirely, so release-to-send still
     // belongs to the first.
     //
-    // A stale owner must never lock the button out, and it can go stale easily: the
-    // composer swaps this button for the recorder bar the moment recording starts,
-    // so the release often reaches a button that no longer exists and `reset` never
-    // runs. `hasPointerCapture` tells the two cases apart — a finger genuinely still
-    // down is still captured, while an owner left over from a previous gesture is
-    // not. Missing capture support reads as "not held", which gives back the old
-    // free-for-all rather than a control that cannot be pressed at all.
+    // A stale owner must never lock the button out. `hasPointerCapture` tells the
+    // two cases apart — a finger genuinely still down is still captured, while an
+    // owner left over from a previous gesture is not. Missing capture support
+    // reads as "not held", which gives back the old free-for-all rather than a
+    // control that cannot be pressed at all.
+    const surface = surfaceRef.current ?? e.currentTarget;
     const owner = ownerRef.current;
     if (owner !== null && owner !== pointerId
-      && e.currentTarget.hasPointerCapture?.(owner)) return;
+      && surface.hasPointerCapture?.(owner)) return;
 
     ownerRef.current = pointerId;
-    e.currentTarget.setPointerCapture?.(pointerId);
+    const gesture = ++gestureRef.current;
+    surface.setPointerCapture?.(pointerId);
 
     origin.current = { x: e.clientX, y: e.clientY };
     startedAt.current = Date.now();
@@ -105,17 +134,21 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
     setDrag({ x: 0, y: 0 });
 
     const res = await onStart?.();
-    // The device can take long enough to open that this finger is gone and the
-    // NEXT one already owns the gesture — a quick double-tap is all it takes. Both
-    // lines below write refs that are no longer this gesture's to write: `reset`
-    // would tear down whoever owns it now, and `armed` is worse for being
-    // survivable. It outlives the release that should have consumed it, so a later
-    // hold reads wasArmed=true and sends a recording that was never started.
-    if (ownerRef.current !== pointerId) return;
+    // The press this belongs to is already over — released, cancelled, or reset
+    // out from under us while the device was opening, and a quick double-tap is
+    // all that takes. Neither branch below may run: `reset` would tear down
+    // whoever owns the gesture now, and arming is the more dangerous of the two
+    // for being survivable — `armed` outlives the release that should have
+    // consumed it, so a later hold reads wasArmed=true and sends a recording
+    // that was never started.
+    //
+    // Compared by gesture TOKEN rather than by pointerId: the browser may hand
+    // the same id to the next finger, and `ownerRef` is null between gestures,
+    // so neither answers "is this still my press".
+    if (gesture !== gestureRef.current) return;
     // Permission was refused, or the device is unavailable. Nothing to hold.
     if (res && res.ok === false) { reset(); return; }
-    // Only arm once the recorder is genuinely running. If the prompt ate the
-    // pointerup, `held` is already false by now and this does nothing.
+    // Only arm once the recorder is genuinely running.
     armed.current = true;
   }, [enabled, coarse, onStart, reset]);
 
@@ -139,7 +172,7 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
   const onPointerUp = useCallback((e) => {
     if (e.pointerId !== ownerRef.current) return;
     if (!held) return;
-    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    (surfaceRef.current ?? e.currentTarget).releasePointerCapture?.(e.pointerId);
 
     const heldMs = Date.now() - startedAt.current;
     const cancelled = -drag.x > CANCEL_THRESHOLD;
@@ -169,14 +202,31 @@ export function useHoldToTalk({ onStart, onSend, onCancel, onLock, enabled = tru
     drag,
     cancelArmed: -drag.x > CANCEL_THRESHOLD,
     lockProgress: Math.min(1, Math.max(0, -drag.y / LOCK_THRESHOLD)),
+    /**
+     * Two sets, because the press and the rest of the gesture live on different
+     * elements: `handlers` goes on the mic button, which only has to be there to
+     * claim the gesture, and everything after that goes on the surface below.
+     * Move and up must NOT also sit on the button — while it is still mounted the
+     * two are on one propagation path and every event would be handled twice.
+     */
     handlers: coarse && enabled
       ? {
         onPointerDown,
+        // The browser context menu on a long press would otherwise interrupt.
+        onContextMenu: (e) => e.preventDefault(),
+      }
+      : {},
+    /** Attach to an element enclosing both the composer row and the recorder bar. */
+    surfaceRef,
+    surfaceHandlers: coarse && enabled
+      ? {
         onPointerMove,
         onPointerUp,
         onPointerCancel: onPointerUp,
-        // The browser context menu on a long press would otherwise interrupt.
-        onContextMenu: (e) => e.preventDefault(),
+        // Only mid-gesture: the callout has to be suppressed once the hold
+        // outlasts the button, but this surface also covers the message input,
+        // where a long press is how you paste.
+        onContextMenu: (e) => { if (ownerRef.current !== null) e.preventDefault(); },
       }
       : {},
     LOCK_THRESHOLD,
