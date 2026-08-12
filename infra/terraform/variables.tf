@@ -14,6 +14,22 @@ variable "environment" {
   description = "Environment name. Tags every resource and namespaces the SSM parameter path."
   type        = string
   default     = "prod"
+
+  # This is not only a tag. data.tf gates RDS deletion_protection on it being
+  # EXACTLY "prod" — the one place the value changes behaviour rather than
+  # labelling something. Any other spelling silently ships the production
+  # database with deletion protection off, and nothing in the plan says so: the
+  # line just reads `deletion_protection = false`.
+  #
+  # "production" is the spelling most likely to be reached for, because it is the
+  # one the application itself uses (RXHIVE_ENVIRONMENT=production in
+  # user_data.sh.tftpl, and config.py's is_production compares against
+  # "production"). Constraining the set makes the mismatch impossible instead of
+  # invisible.
+  validation {
+    condition     = contains(["prod", "staging", "dev"], var.environment)
+    error_message = "environment must be one of: prod, staging, dev. data.tf gates RDS deletion_protection on the exact string \"prod\", so \"production\" would silently disable it."
+  }
 }
 
 # --- Compute -----------------------------------------------------------------
