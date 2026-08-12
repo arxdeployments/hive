@@ -247,26 +247,32 @@ async def create_group(
     name = sanitize_text(body.name).strip()
     if not name:
         raise HTTPException(status_code=400, detail="Group name required")
-    if len(body.org_ids) < 2:
-        raise HTTPException(status_code=400, detail="At least 2 organizations required")
-
-    org_uuids: list[uuid.UUID] = []
+    # De-duplicated BEFORE the >=2 check rather than after it. The check counted
+    # the raw request, so one organization sent twice satisfied it and then
+    # collapsed to a group spanning a single org — a cross-org group crossing
+    # nothing. Same rule as the members invariant below: count what survives
+    # filtering, not what was sent. The map keeps each id's original spelling for
+    # the error messages.
+    by_uuid: dict[uuid.UUID, str] = {}
     for oid in body.org_ids:
         parsed = parse_uuid(oid)
         if parsed is None:
             raise HTTPException(status_code=400, detail=f"Invalid org ID: {oid}")
-        org_uuids.append(parsed)
+        by_uuid.setdefault(parsed, oid)
+    org_uuids = list(by_uuid)
+    if len(org_uuids) < 2:
+        raise HTTPException(status_code=400, detail="At least 2 organizations required")
+
     orgs: dict[uuid.UUID, Organization] = {
         o.id: o
         for o in (
             (await db.execute(select(Organization).where(Organization.id.in_(org_uuids)))).scalars().all()
         )
     }
-    for oid, parsed in zip(body.org_ids, org_uuids, strict=True):
+    for parsed, oid in by_uuid.items():
         org = orgs.get(parsed)
         if org is None or not org.is_active:
             raise HTTPException(status_code=404, detail=f"Organization not found: {oid}")
-    org_uuids = list(dict.fromkeys(org_uuids))
 
     if len(body.members) < 2:
         raise HTTPException(status_code=400, detail="At least 2 members required")
@@ -387,7 +393,13 @@ async def update_group(
 
     updates: dict = {}
     if body.name is not None:
-        updates["name"] = sanitize_text(body.name).strip()
+        new_name = sanitize_text(body.name).strip()
+        if not new_name:
+            # create_group refuses a blank name; this path applied one. A name that
+            # sanitizes away left a nameless row in every member's sidebar — and
+            # broadcast a rename system message announcing it.
+            raise HTTPException(status_code=400, detail="Group name required")
+        updates["name"] = new_name
     if body.description is not None:
         updates["description"] = sanitize_text(body.description)
     if body.avatar_url is not None:
@@ -557,7 +569,6 @@ async def toggle_archive(
     actor: User = Depends(require_superadmin),
     db: AsyncSession = Depends(get_db),
 ):
-    _ = actor
     conv = await _load_group(db, group_id)
     conv.is_active = not conv.is_active
     await db.commit()
@@ -568,6 +579,18 @@ async def toggle_archive(
         await publish_to_users(
             member_ids, {"type": "removed_from_conversation", "conversation_id": str(conv.id)}
         )
+    # Archiving drops the group out of every member's list — the same state change
+    # PUT /{group_id} makes and audits, and the same one delete_group audits. Only
+    # this route left no record of who did it.
+    await log_audit(
+        db,
+        actor_id=actor.id,
+        actor_type="superadmin",
+        action="cross_org_group_unarchived" if conv.is_active else "cross_org_group_archived",
+        target=str(conv.id),
+        details={"name": conv.name},
+    )
+    await db.commit()
     return {"is_active": conv.is_active}
 
 
