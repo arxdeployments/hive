@@ -54,10 +54,18 @@ class RateLimiter:
         """
         hits: int | None = None
         async with degrade_on_outage(f"rate limit ({self.scope})"):
-            redis = get_redis()
-            hits = await redis.incr(key)
-            if hits == 1:
-                await redis.expire(key, self.seconds)
+            # INCR and EXPIRE must land together. As two round-trips, a connection
+            # lost between them left the counter with no TTL: it never rolled over,
+            # so once it passed the limit that IP was 429ed out of sign-in
+            # permanently, with Retry-After telling it to try again in a second,
+            # forever. MULTI/EXEC makes the pair atomic, and EXPIRE NX sets the TTL
+            # only when the key has none — so a fixed window is never extended by a
+            # later hit, and a counter that did lose its TTL is repaired on the next
+            # request rather than staying immortal.
+            pipe = get_redis().pipeline()
+            pipe.incr(key)
+            pipe.expire(key, self.seconds, nx=True)
+            hits = (await pipe.execute())[0]
         return hits
 
     async def _retry_after(self, key: str) -> int:

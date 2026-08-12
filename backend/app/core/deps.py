@@ -50,7 +50,15 @@ async def _load_user(token: str | None, db: AsyncSession) -> User:
     payload = decode_access_token(token)
     if not payload:
         raise _credentials_error
-    user = await db.get(User, uuid.UUID(payload["sub"]))
+    # `decode_access_token` verifies the signature and the token type, not the
+    # shape of the claims, so a token carrying a missing or malformed `sub`
+    # reached `uuid.UUID()` unguarded and left this path answering 500 to what is
+    # simply a failed authentication. The WebSocket handshake below already
+    # caught exactly this; the HTTP path is the one that drifted.
+    try:
+        user = await db.get(User, uuid.UUID(payload["sub"]))
+    except (ValueError, KeyError):
+        raise _credentials_error from None
     if not user or not user.is_active:
         raise _credentials_error
     if _mobile_grant_revoked(payload, user):
