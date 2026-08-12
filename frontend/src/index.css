@@ -1,4 +1,10 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+/* Inter is requested by a <link> in index.html, not by an @import here.
+   An @import inside a render-blocking stylesheet is invisible to the preload
+   scanner: the browser does not request fonts.googleapis.com until this bundle
+   has finished downloading, so the font CSS — and then the woff2 it names —
+   hang off the end of it as extra serialised round trips. The preconnects in
+   index.html only warm the socket; they cannot make the request happen sooner.
+   Keep the weight list in index.html identical to what this @import asked for. */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;

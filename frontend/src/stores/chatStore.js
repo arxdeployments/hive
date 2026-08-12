@@ -68,13 +68,30 @@ const useChatStore = create((set) => ({
   )),
 
   addMessage: (convId, message) => set((state) => {
-    const existing = state.messages[convId] || EMPTY_MESSAGES;
+    const existing = state.messages[convId];
+    // Only accumulate into a thread this tab has actually loaded.
+    //
+    // Every inbound broadcast landed here, for every conversation the user is a
+    // member of, whether or not its window had ever been opened — and nothing
+    // ever evicted any of it. A long-lived tab in a busy org therefore grew a
+    // full message array for threads nobody had looked at, for the life of the
+    // session. There is nothing to append to: with no window loaded, ChatPanel
+    // fetches the thread from the API when it is opened, so a partial array
+    // built from whatever happened to arrive while the tab was open is not a
+    // head start, it is a second source of truth.
+    //
+    // The ACTIVE conversation is exempt and that exemption is load-bearing: its
+    // window can legitimately be empty — a thread with no history, or one whose
+    // fetch failed and is showing the error strip — and live arrivals still have
+    // to paint into it.
+    if (!existing?.length && convId !== state.activeConversationId) return state;
+    const base = existing || EMPTY_MESSAGES;
     // Avoid duplicates
-    if (existing.find(m => m._id === message._id)) return state;
+    if (base.find(m => m._id === message._id)) return state;
     return {
       messages: {
         ...state.messages,
-        [convId]: [...existing, message]
+        [convId]: [...base, message]
       }
     };
   }),

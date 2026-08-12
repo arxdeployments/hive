@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Play } from 'lucide-react';
 import { FullscreenVideoViewer } from './FullscreenVideoViewer';
-import { extractVideoPoster, formatVideoDuration } from '../../utils/videoPoster';
+import { extractVideoPoster, formatVideoDuration, releasePoster } from '../../utils/videoPoster';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 const resolveUrl = (url) => (!url ? '' : url.startsWith('http') ? url : `${backendUrl}${url}`);
@@ -49,19 +49,33 @@ export const VideoBubble = ({ message, isOwn, footer, caption }) => {
     if (!el || typeof IntersectionObserver === 'undefined') return undefined;
 
     let cancelled = false;
+    // The URL this bubble minted, so it can be freed when the bubble goes. The
+    // thread is virtualised: rows unmount as they scroll out, and every poster
+    // handed out here used to stay registered for the life of the document.
+    let mine = null;
     const io = new IntersectionObserver((entries) => {
       if (!entries.some((e) => e.isIntersecting)) return;
       io.disconnect();
       extractVideoPoster(src).then((res) => {
-        if (cancelled) return;
-        if (res.posterUrl) setPoster(res.posterUrl);
+        // Cancelled between the request and its answer: free it here or nothing
+        // ever will, because it never reached state.
+        if (cancelled) { releasePoster(res.posterUrl); return; }
+        if (res.posterUrl) {
+          mine = res.posterUrl;
+          setPoster(res.posterUrl);
+        }
         // Only fills a gap — a server-sent duration is authoritative and stays.
         setDuration((prev) => (prev == null ? res.duration : prev));
       });
     }, { rootMargin: '200px' });
 
     io.observe(el);
-    return () => { cancelled = true; io.disconnect(); };
+    return () => {
+      cancelled = true;
+      io.disconnect();
+      releasePoster(mine);
+      mine = null;
+    };
   }, [src, serverPoster]);
 
   const shownPoster = serverPoster || poster;
