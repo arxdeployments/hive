@@ -174,6 +174,13 @@ class Conversation(Base):
     perm_invite_via_link: Mapped[bool] = mapped_column(default=True)
     perm_approve_new_members: Mapped[bool] = mapped_column(default=False)
     is_active: Mapped[bool] = mapped_column(default=True)
+    # Deletion tombstone, deliberately NOT the same column as is_active. Archiving
+    # and deleting a cross-org group both drop it out of every member's list, so
+    # while is_active was the only signal the two were the same state — and the
+    # archive toggle, which just flips is_active, read a deleted group as merely
+    # archived and put it back. deleted_at is one-way: nothing clears it, and the
+    # admin paths in api/cross_org.py refuse to load a row that has it set.
+    deleted_at: Mapped[dt.datetime | None]
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     last_message_at: Mapped[dt.datetime | None]
     created_at: Mapped[dt.datetime] = _now()

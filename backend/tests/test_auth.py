@@ -1,10 +1,13 @@
 """Auth hardening: cookies, rotation, revocation, rate limit, password policy."""
 
+import jwt
 from sqlalchemy import select
 
-from app.core.security import ACCESS_COOKIE, REFRESH_COOKIE
+from app.core.config import get_settings
+from app.core.security import ACCESS_COOKIE, JWT_ALGORITHM, REFRESH_COOKIE
 from app.db.models import RefreshToken, User, UserRole
 from app.db.session import SessionLocal
+from app.realtime.redis_bus import get_redis
 from tests.conftest import login, make_user
 
 
@@ -106,6 +109,59 @@ async def test_login_rate_limiter_fires(client):
         statuses.append(resp.status_code)
     assert 429 in statuses
     assert statuses[-1] == 429
+
+
+async def test_rate_limit_counter_always_carries_a_ttl(client):
+    """A counter that loses its TTL never rolls over: it climbs past the limit and
+    then 429s that IP out of sign-in permanently, with Retry-After promising a
+    retry in one second forever. INCR and EXPIRE were two round-trips, so a
+    connection lost between them left exactly that. They now go in one MULTI/EXEC,
+    and EXPIRE NX also repairs a counter that already lost its TTL."""
+    await make_user("owen@x.com")
+    redis = get_redis()
+
+    await client.post("/api/auth/login", json={"email": "owen@x.com", "password": "wrong-pass-1"})
+    keys = [k async for k in redis.scan_iter(match="ratelimit:login:*")]
+    assert keys, "the login limiter recorded no counter"
+    for key in keys:
+        assert await redis.ttl(key) > 0
+
+    # Strip the TTL to stand in for the lost EXPIRE, then show the next request
+    # restores it rather than counting up against an immortal key.
+    for key in keys:
+        await redis.persist(key)
+        assert await redis.ttl(key) == -1
+    await client.post("/api/auth/login", json={"email": "owen@x.com", "password": "wrong-pass-1"})
+    for key in keys:
+        assert await redis.ttl(key) > 0
+
+
+async def test_access_token_with_unusable_subject_is_401_not_500(client):
+    """decode_access_token verifies the signature and the token type, not the shape
+    of the claims, so a signed token whose `sub` is missing or not a UUID reached
+    uuid.UUID() unguarded and answered 500 to what is only a failed
+    authentication.
+
+    The two guarded cases are the reachable ones: a `sub` that is a string but
+    not a UUID (ValueError) and an absent `sub` (KeyError). The non-string cases
+    below never reach uuid.UUID() at all — PyJWT 2.10 rejects a numeric, null or
+    structured `sub` inside jwt.decode with InvalidSubjectError, which is a
+    PyJWTError and so already returns None from decode_access_token. They are
+    here to pin that down: if the pin ever moves below 2.10 that validation
+    disappears, uuid.UUID() starts seeing those values, and TypeError /
+    AttributeError become live 500s that deps.py does not catch."""
+    secret = get_settings().secret_key
+    for claims in (
+        {"sub": "not-a-uuid", "type": "access"},
+        {"type": "access"},
+        {"sub": None, "type": "access"},
+        {"sub": 12345, "type": "access"},
+        {"sub": ["not", "a", "uuid"], "type": "access"},
+    ):
+        token = jwt.encode(claims, secret, algorithm=JWT_ALGORITHM)
+        resp = await client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 401, f"{claims} answered {resp.status_code}"
+        assert resp.json()["detail"] == "Not authenticated"
 
 
 async def test_csrf_header_required_for_cookie_mutations(client):
