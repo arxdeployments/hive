@@ -98,6 +98,78 @@ final class AuthStoreRestoreTests: XCTestCase {
         )
     }
 
+    /// A refresh refused with a 403 that carries no denial code.
+    ///
+    /// The code decides which *screen* a mobile denial gets. It says nothing about
+    /// whether the session is over: the server was reached and refused the refresh
+    /// token, which is the whole of the evidence. Tying the two together left a
+    /// provably-dead cookie in the jar, so every relaunch spent another doomed
+    /// refresh on it and no launch could ever recover.
+    func test_refreshRefusedWith403AndNoCode_stillDiscardsTheDeadCookie() async {
+        plantRefreshCookie()
+        MockURLProtocol.install { request, _ in
+            request.url?.path == "/api/auth/refresh"
+                ? .json(403, #"{"detail":"Mobile sessions are disabled for this deployment"}"#)
+                : .json(401, Self.notAuthenticated)
+        }
+
+        let auth = AuthStore(api: makeClient())
+        await auth.restoreSession(minimumSplash: .zero)
+
+        XCTAssertFalse(
+            refreshCookieNames().contains("rx_refresh"),
+            "A delivered refresh rejection is terminal whether or not it named a code"
+        )
+        XCTAssertGreaterThan(
+            MockURLProtocol.count(path: "/api/auth/refresh", method: "POST"), 0,
+            "The fixture never exercised the refresh path, so it proved nothing"
+        )
+    }
+
+    /// The same, for a code this build has never heard of — a backend that grew a
+    /// third denial. Unknown means "do not guess at a screen", not "ignore the
+    /// refusal".
+    func test_refreshRefusedWith403AndAnUnknownCode_stillDiscardsTheDeadCookie() async {
+        plantRefreshCookie()
+        MockURLProtocol.install { request, _ in
+            request.url?.path == "/api/auth/refresh"
+                ? .json(403, #"{"detail":"Mobile access is not available in your region","code":"MOBILE_REGION_BLOCKED"}"#)
+                : .json(401, Self.notAuthenticated)
+        }
+
+        let auth = AuthStore(api: makeClient())
+        await auth.restoreSession(minimumSplash: .zero)
+
+        XCTAssertEqual(
+            auth.phase, .signedOut,
+            "An unrecognised code must not be routed to one of the two screens this "
+                + "build has copy for"
+        )
+        XCTAssertFalse(refreshCookieNames().contains("rx_refresh"))
+    }
+
+    /// A coded denial still reaches its own screen, and still clears the cookie.
+    func test_refreshRefusedWithACodedDenial_showsTheDenialScreenAndClears() async {
+        plantRefreshCookie()
+        MockURLProtocol.install { request, _ in
+            request.url?.path == "/api/auth/refresh"
+                ? .json(403, #"{"detail":"Super admin accounts can only sign in on the web app","code":"SUPERADMIN_MOBILE_DENIED"}"#)
+                : .json(401, Self.notAuthenticated)
+        }
+
+        let auth = AuthStore(api: makeClient())
+        await auth.restoreSession(minimumSplash: .zero)
+
+        XCTAssertEqual(
+            auth.phase,
+            .accessDenied(
+                reason: "Super admin accounts can only sign in on the web app",
+                denial: .superadminWebOnly
+            )
+        )
+        XCTAssertFalse(refreshCookieNames().contains("rx_refresh"))
+    }
+
     // MARK: - Unproven failure must not clear
 
     func test_unreachableAtLaunch_keepsTheCookie() async {

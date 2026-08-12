@@ -114,12 +114,16 @@ final class AuthStore: ObservableObject {
                 // with `/login` as a path that must never refresh.
                 restored = try await api.send(.get, "/api/auth/me", as: CurrentUser.self)
             } catch let error as APIError {
-                // 403 here means the grant was pulled while the app was closed.
-                if case .forbidden(let detail, .some(let denial)) = error {
+                // 403 here means the grant was pulled while the app was closed. Read
+                // through `mobileDenial` so it does not matter whether the refusal
+                // arrived on this response or on the refresh underneath it — and note
+                // an *uncoded* 403 deliberately falls through to `endsSession` below,
+                // which still discards the cookie the server just refused.
+                if let denial = error.mobileDenial {
                     await splash.value
                     await api.clearSessionCookies()
                     sessionGeneration &+= 1
-                    phase = .accessDenied(reason: detail, denial: denial)
+                    phase = .accessDenied(reason: error.userMessage, denial: denial)
                     return
                 }
                 // Reached and refused, so the cookie in the jar is provably dead.
@@ -212,8 +216,8 @@ final class AuthStore: ObservableObject {
             let full = (try? await api.send(.get, "/api/auth/me", as: CurrentUser.self)) ?? response.user
             enterSignedIn(full)
         } catch let error as APIError {
-            if case .forbidden(let detail, .some(let denial)) = error {
-                phase = .accessDenied(reason: detail, denial: denial)
+            if let denial = error.mobileDenial {
+                phase = .accessDenied(reason: error.userMessage, denial: denial)
                 return
             }
             signInError = error.userMessage
@@ -266,16 +270,15 @@ final class AuthStore: ObservableObject {
                 RememberedUser.save(user)
             }
             return .valid
-        } catch let error as APIError where error.isMobileAccessDenied {
-            if case .forbidden(let detail, .some(let denial)) = error {
+        } catch let error as APIError {
+            if let denial = error.mobileDenial {
                 await api.clearSessionCookies()
                 sessionGeneration &+= 1
                 RememberedUser.clear()
                 realtime.disconnect()
-                phase = .accessDenied(reason: detail, denial: denial)
+                phase = .accessDenied(reason: error.userMessage, denial: denial)
+                return .rejected
             }
-            return .rejected
-        } catch let error as APIError {
             return error.isRetryable ? .unreachable : .rejected
         } catch {
             return .unreachable

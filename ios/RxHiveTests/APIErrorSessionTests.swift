@@ -20,6 +20,34 @@ final class APIErrorSessionTests: XCTestCase {
         )
     }
 
+    /// A delivered refresh rejection is terminal on its own terms. The denial code
+    /// picks a screen; it is not evidence about the session, and reading it as such
+    /// left a provably-dead cookie in the jar for every uncoded 403.
+    func test_endsSession_trueForEveryDeliveredRefreshRejection() {
+        let refusals: [APIError] = [
+            .sessionRefused(detail: Self.mobileDenied, denial: .notApproved),
+            .sessionRefused(detail: "Super admin accounts can only sign in on the web app",
+                            denial: .superadminWebOnly),
+            // No code: an older backend, or a refusal this build has not heard of.
+            .sessionRefused(detail: "Mobile sessions are disabled for this deployment", denial: nil),
+            // Not even a sentence.
+            .sessionRefused(detail: "", denial: nil),
+        ]
+        for refusal in refusals {
+            XCTAssertTrue(refusal.endsSession, "\(refusal) refused a delivered refresh token")
+            XCTAssertFalse(refusal.isRetryable, "\(refusal) cannot succeed on a retry")
+        }
+    }
+
+    /// The routing half is unchanged: only a recognised code names a screen.
+    func test_onlyACodedRefusalNamesADenialScreen() {
+        XCTAssertNil(APIError.sessionRefused(detail: "no code here", denial: nil).mobileDenial)
+        XCTAssertEqual(
+            APIError.sessionRefused(detail: Self.mobileDenied, denial: .notApproved).mobileDenial,
+            .notApproved
+        )
+    }
+
     func test_endsSession_falseForEverythingThatProvesNothing() {
         XCTAssertFalse(
             APIError.transport(underlying: "The Internet connection appears to be offline.")
@@ -74,6 +102,8 @@ final class APIErrorSessionTests: XCTestCase {
             .credentials(detail: "Invalid email or password"),
             .forbidden(detail: Self.mobileDenied, denial: .notApproved),
             .forbidden(detail: "Not a member", denial: nil),
+            .sessionRefused(detail: Self.mobileDenied, denial: .notApproved),
+            .sessionRefused(detail: "", denial: nil),
             .notFound,
             .validation(detail: "email: value is not a valid email address"),
             .rateLimited(retryAfter: nil),

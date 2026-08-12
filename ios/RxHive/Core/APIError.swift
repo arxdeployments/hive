@@ -18,6 +18,22 @@ enum APIError: Error, Equatable {
     /// and — when the server sent one — the stable code saying *which* refusal it is.
     /// `denial` is nil for every 403 that is not the mobile gate.
     case forbidden(detail: String, denial: MobileDenialKind?)
+    /// A *delivered* refresh rejected with a 403: the server was reached, was given
+    /// the refresh token, and refused it. Terminal by construction — the same
+    /// evidence as `.unauthorized`, which is why it is a case and not a flavour of
+    /// `.forbidden`.
+    ///
+    /// The distinction earns its keep because the two arrive from opposite places. An
+    /// ordinary `.forbidden` is one endpoint refusing one resource ("You are not a
+    /// member of this group") and must never cost the user their session. This is the
+    /// session itself being refused. They were the same case until a 403 with no
+    /// denial code — an older backend, or a denial this build has not heard of — left
+    /// a provably-dead credential in the jar: `endsSession` was reading the routing
+    /// code, which says which screen to show and nothing about whether the session
+    /// survived. Every relaunch then spent another doomed refresh on it.
+    ///
+    /// `denial` still carries the code when there is one, so routing is unchanged.
+    case sessionRefused(detail: String, denial: MobileDenialKind?)
     case notFound
     /// 400/409/422 — the server explained what was wrong with the request.
     case validation(detail: String)
@@ -42,6 +58,10 @@ enum APIError: Error, Equatable {
             // ("Mobile access has not been enabled for this account…"), so they
             // are shown verbatim rather than replaced with something vaguer.
             return detail.isEmpty ? "You don't have access to this." : detail
+        case .sessionRefused(let detail, _):
+            // Same prose when the server sent some. With none, this is an expiry the
+            // user has to act on, not a resource they cannot reach.
+            return detail.isEmpty ? "Your session expired. Please sign in again." : detail
         case .notFound:
             return "That's no longer available."
         case .validation(let detail):
@@ -64,7 +84,8 @@ enum APIError: Error, Equatable {
     var isRetryable: Bool {
         switch self {
         case .transport, .server, .rateLimited: return true
-        case .unauthorized, .credentials, .forbidden, .notFound, .validation, .decoding: return false
+        case .unauthorized, .credentials, .forbidden, .sessionRefused, .notFound, .validation, .decoding:
+            return false
         }
     }
 
@@ -72,7 +93,13 @@ enum APIError: Error, Equatable {
     /// only condition under which stored credentials may be discarded.
     var endsSession: Bool {
         switch self {
-        case .unauthorized: return true
+        // Both mean the same thing: the server was reached, was handed the refresh
+        // token, and refused it. Nothing else about the response can change that, and
+        // in particular the denial code cannot — it selects a screen.
+        case .unauthorized, .sessionRefused: return true
+        // An ordinary 403 is about one resource and must never end a session. A coded
+        // mobile denial is the exception: it says this account cannot use the app at
+        // all, so a credential for it is worth dropping wherever it turned up.
         case .forbidden: return isMobileAccessDenied
         default: return false
         }
@@ -93,9 +120,15 @@ enum APIError: Error, Equatable {
     }
 
     /// Which mobile denial this is, if it is one at all.
+    ///
+    /// Both cases that can carry a code are read here, so callers choosing a screen
+    /// never have to care whether the refusal arrived on a login response or on a
+    /// refresh rejection.
     var mobileDenial: MobileDenialKind? {
-        guard case .forbidden(_, let denial) = self else { return nil }
-        return denial
+        switch self {
+        case .forbidden(_, let denial), .sessionRefused(_, let denial): return denial
+        default: return nil
+        }
     }
 }
 

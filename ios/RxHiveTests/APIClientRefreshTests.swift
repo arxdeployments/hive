@@ -350,7 +350,7 @@ final class APIClientRefreshTests: XCTestCase {
             _ = try await client.send(.get, "/api/auth/me", as: CurrentUser.self)
             XCTFail("Expected the request to fail")
         } catch let error as APIError {
-            XCTAssertEqual(error, .forbidden(detail: Self.mobileDenied, denial: .notApproved))
+            XCTAssertEqual(error, .sessionRefused(detail: Self.mobileDenied, denial: .notApproved))
             XCTAssertTrue(error.isMobileAccessDenied)
             XCTAssertTrue(error.endsSession)
         }
@@ -393,9 +393,15 @@ final class APIClientRefreshTests: XCTestCase {
             XCTFail("Expected the request to fail")
         } catch let error as APIError {
             XCTAssertEqual(
-                error, .forbidden(detail: "This deployment has no mobile access", denial: nil)
+                error, .sessionRefused(detail: "This deployment has no mobile access", denial: nil)
             )
-            XCTAssertFalse(error.isMobileAccessDenied)
+            XCTAssertFalse(error.isMobileAccessDenied, "No code means no screen to route to")
+            XCTAssertTrue(
+                error.endsSession,
+                "But the server still refused a delivered refresh token, which is the "
+                    + "whole of the evidence that the session is over"
+            )
+            XCTAssertFalse(error.isRetryable)
         }
 
         await settle()

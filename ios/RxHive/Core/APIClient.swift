@@ -277,10 +277,14 @@ actor APIClient {
 
             case .rejected(let status, let detail, let denial):
                 // The server was reached and said no. This is the only branch that
-                // may end the session.
+                // may end the session — and it does so for either status, because
+                // what proves the session over is the refusal of a delivered token,
+                // not which status or code came back with it. `.sessionRefused`
+                // rather than `.forbidden` for the 403 keeps that from depending on
+                // whether the response named a denial.
                 await Self.announceSessionEnded(status: status, detail: detail, denial: denial)
                 throw status == 403
-                    ? APIError.forbidden(detail: detail, denial: denial)
+                    ? APIError.sessionRefused(detail: detail, denial: denial)
                     : APIError.unauthorized
 
             case .unreachable(let reason):
