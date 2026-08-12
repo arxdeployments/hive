@@ -127,3 +127,60 @@ async def test_archiving_a_group_is_audited(client, two_orgs_with_users):
         )
     assert "cross_org_group_archived" in actions
     assert "cross_org_group_unarchived" in actions
+
+
+async def test_a_deleted_group_cannot_be_resurrected_by_an_archive_toggle(client, two_orgs_with_users):
+    """Delete and archive both set is_active = False, and that was the only state
+    either wrote — so /archive read a deleted group as merely archived and
+    toggled it back to active, re-broadcasting it to every member. Deletion is
+    now a distinct durable state and the admin paths refuse to load it."""
+    users = two_orgs_with_users
+    async with _superadmin() as root:
+        resp = await root.post(
+            "/api/admin/cross-org-groups",
+            json=_payload(users, [str(users["org_a"].id), str(users["org_b"].id)]),
+        )
+        assert resp.status_code == 200, resp.text
+        group = resp.json()["_id"]
+
+        assert (await root.delete(f"/api/admin/cross-org-groups/{group}")).status_code == 200
+
+        # Every path that mutates the group, not just the toggle that exposed it.
+        assert (await root.post(f"/api/admin/cross-org-groups/{group}/archive")).status_code == 404
+        assert (
+            await root.put(f"/api/admin/cross-org-groups/{group}", json={"is_active": True})
+        ).status_code == 404
+        assert (await root.get(f"/api/admin/cross-org-groups/{group}")).status_code == 404
+        assert (await root.delete(f"/api/admin/cross-org-groups/{group}")).status_code == 404
+
+        # And it is listed under neither status — "archived" is where it used to
+        # surface with an unarchive button next to it.
+        for status in ("active", "archived"):
+            listing = (await root.get("/api/admin/cross-org-groups", params={"status": status})).json()
+            assert [g["_id"] for g in listing["data"]] == []
+            assert listing["total"] == 0
+
+    async with SessionLocal() as db:
+        conv = (await db.execute(select(Conversation))).scalar_one()
+        assert conv.deleted_at is not None
+        assert conv.is_active is False
+
+
+async def test_archiving_still_round_trips_for_a_group_that_was_never_deleted(client, two_orgs_with_users):
+    """The tombstone check must not catch ordinary archived groups: an archived
+    group stays listable under status=archived and unarchivable."""
+    users = two_orgs_with_users
+    async with _superadmin() as root:
+        resp = await root.post(
+            "/api/admin/cross-org-groups",
+            json=_payload(users, [str(users["org_a"].id), str(users["org_b"].id)]),
+        )
+        group = resp.json()["_id"]
+
+        assert (await root.post(f"/api/admin/cross-org-groups/{group}/archive")).json()["is_active"] is False
+        listing = (await root.get("/api/admin/cross-org-groups", params={"status": "archived"})).json()
+        assert [g["_id"] for g in listing["data"]] == [group]
+
+        assert (await root.post(f"/api/admin/cross-org-groups/{group}/archive")).json()["is_active"] is True
+        listing = (await root.get("/api/admin/cross-org-groups", params={"status": "active"})).json()
+        assert [g["_id"] for g in listing["data"]] == [group]

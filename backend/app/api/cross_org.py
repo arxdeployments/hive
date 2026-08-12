@@ -184,7 +184,17 @@ async def _load_group(
     gid = parse_uuid(group_id)
     if gid is None:
         raise HTTPException(status_code=400, detail=invalid_detail)
-    stmt = select(Conversation).where(Conversation.id == gid, Conversation.type == ConversationType.cross_org)
+    # deleted_at is checked here rather than in each route: a deleted group is
+    # gone, so archive, update, member changes and a second delete all 404
+    # instead of operating on it. Archiving used to be the loud one — it flips
+    # is_active, which a delete also set, so the toggle read a deleted group as
+    # archived and restored it — but every route that mutates conv had the same
+    # hole through it.
+    stmt = select(Conversation).where(
+        Conversation.id == gid,
+        Conversation.type == ConversationType.cross_org,
+        Conversation.deleted_at.is_(None),
+    )
     if active_only:
         stmt = stmt.where(Conversation.is_active.is_(True))
     conv = (await db.execute(stmt)).scalar_one_or_none()
@@ -203,7 +213,12 @@ async def list_groups(
     db: AsyncSession = Depends(get_db),
 ):
     _ = actor
-    stmt = select(Conversation).where(Conversation.type == ConversationType.cross_org)
+    # Deleted groups are excluded from every status, "archived" included: they
+    # share is_active = False with archived ones, so listing them there offered
+    # the admin an unarchive button for a group they had destroyed.
+    stmt = select(Conversation).where(
+        Conversation.type == ConversationType.cross_org, Conversation.deleted_at.is_(None)
+    )
     if status == "active":
         stmt = stmt.where(Conversation.is_active.is_(True))
     elif status == "archived":
@@ -601,6 +616,10 @@ async def delete_group(
     db: AsyncSession = Depends(get_db),
 ):
     conv = await _load_group(db, group_id)
+    # Both columns: deleted_at is the durable state that separates this from an
+    # archive, and is_active stays False so the member-facing read paths, which
+    # only know about is_active, keep the group out of every list as before.
+    conv.deleted_at = now_utc()
     conv.is_active = False
     await db.commit()
     member_ids = await participant_ids(db, conv.id)

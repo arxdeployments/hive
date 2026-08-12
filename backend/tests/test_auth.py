@@ -140,12 +140,27 @@ async def test_access_token_with_unusable_subject_is_401_not_500(client):
     """decode_access_token verifies the signature and the token type, not the shape
     of the claims, so a signed token whose `sub` is missing or not a UUID reached
     uuid.UUID() unguarded and answered 500 to what is only a failed
-    authentication. The WebSocket handshake already caught this."""
+    authentication.
+
+    The two guarded cases are the reachable ones: a `sub` that is a string but
+    not a UUID (ValueError) and an absent `sub` (KeyError). The non-string cases
+    below never reach uuid.UUID() at all — PyJWT 2.10 rejects a numeric, null or
+    structured `sub` inside jwt.decode with InvalidSubjectError, which is a
+    PyJWTError and so already returns None from decode_access_token. They are
+    here to pin that down: if the pin ever moves below 2.10 that validation
+    disappears, uuid.UUID() starts seeing those values, and TypeError /
+    AttributeError become live 500s that deps.py does not catch."""
     secret = get_settings().secret_key
-    for claims in ({"sub": "not-a-uuid", "type": "access"}, {"type": "access"}):
+    for claims in (
+        {"sub": "not-a-uuid", "type": "access"},
+        {"type": "access"},
+        {"sub": None, "type": "access"},
+        {"sub": 12345, "type": "access"},
+        {"sub": ["not", "a", "uuid"], "type": "access"},
+    ):
         token = jwt.encode(claims, secret, algorithm=JWT_ALGORITHM)
         resp = await client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
-        assert resp.status_code == 401
+        assert resp.status_code == 401, f"{claims} answered {resp.status_code}"
         assert resp.json()["detail"] == "Not authenticated"
 
 
