@@ -338,7 +338,9 @@ final class APIClientRefreshTests: XCTestCase {
             switch request.url?.path {
             case "/api/auth/me": return .json(401, Self.notAuthenticated)
             case "/api/auth/refresh":
-                return .json(403, #"{"detail":"\#(Self.mobileDenied)"}"#)
+                // The envelope `CodedHTTPException` actually sends: the sentence to
+                // show, and the code that decides which screen shows it.
+                return .json(403, #"{"detail":"\#(Self.mobileDenied)","code":"MOBILE_NOT_APPROVED"}"#)
             default: return .json(500, #"{"detail":"unscripted request"}"#)
             }
         }
@@ -348,7 +350,7 @@ final class APIClientRefreshTests: XCTestCase {
             _ = try await client.send(.get, "/api/auth/me", as: CurrentUser.self)
             XCTFail("Expected the request to fail")
         } catch let error as APIError {
-            XCTAssertEqual(error, .forbidden(detail: Self.mobileDenied))
+            XCTAssertEqual(error, .forbidden(detail: Self.mobileDenied, denial: .notApproved))
             XCTAssertTrue(error.isMobileAccessDenied)
             XCTAssertTrue(error.endsSession)
         }
@@ -359,6 +361,47 @@ final class APIClientRefreshTests: XCTestCase {
         XCTAssertEqual(
             notices.posts.first?[APIClient.detailKey] as? String, Self.mobileDenied,
             "The denial sentence must travel with the notification"
+        )
+        XCTAssertEqual(
+            notices.posts.first?[APIClient.denialKey] as? String,
+            MobileDenialKind.notApproved.rawValue,
+            "So must the code, or the listener is back to reading the sentence"
+        )
+    }
+
+    /// (g2) A 403 the refresh path reports with no denial code is an ordinary
+    /// refusal. It still ends the session — the server refused a delivered token —
+    /// but it must not claim to be the mobile gate, because the screen that handles
+    /// that case tells the user to go and ask a super admin for a grant.
+    func test_403WithNoDenialCodeIsNotTreatedAsTheMobileGate() async throws {
+        plantRefreshCookie()
+        MockURLProtocol.install { request, _ in
+            switch request.url?.path {
+            case "/api/auth/me": return .json(401, Self.notAuthenticated)
+            case "/api/auth/refresh":
+                // Deliberately prose that *looks* like the mobile gate. Under the old
+                // substring classifier this would have been routed to the denial
+                // screen on the strength of the wording alone.
+                return .json(403, #"{"detail":"This deployment has no mobile access"}"#)
+            default: return .json(500, #"{"detail":"unscripted request"}"#)
+            }
+        }
+
+        let client = makeClient()
+        do {
+            _ = try await client.send(.get, "/api/auth/me", as: CurrentUser.self)
+            XCTFail("Expected the request to fail")
+        } catch let error as APIError {
+            XCTAssertEqual(
+                error, .forbidden(detail: "This deployment has no mobile access", denial: nil)
+            )
+            XCTAssertFalse(error.isMobileAccessDenied)
+        }
+
+        await settle()
+        XCTAssertNil(
+            notices.posts.first?[APIClient.denialKey],
+            "An uncoded 403 must not arrive looking like a mobile denial"
         )
     }
 

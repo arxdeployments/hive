@@ -16,7 +16,11 @@ final class AuthStore: ObservableObject {
         /// Authenticated, but this account may not use the mobile app. A separate
         /// phase from `signedOut` because the copy has to explain *why*, or the
         /// user will simply retype their password until they give up.
-        case accessDenied(reason: String)
+        ///
+        /// `reason` is the server's sentence, shown as-is; `denial` is its code, and
+        /// the only thing that selects between the two screens. Carried together so
+        /// the view never has to read the prose to work out which one it is.
+        case accessDenied(reason: String, denial: MobileDenialKind)
     }
 
     @Published private(set) var phase: Phase = .launching
@@ -64,7 +68,11 @@ final class AuthStore: ObservableObject {
         ) { [weak self] note in
             let detail = note.userInfo?[APIClient.detailKey] as? String ?? ""
             let status = note.userInfo?[APIClient.statusKey] as? Int ?? 401
-            Task { @MainActor in await self?.handleSessionLost(status: status, detail: detail) }
+            let denial = (note.userInfo?[APIClient.denialKey] as? String)
+                .flatMap(MobileDenialKind.init(rawValue:))
+            Task { @MainActor in
+                await self?.handleSessionLost(status: status, detail: detail, denial: denial)
+            }
         }
 
         // The socket's token-expiry path asks us to refresh; a plain /me is the
@@ -74,7 +82,13 @@ final class AuthStore: ObservableObject {
             return await self.revalidateSession()
         }
         realtime.onUnauthorized = { [weak self] reason in
-            Task { @MainActor in await self?.handleSessionLost(status: 401, detail: reason) }
+            // A close frame carries a code and a reason string, not a JSON envelope,
+            // so there is no denial code to pass — as before, this lands on "session
+            // expired". A revoked grant still reaches its own screen: the next API
+            // call or refresh gets the coded 403.
+            Task { @MainActor in
+                await self?.handleSessionLost(status: 401, detail: reason, denial: nil)
+            }
         }
     }
 
@@ -101,11 +115,11 @@ final class AuthStore: ObservableObject {
                 restored = try await api.send(.get, "/api/auth/me", as: CurrentUser.self)
             } catch let error as APIError {
                 // 403 here means the grant was pulled while the app was closed.
-                if error.isMobileAccessDenied, case .forbidden(let detail) = error {
+                if case .forbidden(let detail, .some(let denial)) = error {
                     await splash.value
                     await api.clearSessionCookies()
                     sessionGeneration &+= 1
-                    phase = .accessDenied(reason: detail)
+                    phase = .accessDenied(reason: detail, denial: denial)
                     return
                 }
                 // Reached and refused, so the cookie in the jar is provably dead.
@@ -191,15 +205,15 @@ final class AuthStore: ObservableObject {
             // present a portal it does not implement.
             guard response.user.role != .superadmin else {
                 await api.clearSessionCookies()
-                phase = .accessDenied(reason: AuthCopy.superadminWebOnly)
+                phase = .accessDenied(reason: AuthCopy.superadminWebOnly, denial: .superadminWebOnly)
                 return
             }
             // Fetch /me for the fields login omits (avatar, about, presence).
             let full = (try? await api.send(.get, "/api/auth/me", as: CurrentUser.self)) ?? response.user
             enterSignedIn(full)
         } catch let error as APIError {
-            if error.isMobileAccessDenied, case .forbidden(let detail) = error {
-                phase = .accessDenied(reason: detail)
+            if case .forbidden(let detail, .some(let denial)) = error {
+                phase = .accessDenied(reason: detail, denial: denial)
                 return
             }
             signInError = error.userMessage
@@ -253,12 +267,12 @@ final class AuthStore: ObservableObject {
             }
             return .valid
         } catch let error as APIError where error.isMobileAccessDenied {
-            if case .forbidden(let detail) = error {
+            if case .forbidden(let detail, .some(let denial)) = error {
                 await api.clearSessionCookies()
                 sessionGeneration &+= 1
                 RememberedUser.clear()
                 realtime.disconnect()
-                phase = .accessDenied(reason: detail)
+                phase = .accessDenied(reason: detail, denial: denial)
             }
             return .rejected
         } catch let error as APIError {
@@ -270,7 +284,7 @@ final class AuthStore: ObservableObject {
 
     /// End the session for real. Only reached when the server was contacted and
     /// refused — never for a transport failure, a 5xx or a 429.
-    private func handleSessionLost(status: Int, detail: String) async {
+    private func handleSessionLost(status: Int, detail: String, denial: MobileDenialKind?) async {
         guard case .signedIn = phase else { return }
         let generation = sessionGeneration
 
@@ -289,8 +303,12 @@ final class AuthStore: ObservableObject {
         // A withdrawn mobile grant has its own screen and its own sentence, written
         // precisely so the user does not sit there retyping a password that will
         // never work. Route to it instead of flattening it into "session expired".
-        if status == 403, !detail.isEmpty {
-            phase = .accessDenied(reason: detail)
+        //
+        // Gated on the denial code, not on `status == 403` plus a non-empty sentence:
+        // any 403 the refresh path reports would otherwise land on a screen that
+        // asserts this is the mobile gate and tells the user to ask a super admin.
+        if let denial {
+            phase = .accessDenied(reason: detail, denial: denial)
         } else {
             phase = .signedOut
             signInError = AuthCopy.sessionExpired

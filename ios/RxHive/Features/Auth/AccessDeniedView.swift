@@ -12,11 +12,24 @@ import SwiftUI
 ///   * not approved yet   — a super admin can grant it
 ///   * super admin account — nothing to grant; the portal is web-only by design
 struct AccessDeniedView: View {
+    /// The server's own explanation, shown verbatim.
     let reason: String
+    /// Which denial this is, decoded from the backend's stable code
+    /// (`MobileDenialKind`) — never inferred from `reason`.
+    ///
+    /// It was inferred from `reason` before, by looking for "super admin" in it. But
+    /// the not-approved sentence ends "Ask your super admin to approve mobile
+    /// sign-in" — it names the person who can fix it — so that test matched *both*
+    /// 403s, and every un-granted member got the superadmin screen: titled "Use the
+    /// web app", with the panel naming their actual remedy suppressed, directly above
+    /// the server's own sentence telling them to ask an admin.
+    let denial: MobileDenialKind
     let onBack: () -> Void
 
+    /// Superadmins cannot be granted access, so offering "ask an admin" would be
+    /// misleading.
     private var isSuperadminCase: Bool {
-        MobileDenialKind(reason: reason) == .superadminWebOnly
+        denial == .superadminWebOnly
     }
 
     var body: some View {
@@ -102,34 +115,6 @@ struct AccessDeniedView: View {
             .padding(.horizontal, Theme.Layout.gutter)
         }
         .preferredColorScheme(.dark)
-    }
-}
-
-/// Which of the two mobile 403s a denial is, and therefore which remedy to offer.
-///
-/// The server sends only `detail`, so its prose is the only thing separating them —
-/// a named type rather than an inline test so the coupling has somewhere to live,
-/// and so it can be pinned by a test without widening a `View`'s members. If the
-/// backend ever grows a machine-readable code, this is the one place to change.
-enum MobileDenialKind: Equatable {
-    /// A super admin account. Nothing can be granted — the portal is web-only.
-    case superadminWebOnly
-    /// A member who simply has not been approved yet. A super admin can fix it.
-    case notApproved
-
-    init(reason: String) {
-        // "super admin ACCOUNT", not "super admin". `MOBILE_NOT_APPROVED` ends
-        // "Ask your super admin to approve mobile sign-in" — it names the person who
-        // can fix it — so the looser test matched BOTH 403s and sent every
-        // un-granted member to the superadmin screen: titled "Use the web app", with
-        // the panel naming their actual remedy suppressed, directly above the
-        // server's own sentence telling them to ask an admin.
-        //
-        // `SUPERADMIN_MOBILE_DENIED` opens "Super admin accounts can only…", so it
-        // still matches. Both strings are pinned in AccessDeniedClassificationTests.
-        self = reason.localizedCaseInsensitiveContains("super admin account")
-            ? .superadminWebOnly
-            : .notApproved
     }
 }
 

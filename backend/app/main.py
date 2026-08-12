@@ -11,6 +11,7 @@ from sqlalchemy import text
 
 from app.core.config import get_settings
 from app.core.deps import require_superadmin
+from app.core.errors import CodedHTTPException, coded_http_exception_handler
 from app.core.observability import AccessLogMiddleware, snapshot
 from app.db.models import User
 from app.db.session import engine
@@ -85,6 +86,10 @@ app = FastAPI(
     redoc_url=None if settings.is_production else "/redoc",
     openapi_url=None if settings.is_production else "/openapi.json",
 )
+
+# Only refusals that a client has to *branch* on raise this; everything else keeps
+# FastAPI's own `{"detail": ...}` handler untouched.
+app.add_exception_handler(CodedHTTPException, coded_http_exception_handler)
 
 if settings.cors_origin_list:
     app.add_middleware(

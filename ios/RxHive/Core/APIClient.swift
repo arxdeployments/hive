@@ -54,10 +54,13 @@ actor APIClient {
     ///
     /// `userInfo[detailKey]` carries the server's own sentence when it sent one, so
     /// a revoked mobile grant can reach the screen written to explain it instead of
-    /// being flattened into "your session expired".
+    /// being flattened into "your session expired". `userInfo[denialKey]` carries the
+    /// backend's denial code for that case — the sentence is what gets shown, the
+    /// code is what decides which of the two denial screens shows it.
     static let sessionExpiredNotification = Notification.Name("RxHiveSessionExpired")
     static let detailKey = "detail"
     static let statusKey = "status"
+    static let denialKey = "denial"
 
     /// Bumped on every successful refresh. A request that was already on the wire
     /// when someone else refreshed comes back 401 through no fault of the session;
@@ -272,11 +275,13 @@ actor APIClient {
             case .refreshed:
                 return try await performRaw(request, isRetry: true)
 
-            case .rejected(let status, let detail):
+            case .rejected(let status, let detail, let denial):
                 // The server was reached and said no. This is the only branch that
                 // may end the session.
-                await Self.announceSessionEnded(status: status, detail: detail)
-                throw status == 403 ? APIError.forbidden(detail: detail) : APIError.unauthorized
+                await Self.announceSessionEnded(status: status, detail: detail, denial: denial)
+                throw status == 403
+                    ? APIError.forbidden(detail: detail, denial: denial)
+                    : APIError.unauthorized
 
             case .unreachable(let reason):
                 // Nothing was established. Report it as what it is — a delivery
@@ -308,7 +313,7 @@ actor APIClient {
         // store, or a rotation whose response we lost and have since re-received.
         // If the jar has moved on, the token we just presented was simply the old
         // one; try the new one once before declaring the session dead.
-        if case .rejected(let status, _) = outcome, status == 401 {
+        if case .rejected(let status, _, _) = outcome, status == 401 {
             let current = refreshCookieValue()
             if let current, current != presented {
                 log.notice("Refresh token rotated underneath us; retrying with the current one")
@@ -339,10 +344,15 @@ actor APIClient {
             case 401, 403:
                 // Reached and refused: an unknown/consumed/expired token (401), or
                 // the mobile grant withdrawn mid-session (403). The detail is the
-                // backend's own prose and is carried through to the screen.
-                let detail = (try? decoder.decode(APIErrorBody.self, from: body))?.detail ?? ""
+                // backend's own prose and is carried through to the screen; the code
+                // beside it is what decides *which* screen.
+                let envelope = try? decoder.decode(APIErrorBody.self, from: body)
                 log.notice("Refresh refused with \(http.statusCode); session is over")
-                return .rejected(status: http.statusCode, detail: detail)
+                return .rejected(
+                    status: http.statusCode,
+                    detail: envelope?.detail ?? "",
+                    denial: Self.denial(in: envelope)
+                )
 
             case 429:
                 // Shared-IP throttling. Dozens of phones off one clinic NAT all
@@ -407,11 +417,15 @@ actor APIClient {
     }
 
     @MainActor
-    private static func announceSessionEnded(status: Int, detail: String) {
+    private static func announceSessionEnded(status: Int, detail: String, denial: MobileDenialKind?) {
+        var userInfo: [String: Any] = [statusKey: status, detailKey: detail]
+        // Only present for a mobile denial, so a listener can route on the code
+        // rather than re-deriving it from the sentence it is about to display.
+        if let denial { userInfo[denialKey] = denial.rawValue }
         NotificationCenter.default.post(
             name: sessionExpiredNotification,
             object: nil,
-            userInfo: [statusKey: status, detailKey: detail]
+            userInfo: userInfo
         )
     }
 
@@ -421,10 +435,11 @@ actor APIClient {
         headers: HTTPURLResponse,
         decoder: JSONDecoder
     ) -> APIError {
-        let detail = (try? decoder.decode(APIErrorBody.self, from: data))?.detail ?? ""
+        let body = try? decoder.decode(APIErrorBody.self, from: data)
+        let detail = body?.detail ?? ""
         switch status {
         case 401: return .unauthorized
-        case 403: return .forbidden(detail: detail)
+        case 403: return .forbidden(detail: detail, denial: Self.denial(in: body))
         case 404: return .notFound
         case 400, 409, 422: return .validation(detail: detail)
         case 429:
@@ -433,6 +448,15 @@ actor APIClient {
         default:
             return .server(status: status, detail: detail.isEmpty ? nil : detail)
         }
+    }
+
+    /// The mobile denial the server named, if it named one we know.
+    ///
+    /// An unrecognised code is deliberately nil rather than a guess: a denial this
+    /// build has never heard of must not be routed to one of the two screens written
+    /// for the two it has.
+    private static func denial(in body: APIErrorBody?) -> MobileDenialKind? {
+        body?.code.flatMap(MobileDenialKind.init(rawValue:))
     }
 
     // MARK: - Cookie lifecycle
@@ -476,7 +500,9 @@ actor APIClient {
 /// having got an answer. Only the former is evidence about the session.
 enum RefreshOutcome {
     case refreshed
-    case rejected(status: Int, detail: String)
+    /// `denial` is set only when the refusal was the mobile gate and the server said
+    /// so by code, so the screen that explains it can be chosen without reading prose.
+    case rejected(status: Int, detail: String, denial: MobileDenialKind?)
     case unreachable(reason: String)
 }
 

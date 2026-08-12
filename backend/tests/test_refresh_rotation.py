@@ -24,6 +24,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
+from app.api.auth import MOBILE_NOT_APPROVED_CODE
 from app.core import rate_limit
 from app.core.security import REFRESH_COOKIE, hash_refresh_token
 from app.db.models import RefreshToken, User
@@ -137,6 +138,7 @@ async def test_replay_inside_grace_is_still_gated_on_the_mobile_grant(client):
     resp = await _refresh_with(client, lost)
     assert resp.status_code == 403
     assert "Mobile access has not been enabled" in resp.json()["detail"]
+    assert resp.json()["code"] == MOBILE_NOT_APPROVED_CODE
     assert await _live_tokens(user.id) == []
 
 

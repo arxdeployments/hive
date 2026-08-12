@@ -69,8 +69,8 @@ struct RootView: View {
                 SignInView()
                     .transition(.opacity.combined(with: .scale(scale: 0.98)))
 
-            case .accessDenied(let reason):
-                AccessDeniedView(reason: reason) {
+            case .accessDenied(let reason, let denial):
+                AccessDeniedView(reason: reason, denial: denial) {
                     auth.dismissAccessDenied()
                 }
                 .transition(.opacity)

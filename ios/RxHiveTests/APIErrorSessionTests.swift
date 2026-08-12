@@ -15,7 +15,7 @@ final class APIErrorSessionTests: XCTestCase {
             ".unauthorized is only produced when the server refused a delivered refresh token"
         )
         XCTAssertTrue(
-            APIError.forbidden(detail: Self.mobileDenied).endsSession,
+            APIError.forbidden(detail: Self.mobileDenied, denial: .notApproved).endsSession,
             "A withdrawn mobile grant ends the session"
         )
     }
@@ -44,9 +44,25 @@ final class APIErrorSessionTests: XCTestCase {
     /// sign the user out of the app.
     func test_endsSession_falseForAnOrdinary403() {
         XCTAssertFalse(
-            APIError.forbidden(detail: "You are not a member of this group").endsSession
+            APIError.forbidden(detail: "You are not a member of this group", denial: nil).endsSession
         )
-        XCTAssertFalse(APIError.forbidden(detail: "").endsSession)
+        XCTAssertFalse(APIError.forbidden(detail: "", denial: nil).endsSession)
+    }
+
+    /// The gate is the code, not the wording. A 403 whose sentence happens to talk
+    /// about mobile access or the web app is still an ordinary 403 unless the server
+    /// named it — otherwise any endpoint's copy could cost a user their session.
+    func test_endsSession_falseFor403ProseThatMerelyLooksLikeTheMobileGate() {
+        let lookalikes = [
+            "Mobile access to this ward's roster is restricted",
+            "Open the web app to manage billing",
+            Self.mobileDenied,
+        ]
+        for detail in lookalikes {
+            let error = APIError.forbidden(detail: detail, denial: nil)
+            XCTAssertFalse(error.isMobileAccessDenied, "\(detail) carried no denial code")
+            XCTAssertFalse(error.endsSession, "\(detail) must not discard the user's credential")
+        }
     }
 
     /// `isRetryable` and `endsSession` must never both be true — retrying a request
@@ -56,8 +72,8 @@ final class APIErrorSessionTests: XCTestCase {
         let all: [APIError] = [
             .unauthorized,
             .credentials(detail: "Invalid email or password"),
-            .forbidden(detail: Self.mobileDenied),
-            .forbidden(detail: "Not a member"),
+            .forbidden(detail: Self.mobileDenied, denial: .notApproved),
+            .forbidden(detail: "Not a member", denial: nil),
             .notFound,
             .validation(detail: "email: value is not a valid email address"),
             .rateLimited(retryAfter: nil),

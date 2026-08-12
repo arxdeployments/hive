@@ -9,6 +9,7 @@ Three rules, each with a test that fails if the rule regresses:
 
 from sqlalchemy import select
 
+from app.api.auth import MOBILE_NOT_APPROVED_CODE, SUPERADMIN_MOBILE_DENIED_CODE
 from app.db.models import RefreshToken, User, UserRole
 from app.db.session import SessionLocal
 from tests.conftest import login, make_org, make_user
@@ -29,6 +30,8 @@ async def test_member_without_grant_cannot_login_on_mobile(client):
     assert resp.status_code == 403
     # Must not read as a credential problem, or the user retypes forever.
     assert "Mobile access has not been enabled" in resp.json()["detail"]
+    # The code is what the client routes on; the sentence above is only for reading.
+    assert resp.json()["code"] == MOBILE_NOT_APPROVED_CODE
 
 
 async def test_member_with_grant_can_login_on_mobile(client):
@@ -59,6 +62,33 @@ async def test_superadmin_cannot_login_on_mobile_even_with_grant(client):
     resp = await client.post("/api/auth/login", json=_mobile_login("root2@x.com"))
     assert resp.status_code == 403
     assert "only sign in on the web" in resp.json()["detail"]
+    assert resp.json()["code"] == SUPERADMIN_MOBILE_DENIED_CODE
+
+
+async def test_the_two_mobile_denials_are_distinguishable_without_reading_the_prose(client):
+    """The reason this code exists at all.
+
+    Both sentences mention a super admin, so the wording cannot separate them — and
+    the client has to, because one denial has a remedy and the other never will.
+    """
+    await make_user("prose1@x.com")  # member, no grant
+    await make_user("prose2@x.com", role=UserRole.superadmin)
+
+    member = await client.post("/api/auth/login", json=_mobile_login("prose1@x.com"))
+    superadmin = await client.post("/api/auth/login", json=_mobile_login("prose2@x.com"))
+
+    assert "super admin" in member.json()["detail"].lower()
+    assert "super admin" in superadmin.json()["detail"].lower()
+    assert member.json()["code"] != superadmin.json()["code"]
+
+
+async def test_an_ordinary_refusal_keeps_the_plain_detail_envelope(client):
+    """`code` is added only where a client must branch. Every other error response
+    keeps FastAPI's exact shape, so nothing else on the wire moved."""
+    await make_user("plain@x.com", mobile_access=True)
+    resp = await client.post("/api/auth/login", json=_mobile_login("plain@x.com", "wrong-pass-9"))
+    assert resp.status_code == 401
+    assert resp.json() == {"detail": "Invalid email or password"}
 
 
 async def test_web_login_is_unaffected_by_the_grant(client):
@@ -129,6 +159,7 @@ async def test_revoking_grant_blocks_mobile_refresh_and_burns_the_token(client):
 
     resp = await client.post("/api/auth/refresh")
     assert resp.status_code == 403
+    assert resp.json()["code"] == MOBILE_NOT_APPROVED_CODE
     async with SessionLocal() as db:
         tokens = (
             (await db.execute(select(RefreshToken).where(RefreshToken.user_id == user.id))).scalars().all()

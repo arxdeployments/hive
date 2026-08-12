@@ -14,8 +14,10 @@ enum APIError: Error, Equatable {
     /// never happened — the single most confusing symptom of the old behaviour.
     case credentials(detail: String)
     /// Authenticated, but this client/account is not allowed. Carries the server's
-    /// `detail`, which for the mobile gate is a sentence written to be shown as-is.
-    case forbidden(detail: String)
+    /// `detail`, which for the mobile gate is a sentence written to be shown as-is,
+    /// and — when the server sent one — the stable code saying *which* refusal it is.
+    /// `denial` is nil for every 403 that is not the mobile gate.
+    case forbidden(detail: String, denial: MobileDenialKind?)
     case notFound
     /// 400/409/422 — the server explained what was wrong with the request.
     case validation(detail: String)
@@ -35,7 +37,7 @@ enum APIError: Error, Equatable {
             return "Your session expired. Please sign in again."
         case .credentials(let detail):
             return detail.isEmpty ? "Those details didn't work. Please try again." : detail
-        case .forbidden(let detail):
+        case .forbidden(let detail, _):
             // The backend's mobile-gate messages are already user-facing prose
             // ("Mobile access has not been enabled for this account…"), so they
             // are shown verbatim rather than replaced with something vaguer.
@@ -78,11 +80,45 @@ enum APIError: Error, Equatable {
 
     /// True when the failure means "this account cannot use the mobile app",
     /// as opposed to any other 403. Drives the dedicated sign-in denial screen.
+    ///
+    /// A 403 counts only if the server named it with a denial code. This was
+    /// previously a substring test on `detail` ("mobile access", "web app"), which
+    /// made every wording decision on the backend an authorization decision here:
+    /// a copy edit could drop an account out of this screen and into "session
+    /// expired", and an unrelated 403 that happened to mention the web app could
+    /// fall into it. Requiring the code errs the safe way — an unrecognised 403 is
+    /// simply not treated as the mobile gate.
     var isMobileAccessDenied: Bool {
-        guard case .forbidden(let detail) = self else { return false }
-        let lowered = detail.lowercased()
-        return lowered.contains("mobile access") || lowered.contains("web app")
+        mobileDenial != nil
     }
+
+    /// Which mobile denial this is, if it is one at all.
+    var mobileDenial: MobileDenialKind? {
+        guard case .forbidden(_, let denial) = self else { return nil }
+        return denial
+    }
+}
+
+/// Which of the two mobile 403s a denial is, and therefore which remedy to offer.
+///
+/// The raw values are the backend's own denial codes (`api/auth.py`:
+/// `SUPERADMIN_MOBILE_DENIED_CODE`, `MOBILE_NOT_APPROVED_CODE`), and that is the
+/// entire point of the type. This used to be decided by looking for phrases in the
+/// user-facing sentence, and the two sentences are not reliably distinguishable:
+/// `MOBILE_NOT_APPROVED` ends "Ask your super admin to approve mobile sign-in" — it
+/// names the person who can fix it — so a test for "super admin" matched *both*
+/// 403s and sent every un-granted member to the superadmin screen: titled "Use the
+/// web app", with the panel naming their actual remedy suppressed, directly above
+/// the server's own sentence telling them to ask an admin. A code cannot be
+/// reworded by an edit to the copy.
+///
+/// Lives in Core, beside the error it arrives on, because it is a wire contract
+/// rather than a detail of the screen that renders it.
+enum MobileDenialKind: String, Equatable {
+    /// A super admin account. Nothing can be granted — the portal is web-only.
+    case superadminWebOnly = "SUPERADMIN_MOBILE_DENIED"
+    /// A member who simply has not been approved yet. A super admin can fix it.
+    case notApproved = "MOBILE_NOT_APPROVED"
 }
 
 /// FastAPI's error envelope: `{"detail": ...}`.
@@ -93,6 +129,11 @@ enum APIError: Error, Equatable {
 /// handled.
 struct APIErrorBody: Decodable {
     let detail: String
+    /// Present only where the server has committed to a stable code for a refusal
+    /// the client must branch on (`core/errors.py`: `CodedHTTPException`). Optional
+    /// because the ordinary envelope has no such field, and absence must decode
+    /// cleanly rather than turning an error response into a decoding failure.
+    let code: String?
 
     private struct ValidationItem: Decodable {
         let loc: [LocComponent]?
@@ -140,7 +181,8 @@ struct APIErrorBody: Decodable {
         } else {
             detail = ""
         }
+        code = try? container.decodeIfPresent(String.self, forKey: .code)
     }
 
-    private enum CodingKeys: String, CodingKey { case detail }
+    private enum CodingKeys: String, CodingKey { case detail, code }
 }
