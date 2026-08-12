@@ -301,11 +301,25 @@ async def refresh(
     # A mobile session outlives the grant that created it unless the grant is
     # re-checked here — same reasoning as is_active directly above. The session is
     # burned before raising so a revoked user cannot keep retrying this token.
+    #
+    # The gate itself is `_assert_mobile_allowed`, not a copy of its condition. The
+    # copy that used to live here collapsed both cases into MOBILE_NOT_APPROVED, so a
+    # superadmin holding a mobile session was told to ask a super admin to approve
+    # mobile sign-in — advice addressed to themselves, and the phone picked the
+    # remedy screen over the web-only one on the strength of that code. The two
+    # refusals stay distinct because the remedies are: a grant can be given, a
+    # superadmin's web-only portal cannot.
     session_client = token.client or WEB_CLIENT
-    if session_client == MOBILE_CLIENT and (user.role == UserRole.superadmin or not user.mobile_access):
-        token.revoked_at = now_utc()
-        await db.commit()
-        raise CodedHTTPException(status_code=403, detail=MOBILE_NOT_APPROVED, code=MOBILE_NOT_APPROVED_CODE)
+    if session_client == MOBILE_CLIENT:
+        try:
+            _assert_mobile_allowed(user)
+        except HTTPException:
+            # Broader than CodedHTTPException on purpose: burning the token is the
+            # security-relevant half, and it must not stop happening if the gate ever
+            # grows a refusal that is not coded.
+            token.revoked_at = now_utc()
+            await db.commit()
+            raise
 
     token.revoked_at = now_utc()  # rotation: old token is single-use
     await _issue_session(db, user, response, request, client=session_client, replaces=token)
