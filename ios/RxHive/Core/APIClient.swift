@@ -517,7 +517,28 @@ struct MultipartPart {
     let data: Data
 }
 
-private enum MultipartBuilder {
+// Not `private`: `MultipartBuilderTests` reaches this through `@testable import`.
+// A malformed body has no UI symptom until an upload fails, so the wire format is
+// asserted directly rather than inferred from a failing request.
+enum MultipartBuilder {
+
+    /// A filename arrives here straight from the document picker
+    /// (`MessageComposer.stage`, `url.lastPathComponent`) and nothing between there
+    /// and this line rewrites it, so it can carry a quote or a newline. Interpolated
+    /// raw, a quote closes the quoted string early and a CRLF starts a header line of
+    /// its own — either way the body stops being well-formed multipart, and a name as
+    /// ordinary as `patient "smith" scan.pdf` fails to upload.
+    ///
+    /// Stripped rather than percent-escaped, to match what the backend already does
+    /// with this very value on the way back out (`services/storage.py:414`). Escaping
+    /// instead would round-trip the name back to the user as `%22`.
+    private static func headerSafe(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\"", with: "")
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+    }
+
     static func body(boundary: String, parts: [MultipartPart], fields: [String: String]) -> Data {
         var body = Data()
         let crlf = "\r\n"
@@ -530,7 +551,7 @@ private enum MultipartBuilder {
         for part in parts {
             body.append("--\(boundary)\(crlf)")
             body.append(
-                "Content-Disposition: form-data; name=\"\(part.name)\"; filename=\"\(part.filename)\"\(crlf)"
+                "Content-Disposition: form-data; name=\"\(part.name)\"; filename=\"\(headerSafe(part.filename))\"\(crlf)"
             )
             body.append("Content-Type: \(part.mimeType)\(crlf)\(crlf)")
             body.append(part.data)

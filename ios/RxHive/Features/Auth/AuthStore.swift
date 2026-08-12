@@ -26,7 +26,7 @@ final class AuthStore: ObservableObject {
 
     let realtime = RealtimeClient()
 
-    private let api = APIClient.shared
+    private let api: APIClient
     private let log = Logger(subsystem: "ai.rhythmrx.rxhive", category: "auth")
     private var expiryObserver: NSObjectProtocol?
 
@@ -51,7 +51,12 @@ final class AuthStore: ObservableObject {
         return nil
     }
 
-    init() {
+    /// `api` is injectable for tests only — the app builds this with the default.
+    /// Without a seam the launch path cannot be driven at all: it reaches the network
+    /// through the shared client, which no `MockURLProtocol` session can stand in for.
+    init(api: APIClient = .shared) {
+        self.api = api
+
         expiryObserver = NotificationCenter.default.addObserver(
             forName: APIClient.sessionExpiredNotification,
             object: nil,
@@ -102,6 +107,20 @@ final class AuthStore: ObservableObject {
                     sessionGeneration &+= 1
                     phase = .accessDenied(reason: detail)
                     return
+                }
+                // Reached and refused, so the cookie in the jar is provably dead.
+                // `handleSessionLost` cannot do this for us — it is gated on
+                // `.signedIn` and we are still `.launching`, so the notification
+                // `APIClient` posted on the way here was a no-op. Left alone the dead
+                // cookie survives every relaunch, and `hasPersistedSession()` keeps
+                // sending the splash through a refresh that can only be refused again.
+                //
+                // `endsSession` rather than a second hand-rolled test: it is the
+                // predicate written for this decision, and the only one with a test
+                // pinning the permissive direction shut.
+                if error.endsSession {
+                    await api.clearSessionCookies()
+                    RememberedUser.clear()
                 }
                 unreachable = error.isRetryable
                 log.notice("Session restore failed: \(String(describing: error), privacy: .public)")
