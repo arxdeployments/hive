@@ -46,7 +46,9 @@ const replyPreview = (replyMsg) => {
   switch (replyMsg.type) {
     case 'image': return '📷 Photo';
     case 'video': return '🎥 Video';
-    case 'audio': return '🎤 Audio';
+    // 'Voice message' to match `audioName` below, which is what the quoted
+    // bubble itself displays — the quote used to rename the message it points at.
+    case 'audio': return '🎤 Voice message';
     case 'file': return '📎 File';
     default: return (replyMsg.content || '').substring(0, 100);
   }

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { MessageSquarePlus, Users, Search, Settings } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
@@ -48,29 +48,44 @@ export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
   // conversations" from "we never found out", which rendered identically.
   const [loadFailed, setLoadFailed] = useState(false);
 
+  // Only the newest load may write. `search` is in the deps below, so every
+  // keystroke rebuilds this callback and re-runs the effect — several loads are
+  // in flight at once and nothing makes them return in the order they were sent.
+  // A two-character prefix matching every thread is slower to answer than the
+  // five-character one typed after it, so the sidebar could settle on a search
+  // the box no longer contains. The reconnect poll, the visibility handler and
+  // both retry buttons stack more callers on top of that.
+  const reqSeqRef = useRef(0);
+
   const fetchConversations = useCallback(async () => {
+    const seq = ++reqSeqRef.current;
     try {
       const { data } = await client.get('/api/conversations', {
         params: { search, filter }
       });
+      if (seq !== reqSeqRef.current) return;
       setConversations(data.data);
       setLoadFailed(false);
     } catch (err) {
       console.error('Failed to fetch conversations', err);
       // The list is left exactly as it was — a failed refresh must not blank a
-      // sidebar that is already showing good data. The flag only decides
-      // whether the EMPTY state is allowed to claim "No conversations yet",
-      // which is a statement about the account and was being made on the
-      // strength of a request that never came back.
-      setLoadFailed(true);
+      // sidebar that is already showing good data. The flag decides whether the
+      // EMPTY state may claim "No conversations yet" — a statement about the
+      // account, and one that was being made on the strength of a request that
+      // never came back — and, when rows were kept, whether the refresh warning
+      // goes up over them.
+      if (seq === reqSeqRef.current) setLoadFailed(true);
     } finally {
-      setLoading(false);
+      if (seq === reqSeqRef.current) setLoading(false);
     }
   }, [search, filter, setConversations]);
 
   useEffect(() => {
     const timer = setTimeout(fetchConversations, 300);
-    return () => clearTimeout(timer);
+    // Bumping as well as clearing: if the timer already fired, the request it
+    // started is in the air and this keystroke (or an unmount) disowns it, rather
+    // than leaving a 300ms window in which it could still write.
+    return () => { clearTimeout(timer); reqSeqRef.current++; };
   }, [fetchConversations]);
 
   /**
@@ -273,6 +288,35 @@ export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
 
       {/* Conversation List */}
       <div className="flex-1 overflow-y-auto scrollable-area min-h-0">
+        {/* A refresh that failed over a list we still have. The empty-state
+            branch below cannot cover this — it is gated on having nothing left
+            to show — so without this the sidebar presents stale threads as
+            current: the same lie the ChatPanel strip exists to prevent, and the
+            more likely one, since the reconnect poll and the visibility handler
+            both refresh a list that is already populated.
+
+            Sibling of the branch chain rather than a fourth arm of it: those
+            arms are mutually exclusive and this has to render ALONGSIDE the
+            rows. Sticky rather than absolute so it stays reachable once the
+            user scrolls a long list, and it cannot overlap the skeleton — that
+            needs `loading`, which only ever goes false. */}
+        {loadFailed && conversations.length > 0 && (
+          <div
+            role="alert"
+            data-testid="conversations-refresh-error"
+            className="sticky top-0 z-10 flex items-center justify-between gap-2 px-4 py-2 bg-[#0A0A0A]/95 border-b border-[#1F1F1F]"
+          >
+            <span className="text-xs text-[#A3A3A3]">Couldn&apos;t refresh conversations.</span>
+            <button
+              type="button"
+              onClick={fetchConversations}
+              data-testid="conversations-refresh-retry"
+              className="px-2 py-1 text-xs text-[#10B981] border border-[#10B981]/40 rounded-[6px] hover:bg-[#10B981]/10 transition-colors flex-shrink-0"
+            >
+              Try again
+            </button>
+          </div>
+        )}
         {loading ? (
           <div className="space-y-1 p-2">
             {[...Array(6)].map((_, i) => (

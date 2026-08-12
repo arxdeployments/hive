@@ -64,7 +64,10 @@ const messagePreview = (msg) => {
   switch (msg.type) {
     case 'image': return '📷 Photo';
     case 'video': return '🎥 Video';
-    case 'audio': return '🎤 Audio';
+    // 'Voice message', not 'Audio': the sidebar row, the push notification and
+    // the audio bubble's own filename fallback all say this, so a banner or a
+    // confirm dialog quoting the same message must not rename it.
+    case 'audio': return '🎤 Voice message';
     case 'file': return `📎 ${msg.filename || msg.content || 'File'}`;
     default: return (msg.content || '').slice(0, 140);
   }
@@ -159,10 +162,20 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   // indistinguishable from a conversation that genuinely has no history — the
   // app confidently showing "nothing here" about a thread it never loaded.
   const [loadErrorByConv, setLoadErrorByConv] = useState({});
-  // Only the newest fetch may write the flag. The mount fetch, the reconnect
-  // force-fetch and StrictMode's double mount can all be in flight together, so
-  // without this a slow FAILURE could land after a fast success and put the
-  // strip back up over a thread that had loaded fine.
+  // Only the newest window fetch may write ANY of the window state — the message
+  // array, hasMore/hasNewer, loadedWindowsRef, the error flag and the spinner.
+  // The mount fetch, the reconnect force-fetch, StrictMode's double mount and an
+  // `around` jump can all be in flight together, so without this a slow reply
+  // lands after a fast one and restores the window it superseded: a stale
+  // message array, or a FAILURE putting the error strip back over a thread that
+  // had loaded fine. handleJumpToMessage shares this counter because it replaces
+  // the same array — the two paths race each other, not just themselves.
+  //
+  // loadMore READS this counter without incrementing it. It extends the window
+  // instead of replacing it, so it has nothing to supersede: bumping would
+  // wrongly disown a replacement fetch already in flight and strand its spinner
+  // along with it. All it needs to know is whether the window it measured its
+  // `before` anchor against is still the window on screen.
   const fetchSeqRef = useRef(0);
   const [announcement, setAnnouncement] = useState('');
   const lastSpokenRef = useRef(null);
@@ -236,6 +249,9 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       });
       // Loaded messages have no `status` — derive the ticks from the read_by /
       // delivered_to receipts the API sends, or every own message reads as unread.
+      // A newer fetch (or a jump) has taken over this conversation's window —
+      // everything below writes that window, so bail before touching any of it.
+      if (seq !== fetchSeqRef.current) return;
       const fetched = withDerivedStatuses(data.messages, myUserId);
 
       // Carry over 'failed' bubbles, which the server has never seen.
@@ -276,16 +292,19 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // latest" from an around-window.
       setHasNewerByConv(prev => ({ ...prev, [conversationId]: false }));
       loadedWindowsRef.current.add(conversationId);
-      if (seq === fetchSeqRef.current) {
-        setLoadErrorByConv(prev => (prev[conversationId] ? { ...prev, [conversationId]: false } : prev));
-      }
+      // No seq check needed: the bail above already established that this is
+      // still the newest fetch, and nothing since then has awaited.
+      setLoadErrorByConv(prev => (prev[conversationId] ? { ...prev, [conversationId]: false } : prev));
     } catch (err) {
       console.error('Failed to fetch messages', err);
       if (seq === fetchSeqRef.current) {
         setLoadErrorByConv(prev => ({ ...prev, [conversationId]: true }));
       }
     } finally {
-      setLoading(false);
+      // The spinner is window state as much as the array is: a superseded fetch
+      // clearing it would drop the newest fetch's own spinner and show whatever
+      // stale window is underneath as if it were loaded.
+      if (seq === fetchSeqRef.current) setLoading(false);
     }
   }, [conversationId, setMessages, myUserId]);
 
@@ -376,6 +395,15 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     // map here rebuilt this callback on every message anywhere in the app.
     const msgs = useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES;
     if (msgs.length === 0) return;
+    // Snapshot of the window this page is being measured against, taken with the
+    // anchor below and read rather than bumped (see fetchSeqRef). `loadingMore`
+    // only stops loadMore racing ITSELF; nothing stopped it racing a window
+    // replacement. A reconnect force-fetch or an `around` jump landing first
+    // swaps the array underneath, and splicing a page from before the OLD anchor
+    // onto the front of the NEW window builds a thread with a hole in the middle
+    // — under a `has_more` computed for an anchor that window no longer starts
+    // at, so "load older" then stops at the wrong end of the gap.
+    const seq = fetchSeqRef.current;
 
     setLoadingMore(true);
     try {
@@ -383,6 +411,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       const { data } = await client.get(`/api/conversations/${conversationId}/messages`, {
         params: { before: oldestMsg._id, limit: 50 }
       });
+      if (seq !== fetchSeqRef.current) return;
       if (data.messages.length > 0) {
         prependMessages(conversationId, withDerivedStatuses(data.messages, myUserId));
       }
@@ -390,6 +419,11 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     } catch (err) {
       console.error('Failed to load more messages', err);
     } finally {
+      // Deliberately NOT guarded, unlike the spinner in fetchMessages: this flag
+      // is also the re-entry lock in the guard at the top, so a superseded page
+      // that left it set would block pagination for the rest of the session and
+      // pin the spinner with no request behind it. Releasing a lock has to be
+      // unconditional; only the writes that publish into the window are gated.
       setLoadingMore(false);
     }
   }, [hasMore, loadingMore, conversationId, prependMessages, myUserId]);
@@ -1043,11 +1077,16 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     if (scrollToLoaded(originalMsgId)) return true;
     if (!conversationId) return false;
 
+    // Same counter as fetchMessages: this replaces the same window, so the two
+    // paths race each other. A jump that resolves after a newer fetch (or a
+    // newer jump) must not swap its window back in.
+    const seq = ++fetchSeqRef.current;
     setJumpLoading(true);
     try {
       const { data } = await client.get(`/api/conversations/${conversationId}/messages`, {
         params: { around: originalMsgId, limit: 50 },
       });
+      if (seq !== fetchSeqRef.current) return false;
       if (!data?.anchor_id) {
         // The server could not resolve the anchor — the message is gone, or was
         // never in this conversation. Say so rather than silently doing nothing.
@@ -1396,7 +1435,13 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
             data-testid="messages-load-error"
             className="absolute top-0 left-0 right-0 z-[6] flex flex-col items-center gap-2 py-4 bg-[#0A0A0A]/95 border-b border-[#1F1F1F]"
           >
-            <p className="text-sm text-[#A3A3A3]">Couldn&apos;t load messages.</p>
+            {/* `role="alert"` rather than aria-live on a pre-mounted region: the
+                announcer above has to exist first because its *text* changes,
+                whereas an alert is announced by the act of being inserted, which
+                is exactly what happens here. It also survives retry — a second
+                failure remounts this node and so announces again, where a
+                persistent region holding the same string would stay silent. */}
+            <p role="alert" className="text-sm text-[#A3A3A3]">Couldn&apos;t load messages.</p>
             <button
               type="button"
               onClick={() => fetchMessages({ force: true })}

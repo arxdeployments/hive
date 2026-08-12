@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Plus, Search, Pencil, Users as UsersIcon, Loader2,
@@ -86,9 +86,13 @@ export default function UsersPage() {
     })();
   }, [selectedOrg]);
 
+  // One counter for every load below, effect-driven and imperative alike.
+  const fetchSeqRef = useRef(0);
+
   /**
-   * One list load. `isCurrent` lets the caller disown a response that is no
-   * longer the one the screen is waiting for.
+   * One list load. Each takes a ticket from `fetchSeqRef` and only the holder
+   * of the newest may write — the same request-token scheme the window fetches
+   * in ChatPanel use.
    *
    * Every keystroke in the search box rewrites `search`, which rebuilds this
    * callback and re-runs the effect below, so several loads are in flight at
@@ -98,13 +102,19 @@ export default function UsersPage() {
    * response lands LAST wins: the table and the "of N" total settle on a query
    * the search box no longer contains, and stay wrong until the next keystroke.
    *
-   * Same shape and same reasoning as the pinned-messages fetch in ChatPanel.
-   * Threaded as an optional predicate rather than hard-wired, because the
-   * refreshes fired after create, edit and bulk actions call this imperatively
-   * with nothing to supersede them — they pass no argument and are always
-   * current.
+   * A flag scoped to one effect run could not cover that, because it only ever
+   * disowned the run that created it. The refreshes fired after create, edit
+   * and bulk actions call this imperatively, outside any effect, so they held
+   * no flag and counted as current unconditionally: one still in flight when a
+   * filter change or a keystroke started a newer load would land second and
+   * overwrite that newer result with its own differently-filtered rows. It
+   * failed in the other direction too — starting an imperative refresh did not
+   * supersede an effect load already in flight, so a slow pre-create response
+   * could land after the refresh and drop the row just created back out of the
+   * table. One shared counter orders all four call sites against each other.
    */
-  const fetchUsers = useCallback(async (isCurrent = () => true) => {
+  const fetchUsers = useCallback(async () => {
+    const seq = ++fetchSeqRef.current;
     setLoading(true);
     try {
       const params = { page, limit, search };
@@ -113,24 +123,25 @@ export default function UsersPage() {
       if (statusFilter) params.status = statusFilter;
       if (mobileFilter) params.mobile = mobileFilter;
       const { data } = await client.get('/api/admin/users', { params });
-      if (!isCurrent()) return;
+      if (seq !== fetchSeqRef.current) return;
       setUsers(data.data);
       setTotal(data.total);
     } catch {
       // A superseded load's failure is not this screen's failure any more:
       // toasting it would report an error against a query nobody is looking at.
-      if (isCurrent()) toast.error('Failed to load users');
+      if (seq === fetchSeqRef.current) toast.error('Failed to load users');
     } finally {
       // Guarded too, or a slow superseded response would clear the spinner
       // while the load the user IS waiting for is still in flight.
-      if (isCurrent()) setLoading(false);
+      if (seq === fetchSeqRef.current) setLoading(false);
     }
   }, [selectedOrg, selectedDept, statusFilter, mobileFilter, page, search]);
 
   useEffect(() => {
-    let current = true;
-    fetchUsers(() => current);
-    return () => { current = false; };
+    fetchUsers();
+    // Bumping on the way out keeps what the per-run flag did on unmount: a
+    // response arriving for a screen that is gone writes nothing.
+    return () => { fetchSeqRef.current++; };
   }, [fetchUsers]);
 
   // Load create depts when org changes
