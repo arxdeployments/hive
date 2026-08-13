@@ -14,20 +14,25 @@
  * SPA down to the top-level error boundary. A one-character display name in the
  * admin user editor was enough to do it.
  *
- * Every branch is type-checked before it is returned, including `message`:
- * anything that is not a non-empty string falls through to the caller's own
- * fallback copy, so this function can only ever return a string and the crash
- * has nowhere left to come from. The array branch takes the first entry's
- * `msg`, which is the readable half of a validation error ("String should have
- * at least 2 characters"); `loc` and `type` are for programs, not people.
+ * Every branch is type-checked before it is returned, including `message` and
+ * the caller's own `fallback`: anything that is not a non-empty string falls
+ * through to the next branch and, in the last resort, to FALLBACK_ERROR. So
+ * returning a string is this function's guarantee rather than a rule every call
+ * site has to keep getting right — and the cost of one getting it wrong is the
+ * whole SPA, not one bad toast. The array branch takes the first entry's `msg`,
+ * which is the readable half of a validation error ("String should have at
+ * least 2 characters"); `loc` and `type` are for programs, not people.
  */
+const FALLBACK_ERROR = 'Something went wrong';
+
 export const apiError = (err, fallback) => {
   const d = err?.response?.data;
   return (
     (typeof d?.detail === 'string' && d.detail) ||
     (Array.isArray(d?.detail) && typeof d.detail[0]?.msg === 'string' && d.detail[0].msg) ||
     (typeof d?.message === 'string' && d.message) ||
-    fallback
+    (typeof fallback === 'string' && fallback) ||
+    FALLBACK_ERROR
   );
 };
 

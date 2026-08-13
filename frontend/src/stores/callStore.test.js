@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, describe, it, mock } from 'node:test';
 
-import useCallStore, { LINK_OK, LINK_RECONNECTING } from './callStore.js';
+import useCallStore, { LINK_OK, LINK_RECONNECTING, formatCallDuration } from './callStore.js';
 
 /**
  * Store-level tests, run by Node's own test runner (`npm run test:unit`).
@@ -128,5 +128,36 @@ describe('callStore', () => {
     assert.deepEqual(store().miniPosition, { x: 12, y: 34 });
     store().resetCall();
     assert.deepEqual(store().miniPosition, { x: 12, y: 34 });
+  });
+});
+
+/**
+ * Outside the block above on purpose: this is a pure function and none of it
+ * wants the mock clock.
+ *
+ * ActiveCallView and MinimizedCallBanner both render `formatCallDuration(
+ * callDuration)` and import it from here, so covering the function covers both
+ * surfaces — which is the whole reason it stopped being two copies.
+ */
+describe('formatCallDuration', () => {
+  it('formats a finite duration as padded mm:ss', () => {
+    assert.equal(formatCallDuration(0), '00:00');
+    assert.equal(formatCallDuration(42), '00:42');
+    assert.equal(formatCallDuration(90), '01:30');
+    assert.equal(formatCallDuration('90'), '01:30');
+    assert.equal(formatCallDuration(3661), '61:01');
+    assert.equal(formatCallDuration(42.9), '00:42');
+  });
+
+  // The regression: Infinity is truthy, so `Number(seconds) || 0` passed it
+  // through, and `Infinity % 60` is NaN — the clock read "Infinity:NaN".
+  it('renders every non-finite duration as zero', () => {
+    for (const bad of [Infinity, -Infinity, NaN, undefined, null, 'abc', {}]) {
+      assert.equal(formatCallDuration(bad), '00:00', `for ${String(bad)}`);
+    }
+  });
+
+  it('floors a negative duration to zero rather than a negative clock', () => {
+    assert.equal(formatCallDuration(-5), '00:00');
   });
 });

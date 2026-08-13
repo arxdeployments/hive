@@ -361,11 +361,16 @@ export const hasLiveCall = (s) =>
  * ships, and because a fixed-width clock does not reflow the pill every time it
  * crosses ten minutes.
  *
- * `Number(seconds) || 0` rather than `seconds || 0` so a NaN or a string cannot
- * reach the arithmetic and render "NaN:NaN".
+ * Guarded with `Number.isFinite` rather than `Number(seconds) || 0` so nothing
+ * non-numeric reaches the arithmetic. The `|| 0` caught NaN and strings, both
+ * being falsy once coerced, but Infinity is truthy and went straight through it:
+ * `Infinity % 60` is NaN, so the clock rendered "Infinity:NaN" — the very thing
+ * the guard was there to prevent, in a worse form. -Infinity escaped only by
+ * accident, on the `Math.max` floor below.
  */
 export const formatCallDuration = (seconds) => {
-  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const numeric = Number(seconds);
+  const total = Number.isFinite(numeric) ? Math.max(0, Math.floor(numeric)) : 0;
   const m = Math.floor(total / 60);
   const sec = total % 60;
   return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
