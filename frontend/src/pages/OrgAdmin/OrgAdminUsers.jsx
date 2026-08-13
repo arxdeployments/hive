@@ -7,6 +7,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import client from '../../api/client';
 
 import { generatePassword as genPassword } from '../../utils/generatePassword';
+import { apiError } from '../../utils/helpers';
 
 export default function OrgAdminUsers() {
   const { user: me } = useAuth();
@@ -76,7 +77,7 @@ export default function OrgAdminUsers() {
         action: { label: 'Copy', onClick: () => { navigator.clipboard.writeText(formPassword); toast.success('Copied!'); } }
       });
       setShowCreate(false); fetchUsers();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(apiError(err, 'Failed')); }
     finally { setSaving(false); }
   };
 
@@ -91,7 +92,7 @@ export default function OrgAdminUsers() {
         display_name: editName, role: editRole, is_active: editActive, dept_id: editDept
       });
       toast.success('User updated'); setEditUser(null); fetchUsers();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(apiError(err, 'Failed')); }
   };
 
   const handleResetPw = async () => {

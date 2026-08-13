@@ -30,6 +30,7 @@ import client from '../../api/client';
 import wsClient from '../../services/websocket';
 import { withDerivedStatuses } from '../../utils/messageStatus';
 import { toast } from 'sonner';
+import { apiError } from '../../utils/helpers';
 
 const EMPTY_PINNED = [];
 
@@ -720,7 +721,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       pendingDraftRef.current = seed;
       store.setActiveConversation(data._id);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to open chat');
+      toast.error(apiError(err, 'Failed to open chat'));
     }
   }, [myUserId, conversationId]);
 
@@ -894,7 +895,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       setLeaveConfirm(false);
       closeChat();
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to leave group');
+      toast.error(apiError(err, 'Failed to leave group'));
     } finally {
       setLeaveBusy(false);
     }
@@ -944,7 +945,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     try {
       await client.put(`/api/conversations/messages/${msgId}`, { content: trimmed });
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to edit message');
+      toast.error(apiError(err, 'Failed to edit message'));
     }
     cancelEdit();
   };
@@ -1221,7 +1222,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       setPinCursor(0);
       toast.success('Unpinned');
     } catch (err) {
-      toast.error(err?.response?.data?.detail || 'Failed to unpin');
+      toast.error(apiError(err, 'Failed to unpin'));
     }
   }, [activePin, conversationId]);
 

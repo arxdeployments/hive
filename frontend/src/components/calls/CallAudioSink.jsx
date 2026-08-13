@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import useCallStore from '../../stores/callStore';
-import livekitClient from '../../services/livekitClient';
+import livekitClient from '../../services/livekitLazy';
 
 /**
  * The one and only place remote call audio is played.

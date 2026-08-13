@@ -1,51 +1,34 @@
-import { toast } from 'sonner';
-
-export const handleApiError = (error, options = {}) => {
-  const status = error?.response?.status;
-  const detail = error?.response?.data?.detail;
-  const { retry, silent } = options;
-
-  if (silent) return;
-
-  let message = 'Something went wrong. Please try again.';
-
-  if (!error?.response) {
-    message = 'Network error. Check your connection.';
-  } else {
-    switch (status) {
-      case 400:
-        message = detail || 'Invalid request.';
-        break;
-      case 401:
-        message = 'Session expired. Please log in again.';
-        // Auto-redirect happens via axios interceptor
-        break;
-      case 403:
-        message = detail || "You don't have permission to do this.";
-        break;
-      case 404:
-        message = detail || 'Resource not found.';
-        break;
-      case 422:
-        message = detail || 'Invalid input. Please check your data.';
-        break;
-      case 429:
-        message = 'Too many requests. Please wait a moment.';
-        break;
-      case 500:
-        message = 'Server error. Please try again later.';
-        break;
-      default:
-        message = detail || message;
-    }
-  }
-
-  toast.error(message, {
-    duration: 5000,
-    action: retry ? { label: 'Retry', onClick: retry } : undefined,
-  });
-
-  return message;
+/**
+ * Collapse a FastAPI error body down to one string that is safe to render.
+ *
+ * The API answers in three different shapes and a caller cannot tell which one
+ * it is about to get. `HTTPException` serialises to `{"detail": "<sentence>"}`;
+ * a request that fails pydantic validation serialises to `{"detail": [{loc,
+ * msg, type}, ...]}` — a LIST, not a sentence; and a handful of routes answer
+ * `{"message": ...}` instead. The naive `err.response?.data?.detail || 'X'`
+ * that used to be written out at every call site handles only the first: an
+ * array is truthy, so `||` does not fall through, and the array itself reaches
+ * toast.error(). sonner renders whatever it is handed straight into the tree,
+ * so React throws "Objects are not valid as a React child" from inside
+ * <Toaster> — which is mounted above the router, so the throw takes the whole
+ * SPA down to the top-level error boundary. A one-character display name in the
+ * admin user editor was enough to do it.
+ *
+ * Every branch is type-checked before it is returned, including `message`:
+ * anything that is not a non-empty string falls through to the caller's own
+ * fallback copy, so this function can only ever return a string and the crash
+ * has nowhere left to come from. The array branch takes the first entry's
+ * `msg`, which is the readable half of a validation error ("String should have
+ * at least 2 characters"); `loc` and `type` are for programs, not people.
+ */
+export const apiError = (err, fallback) => {
+  const d = err?.response?.data;
+  return (
+    (typeof d?.detail === 'string' && d.detail) ||
+    (Array.isArray(d?.detail) && typeof d.detail[0]?.msg === 'string' && d.detail[0].msg) ||
+    (typeof d?.message === 'string' && d.message) ||
+    fallback
+  );
 };
 
 // Format relative timestamps

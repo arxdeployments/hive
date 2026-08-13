@@ -10,6 +10,7 @@ import { PageTransition } from '../../components/common/PageTransition';
 import client from '../../api/client';
 
 import { generatePassword } from '../../utils/generatePassword';
+import { apiError } from '../../utils/helpers';
 
 export default function UsersPage() {
   const [orgs, setOrgs] = useState([]);
@@ -206,7 +207,13 @@ export default function UsersPage() {
   };
 
   const handleCreateUser = async () => {
-    if (!createOrg || !createDept || !createEmail || !createName || !createPassword) return;
+    if (!createOrg || !createDept || !createEmail || !createPassword) return;
+    // Mirror UpdateUser/CreateUser's `min_length=2` on display_name. Not
+    // `minLength` on the input: nothing here is inside a <form>, so the browser
+    // never runs constraint validation and the attribute would be pure
+    // decoration. `maxLength` on the input IS live-enforced, so the 100-char
+    // ceiling is expressed there and only the floor is checked here.
+    if (createName.trim().length < 2) return;
     setCreateSaving(true);
     try {
       await client.post('/api/admin/users', {
@@ -229,7 +236,7 @@ export default function UsersPage() {
       setShowCreate(false);
       fetchUsers();
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to create user');
+      toast.error(apiError(err, 'Failed to create user'));
     } finally {
       setCreateSaving(false);
     }
@@ -251,7 +258,7 @@ export default function UsersPage() {
       setEditUser(null);
       fetchUsers();
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to update user');
+      toast.error(apiError(err, 'Failed to update user'));
     } finally {
       setEditSaving(false);
     }
@@ -300,7 +307,7 @@ export default function UsersPage() {
       if (editUser?._id === user._id) setEditMobileAccess(next);
     } catch (err) {
       setUsers(prev => prev.map(u => (u._id === user._id ? { ...u, mobile_access: !next } : u)));
-      toast.error(err.response?.data?.detail || 'Failed to update mobile access');
+      toast.error(apiError(err, 'Failed to update mobile access'));
     } finally {
       setMobilePending(prev => prev.filter(id => id !== user._id));
     }
@@ -317,7 +324,7 @@ export default function UsersPage() {
       setSelectedIds([]);
       fetchUsers();
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Bulk action failed');
+      toast.error(apiError(err, 'Bulk action failed'));
     }
   };
 
@@ -726,6 +733,7 @@ export default function UsersPage() {
                     <div>
                       <label htmlFor="users-09-display-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Display Name *</label>
                       <input id="users-09-display-name" type="text" value={createName} onChange={(e) => setCreateName(e.target.value)}
+                        maxLength={100}
                         placeholder="John Doe" data-testid="user-name-input"
                         className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] placeholder:text-[#A3A3A3]/50 focus:border-[#10B981] focus:outline-none focus:shadow-[0_0_0_3px_rgba(16,185,129,0.25)] transition-all" />
                     </div>
@@ -823,7 +831,7 @@ export default function UsersPage() {
                 <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-[#1F1F1F]">
                   <button onClick={() => setShowCreate(false)} className="px-4 py-2 text-sm text-[#A3A3A3] hover:text-[#F5F5F5] hover:bg-[#1A1A1A] rounded-[6px] transition-colors">Cancel</button>
                   <button onClick={handleCreateUser}
-                    disabled={!createOrg || !createDept || !createEmail || !createName || !createPassword || createPassword.length < 6 || emailAvailable === false || createSaving}
+                    disabled={!createOrg || !createDept || !createEmail || createName.trim().length < 2 || !createPassword || createPassword.length < 6 || emailAvailable === false || createSaving}
                     data-testid="user-create-submit"
                     className="px-4 py-2 text-sm font-medium bg-[#10B981] text-[#0A0A0A] rounded-[6px] hover:bg-[#059669] disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 flex items-center gap-2">
                     {createSaving && <Loader2 size={14} className="animate-spin" />}
@@ -873,6 +881,7 @@ export default function UsersPage() {
                     <div>
                       <label htmlFor="users-13-display-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Display Name</label>
                       <input id="users-13-display-name" type="text" value={editName} onChange={(e) => setEditName(e.target.value)}
+                        maxLength={100}
                         className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none transition-all" />
                     </div>
 
@@ -998,7 +1007,7 @@ export default function UsersPage() {
                       className="flex-1 px-4 py-2.5 text-sm text-[#A3A3A3] hover:text-[#F5F5F5] bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] transition-colors">
                       Cancel
                     </button>
-                    <button onClick={handleEditSave} disabled={editSaving} data-testid="users-edit-save-button"
+                    <button onClick={handleEditSave} disabled={editSaving || editName.trim().length < 2} data-testid="users-edit-save-button"
                       className="flex-1 px-4 py-2.5 text-sm font-medium bg-[#10B981] text-[#0A0A0A] rounded-[6px] hover:bg-[#059669] disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2">
                       {editSaving && <Loader2 size={14} className="animate-spin" />}
                       Save Changes

@@ -4,7 +4,7 @@ import { PhoneOff, ChevronDown, Lock } from 'lucide-react';
 import useCallStore from '../../stores/callStore';
 import callSounds from '../../services/callSounds';
 import wsClient from '../../services/websocket';
-import livekitClient from '../../services/livekitClient';
+import livekitClient from '../../services/livekitLazy';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 

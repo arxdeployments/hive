@@ -1,7 +1,7 @@
 import { toast } from 'sonner';
 import useChatStore from '../stores/chatStore';
 import useCallStore, { hasLiveCall, LINK_OK, LINK_RECONNECTING } from '../stores/callStore';
-import livekitClient from './livekitClient';
+import livekitClient from './livekitLazy';
 import callSounds from './callSounds';
 import { refreshSession, sessionRejected, setSignOutReason } from '../api/client';
 import { withDerivedStatus, applyReadReceipt } from '../utils/messageStatus';
@@ -64,6 +64,21 @@ const PONG_TIMEOUT_MS = 10000;
  * server never answers.
  */
 const ACK_TIMEOUT_MS = 15000;
+
+/**
+ * How long a desktop notification waits for a service worker to activate before
+ * giving up and using the `Notification` constructor instead.
+ *
+ * `navigator.serviceWorker.ready` resolves only when a registration reaches
+ * "activated" and, per spec, NEVER rejects. So when registration failed there is
+ * nothing to activate and the await parks for the life of the tab — and
+ * lib/pwa.js swallows a failed `register()` with a console.warn, so a mis-served
+ * /sw.js, a path rewrite in front of the app or an enterprise policy all land
+ * here silently. The `catch` below was written as the fallback path and could
+ * never run: a promise that never settles throws nothing. Every desktop
+ * notification was simply lost, with no error anywhere to say so.
+ */
+const SW_READY_TIMEOUT_MS = 3000;
 
 // Auth rides in httpOnly cookies — the WS handshake carries them automatically
 // (same-origin in production behind Caddy, and via the Vite proxy in dev).
@@ -1518,7 +1533,13 @@ class RxHiveWebSocket {
 
       if ('serviceWorker' in navigator) {
         try {
-          const reg = await navigator.serviceWorker.ready;
+          // Raced, not awaited outright — see SW_READY_TIMEOUT_MS. The loser is
+          // `undefined` rather than a rejection, so a timeout falls through to
+          // the constructor below by the same route a real failure would.
+          const reg = await Promise.race([
+            navigator.serviceWorker.ready,
+            new Promise((resolve) => { setTimeout(resolve, SW_READY_TIMEOUT_MS); }),
+          ]);
           if (reg && typeof reg.showNotification === 'function') {
             await reg.showNotification(title, options);
             return;

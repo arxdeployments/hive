@@ -15,6 +15,7 @@ import client from '../../api/client';
 import { CallsTab } from '../calls/CallsTab';
 import { WorkspaceSwitcher } from '../shared/WorkspaceSwitcher';
 import useCallStore from '../../stores/callStore';
+import { apiError } from '../../utils/helpers';
 
 const FILTER_TABS = [
   { key: 'all', label: 'All' },
@@ -127,7 +128,7 @@ export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
       await fetchConversations();
       onSelectConversation(data._id);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to create conversation');
+      toast.error(apiError(err, 'Failed to create conversation'));
     }
   };
 

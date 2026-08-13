@@ -14,6 +14,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
+import { apiError } from '../../utils/helpers';
 import {
   Check,
   Copy,
@@ -183,7 +184,7 @@ export const GroupInfoPanel = ({
       toast.success('Group name updated');
       setEditingName(false);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to update group name');
+      toast.error(apiError(err, 'Failed to update group name'));
     } finally {
       setSavingInfo(false);
     }
@@ -198,7 +199,7 @@ export const GroupInfoPanel = ({
       toast.success('Description updated');
       setEditingDesc(false);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to update description');
+      toast.error(apiError(err, 'Failed to update description'));
     } finally {
       setSavingInfo(false);
     }
@@ -215,7 +216,7 @@ export const GroupInfoPanel = ({
       toast.success(value ? 'Notifications muted' : 'Notifications unmuted');
     } catch (err) {
       setMuted(!next); // roll back
-      toast.error(err.response?.data?.detail || 'Failed to change mute');
+      toast.error(apiError(err, 'Failed to change mute'));
     } finally {
       setMutePending(false);
     }
@@ -230,7 +231,7 @@ export const GroupInfoPanel = ({
       setPermissions(data);
     } catch (err) {
       setPermissions(previous); // roll back
-      toast.error(err.response?.data?.detail || 'Failed to update permission');
+      toast.error(apiError(err, 'Failed to update permission'));
     } finally {
       setPermSaving(null);
     }
@@ -255,7 +256,7 @@ export const GroupInfoPanel = ({
       onClose?.();
       setActiveConversation(null);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to leave group');
+      toast.error(apiError(err, 'Failed to leave group'));
     } finally {
       setConfirmBusy(false);
     }
@@ -267,7 +268,7 @@ export const GroupInfoPanel = ({
       toast.success('Member added');
       setShowAddMembers(false);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to add member');
+      toast.error(apiError(err, 'Failed to add member'));
     }
   };
 
@@ -277,7 +278,7 @@ export const GroupInfoPanel = ({
       await client.delete(`/api/conversations/${convId}/members/${memberId}`);
       toast.success('Member removed');
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to remove member');
+      toast.error(apiError(err, 'Failed to remove member'));
     }
   };
 
@@ -287,7 +288,7 @@ export const GroupInfoPanel = ({
       await client.put(`/api/conversations/${convId}/members/${memberId}/role`, { role });
       toast.success(role === 'admin' ? 'Made admin' : 'Removed as admin');
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to change role');
+      toast.error(apiError(err, 'Failed to change role'));
     }
   };
 
@@ -298,7 +299,7 @@ export const GroupInfoPanel = ({
       onClose?.();
       setActiveConversation(data._id);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to open chat');
+      toast.error(apiError(err, 'Failed to open chat'));
     }
   };
 

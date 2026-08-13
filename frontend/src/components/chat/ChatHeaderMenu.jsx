@@ -40,7 +40,8 @@ import { toast } from 'sonner';
 import client from '../../api/client';
 import useChatStore from '../../stores/chatStore';
 import { ScheduleCallModal } from '../calls/CallsTab';
-import { MenuDivider, MenuItem, MenuSurface, apiError, createAndCopyCallLink } from './menuKit';
+import { MenuDivider, MenuItem, MenuSurface, createAndCopyCallLink } from './menuKit';
+import { apiError } from '../../utils/helpers';
 
 export const ChatHeaderMenu = ({ type, conversation, onAction, disabled = false }) => {
   const [open, setOpen] = useState(false);

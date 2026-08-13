@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Phone, Video, PhoneOff, Users } from 'lucide-react';
 import useCallStore from '../../stores/callStore';
 import wsClient from '../../services/websocket';
-import livekitClient from '../../services/livekitClient';
+import livekitClient from '../../services/livekitLazy';
 import callSounds from '../../services/callSounds';
 import { isSoundMuted as isSoundOff } from '../../utils/notificationPrefs';
 

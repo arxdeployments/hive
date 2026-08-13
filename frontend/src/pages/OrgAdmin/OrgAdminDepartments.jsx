@@ -5,6 +5,7 @@ import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
 import { useAuth } from '../../contexts/AuthContext';
 import client from '../../api/client';
+import { apiError } from '../../utils/helpers';
 
 export default function OrgAdminDepartments() {
   const { user: me } = useAuth();
@@ -56,14 +57,14 @@ export default function OrgAdminDepartments() {
         toast.success('Department created');
       }
       setShowModal(false); fetchDepts();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(apiError(err, 'Failed')); }
     finally { setSaving(false); }
   };
 
   const handleDelete = async (dept) => {
     if (!window.confirm(`Delete department "${dept.name}"?`)) return;
     try { await client.delete(`/api/org-admin/departments/${dept._id}`); toast.success('Deleted'); fetchDepts(); }
-    catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
+    catch (err) { toast.error(apiError(err, 'Failed')); }
   };
 
   return (

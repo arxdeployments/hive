@@ -37,6 +37,7 @@ import { StagedFilePreview } from './StagedFilePreview';
 import { MediaEditor } from './editor/MediaEditor';
 import useAudioRecorder from '../../hooks/useAudioRecorder';
 import { canRecordAudio } from '../../utils/audioFormat';
+import { apiError } from '../../utils/helpers';
 
 // Client-side size hints (server still enforces its own limits).
 const MAX_IMAGE_SIZE = 16 * 1024 * 1024;   // 16MB
@@ -561,7 +562,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
       await sendMediaFile(file, replyTo?._id || null, '', Math.round(rec.duration * 10) / 10);
       recorder.reset();
     } catch (err) {
-      toast.error(err?.response?.data?.detail || err.message || 'Failed to send voice message');
+      toast.error(apiError(err, err.message || 'Failed to send voice message'));
     } finally {
       setVoiceSending(false);
       sendingVoiceRef.current = false;
@@ -732,7 +733,7 @@ const MessageComposerInner = ({ conversationId, onSend, disabled, replyTo, draft
           if (aborted) { URL.revokeObjectURL(item.url); continue; }
           stillFailed.push(item);
           toast.error(
-            `${item.name || 'File'}: ${err?.response?.data?.detail || err.message || 'Upload failed'}`
+            `${item.name || 'File'}: ${apiError(err, err.message || 'Upload failed')}`
           );
         } finally {
           uploadControllers.current.delete(item.id);

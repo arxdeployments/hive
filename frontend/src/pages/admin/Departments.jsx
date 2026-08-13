@@ -4,6 +4,7 @@ import { Plus, Search, Pencil, Trash2, FolderTree, Loader2, ChevronLeft, Chevron
 import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
 import client from '../../api/client';
+import { apiError } from '../../utils/helpers';
 
 export default function Departments() {
   const [orgs, setOrgs] = useState([]);
@@ -91,7 +92,7 @@ export default function Departments() {
       closeModal();
       fetchDepts();
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to save');
+      toast.error(apiError(err, 'Failed to save'));
     } finally {
       setFormSaving(false);
     }
@@ -104,7 +105,7 @@ export default function Departments() {
       setDeleteDept(null);
       fetchDepts();
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to delete');
+      toast.error(apiError(err, 'Failed to delete'));
     }
   };
 

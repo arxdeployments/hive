@@ -3,6 +3,7 @@ import { Pencil, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
 import client from '../../api/client';
+import { apiError } from '../../utils/helpers';
 
 export default function OrgAdminSettings() {
   const [org, setOrg] = useState(null);
@@ -20,7 +21,7 @@ export default function OrgAdminSettings() {
     try {
       const { data } = await client.put('/api/org-admin/settings', { name: newName.trim() });
       setOrg(data); setEditingName(false); toast.success('Name updated');
-    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(apiError(err, 'Failed')); }
     finally { setSaving(false); }
   };
 

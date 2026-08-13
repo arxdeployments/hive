@@ -4,6 +4,7 @@ import { Plus, Search, Trash2, Globe, Archive, RotateCcw, ChevronLeft, ChevronRi
 import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
 import client from '../../api/client';
+import { apiError } from '../../utils/helpers';
 
 export default function CrossOrgGroups() {
   const [groups, setGroups] = useState([]);
@@ -126,7 +127,7 @@ export default function CrossOrgGroups() {
       setShowCreate(false);
       fetchGroups();
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to create group');
+      toast.error(apiError(err, 'Failed to create group'));
     } finally { setCreating(false); }
   };
 
