@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.deps import get_current_user
+from app.core.errors import CodedHTTPException
 from app.core.rate_limit import login_limiter, password_limiter, refresh_limiter
 from app.core.security import (
     ACCESS_COOKIE,
@@ -61,6 +62,15 @@ MOBILE_NOT_APPROVED = (
     "Mobile access has not been enabled for this account. Ask your super admin to approve mobile sign-in."
 )
 
+# The sentences above are what the user reads; these are what the client branches
+# on. The two denials need different screens — one offers a remedy, the other says
+# the portal is web-only and always will be — and the sentences cannot tell them
+# apart reliably: MOBILE_NOT_APPROVED names the super admin as the remedy, so any
+# test for that phrase matches both. Reword the prose freely; these are the wire
+# contract, decoded verbatim by the iOS client (`MobileDenialKind`).
+SUPERADMIN_MOBILE_DENIED_CODE = "SUPERADMIN_MOBILE_DENIED"
+MOBILE_NOT_APPROVED_CODE = "MOBILE_NOT_APPROVED"
+
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -80,9 +90,11 @@ def _assert_mobile_allowed(user: User) -> None:
     keys to every tenant.
     """
     if user.role == UserRole.superadmin:
-        raise HTTPException(status_code=403, detail=SUPERADMIN_MOBILE_DENIED)
+        raise CodedHTTPException(
+            status_code=403, detail=SUPERADMIN_MOBILE_DENIED, code=SUPERADMIN_MOBILE_DENIED_CODE
+        )
     if not user.mobile_access:
-        raise HTTPException(status_code=403, detail=MOBILE_NOT_APPROVED)
+        raise CodedHTTPException(status_code=403, detail=MOBILE_NOT_APPROVED, code=MOBILE_NOT_APPROVED_CODE)
 
 
 def wire_role(role: UserRole) -> str:
@@ -289,11 +301,25 @@ async def refresh(
     # A mobile session outlives the grant that created it unless the grant is
     # re-checked here — same reasoning as is_active directly above. The session is
     # burned before raising so a revoked user cannot keep retrying this token.
+    #
+    # The gate itself is `_assert_mobile_allowed`, not a copy of its condition. The
+    # copy that used to live here collapsed both cases into MOBILE_NOT_APPROVED, so a
+    # superadmin holding a mobile session was told to ask a super admin to approve
+    # mobile sign-in — advice addressed to themselves, and the phone picked the
+    # remedy screen over the web-only one on the strength of that code. The two
+    # refusals stay distinct because the remedies are: a grant can be given, a
+    # superadmin's web-only portal cannot.
     session_client = token.client or WEB_CLIENT
-    if session_client == MOBILE_CLIENT and (user.role == UserRole.superadmin or not user.mobile_access):
-        token.revoked_at = now_utc()
-        await db.commit()
-        raise HTTPException(status_code=403, detail=MOBILE_NOT_APPROVED)
+    if session_client == MOBILE_CLIENT:
+        try:
+            _assert_mobile_allowed(user)
+        except HTTPException:
+            # Broader than CodedHTTPException on purpose: burning the token is the
+            # security-relevant half, and it must not stop happening if the gate ever
+            # grows a refusal that is not coded.
+            token.revoked_at = now_utc()
+            await db.commit()
+            raise
 
     token.revoked_at = now_utc()  # rotation: old token is single-use
     await _issue_session(db, user, response, request, client=session_client, replaces=token)

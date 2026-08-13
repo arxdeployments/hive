@@ -14,8 +14,26 @@ enum APIError: Error, Equatable {
     /// never happened — the single most confusing symptom of the old behaviour.
     case credentials(detail: String)
     /// Authenticated, but this client/account is not allowed. Carries the server's
-    /// `detail`, which for the mobile gate is a sentence written to be shown as-is.
-    case forbidden(detail: String)
+    /// `detail`, which for the mobile gate is a sentence written to be shown as-is,
+    /// and — when the server sent one — the stable code saying *which* refusal it is.
+    /// `denial` is nil for every 403 that is not the mobile gate.
+    case forbidden(detail: String, denial: MobileDenialKind?)
+    /// A *delivered* refresh rejected with a 403: the server was reached, was given
+    /// the refresh token, and refused it. Terminal by construction — the same
+    /// evidence as `.unauthorized`, which is why it is a case and not a flavour of
+    /// `.forbidden`.
+    ///
+    /// The distinction earns its keep because the two arrive from opposite places. An
+    /// ordinary `.forbidden` is one endpoint refusing one resource ("You are not a
+    /// member of this group") and must never cost the user their session. This is the
+    /// session itself being refused. They were the same case until a 403 with no
+    /// denial code — an older backend, or a denial this build has not heard of — left
+    /// a provably-dead credential in the jar: `endsSession` was reading the routing
+    /// code, which says which screen to show and nothing about whether the session
+    /// survived. Every relaunch then spent another doomed refresh on it.
+    ///
+    /// `denial` still carries the code when there is one, so routing is unchanged.
+    case sessionRefused(detail: String, denial: MobileDenialKind?)
     case notFound
     /// 400/409/422 — the server explained what was wrong with the request.
     case validation(detail: String)
@@ -35,11 +53,15 @@ enum APIError: Error, Equatable {
             return "Your session expired. Please sign in again."
         case .credentials(let detail):
             return detail.isEmpty ? "Those details didn't work. Please try again." : detail
-        case .forbidden(let detail):
+        case .forbidden(let detail, _):
             // The backend's mobile-gate messages are already user-facing prose
             // ("Mobile access has not been enabled for this account…"), so they
             // are shown verbatim rather than replaced with something vaguer.
             return detail.isEmpty ? "You don't have access to this." : detail
+        case .sessionRefused(let detail, _):
+            // Same prose when the server sent some. With none, this is an expiry the
+            // user has to act on, not a resource they cannot reach.
+            return detail.isEmpty ? "Your session expired. Please sign in again." : detail
         case .notFound:
             return "That's no longer available."
         case .validation(let detail):
@@ -62,7 +84,8 @@ enum APIError: Error, Equatable {
     var isRetryable: Bool {
         switch self {
         case .transport, .server, .rateLimited: return true
-        case .unauthorized, .credentials, .forbidden, .notFound, .validation, .decoding: return false
+        case .unauthorized, .credentials, .forbidden, .sessionRefused, .notFound, .validation, .decoding:
+            return false
         }
     }
 
@@ -70,7 +93,13 @@ enum APIError: Error, Equatable {
     /// only condition under which stored credentials may be discarded.
     var endsSession: Bool {
         switch self {
-        case .unauthorized: return true
+        // Both mean the same thing: the server was reached, was handed the refresh
+        // token, and refused it. Nothing else about the response can change that, and
+        // in particular the denial code cannot — it selects a screen.
+        case .unauthorized, .sessionRefused: return true
+        // An ordinary 403 is about one resource and must never end a session. A coded
+        // mobile denial is the exception: it says this account cannot use the app at
+        // all, so a credential for it is worth dropping wherever it turned up.
         case .forbidden: return isMobileAccessDenied
         default: return false
         }
@@ -78,11 +107,51 @@ enum APIError: Error, Equatable {
 
     /// True when the failure means "this account cannot use the mobile app",
     /// as opposed to any other 403. Drives the dedicated sign-in denial screen.
+    ///
+    /// A 403 counts only if the server named it with a denial code. This was
+    /// previously a substring test on `detail` ("mobile access", "web app"), which
+    /// made every wording decision on the backend an authorization decision here:
+    /// a copy edit could drop an account out of this screen and into "session
+    /// expired", and an unrelated 403 that happened to mention the web app could
+    /// fall into it. Requiring the code errs the safe way — an unrecognised 403 is
+    /// simply not treated as the mobile gate.
     var isMobileAccessDenied: Bool {
-        guard case .forbidden(let detail) = self else { return false }
-        let lowered = detail.lowercased()
-        return lowered.contains("mobile access") || lowered.contains("web app")
+        mobileDenial != nil
     }
+
+    /// Which mobile denial this is, if it is one at all.
+    ///
+    /// Both cases that can carry a code are read here, so callers choosing a screen
+    /// never have to care whether the refusal arrived on a login response or on a
+    /// refresh rejection.
+    var mobileDenial: MobileDenialKind? {
+        switch self {
+        case .forbidden(_, let denial), .sessionRefused(_, let denial): return denial
+        default: return nil
+        }
+    }
+}
+
+/// Which of the two mobile 403s a denial is, and therefore which remedy to offer.
+///
+/// The raw values are the backend's own denial codes (`api/auth.py`:
+/// `SUPERADMIN_MOBILE_DENIED_CODE`, `MOBILE_NOT_APPROVED_CODE`), and that is the
+/// entire point of the type. This used to be decided by looking for phrases in the
+/// user-facing sentence, and the two sentences are not reliably distinguishable:
+/// `MOBILE_NOT_APPROVED` ends "Ask your super admin to approve mobile sign-in" — it
+/// names the person who can fix it — so a test for "super admin" matched *both*
+/// 403s and sent every un-granted member to the superadmin screen: titled "Use the
+/// web app", with the panel naming their actual remedy suppressed, directly above
+/// the server's own sentence telling them to ask an admin. A code cannot be
+/// reworded by an edit to the copy.
+///
+/// Lives in Core, beside the error it arrives on, because it is a wire contract
+/// rather than a detail of the screen that renders it.
+enum MobileDenialKind: String, Equatable {
+    /// A super admin account. Nothing can be granted — the portal is web-only.
+    case superadminWebOnly = "SUPERADMIN_MOBILE_DENIED"
+    /// A member who simply has not been approved yet. A super admin can fix it.
+    case notApproved = "MOBILE_NOT_APPROVED"
 }
 
 /// FastAPI's error envelope: `{"detail": ...}`.
@@ -93,6 +162,11 @@ enum APIError: Error, Equatable {
 /// handled.
 struct APIErrorBody: Decodable {
     let detail: String
+    /// Present only where the server has committed to a stable code for a refusal
+    /// the client must branch on (`core/errors.py`: `CodedHTTPException`). Optional
+    /// because the ordinary envelope has no such field, and absence must decode
+    /// cleanly rather than turning an error response into a decoding failure.
+    let code: String?
 
     private struct ValidationItem: Decodable {
         let loc: [LocComponent]?
@@ -140,7 +214,8 @@ struct APIErrorBody: Decodable {
         } else {
             detail = ""
         }
+        code = try? container.decodeIfPresent(String.self, forKey: .code)
     }
 
-    private enum CodingKeys: String, CodingKey { case detail }
+    private enum CodingKeys: String, CodingKey { case detail, code }
 }

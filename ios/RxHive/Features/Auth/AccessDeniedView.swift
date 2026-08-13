@@ -12,14 +12,24 @@ import SwiftUI
 ///   * not approved yet   — a super admin can grant it
 ///   * super admin account — nothing to grant; the portal is web-only by design
 struct AccessDeniedView: View {
+    /// The server's own explanation, shown verbatim.
     let reason: String
+    /// Which denial this is, decoded from the backend's stable code
+    /// (`MobileDenialKind`) — never inferred from `reason`.
+    ///
+    /// It was inferred from `reason` before, by looking for "super admin" in it. But
+    /// the not-approved sentence ends "Ask your super admin to approve mobile
+    /// sign-in" — it names the person who can fix it — so that test matched *both*
+    /// 403s, and every un-granted member got the superadmin screen: titled "Use the
+    /// web app", with the panel naming their actual remedy suppressed, directly above
+    /// the server's own sentence telling them to ask an admin.
+    let denial: MobileDenialKind
     let onBack: () -> Void
 
     /// Superadmins cannot be granted access, so offering "ask an admin" would be
-    /// misleading. Detected from the server's message rather than a second flag,
-    /// since that message is the only thing that distinguishes the two 403s.
+    /// misleading.
     private var isSuperadminCase: Bool {
-        reason.localizedCaseInsensitiveContains("super admin")
+        denial == .superadminWebOnly
     }
 
     var body: some View {

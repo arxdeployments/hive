@@ -9,6 +9,7 @@ Three rules, each with a test that fails if the rule regresses:
 
 from sqlalchemy import select
 
+from app.api.auth import MOBILE_NOT_APPROVED_CODE, SUPERADMIN_MOBILE_DENIED_CODE
 from app.db.models import RefreshToken, User, UserRole
 from app.db.session import SessionLocal
 from tests.conftest import login, make_org, make_user
@@ -29,6 +30,8 @@ async def test_member_without_grant_cannot_login_on_mobile(client):
     assert resp.status_code == 403
     # Must not read as a credential problem, or the user retypes forever.
     assert "Mobile access has not been enabled" in resp.json()["detail"]
+    # The code is what the client routes on; the sentence above is only for reading.
+    assert resp.json()["code"] == MOBILE_NOT_APPROVED_CODE
 
 
 async def test_member_with_grant_can_login_on_mobile(client):
@@ -59,6 +62,33 @@ async def test_superadmin_cannot_login_on_mobile_even_with_grant(client):
     resp = await client.post("/api/auth/login", json=_mobile_login("root2@x.com"))
     assert resp.status_code == 403
     assert "only sign in on the web" in resp.json()["detail"]
+    assert resp.json()["code"] == SUPERADMIN_MOBILE_DENIED_CODE
+
+
+async def test_the_two_mobile_denials_are_distinguishable_without_reading_the_prose(client):
+    """The reason this code exists at all.
+
+    Both sentences mention a super admin, so the wording cannot separate them — and
+    the client has to, because one denial has a remedy and the other never will.
+    """
+    await make_user("prose1@x.com")  # member, no grant
+    await make_user("prose2@x.com", role=UserRole.superadmin)
+
+    member = await client.post("/api/auth/login", json=_mobile_login("prose1@x.com"))
+    superadmin = await client.post("/api/auth/login", json=_mobile_login("prose2@x.com"))
+
+    assert "super admin" in member.json()["detail"].lower()
+    assert "super admin" in superadmin.json()["detail"].lower()
+    assert member.json()["code"] != superadmin.json()["code"]
+
+
+async def test_an_ordinary_refusal_keeps_the_plain_detail_envelope(client):
+    """`code` is added only where a client must branch. Every other error response
+    keeps FastAPI's exact shape, so nothing else on the wire moved."""
+    await make_user("plain@x.com", mobile_access=True)
+    resp = await client.post("/api/auth/login", json=_mobile_login("plain@x.com", "wrong-pass-9"))
+    assert resp.status_code == 401
+    assert resp.json() == {"detail": "Invalid email or password"}
 
 
 async def test_web_login_is_unaffected_by_the_grant(client):
@@ -129,11 +159,62 @@ async def test_revoking_grant_blocks_mobile_refresh_and_burns_the_token(client):
 
     resp = await client.post("/api/auth/refresh")
     assert resp.status_code == 403
+    assert resp.json()["code"] == MOBILE_NOT_APPROVED_CODE
     async with SessionLocal() as db:
         tokens = (
             (await db.execute(select(RefreshToken).where(RefreshToken.user_id == user.id))).scalars().all()
         )
         assert tokens and all(t.revoked_at is not None for t in tokens)
+
+
+async def test_superadmin_mobile_refresh_is_denied_as_the_web_only_case(client):
+    """A mobile session whose account is a superadmin must be refused as the
+    superadmin case, not as an ungranted one.
+
+    The two 403s drive different screens on the phone: one says "ask a super admin
+    for the grant", the other says "the portal is web-only". Reporting the first to a
+    superadmin tells them to ask themselves for something no one can grant.
+
+    Setting the role directly is the point, not a shortcut: no endpoint can promote to
+    superadmin (`UserUpdate.role` is Literal["admin", "member"], and the update
+    endpoint refuses superadmin targets), and the login gate never issues a mobile
+    session to one — so out-of-band promotion is the only way in, and the branch is
+    still expected to be exact.
+    """
+    user = await make_user("promoted@x.com", mobile_access=True)
+    assert (await client.post("/api/auth/login", json=_mobile_login("promoted@x.com"))).status_code == 200
+
+    async with SessionLocal() as db:
+        (await db.get(User, user.id)).role = UserRole.superadmin
+        await db.commit()
+
+    resp = await client.post("/api/auth/refresh")
+    assert resp.status_code == 403
+    assert resp.json()["code"] == SUPERADMIN_MOBILE_DENIED_CODE
+    assert "only sign in on the web" in resp.json()["detail"]
+
+    # Still burned, exactly as the ungranted case is: a refused mobile session must
+    # not be retryable.
+    async with SessionLocal() as db:
+        tokens = (
+            (await db.execute(select(RefreshToken).where(RefreshToken.user_id == user.id))).scalars().all()
+        )
+        assert tokens and all(t.revoked_at is not None for t in tokens)
+
+
+async def test_an_ungranted_mobile_refresh_still_reports_the_member_case(client):
+    """The other half of the split: a plain member keeps MOBILE_NOT_APPROVED, so the
+    phone still offers the remedy that actually exists for them."""
+    user = await make_user("stillmember@x.com", mobile_access=True)
+    await client.post("/api/auth/login", json=_mobile_login("stillmember@x.com"))
+
+    async with SessionLocal() as db:
+        (await db.get(User, user.id)).mobile_access = False
+        await db.commit()
+
+    resp = await client.post("/api/auth/refresh")
+    assert resp.status_code == 403
+    assert resp.json()["code"] == MOBILE_NOT_APPROVED_CODE
 
 
 async def test_mobile_session_refresh_keeps_working_while_granted(client):
