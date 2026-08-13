@@ -73,6 +73,35 @@ final class AuthStoreRestoreTests: XCTestCase {
         (jar.cookies(for: AppConfig.apiBaseURL) ?? []).map(\.name)
     }
 
+    /// The record a signed-in launch leaves behind, so a later offline launch can
+    /// bring the app up. `CurrentUser` is `Decodable`-only, so it is built the one way
+    /// production builds it: through the decoder, from the server's own wire shape.
+    @discardableResult
+    private func plantRememberedUser(file: StaticString = #filePath, line: UInt = #line) -> Bool {
+        let json = """
+        {
+          "id": "user-1",
+          "email": "nurse@example.com",
+          "name": "Ada Nurse",
+          "role": "member",
+          "org_id": "org-1",
+          "dept_id": "dept-1",
+          "avatar_url": null,
+          "about": "Ward 4",
+          "mobile_access": true
+        }
+        """
+        guard let user = try? JSONDecoder().decode(CurrentUser.self, from: Data(json.utf8)) else {
+            XCTFail("Could not build a CurrentUser to remember", file: file, line: line)
+            return false
+        }
+        RememberedUser.save(user)
+        XCTAssertNotNil(RememberedUser.load(),
+                        "Test fixture: saving the remembered user did not take",
+                        file: file, line: line)
+        return true
+    }
+
     // MARK: - Proven failure clears
 
     func test_refreshRefusedAtLaunch_discardsTheDeadCookie() async {
@@ -168,6 +197,50 @@ final class AuthStoreRestoreTests: XCTestCase {
             )
         )
         XCTAssertFalse(refreshCookieNames().contains("rx_refresh"))
+    }
+
+    /// A denial is the most definite refusal the app can get: this account may not
+    /// use it at all. The cached copy of that account — email, display name, avatar,
+    /// "about", and the org and department it belongs to — must not outlive it in
+    /// UserDefaults. The early return for the denial screen skipped the cleanup that
+    /// every other terminal path runs.
+    func test_codedDenialAtLaunch_alsoDiscardsTheRememberedAccount() async {
+        plantRefreshCookie()
+        plantRememberedUser()
+        MockURLProtocol.install { request, _ in
+            request.url?.path == "/api/auth/refresh"
+                ? .json(403, #"{"detail":"Mobile access has not been enabled for this account.","code":"MOBILE_NOT_APPROVED"}"#)
+                : .json(401, Self.notAuthenticated)
+        }
+
+        let auth = AuthStore(api: makeClient())
+        await auth.restoreSession(minimumSplash: .zero)
+
+        XCTAssertEqual(
+            auth.phase,
+            .accessDenied(
+                reason: "Mobile access has not been enabled for this account.",
+                denial: .notApproved
+            )
+        )
+        XCTAssertNil(
+            RememberedUser.load(),
+            "A refused account must not leave its profile behind on the device"
+        )
+        XCTAssertFalse(refreshCookieNames().contains("rx_refresh"))
+    }
+
+    /// The same cleanup on the uncoded path, which reaches it via `endsSession`.
+    func test_uncodedRefusalAtLaunch_alsoDiscardsTheRememberedAccount() async {
+        plantRefreshCookie()
+        plantRememberedUser()
+        MockURLProtocol.install { _, _ in .json(401, Self.notAuthenticated) }
+
+        let auth = AuthStore(api: makeClient())
+        await auth.restoreSession(minimumSplash: .zero)
+
+        XCTAssertEqual(auth.phase, .signedOut)
+        XCTAssertNil(RememberedUser.load())
     }
 
     // MARK: - Unproven failure must not clear

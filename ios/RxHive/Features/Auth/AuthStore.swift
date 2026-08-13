@@ -122,6 +122,13 @@ final class AuthStore: ObservableObject {
                 if let denial = error.mobileDenial {
                     await splash.value
                     await api.clearSessionCookies()
+                    // Returning early skips the `endsSession` cleanup below, so this
+                    // branch has to do its own — and a refusal this definite is the
+                    // last place to keep a copy of the account. The record holds the
+                    // user's email, display name, avatar, "about" text and their org
+                    // and department ids; `revalidateSession` already drops it for the
+                    // same denial mid-session.
+                    RememberedUser.clear()
                     sessionGeneration &+= 1
                     phase = .accessDenied(reason: error.userMessage, denial: denial)
                     return
