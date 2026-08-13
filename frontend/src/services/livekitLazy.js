@@ -207,14 +207,40 @@ const livekitClient = {
    * room, and for the same reason: a microphone that never moved must not be
    * announced as muted.
    */
-  setMicEnabled: (enabled) => load().then(
-    (s) => s.setMicEnabled(enabled),
-    unavailable(() => !useCallStore.getState().isMuted)
+  //
+  // BOTH TOGGLES GO STRAIGHT THROUGH WHEN THE SDK IS ALREADY HERE, and that is
+  // not an optimisation — deferring them is a correctness bug.
+  //
+  // livekitClient writes the store OPTIMISTICALLY AND SYNCHRONOUSLY as the first
+  // thing each toggle does, before it awaits the SDK, and that write is what
+  // makes tap N read the opposite of tap N-1: both callers compute their target
+  // from `useCallStore.getState()` at tap time. Routing the call through
+  // `load().then(...)` moves that write behind a microtask, so four taps inside
+  // one frame all read the same value, all ask for the same state, and the
+  // camera never settles back — which is exactly what group-calling.spec's
+  // rapid-tap case caught.
+  //
+  // The `load()` path is kept for the window before the first join resolves: a
+  // group call's initiator is put into `callState: 'connected'` by the socket
+  // handler before `joinCall` is called, so the mute button is live while the
+  // chunk is still in flight. There the deferral is harmless — there is no room
+  // yet, so livekitClient's own no-room path is where the call lands either way.
+  setMicEnabled: (enabled) => (
+    sdk
+      ? sdk.setMicEnabled(enabled)
+      : load().then(
+        (s) => s.setMicEnabled(enabled),
+        unavailable(() => !useCallStore.getState().isMuted)
+      )
   ),
 
-  setCameraEnabled: (enabled) => load().then(
-    (s) => s.setCameraEnabled(enabled),
-    unavailable(() => useCallStore.getState().isCameraOn)
+  setCameraEnabled: (enabled) => (
+    sdk
+      ? sdk.setCameraEnabled(enabled)
+      : load().then(
+        (s) => s.setCameraEnabled(enabled),
+        unavailable(() => useCallStore.getState().isCameraOn)
+      )
   ),
 
   startScreenShare: () => load().then(
