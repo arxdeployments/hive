@@ -5,20 +5,13 @@ import {
   MoreHorizontal, ChevronDown, UserPlus, Lock,
   Monitor, MonitorOff, MonitorUp, MessageSquare, SwitchCamera
 } from 'lucide-react';
-import useCallStore, { isCallStalled } from '../../stores/callStore';
+import useCallStore, { isCallStalled, formatCallDuration } from '../../stores/callStore';
 import { StreamVideo } from './StreamVideo';
-import livekitClient from '../../services/livekitClient';
+import livekitClient from '../../services/livekitLazy';
 import callSounds from '../../services/callSounds';
 import wsClient from '../../services/websocket';
 import { VideoGrid } from './VideoGrid';
 import { AddParticipantsModal } from './AddParticipantsModal';
-
-const formatDuration = (s) => {
-  const total = Math.max(0, Math.floor(s || 0));
-  const m = Math.floor(total / 60);
-  const sec = total % 60;
-  return `${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
-};
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 
@@ -221,7 +214,7 @@ export const ActiveCallView = () => {
   if (isEnded) statusText = 'Call ended';
   else if (reconnecting) statusText = 'Connecting…';
   else if (isConnecting) statusText = 'Connecting';
-  else if (isConnected) statusText = formatDuration(callDuration);
+  else if (isConnected) statusText = formatCallDuration(callDuration);
 
   // ---- Handlers ----
   const handleEnd = () => {

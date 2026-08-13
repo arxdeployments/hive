@@ -5,6 +5,7 @@ import { toast } from 'sonner';
 import client from '../../api/client';
 import useChatStore from '../../stores/chatStore';
 import { useModalDialog } from '../../hooks/useModalDialog';
+import { apiError } from '../../utils/helpers';
 
 /**
  * `message` forwards one message (the message context menu's path). `messages`
@@ -72,7 +73,7 @@ export const ForwardModal = ({ message, messages, isOpen, onClose }) => {
       onClose();
       return;
     }
-    toast.error(lastError?.response?.data?.detail || 'Forward failed');
+    toast.error(apiError(lastError, 'Forward failed'));
   };
 
   if (!isOpen || targetIds.length === 0) return null;

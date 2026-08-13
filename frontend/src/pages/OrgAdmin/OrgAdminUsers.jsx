@@ -7,6 +7,7 @@ import { useAuth } from '../../contexts/AuthContext';
 import client from '../../api/client';
 
 import { generatePassword as genPassword } from '../../utils/generatePassword';
+import { apiError } from '../../utils/helpers';
 
 export default function OrgAdminUsers() {
   const { user: me } = useAuth();
@@ -64,19 +65,28 @@ export default function OrgAdminUsers() {
   };
 
   const handleCreate = async () => {
+    // Mirror OrgCreateUser's `min_length=2` on display_name, against the trimmed
+    // value. Checking `!formName` only asked whether the box was non-empty, and
+    // the API measures the string it is sent, not the one it stores: "  " is two
+    // characters on the wire, clears min_length, and is then stripped before the
+    // insert, so the account landed with a blank name. " a " got through the same
+    // way and stored a one-character one. Sending the trimmed value keeps what is
+    // stored identical to what was validated here.
+    const name = formName.trim();
+    if (name.length < 2) return;
     setSaving(true);
     try {
       // Always 'member'. The API rejects anything else from an org admin, so
       // there is no role to choose and no state to hold one in.
       await client.post('/api/org-admin/users', {
-        dept_id: formDept, email: formEmail, display_name: formName, password: formPassword, role: 'member'
+        dept_id: formDept, email: formEmail, display_name: name, password: formPassword, role: 'member'
       });
       toast.success('User created', {
         description: `Password: ${formPassword}`, duration: 10000,
         action: { label: 'Copy', onClick: () => { navigator.clipboard.writeText(formPassword); toast.success('Copied!'); } }
       });
       setShowCreate(false); fetchUsers();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(apiError(err, 'Failed')); }
     finally { setSaving(false); }
   };
 
@@ -86,12 +96,18 @@ export default function OrgAdminUsers() {
   };
 
   const handleEditSave = async () => {
+    // The same floor, which this drawer had no version of at all. OrgUpdateUser
+    // carries no `min_length`, so a rename to "a" was accepted and kept, while a
+    // rename to whitespace was quietly discarded server-side and still reported
+    // "User updated" over a list that had not changed.
+    const name = editName.trim();
+    if (name.length < 2) return;
     try {
       await client.put(`/api/org-admin/users/${editUser._id}`, {
-        display_name: editName, role: editRole, is_active: editActive, dept_id: editDept
+        display_name: name, role: editRole, is_active: editActive, dept_id: editDept
       });
       toast.success('User updated'); setEditUser(null); fetchUsers();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(apiError(err, 'Failed')); }
   };
 
   const handleResetPw = async () => {
@@ -212,7 +228,14 @@ export default function OrgAdminUsers() {
                 </div>
                 <div>
                   <label htmlFor="orgadminusers-03-display-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Display Name *</label>
+                  {/* OrgCreateUser caps display_name at 100. `maxLength` is
+                      live-enforced by the browser on typing and pasting alike, so
+                      the ceiling belongs here — unlike the floor, which cannot be
+                      a `minLength` attribute because nothing on this page is
+                      inside a <form> and constraint validation never runs. The
+                      edit drawer's ceiling is a different number; see there. */}
                   <input id="orgadminusers-03-display-name" type="text" value={formName} onChange={(e) => setFormName(e.target.value)}
+                    maxLength={100}
                     className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none" />
                 </div>
                 <div>
@@ -253,7 +276,7 @@ export default function OrgAdminUsers() {
               </div>
               <div className="flex justify-end gap-3 mt-6">
                 <button onClick={() => setShowCreate(false)} className="px-4 py-2 text-sm text-[#A3A3A3] hover:text-[#F5F5F5] rounded-[6px] transition-colors">Cancel</button>
-                <button onClick={handleCreate} disabled={!formEmail || !formName || !formDept || !formPassword || saving}
+                <button onClick={handleCreate} disabled={!formEmail || formName.trim().length < 2 || !formDept || !formPassword || saving}
                   className="px-4 py-2 text-sm font-medium bg-[#10B981] text-[#0A0A0A] rounded-[6px] hover:bg-[#059669] disabled:opacity-50 transition-all flex items-center gap-2">
                   {saving && <Loader2 size={14} className="animate-spin" />} Create User
                 </button>
@@ -275,7 +298,14 @@ export default function OrgAdminUsers() {
               </div>
               <div className="space-y-5">
                 <div><label htmlFor="orgadminusers-05-name" className="text-sm text-[#A3A3A3] mb-1.5 block">Name</label>
+                  {/* 200, not the create form's 100: OrgUpdateUser is bounded at
+                      the User.display_name column width rather than the create
+                      schema's limit. Matching each input to its own endpoint is
+                      the point of the attribute — capping this at 100 would refuse
+                      renames the API accepts, and would strand any name already
+                      longer than that in a box that could only be shortened. */}
                   <input id="orgadminusers-05-name" value={editName} onChange={e => setEditName(e.target.value)}
+                    maxLength={200}
                     className="w-full h-10 px-4 bg-[#1A1A1A] border border-[#2D2D2D] rounded-[6px] text-sm text-[#F5F5F5] focus:border-[#10B981] focus:outline-none" /></div>
                 <div><label htmlFor="orgadminusers-06-email" className="text-sm text-[#A3A3A3] mb-1.5 block">Email</label>
                   <input id="orgadminusers-06-email" value={editUser.email} readOnly className="w-full h-10 px-4 bg-[#0F0F0F] border border-[#1F1F1F] rounded-[6px] text-sm text-[#A3A3A3]" /></div>
@@ -341,7 +371,8 @@ export default function OrgAdminUsers() {
                 )}
                 <div className="flex gap-3 pt-4">
                   <button onClick={() => setEditUser(null)} className="flex-1 px-4 py-2.5 text-sm bg-[#1A1A1A] border border-[#2D2D2D] text-[#A3A3A3] rounded-[6px]">Cancel</button>
-                  <button onClick={handleEditSave} className="flex-1 px-4 py-2.5 text-sm font-medium bg-[#10B981] text-[#0A0A0A] rounded-[6px] hover:bg-[#059669] transition-all">Save</button>
+                  <button onClick={handleEditSave} disabled={editName.trim().length < 2}
+                    className="flex-1 px-4 py-2.5 text-sm font-medium bg-[#10B981] text-[#0A0A0A] rounded-[6px] hover:bg-[#059669] disabled:opacity-50 disabled:cursor-not-allowed transition-all">Save</button>
                 </div>
               </div>
             </motion.div>

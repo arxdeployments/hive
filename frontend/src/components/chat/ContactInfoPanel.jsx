@@ -23,6 +23,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { apiError } from '../../utils/helpers';
 import {
   Check,
   Copy,
@@ -254,7 +255,7 @@ export const ContactInfoPanel = ({
       toast.success(value ? 'Notifications muted' : 'Notifications unmuted');
     } catch (err) {
       setMuted(!next); // roll back
-      toast.error(err.response?.data?.detail || 'Failed to change mute');
+      toast.error(apiError(err, 'Failed to change mute'));
     } finally {
       setMutePending(false);
     }

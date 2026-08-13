@@ -229,14 +229,6 @@ const useChatStore = create((set) => ({
   }),
 
   /**
-   * Apply a pin change (from my own toggle, or from a conversation_pin_update
-   * frame sent by another of my tabs) and re-sort.
-   *
-   * updateConversation deliberately does NOT re-sort, so using it here would flip
-   * the pin badge while leaving the row where it was until the next inbound
-   * message or refetch.
-   */
-  /**
    * Bumped whenever a message_pin_update arrives for a conversation, so
    * ChatPanel's /pinned fetch can re-run.
    *
@@ -253,6 +245,14 @@ const useChatStore = create((set) => ({
     pinnedVersion: { ...state.pinnedVersion, [convId]: (state.pinnedVersion[convId] || 0) + 1 },
   })),
 
+  /**
+   * Apply a pin change (from my own toggle, or from a conversation_pin_update
+   * frame sent by another of my tabs) and re-sort.
+   *
+   * updateConversation deliberately does NOT re-sort, so using it here would flip
+   * the pin badge while leaving the row where it was until the next inbound
+   * message or refetch.
+   */
   setConversationPinned: (convId, isPinned, pinOrder) => set((state) => {
     const convs = state.conversations.map(c => (
       c._id === convId

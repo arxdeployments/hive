@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Phone, Video, Link2, Hash, Calendar, PhoneIncoming, PhoneOutgoing, PhoneMissed, X, Clock } from 'lucide-react';
-import { formatRelativeTime } from '../../utils/helpers';
+import { apiError, formatRelativeTime } from '../../utils/helpers';
 import client from '../../api/client';
 import useCallStore from '../../stores/callStore';
 import wsClient from '../../services/websocket';
@@ -61,12 +61,7 @@ export const ScheduleCallModal = ({
       onScheduled?.();
       onClose();
     } catch (err) {
-      const d = err?.response?.data;
-      const msg = (typeof d?.detail === 'string' && d.detail)
-        || (Array.isArray(d?.detail) && d.detail[0]?.msg)
-        || d?.message
-        || 'Failed to schedule call';
-      toast.error(msg);
+      toast.error(apiError(err, 'Failed to schedule call'));
     } finally {
       setSaving(false);
     }

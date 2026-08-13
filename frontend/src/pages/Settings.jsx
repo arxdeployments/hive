@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
 import { PageTransition } from '../components/common/PageTransition';
 import client from '../api/client';
+import { apiError } from '../utils/helpers';
 import { enablePushNotifications, disablePushNotifications } from '../lib/pwa';
 
 const FONT_PX = { small: '14px', medium: '16px', large: '18px' };
@@ -40,15 +41,6 @@ const fontKey = (size) => (Object.prototype.hasOwnProperty.call(FONT_PX, size) ?
 export function applyFontSize(size) {
   document.documentElement.style.fontSize = FONT_PX[fontKey(size)];
 }
-
-const extractError = (err, fallback) => {
-  const d = err?.response?.data;
-  if (!d) return fallback;
-  if (typeof d.detail === 'string') return d.detail;
-  if (Array.isArray(d.detail) && d.detail[0]?.msg) return d.detail[0].msg;
-  if (typeof d.message === 'string') return d.message;
-  return fallback;
-};
 
 // Track 36x20 with a 16px knob and a 2px inset — the standard compact switch,
 // and the same geometry as InfoPanelPrimitives' Switch so the app has one
@@ -186,7 +178,7 @@ export default function SettingsPage() {
       setNewPassword('');
       setConfirmPassword('');
     } catch (err) {
-      toast.error(extractError(err, 'Failed to change password'));
+      toast.error(apiError(err, 'Failed to change password'));
     } finally {
       setChangingPassword(false);
     }

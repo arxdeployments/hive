@@ -1,7 +1,7 @@
 import { toast } from 'sonner';
 import useChatStore from '../stores/chatStore';
 import useCallStore, { hasLiveCall, LINK_OK, LINK_RECONNECTING } from '../stores/callStore';
-import livekitClient from './livekitClient';
+import livekitClient from './livekitLazy';
 import callSounds from './callSounds';
 import { refreshSession, sessionRejected, setSignOutReason } from '../api/client';
 import { withDerivedStatus, applyReadReceipt } from '../utils/messageStatus';
@@ -64,6 +64,39 @@ const PONG_TIMEOUT_MS = 10000;
  * server never answers.
  */
 const ACK_TIMEOUT_MS = 15000;
+
+/**
+ * How long a desktop notification waits for a service worker to activate before
+ * giving up and using the `Notification` constructor instead.
+ *
+ * `navigator.serviceWorker.ready` resolves only when a registration reaches
+ * "activated" and, per spec, NEVER rejects. So when registration failed there is
+ * nothing to activate and the await parks for the life of the tab — and
+ * lib/pwa.js swallows a failed `register()` with a console.warn, so a mis-served
+ * /sw.js, a path rewrite in front of the app or an enterprise policy all land
+ * here silently. The `catch` below was written as the fallback path and could
+ * never run: a promise that never settles throws nothing. Every desktop
+ * notification was simply lost, with no error anywhere to say so.
+ */
+const SW_READY_TIMEOUT_MS = 3000;
+
+/**
+ * How much longer a notification with nowhere else to go will wait for that same
+ * activation to finish.
+ *
+ * Only Android Chrome gets here, and only because losing the race above is fatal
+ * there: the `Notification` constructor is unsupported and throws, so a worker
+ * that was merely slow to activate — a cold start, a slow device, a first
+ * install — took the notification down with it. Nothing was listening when the
+ * registration turned up a moment later.
+ *
+ * Bounded, for the two reasons the timeout above exists at all. `ready` never
+ * settles when registration failed outright, so an open-ended continuation would
+ * park for the life of the tab, once per dropped message. And a message alert
+ * that surfaces long after the message is noise rather than a rescue — past this
+ * point the unread badge is the better messenger.
+ */
+const SW_LATE_READY_TIMEOUT_MS = 30000;
 
 // Auth rides in httpOnly cookies — the WS handshake carries them automatically
 // (same-origin in production behind Caddy, and via the Vite proxy in dev).
@@ -1518,7 +1551,13 @@ class RxHiveWebSocket {
 
       if ('serviceWorker' in navigator) {
         try {
-          const reg = await navigator.serviceWorker.ready;
+          // Raced, not awaited outright — see SW_READY_TIMEOUT_MS. The loser is
+          // `undefined` rather than a rejection, so a timeout falls through to
+          // the constructor below by the same route a real failure would.
+          const reg = await Promise.race([
+            navigator.serviceWorker.ready,
+            new Promise((resolve) => { setTimeout(resolve, SW_READY_TIMEOUT_MS); }),
+          ]);
           if (reg && typeof reg.showNotification === 'function') {
             await reg.showNotification(title, options);
             return;
@@ -1528,12 +1567,32 @@ class RxHiveWebSocket {
         }
       }
 
-      const notif = new Notification(title, options);
-      notif.onclick = () => {
-        window.focus();
-        store.setActiveConversation(convId);
-        notif.close();
-      };
+      try {
+        const notif = new Notification(title, options);
+        notif.onclick = () => {
+          window.focus();
+          store.setActiveConversation(convId);
+          notif.close();
+        };
+      } catch (err) {
+        // Where Android Chrome landed whenever activation overran the race
+        // above: `reg` came back undefined, the constructor threw as it always
+        // does there, and the outer catch dropped the notification for good.
+        //
+        // Losing that race is not the same as having no service worker, so the
+        // registration still activating gets a second chance to deliver. No
+        // guard is needed against showing this twice — the only way here is the
+        // constructor throwing, and a constructor that throws has shown nothing.
+        // A successful one returns without ever attaching this wait.
+        if (!('serviceWorker' in navigator)) throw err;
+        const reg = await Promise.race([
+          navigator.serviceWorker.ready,
+          new Promise((resolve) => { setTimeout(resolve, SW_LATE_READY_TIMEOUT_MS); }),
+        ]);
+        if (reg && typeof reg.showNotification === 'function') {
+          await reg.showNotification(title, options);
+        }
+      }
     } catch {
       // Notification may fail in some contexts
     }

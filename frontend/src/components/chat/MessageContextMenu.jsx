@@ -71,6 +71,7 @@ import {
 import { toast } from 'sonner';
 import client from '../../api/client';
 import useChatStore from '../../stores/chatStore';
+import { apiError } from '../../utils/helpers';
 
 const EDGE_GAP = 8;
 
@@ -255,8 +256,7 @@ export const MessageContextMenu = ({ message, isOwn, isGroup, position, onAction
         // with "This conversation already has N pinned messages…", which the
         // generic string below turned into something indistinguishable from a
         // network error — the user had no idea why the pin refused.
-        const detail = err?.response?.data?.detail;
-        toast.error(detail || (isStar
+        toast.error(apiError(err, isStar
           ? `Failed to ${optimistic ? 'star' : 'unstar'} message`
           : `Failed to ${optimistic ? 'pin' : 'unpin'} message`));
       });

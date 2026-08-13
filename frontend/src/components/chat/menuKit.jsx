@@ -12,6 +12,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { AnimatePresence, motion } from 'framer-motion';
 import { toast } from 'sonner';
 import client from '../../api/client';
+import { apiError } from '../../utils/helpers';
 
 const EDGE = 8; // keep this far away from every viewport edge
 const GAP = 6; // distance between anchor and surface
@@ -19,17 +20,6 @@ const GAP = 6; // distance between anchor and surface
 /** Enabled menu items, in DOM order — the arrow-key ring. */
 const menuItemsOf = (root) =>
   root ? Array.from(root.querySelectorAll('[role="menuitem"]:not([aria-disabled="true"])')) : [];
-
-/** FastAPI error bodies come in three shapes; collapse them to one string. */
-export const apiError = (err, fallback) => {
-  const d = err?.response?.data;
-  return (
-    (typeof d?.detail === 'string' && d.detail) ||
-    (Array.isArray(d?.detail) && d.detail[0]?.msg) ||
-    d?.message ||
-    fallback
-  );
-};
 
 /**
  * Clipboard write that also works where `navigator.clipboard` is missing

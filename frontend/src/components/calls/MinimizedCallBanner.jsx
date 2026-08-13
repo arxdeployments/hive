@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion, useMotionValue } from 'framer-motion';
 import { Mic, MicOff, PhoneOff, Video } from 'lucide-react';
-import useCallStore, { isCallStalled } from '../../stores/callStore';
-import livekitClient from '../../services/livekitClient';
+import useCallStore, { isCallStalled, formatCallDuration } from '../../stores/callStore';
+import livekitClient from '../../services/livekitLazy';
 import wsClient from '../../services/websocket';
 import { StreamVideo } from './StreamVideo';
 
@@ -44,12 +44,6 @@ const SIZE = {
   voice: { w: 216, h: 76 },
 };
 const EDGE = 12;
-
-const formatDuration = (s) => {
-  const m = Math.floor(s / 60);
-  const sec = s % 60;
-  return `${m}:${sec.toString().padStart(2, '0')}`;
-};
 
 const readStoredPosition = () => {
   try {
@@ -172,7 +166,7 @@ export const MinimizedCallBanner = () => {
   const status = reconnecting
     ? 'Connecting…'
     : callState === 'connected'
-      ? formatDuration(callDuration)
+      ? formatCallDuration(callDuration)
       : callState === 'outgoing_ringing' ? 'Ringing…' : 'Connecting…';
 
   return (

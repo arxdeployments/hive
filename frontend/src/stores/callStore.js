@@ -347,4 +347,33 @@ export const isCallStalled = (s) =>
 export const hasLiveCall = (s) =>
   s.callState !== 'idle' && s.callState !== 'ended';
 
+/**
+ * `callDuration` as the in-call clock: mm:ss, with the minutes PADDED.
+ *
+ * It lives beside the state it formats because it has to be the same function in
+ * both places. ActiveCallView and MinimizedCallBanner are the same call — the
+ * minimise button swaps one for the other — and each carried its own copy, one
+ * padding the minutes and one not. So a call reading "00:42" expanded became
+ * "0:42" the instant it was minimised and "00:42" again on restore: the clock
+ * appeared to change format every time the window did.
+ *
+ * Padded is the side that wins because it is what the other client already
+ * ships, and because a fixed-width clock does not reflow the pill every time it
+ * crosses ten minutes.
+ *
+ * Guarded with `Number.isFinite` rather than `Number(seconds) || 0` so nothing
+ * non-numeric reaches the arithmetic. The `|| 0` caught NaN and strings, both
+ * being falsy once coerced, but Infinity is truthy and went straight through it:
+ * `Infinity % 60` is NaN, so the clock rendered "Infinity:NaN" — the very thing
+ * the guard was there to prevent, in a worse form. -Infinity escaped only by
+ * accident, on the `Math.max` floor below.
+ */
+export const formatCallDuration = (seconds) => {
+  const numeric = Number(seconds);
+  const total = Number.isFinite(numeric) ? Math.max(0, Math.floor(numeric)) : 0;
+  const m = Math.floor(total / 60);
+  const sec = total % 60;
+  return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+};
+
 export default useCallStore;

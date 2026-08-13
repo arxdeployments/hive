@@ -7,6 +7,7 @@ import client from '../../api/client';
 import { transcodeImage } from '../../utils/mediaQuality';
 import { toast } from 'sonner';
 import { useModalDialog } from '../../hooks/useModalDialog';
+import { apiError } from '../../utils/helpers';
 
 const backendUrl = import.meta.env.VITE_BACKEND_URL || '';
 
@@ -49,7 +50,7 @@ export const ProfileDrawer = ({ isOpen, onClose }) => {
       setEditingName(false);
       toast.success('Name updated');
       checkAuth();
-    } catch (err) { toast.error(err.response?.data?.detail || 'Failed to update'); }
+    } catch (err) { toast.error(apiError(err, 'Failed to update')); }
   };
 
   const handleSaveAbout = async () => {
@@ -58,7 +59,7 @@ export const ProfileDrawer = ({ isOpen, onClose }) => {
       setProfile(prev => ({ ...prev, about: data.about }));
       setEditingAbout(false);
       toast.success('About updated');
-    } catch (err) { toast.error(err.response?.data?.detail || 'Failed to update'); }
+    } catch (err) { toast.error(apiError(err, 'Failed to update')); }
   };
 
   const handleAvatarUpload = async (e) => {

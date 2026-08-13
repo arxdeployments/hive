@@ -4,6 +4,7 @@ import { Search, X, ArrowLeft, Camera, Users, Loader2 } from 'lucide-react';
 import client from '../../api/client';
 import { toast } from 'sonner';
 import { useModalDialog } from '../../hooks/useModalDialog';
+import { apiError } from '../../utils/helpers';
 
 /**
  * `prefillMembers` / `prefillName` / `prefillDescription` back GroupInfoPanel's
@@ -100,7 +101,7 @@ export const CreateGroupModal = ({
       onGroupCreated(data);
       onClose();
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to create group');
+      toast.error(apiError(err, 'Failed to create group'));
     } finally {
       setCreating(false);
     }
