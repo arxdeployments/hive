@@ -165,17 +165,28 @@ class LocalRegistry:
 
         Returns False when the socket is gone or has just been dropped for being
         wedged, so a caller is never told a frame was queued when it was not.
+
+        Lookup, the closing check and the enqueue are ONE critical section, because
+        that return value is a promise. Releasing the lock in between let `remove` pop
+        the connection and cancel its writer before the enqueue landed, and this then
+        answered True for a frame no live writer would ever pick up.
+
+        _reader deliberately does not take the lock for its own enqueue: it makes no
+        promise to anyone, so the worst a removal race costs there is a frame left in
+        the outbox of a connection about to be collected — and taking this lock per
+        message would put every event on the worker behind add/remove.
         """
         async with self._lock:
             conn = self.connections.get(str(user_id), {}).get(conn_id)
-        if conn is None or conn.closing:
-            return False
-        try:
-            conn.outbox.put_nowait(payload)
-        except asyncio.QueueFull:
-            self._drop_wedged(conn)
-            return False
-        return True
+            if conn is None or conn.closing:
+                return False
+            try:
+                conn.outbox.put_nowait(payload)
+            except asyncio.QueueFull:
+                # Safe under the lock: _drop_wedged never awaits.
+                self._drop_wedged(conn)
+                return False
+            return True
 
     async def _writer(self, conn: _Conn) -> None:
         """Drain one socket's outbox. The only place send_text is called."""
