@@ -23,6 +23,7 @@ security-relevant half.
 """
 
 import asyncio
+import json
 import uuid
 
 from httpx import ASGITransport, AsyncClient
@@ -205,15 +206,15 @@ async def test_a_socket_that_never_drains_is_dropped_rather_than_waited_for():
         await registry.stop()
 
 
-async def test_a_burst_larger_than_the_outbox_does_not_close_a_healthy_socket():
+async def test_a_burst_larger_than_the_outbox_does_not_close_a_healthy_socket_over_real_redis():
     """Queue depth must measure socket slowness, not reader burstiness.
 
-    get_message() returns already-buffered messages without suspending, and awaiting
-    a coroutine that returns immediately does not yield in asyncio. Without a yield
-    in the reader, a backlog gets drained in one tight loop, so a healthy socket's
-    outbox fills and it is closed with 1011 for a burst it could easily have
-    absorbed — a false positive on exactly the clients this change is meant to
-    protect.
+    INTEGRATION check, and deliberately not the guard: a pipeline batches the
+    PUBLISH commands but does not synchronise the SUBSCRIBER socket with the last of
+    them, so the burst may still arrive incrementally and let _reader suspend between
+    frames. It therefore cannot be relied on to fail when the yield is removed — the
+    deterministic version of this is the test below. This one is kept because it
+    exercises the real pub/sub path end to end.
     """
     registry = hub.LocalRegistry()
     await registry.start()
@@ -233,6 +234,64 @@ async def test_a_burst_larger_than_the_outbox_does_not_close_a_healthy_socket():
             if len(healthy.sent) == burst:
                 break
             await asyncio.sleep(0.1)
+
+        assert healthy.closed is None, f"a healthy socket was dropped: {healthy.closed}"
+        assert len(healthy.sent) == burst, f"{len(healthy.sent)}/{burst} delivered"
+    finally:
+        await registry.stop()
+
+
+class _PreloadedPubSub:
+    """A pub/sub whose get_message NEVER suspends while frames remain.
+
+    This is the condition the real broker only reaches sometimes: a run of messages
+    already buffered, returned back to back. Awaiting a coroutine that returns
+    immediately does not yield in asyncio, so a reader without an explicit yield
+    drains the whole run in one tight loop.
+    """
+
+    def __init__(self, messages: list[dict]) -> None:
+        self._messages = list(messages)
+
+    # noqa signature, not style: it has to match the call _reader makes on the real
+    # redis pubsub, so the keyword names and defaults are fixed by that contract.
+    async def get_message(
+        self,
+        ignore_subscribe_messages: bool = True,
+        timeout: float = 1.0,  # noqa: ASYNC109
+    ):
+        if self._messages:
+            return self._messages.pop(0)
+        await asyncio.sleep(0.02)
+        return None
+
+    async def subscribe(self, *_a) -> None: ...
+    async def unsubscribe(self, *_a) -> None: ...
+    async def aclose(self) -> None: ...
+
+
+async def test_reader_yields_so_a_buffered_run_cannot_close_a_healthy_socket():
+    """The deterministic guard for the reader's yield.
+
+    No Redis and no timing: the pub/sub source hands _reader a buffered run of
+    OUTBOX_MAX_FRAMES * 3 frames with no suspension between them. Without the yield
+    the reader enqueues the whole run before any writer is scheduled, the outbox hits
+    its ceiling and a perfectly healthy socket is closed with 1011.
+    """
+    user = uuid.uuid4()
+    burst = hub.OUTBOX_MAX_FRAMES * 3
+    frames = [{"channel": f"user:{user}", "data": json.dumps({"n": i})} for i in range(burst)]
+
+    registry = hub.LocalRegistry()
+    registry._pubsub = _PreloadedPubSub(frames)
+    healthy = _HealthySocket()
+    try:
+        await registry.add(user, "conn", healthy)
+        registry._pubsub_task = asyncio.create_task(registry._reader())
+        for _ in range(200):  # up to 4s, returns as soon as the run is delivered
+            if len(healthy.sent) == burst:
+                break
+            await asyncio.sleep(0.02)
 
         assert healthy.closed is None, f"a healthy socket was dropped: {healthy.closed}"
         assert len(healthy.sent) == burst, f"{len(healthy.sent)}/{burst} delivered"
