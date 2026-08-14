@@ -101,10 +101,14 @@ async def _serialize_page(
     participants: list[ConversationParticipant],
     include_reply: bool = True,
 ) -> list[dict]:
-    """Serialize a page of messages with star/pin state batch-loaded once."""
+    """Serialize a page of messages with star/pin/reply state batch-loaded once."""
     ids = [m.id for m in messages]
     starred_ids = await enrich.starred_message_ids(db, ids, user_id)
     pinned_ids = await enrich.pinned_message_ids(db, ids)
+    # Reply previews for the whole page in one query. Not only an N+1 fix: reading
+    # them per row also expired the eager loads of any target that was itself in the
+    # page, which is what made /starred and /pinned 500. See enrich.reply_targets.
+    replies = await enrich.reply_targets(db, messages) if include_reply else {}
     # Senders arrive batch-loaded via MESSAGE_LOAD_OPTIONS (one IN query, no N+1).
     senders: dict[uuid.UUID, User] = {
         m.sender_id: m.sender for m in messages if m.sender_id is not None and m.sender is not None
@@ -119,6 +123,7 @@ async def _serialize_page(
             for_user=user_id,
             starred_ids=starred_ids,
             pinned_ids=pinned_ids,
+            reply_targets=replies,
         )
         for m in messages
     ]

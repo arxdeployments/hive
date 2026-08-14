@@ -393,6 +393,56 @@ async def pinned_message_ids(db: AsyncSession, message_ids: list[uuid.UUID]) -> 
     return set(rows.scalars().all())
 
 
+async def reply_targets(db: AsyncSession, messages: list[Message]) -> dict[uuid.UUID, Message]:
+    """Reply previews for a whole page, in at most one query.
+
+    Two problems, one line. Serializing a page used to re-read each row's reply
+    target individually, which cost three queries per replying message once
+    selectinload followed up for its sender and its attachments: a measured 152
+    queries for a 50-row page of replies, and roughly 600 for a 200-row /starred.
+
+    The second problem is worse than the first. That per-row read passed
+    populate_existing=True with only sender/attachments in its options, so whenever
+    the target was ALSO a member of the page it refreshed that member and EXPIRED
+    the reactions collection MESSAGE_LOAD_OPTIONS had eagerly loaded for it. Then
+    the loop reached that row, touched msg.reactions, and lazy-loaded — which under
+    asyncio is MissingGreenlet, a 500. /messages escaped it because a reply target
+    is always older and that endpoint reverses to oldest-first, so the clobbered row
+    had already been serialized. /starred and /pinned order newest-first and do not
+    reverse, so they reached it afterwards and failed. Starring or pinning a message
+    together with a reply to it was the entire reproduction, and /pinned is fetched
+    on every conversation open — where the client's catch turns the 500 into a
+    permanently blank pinned banner rather than an error anyone would see.
+
+    So a target already in the page is taken FROM the page and never re-read: it
+    arrived with the full load options, and refreshing it IS the bug. Only genuinely
+    absent targets are queried, and those keep populate_existing, because
+    list_messages resolves `before`/`around` anchors with db.get(), which leaves a
+    bare Message in the identity map that would otherwise satisfy this query with no
+    sender and no attachments loaded and lazy-load later. Those rows are not page
+    members, so refreshing them expires nothing the loop will touch.
+    """
+    in_page = {m.id: m for m in messages}
+    wanted = {m.reply_to_id for m in messages if m.reply_to_id}
+    found = {mid: in_page[mid] for mid in wanted if mid in in_page}
+    missing = wanted - found.keys()
+    if missing:
+        rows = (
+            (
+                await db.execute(
+                    select(Message)
+                    .options(selectinload(Message.sender), selectinload(Message.attachments))
+                    .where(Message.id.in_(missing))
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        found.update({m.id: m for m in rows})
+    return found
+
+
 async def serialize_message(
     db: AsyncSession,
     msg: Message,
@@ -403,6 +453,7 @@ async def serialize_message(
     for_user: uuid.UUID | None = None,
     starred_ids: set[uuid.UUID] | None = None,
     pinned_ids: set[uuid.UUID] | None = None,
+    reply_targets: dict[uuid.UUID, Message] | None = None,
 ) -> dict:
     """Serialize one message.
 
@@ -410,7 +461,9 @@ async def serialize_message(
     user context it is False. `client_msg_id` is likewise scoped to `for_user` —
     a caller that omits it gets a document safe to fan out to anyone, which is
     what the send path wants. List endpoints pass pre-computed `starred_ids` /
-    `pinned_ids` sets so a page costs two queries instead of two per message.
+    `pinned_ids` sets so a page costs two queries instead of two per message, and
+    `reply_targets` for the same reason — see that function for why passing it also
+    keeps this off a 500.
     """
     if sender is None and msg.sender_id:
         sender = await db.get(User, msg.sender_id)
@@ -490,16 +543,23 @@ async def serialize_message(
     doc.update(_attachment_fields([] if msg.deleted_at else list(msg.attachments)))
 
     if include_reply and msg.reply_to_id:
-        # Explicit select (not db.get): an identity-map hit would skip the
-        # eager-load options and later lazy-loads would blow up in async.
-        reply = (
-            await db.execute(
-                select(Message)
-                .options(selectinload(Message.sender), selectinload(Message.attachments))
-                .where(Message.id == msg.reply_to_id)
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
+        if reply_targets is not None:
+            reply = reply_targets.get(msg.reply_to_id)
+        else:
+            # The single-message callers — send, edit, react — have no page to batch
+            # across. Explicit select (not db.get): an identity-map hit would skip
+            # the eager-load options and later lazy-loads would blow up in async.
+            # populate_existing is safe on this path for the reason it was NOT safe
+            # on the page path: there is no sibling row here whose own eager loads
+            # it could expire.
+            reply = (
+                await db.execute(
+                    select(Message)
+                    .options(selectinload(Message.sender), selectinload(Message.attachments))
+                    .where(Message.id == msg.reply_to_id)
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
         if reply:
             reply_media = _attachment_fields([] if reply.deleted_at else list(reply.attachments))
             doc["reply_to_message"] = {

@@ -176,6 +176,78 @@ async def test_text_message_requires_content_and_media_requires_upload(client, t
     assert resp.status_code == 400  # foreign URLs can't be claimed
 
 
+async def test_unread_filter_selects_only_conversations_with_unread(client, two_orgs_with_users):
+    """?filter=unread must return exactly the conversations holding unread messages.
+
+    Previously resolved in Python — load every candidate conversation, count unread
+    for all of them, slice — so the tab cost the caller's whole conversation list no
+    matter the page size. It is a LATERAL probe in the query now, which means the
+    predicate itself is new code on a path that had NO test at all: nothing in the
+    suite exercised filter=unread before this.
+
+    Bob gets three conversations and reads the two most RECENT, leaving the oldest
+    unread. That arrangement is what makes the limit=1 case discriminating, and the
+    margin matters: the query fetches limit + 1 rows to decide has_more, so a single
+    read conversation ahead of the unread one would be absorbed by that slack and
+    prove nothing. TWO of them exceed it — filtering first returns the unread
+    conversation, paginating first returns nothing at all. That is not a hypothetical
+    shape; it is the shape this endpoint had, where the page was sliced out of a
+    list already filtered in Python.
+    """
+    users = two_orgs_with_users
+    from tests.conftest import make_user
+
+    await make_user("erin@a.com", org_id=users["org_a"].id, display_name="Erin")
+    await make_user("frank@a.com", org_id=users["org_a"].id, display_name="Frank")
+
+    # Sent oldest-first, so the sidebar order is frank, erin, alice.
+    await login(client, "alice@a.com")
+    from_alice = await _direct(client, users["bob"].id)
+    await _send(client, from_alice, "alice says hello")
+
+    async with _client_for("erin@a.com") as erin_client:
+        from_erin = await _direct(erin_client, users["bob"].id)
+        await _send(erin_client, from_erin, "erin says hello")
+
+    async with _client_for("frank@a.com") as frank_client:
+        from_frank = await _direct(frank_client, users["bob"].id)
+        await _send(frank_client, from_frank, "frank says hello")
+
+    async with _client_for("bob@a.com") as bob:
+        unread_ids = {
+            c["_id"]
+            for c in (await bob.get("/api/conversations", params={"filter": "unread"})).json()["data"]
+        }
+        assert unread_ids == {from_alice, from_erin, from_frank}, unread_ids
+
+        assert [c["_id"] for c in (await bob.get("/api/conversations")).json()["data"]] == [
+            from_frank,
+            from_erin,
+            from_alice,
+        ]
+        await bob.put(f"/api/conversations/{from_frank}/read")
+        await bob.put(f"/api/conversations/{from_erin}/read")
+
+        resp = await bob.get("/api/conversations", params={"filter": "unread"})
+        assert resp.status_code == 200, resp.text
+        rows = resp.json()["data"]
+        assert [c["_id"] for c in rows] == [from_alice]
+        assert rows[0]["unread_count"] == 1
+        assert resp.json()["has_more"] is False
+
+        # The filter must be applied BEFORE the limit. One slot plus one row of
+        # has_more slack is two, and the two rows that sort into them are both
+        # already read, so paginating first would return an empty tab.
+        resp = await bob.get("/api/conversations", params={"filter": "unread", "limit": 1})
+        assert resp.status_code == 200, resp.text
+        assert [c["_id"] for c in resp.json()["data"]] == [from_alice], resp.json()
+        assert resp.json()["has_more"] is False
+
+        # The unfiltered list still shows all three — the probe narrows this tab only.
+        everything = {c["_id"] for c in (await bob.get("/api/conversations")).json()["data"]}
+        assert {from_alice, from_erin, from_frank} <= everything
+
+
 async def test_content_is_sanitized(client, two_orgs_with_users):
     users = two_orgs_with_users
     await login(client, "alice@a.com")
