@@ -89,6 +89,37 @@ async def test_conversation_list_and_search_are_org_scoped(client, two_orgs_with
         assert "Alice" not in names and "Bob" not in names
 
 
+async def test_directory_lookup_is_scoped_to_the_callers_org(client, two_orgs_with_users):
+    """GET /api/users/directory/{id} must not become a cross-tenant read.
+
+    It exists so the contact panel can ask for one record instead of pulling the
+    whole roster — which is exactly the shape that invites an IDOR, because the
+    id now comes from the URL rather than from a list the server chose.
+
+    Carol (org B) asking for Alice (org A) must get the same answer she gets for
+    an id that does not exist at all: the two are deliberately indistinguishable,
+    so the endpoint cannot be used to probe which ids are real.
+    """
+    users = two_orgs_with_users
+
+    await login(client, "alice@a.com")
+    mine = await client.get(f"/api/users/directory/{users['bob'].id}")
+    assert mine.status_code == 200, mine.text
+    assert mine.json()["display_name"] == "Bob"
+
+    carol = await _fresh_client()
+    async with carol:
+        await login(carol, "carol@b.com")
+
+        cross = await carol.get(f"/api/users/directory/{users['alice'].id}")
+        assert cross.status_code == 404, cross.text
+
+        missing = await carol.get("/api/users/directory/00000000-0000-0000-0000-000000000000")
+        assert missing.status_code == 404
+        # Same status AND same body: a different message would leak existence.
+        assert cross.json() == missing.json()
+
+
 async def test_direct_conversation_across_orgs_rejected(client, two_orgs_with_users):
     users = two_orgs_with_users
     await login(client, "alice@a.com")

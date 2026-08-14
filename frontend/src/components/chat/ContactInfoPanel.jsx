@@ -181,13 +181,26 @@ export const ContactInfoPanel = ({
       return;
     }
     let cancelled = false;
+    // Nothing resolved for THIS target yet, so show nothing for it. Without this
+    // the previous contact's email and department stay on screen for the length of
+    // the request whenever targetId changes and the store has no cached row —
+    // attributed to whoever the panel is now open on.
+    setDirectory(null);
+    // One record, asked for by id.
+    //
+    // This used to GET the entire org roster and run `rows.find(c => c.id === …)`
+    // in the browser — 5.5 MB on a 25,000-user tenant, to read one row. That was
+    // only ever viable while /contacts was unbounded; now that it is capped, the
+    // find would simply have missed for anyone outside the first page and the
+    // panel would have rendered blank with no error to explain it.
     client
-      .get('/api/users/contacts')
+      .get(`/api/users/directory/${targetId}`)
       .then(({ data }) => {
         if (cancelled) return;
-        const rows = Array.isArray(data) ? data : [];
-        if (rows.length) useChatStore.getState().setContacts(rows);
-        setDirectory(rows.find((c) => c.id === targetId) || null);
+        setDirectory(data || null);
+        // Keep the shared contacts map warm for whoever reads it next, without
+        // claiming to have loaded a roster we did not fetch.
+        if (data?.id) useChatStore.getState().upsertContact(data);
       })
       .catch(() => {
         if (!cancelled) setDirectory(null);

@@ -35,10 +35,34 @@ export const ForwardModal = ({ message, messages, isOpen, onClose }) => {
     [items]
   );
 
+  /**
+   * Contacts are fetched per SEARCH, not once per open.
+   *
+   * /api/users/contacts is capped now — it used to return the whole org roster,
+   * which on a 25,000-user tenant was 5.5 MB per open. This modal filtered that
+   * array in the browser, so with a cap and a client-side filter the search box
+   * could only ever find someone inside the first page. Asking the server
+   * instead makes the whole roster reachable again while shipping a screenful.
+   *
+   * Debounced on the same 300ms the sidebar and the contact picker use, so
+   * typing a name is one request rather than one per keystroke.
+   */
   useEffect(() => {
-    if (!isOpen) { setSelected([]); setSearch(''); return; }
-    client.get('/api/users/contacts').then(r => setContacts(r.data)).catch(() => {});
-  }, [isOpen]);
+    if (!isOpen) { setSelected([]); setSearch(''); return undefined; }
+    let cancelled = false;
+    // Drop the previous query's rows before waiting out the debounce. The list
+    // below no longer filters locally, so keeping them would leave people who do
+    // not match what is now typed on screen AND selectable for those 300ms. The
+    // Contacts block is rendered only when non-empty, so this collapses the
+    // section rather than flashing an empty state.
+    setContacts([]);
+    const timer = setTimeout(() => {
+      client.get('/api/users/contacts', { params: { search } })
+        .then(r => { if (!cancelled) setContacts(r.data); })
+        .catch(() => {});
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [isOpen, search]);
 
   const toggle = (type, id) => {
     const key = `${type}:${id}`;
@@ -91,9 +115,9 @@ export const ForwardModal = ({ message, messages, isOpen, onClose }) => {
     c.participants?.some(p => p.display_name?.toLowerCase().includes(search.toLowerCase()))
   ).slice(0, 10);
 
-  const filteredContacts = contacts.filter(c =>
-    !search || c.display_name?.toLowerCase().includes(search.toLowerCase())
-  );
+  // The server has already applied `search` to this list; conversations above
+  // are still filtered locally because they come from the store, not the API.
+  const filteredContacts = contacts;
 
   return (
     <AnimatePresence>
