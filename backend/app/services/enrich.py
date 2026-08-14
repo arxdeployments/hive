@@ -12,7 +12,7 @@ last_read_at instead of stored counters — one source of truth, no drift.
 import datetime as dt
 import uuid
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import func, literal_column, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -54,31 +54,71 @@ async def unread_counts(
     db: AsyncSession, conversation_ids: list[uuid.UUID], user_id: uuid.UUID
 ) -> dict[uuid.UUID, int]:
     """Unread messages per conversation for one user: messages newer than the
-    user's last_read_at, not sent by them, not deleted-for-them, not system."""
+    user's last_read_at, not sent by them, not deleted-for-them, not system.
+
+    Counted per conversation through a LATERAL, and the cursor is a COALESCE
+    rather than an OR. BOTH halves are load-bearing and neither works alone —
+    measured on a seeded 2.1M-message tenant, one sidebar page of 30 conversations:
+
+        hash join + OR (as it was)   96-102ms   58,059 buffers
+        LATERAL, OR kept                199ms   13,744   <- worse
+        hash join + COALESCE          no change  33,746   <- still a Join Filter
+        LATERAL + COALESCE (this)       1.1ms      512
+
+    last_read_at arrives from the joined participant row, so with a hash join the
+    cursor can only be applied AFTER the join, as a Join Filter — which is why this
+    read the whole messages table and threw away 99.8% of it to count 1,747 rows.
+    The LATERAL makes last_read_at a per-conversation constant. Separately,
+    (last_read_at IS NULL OR created_at > last_read_at) is not indexable at all:
+    the IS NULL disjunct means created_at cannot bound the scan, so even inside the
+    LATERAL Postgres still read every message in the conversation. COALESCE to
+    -infinity is the same predicate with one branch, so it becomes an index
+    condition on ix_messages_conversation_created and the scan starts at the cursor.
+
+    The old cost tracked the tenant's TOTAL history: adding a million messages to
+    conversations this user is not a member of took it from 33,746 buffers to
+    58,059, while this version went from 510 to 512.
+
+    sender_id != user_id is kept EXACTLY as it was, NOT made NULL-safe. System
+    messages have a NULL sender, so `NULL != user_id` is NULL rather than true and
+    they are excluded — which is what "not system" above means. IS DISTINCT FROM
+    would silently start counting every system message as unread.
+    """
     if not conversation_ids:
         return {}
     cp = ConversationParticipant
-    stmt = (
-        select(Message.conversation_id, func.count(Message.id))
-        .join(
-            cp,
-            and_(cp.conversation_id == Message.conversation_id, cp.user_id == user_id),
-        )
-        .outerjoin(
-            MessageDeletion,
-            and_(
-                MessageDeletion.message_id == Message.id,
-                MessageDeletion.user_id == user_id,
-            ),
-        )
+    hidden = (
+        select(MessageDeletion.message_id)
         .where(
-            Message.conversation_id.in_(conversation_ids),
+            MessageDeletion.message_id == Message.id,
+            MessageDeletion.user_id == user_id,
+        )
+        .exists()
+    )
+    unread = (
+        select(func.count(Message.id).label("n"))
+        .where(
+            Message.conversation_id == cp.conversation_id,
             Message.sender_id != user_id,
             Message.deleted_at.is_(None),
-            MessageDeletion.message_id.is_(None),
-            (cp.last_read_at.is_(None)) | (Message.created_at > cp.last_read_at),
+            Message.created_at > func.coalesce(cp.last_read_at, literal_column("'-infinity'::timestamptz")),
+            ~hidden,
         )
-        .group_by(Message.conversation_id)
+        .lateral("unread")
+    )
+    # n > 0 keeps the returned dict IDENTICAL to the old GROUP BY, which only
+    # emitted conversations having at least one unread row. Both call sites read it
+    # with .get(conv_id, 0), so explicit zeros would be harmless — but identical is
+    # cheaper to review than equivalent.
+    stmt = (
+        select(cp.conversation_id, unread.c.n)
+        .select_from(cp)
+        .join(unread, true())
+        .where(
+            cp.user_id == user_id,
+            cp.conversation_id.in_(conversation_ids),
+            unread.c.n > 0,
+        )
     )
     rows = (await db.execute(stmt)).all()
     return {conv_id: count for conv_id, count in rows}
@@ -87,39 +127,60 @@ async def unread_counts(
 async def last_messages(
     db: AsyncSession, conversation_ids: list[uuid.UUID], for_user: uuid.UUID
 ) -> dict[uuid.UUID, dict]:
-    """Latest visible message per conversation (excludes delete-for-me)."""
+    """Latest visible message per conversation (excludes delete-for-me).
+
+    One index descent per conversation, via LATERAL — deliberately NOT
+    row_number() OVER (PARTITION BY conversation_id), and not DISTINCT ON. Those
+    are the obvious spellings of "newest per group" and both make Postgres read
+    and sort EVERY message in these conversations to hand back one row each.
+    Measured on a seeded 1.08M-message tenant, for one sidebar page of 30
+    conversations holding 340k messages between them: 252ms, 33,896 buffers
+    (~265MB) and a 75MB external merge sort spilled to disk, to return 30 rows.
+    The same page through this LATERAL is 0.6ms and 343 buffers, because
+    ORDER BY created_at DESC LIMIT 1 inside a per-conversation scope is a backward
+    walk of ix_messages_conversation_created that stops at the first row it can
+    return. DISTINCT ON is not the fix either: ORDER BY conversation_id ASC,
+    created_at DESC cannot be served by a single-direction btree, so it sorts too.
+
+    The window version's cost scaled with the tenant's total history rather than
+    with the page, so it got worse every day the product was used.
+
+    NOT EXISTS rather than a LEFT JOIN ... IS NULL, so the hidden-row test stays
+    inside the per-conversation scan: when the newest messages are deleted-for-me
+    the walk simply continues backwards to the newest one that is not.
+    """
     if not conversation_ids:
         return {}
-    ranked = (
-        select(
-            Message,
-            func.row_number()
-            .over(
-                partition_by=Message.conversation_id,
-                order_by=Message.created_at.desc(),
-            )
-            .label("rn"),
-        )
-        .outerjoin(
-            MessageDeletion,
-            and_(
-                MessageDeletion.message_id == Message.id,
-                MessageDeletion.user_id == for_user,
-            ),
-        )
+    hidden = (
+        select(MessageDeletion.message_id)
         .where(
-            Message.conversation_id.in_(conversation_ids),
-            MessageDeletion.message_id.is_(None),
+            MessageDeletion.message_id == Message.id,
+            MessageDeletion.user_id == for_user,
         )
+        .exists()
+    )
+    convs = (
+        select(Conversation.id.label("conversation_id"))
+        .where(Conversation.id.in_(conversation_ids))
         .subquery()
     )
-    msg = Message.__table__.alias("m")
-    stmt = (
-        select(ranked, User.display_name)
-        .outerjoin(User, User.id == ranked.c.sender_id)
-        .where(ranked.c.rn == 1)
+    newest = (
+        select(Message)
+        .where(Message.conversation_id == convs.c.conversation_id, ~hidden)
+        .order_by(Message.created_at.desc())
+        .limit(1)
+        .lateral("newest")
     )
-    _ = msg  # alias kept for readability of the generated SQL
+    # An INNER lateral join: a conversation whose every message is hidden for this
+    # user yields no row and is therefore absent from the dict, which is exactly
+    # what the window version did — serialize_conversation renders that as
+    # last_message: null.
+    stmt = (
+        select(newest, User.display_name)
+        .select_from(convs)
+        .join(newest, true())
+        .outerjoin(User, User.id == newest.c.sender_id)
+    )
     rows = (await db.execute(stmt)).all()
     out: dict[uuid.UUID, dict] = {}
     for row in rows:

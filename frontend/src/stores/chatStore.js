@@ -182,6 +182,28 @@ const useChatStore = create((set) => ({
 
   setContacts: (contacts) => set({ contacts }),
 
+  /**
+   * Fold one directory record into the cache.
+   *
+   * The contact panel reads this map before it fetches, and it used to be filled
+   * as a side effect of that panel pulling the ENTIRE org roster. Now that it
+   * asks for one record by id, this is what keeps the cache warm — without it
+   * the lookup at the top of that panel would miss every single time, which is
+   * a dead cache rather than an absent one.
+   */
+  upsertContact: (contact) => set((state) => {
+    if (!contact?.id) return state;
+    const existing = state.contacts || [];
+    const at = existing.findIndex((c) => c.id === contact.id);
+    if (at < 0) return { contacts: [...existing, contact] };
+    // Identity is the store's render contract: leave the array alone when the
+    // record has not actually changed.
+    if (existing[at] === contact) return state;
+    const next = existing.slice();
+    next[at] = { ...existing[at], ...contact };
+    return { contacts: next };
+  }),
+
   updateMessageStatus: (convId, messageId, status) => set((state) => {
     const existing = state.messages[convId];
     if (!existing) return state;

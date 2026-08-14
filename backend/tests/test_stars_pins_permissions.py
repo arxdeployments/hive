@@ -309,6 +309,9 @@ async def test_delete_conversation_is_delete_for_me_only(client, two_orgs_with_u
     /{conv_id} is now the ONLY thing that writes MessageDeletion rows — which is
     precisely why the model, the table and every read-side exclusion filter had
     to survive the removal.
+
+    It also pins the sidebar preview, which is derived by a different query than
+    the message list and was previously unasserted.
     """
     users = two_orgs_with_users
     await login(client, "alice@a.com")
@@ -319,9 +322,19 @@ async def test_delete_conversation_is_delete_for_me_only(client, two_orgs_with_u
     assert resp.status_code == 200, resp.text
     assert await _messages(client, conv) == []
 
+    # The sidebar preview comes from enrich.last_messages, which applies the same
+    # exclusion — so Alice's row must LOSE its preview rather than keep the message
+    # she just hid. This is the only assertion that pins the delete-for-me filter
+    # inside that query, and it is the one a "newest per conversation" rewrite can
+    # break while every message-list assertion above stays green.
+    mine = [c for c in (await client.get("/api/conversations")).json()["data"] if c["_id"] == conv]
+    assert mine and mine[0]["last_message"] is None
+
     async with _client_for("bob@a.com") as bob:
         contents = [m["content"] for m in await _messages(bob, conv)]
         assert "keep me for bob" in contents
+        his = [c for c in (await bob.get("/api/conversations")).json()["data"] if c["_id"] == conv]
+        assert his and his[0]["last_message"]["content"] == "keep me for bob"
 
 
 async def test_media_type_link_extracts_urls_without_fetching(client, two_orgs_with_users):

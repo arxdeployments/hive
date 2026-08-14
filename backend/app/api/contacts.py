@@ -7,7 +7,9 @@ search input is escaped + parameterized (was raw $regex — injection/ReDoS),
 and departments are batch-joined instead of one lookup per user.
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import selectinload
 
@@ -39,11 +41,24 @@ def _like_pattern(value: str) -> str:
 @router.get("/contacts")
 async def list_contacts(
     search: str = "",
+    limit: int = Query(200, ge=1, le=500),
     tenant: TenantContext = Depends(get_tenant),
 ) -> list[dict]:
-    """All active users in the caller's org except self, display_name asc.
+    """Active users in the caller's org except self, display_name asc, CAPPED.
 
     Callers without an org (superadmins) have no roster: returns [].
+
+    The cap is the point. This used to return the entire org roster on every
+    contact-picker open: measured against a seeded 25,000-user tenant, one call
+    was 24,999 rows and 5.5 MB, took ~430ms, and spent ~130ms of that inside a
+    single Redis pipeline issuing 24,999 EXISTS — all on the event loop, so it
+    stalled every other request the worker was serving. Nothing consumed more
+    than a screenful of it.
+
+    Every picker in the app already narrows with `search`, which is what makes a
+    cap safe: the roster is reachable, it is just no longer shipped whole. The
+    ceiling is 500 rather than unbounded so a client cannot opt back into the
+    old behaviour by passing a large number.
     """
     user = tenant.user
     if user.org_id is None:
@@ -68,22 +83,65 @@ async def list_contacts(
             )
         )
 
-    rows = (await tenant.db.execute(stmt)).all()
+    rows = (await tenant.db.execute(stmt.limit(limit))).all()
 
     statuses = await presence.get_statuses([u.id for u, _ in rows])
 
-    return [
-        {
-            "id": str(u.id),
-            "display_name": u.display_name,
-            "email": u.email,
-            "avatar_url": u.avatar_url,
-            "department_name": dept_name or "Unknown",
-            "status": statuses.get(str(u.id), "offline"),
-            "last_seen": iso_z(u.last_seen_at),
-        }
-        for u, dept_name in rows
-    ]
+    return [_contact_row(u, dept_name, statuses) for u, dept_name in rows]
+
+
+def _contact_row(u: User, dept_name: str | None, statuses: dict) -> dict:
+    """One directory row. Shared so the list and the single lookup below cannot
+    drift apart — the client stores both in the same contacts map."""
+    return {
+        "id": str(u.id),
+        "display_name": u.display_name,
+        "email": u.email,
+        "avatar_url": u.avatar_url,
+        "department_name": dept_name or "Unknown",
+        "status": statuses.get(str(u.id), "offline"),
+        "last_seen": iso_z(u.last_seen_at),
+    }
+
+
+@router.get("/directory/{user_id}")
+async def get_contact(
+    user_id: uuid.UUID,
+    tenant: TenantContext = Depends(get_tenant),
+) -> dict:
+    """One directory record, by id.
+
+    Exists because the contact panel wanted exactly this and had no way to ask
+    for it: it fetched the ENTIRE org roster and did `rows.find(c => c.id === …)`
+    in the browser. That was tolerable only while /contacts was unbounded, and
+    capping it would have silently broken the panel for anyone outside the first
+    page — the lookup would simply have found nothing and rendered blank.
+
+    Scoped to the caller's own org, so this is not a cross-tenant directory read:
+    an id from another org 404s exactly as an unknown id does, and the two are
+    deliberately indistinguishable to the caller.
+    """
+    user = tenant.user
+    if user.org_id is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    row = (
+        await tenant.db.execute(
+            select(User, Department.name)
+            .outerjoin(Department, Department.id == User.dept_id)
+            .where(
+                User.id == user_id,
+                User.org_id == user.org_id,
+                User.is_active.is_(True),
+            )
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    u, dept_name = row
+    statuses = await presence.get_statuses([u.id])
+    return _contact_row(u, dept_name, statuses)
 
 
 @router.get("/{user_id}/groups-in-common")
