@@ -297,3 +297,30 @@ async def test_reader_yields_so_a_buffered_run_cannot_close_a_healthy_socket():
         assert len(healthy.sent) == burst, f"{len(healthy.sent)}/{burst} delivered"
     finally:
         await registry.stop()
+
+
+async def test_send_to_reaches_the_socket_and_reports_an_unknown_one():
+    """The endpoint's own frames now travel this way, including `pong`.
+
+    pong is the heartbeat reply, so a send_to that silently failed would let clients
+    time out at HEARTBEAT_TIMEOUT while the socket looked healthy from the server side.
+    The False return matters for the same reason: a caller must never be told a frame
+    was queued for a socket that has gone.
+    """
+    registry = hub.LocalRegistry()
+    healthy = _HealthySocket()
+    user, gone = uuid.uuid4(), uuid.uuid4()
+    try:
+        await registry.add(user, "conn", healthy)
+
+        assert await registry.send_to(user, "conn", '{"type":"pong"}') is True
+        for _ in range(50):
+            if healthy.sent:
+                break
+            await asyncio.sleep(0.02)
+        assert healthy.sent == ['{"type":"pong"}']
+
+        assert await registry.send_to(user, "no-such-conn", "x") is False
+        assert await registry.send_to(gone, "conn", "x") is False
+    finally:
+        await registry.stop()

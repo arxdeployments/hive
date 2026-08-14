@@ -59,17 +59,16 @@ class _Conn:
     seconds. Measured on the real registry with one socket wedged, a second user
     received 0 of 5 events for the whole stall and all 5 only once it was released.
 
-    One writer task per socket means the PUB/SUB stream for that socket has exactly
-    one sender, so its frames keep their order without a lock.
+    One writer task per socket means the socket has exactly ONE sender, so its frames
+    keep their order without a lock. That covers the whole outbound stream, not just
+    the pub/sub half: websocket_endpoint queues its own `pong` and protocol-error
+    frames through registry.send_to rather than writing to the socket, so nothing
+    races the reader's frames.
 
-    That guarantee is deliberately scoped to the pub/sub stream. websocket_endpoint
-    still writes `connected`, `pong` and protocol-error frames to the socket
-    directly, so those are not ordered against the pub/sub stream — but they were not
-    before either: _reader has always been a separate task from the receive loop, so
-    the two have always interleaved. None of the direct frames is order-dependent
-    (message_ack and send errors both travel by pub/sub, not by direct write), and
-    unfragmented sends cannot corrupt one another — websockets only rejects
-    concurrent recv, not concurrent send.
+    The single exception is `connected`, and it is deliberate — it is written directly
+    BEFORE the socket is registered, when no writer exists and nothing can have been
+    queued yet, which is what makes it provably the first frame rather than merely
+    usually first. Everything after registration goes through this queue.
     """
 
     __slots__ = ("ws", "outbox", "writer", "closing")
@@ -156,6 +155,27 @@ class LocalRegistry:
         if self._pubsub is not None:
             with contextlib.suppress(Exception):
                 await self._pubsub.aclose()
+
+    async def send_to(self, user_id: uuid.UUID, conn_id: str, payload: str) -> bool:
+        """Queue one frame for ONE socket, through that socket's writer.
+
+        This is how websocket_endpoint writes its own frames — pong and the protocol
+        errors — so that every frame a registered socket receives goes through a single
+        sender and the whole stream is ordered, not just the pub/sub half of it.
+
+        Returns False when the socket is gone or has just been dropped for being
+        wedged, so a caller is never told a frame was queued when it was not.
+        """
+        async with self._lock:
+            conn = self.connections.get(str(user_id), {}).get(conn_id)
+        if conn is None or conn.closing:
+            return False
+        try:
+            conn.outbox.put_nowait(payload)
+        except asyncio.QueueFull:
+            self._drop_wedged(conn)
+            return False
+        return True
 
     async def _writer(self, conn: _Conn) -> None:
         """Drain one socket's outbox. The only place send_text is called."""
@@ -378,6 +398,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     user, token_exp, client = auth
 
     await websocket.accept()
+    # `connected` goes out BEFORE the socket is registered, and that ordering is the
+    # point. Once registry.add subscribes the user's channel and starts the writer, a
+    # published event can be queued for this socket at any moment — so a `connected`
+    # sent after registration is not reliably the first frame on the wire. Sent here
+    # there is no writer yet and nothing can be queued, which makes it provably first;
+    # every frame after it goes through registry.send_to or the pub/sub path, so the
+    # socket's whole stream has exactly one sender and one order.
+    #
+    # Safe to sit outside the try below: nothing has been registered yet, so a client
+    # that vanished mid-handshake leaves nothing to tear down.
+    await websocket.send_text(
+        json.dumps({"type": "connected", "user_id": str(user.id), "timestamp": iso_z(now_utc())})
+    )
     last_active_check = now_utc()
     conn_id = uuid.uuid4().hex
     await registry.add(user.id, conn_id, websocket)
@@ -403,10 +436,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     db_user.last_seen_at = now_utc()
                     await db.commit()
             await _broadcast_presence(user, "online")
-
-        await websocket.send_text(
-            json.dumps({"type": "connected", "user_id": str(user.id), "timestamp": iso_z(now_utc())})
-        )
 
         # A socket coming up is the only moment we can repair call state this user missed
         # while it was down: closing any grace window a previous drop opened, and
@@ -441,7 +470,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 break
 
             if len(raw) > MAX_MESSAGE_BYTES:
-                await websocket.send_text(json.dumps({"type": "error", "detail": "Message too large"}))
+                await registry.send_to(
+                    user.id, conn_id, json.dumps({"type": "error", "detail": "Message too large"})
+                )
                 continue
 
             now = now_utc()
@@ -449,7 +480,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 window_start, window_count = now, 0
             window_count += 1
             if window_count > RATE_LIMIT_PER_MINUTE:
-                await websocket.send_text(json.dumps({"type": "error", "detail": "Rate limited"}))
+                await registry.send_to(
+                    user.id, conn_id, json.dumps({"type": "error", "detail": "Rate limited"})
+                )
                 continue
 
             try:
@@ -457,7 +490,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 if not isinstance(data, dict) or not isinstance(data.get("type"), str):
                     raise ValueError
             except ValueError:
-                await websocket.send_text(json.dumps({"type": "error", "detail": "Invalid frame"}))
+                await registry.send_to(
+                    user.id, conn_id, json.dumps({"type": "error", "detail": "Invalid frame"})
+                )
                 continue
 
             # REVALIDATION — on every frame, not only on ping.
@@ -496,7 +531,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             if data["type"] == "ping":
                 await presence.refresh(user.id)
-                await websocket.send_text(json.dumps({"type": "pong", "timestamp": iso_z(now_utc())}))
+                await registry.send_to(
+                    user.id, conn_id, json.dumps({"type": "pong", "timestamp": iso_z(now_utc())})
+                )
                 continue
 
             try:
@@ -504,7 +541,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             except Exception:
                 logger.exception("error handling ws frame type=%s", data.get("type"))
                 with contextlib.suppress(Exception):
-                    await websocket.send_text(json.dumps({"type": "error", "detail": "Internal error"}))
+                    await registry.send_to(
+                        user.id, conn_id, json.dumps({"type": "error", "detail": "Internal error"})
+                    )
     except WebSocketDisconnect:
         pass
     finally:
