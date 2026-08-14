@@ -203,3 +203,38 @@ async def test_a_socket_that_never_drains_is_dropped_rather_than_waited_for():
     finally:
         stalled.release.set()
         await registry.stop()
+
+
+async def test_a_burst_larger_than_the_outbox_does_not_close_a_healthy_socket():
+    """Queue depth must measure socket slowness, not reader burstiness.
+
+    get_message() returns already-buffered messages without suspending, and awaiting
+    a coroutine that returns immediately does not yield in asyncio. Without a yield
+    in the reader, a backlog gets drained in one tight loop, so a healthy socket's
+    outbox fills and it is closed with 1011 for a burst it could easily have
+    absorbed — a false positive on exactly the clients this change is meant to
+    protect.
+    """
+    registry = hub.LocalRegistry()
+    await registry.start()
+    healthy = _HealthySocket()
+    user = uuid.uuid4()
+    try:
+        await registry.add(user, "conn", healthy)
+        await asyncio.sleep(0.3)
+
+        # ONE pipeline, one round trip: Redis then hands the reader a buffered run of
+        # messages, which is the condition that makes get_message stop suspending.
+        # Publishing them one await at a time would yield between each and never
+        # reproduce it — the mistake this test was written wrong with the first time.
+        burst = hub.OUTBOX_MAX_FRAMES * 3
+        await publish_to_users([user] * burst, {"burst": True})
+        for _ in range(80):  # up to 8s
+            if len(healthy.sent) == burst:
+                break
+            await asyncio.sleep(0.1)
+
+        assert healthy.closed is None, f"a healthy socket was dropped: {healthy.closed}"
+        assert len(healthy.sent) == burst, f"{len(healthy.sent)}/{burst} delivered"
+    finally:
+        await registry.stop()

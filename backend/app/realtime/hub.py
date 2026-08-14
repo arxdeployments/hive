@@ -59,8 +59,17 @@ class _Conn:
     seconds. Measured on the real registry with one socket wedged, a second user
     received 0 of 5 events for the whole stall and all 5 only once it was released.
 
-    One writer task per socket also means send_text has exactly one caller per
-    socket, so frame order is preserved without a lock.
+    One writer task per socket means the PUB/SUB stream for that socket has exactly
+    one sender, so its frames keep their order without a lock.
+
+    That guarantee is deliberately scoped to the pub/sub stream. websocket_endpoint
+    still writes `connected`, `pong` and protocol-error frames to the socket
+    directly, so those are not ordered against the pub/sub stream — but they were not
+    before either: _reader has always been a separate task from the receive loop, so
+    the two have always interleaved. None of the direct frames is order-dependent
+    (message_ack and send errors both travel by pub/sub, not by direct write), and
+    unfragmented sends cannot corrupt one another — websockets only rejects
+    concurrent recv, not concurrent send.
     """
 
     __slots__ = ("ws", "outbox", "writer", "closing")
@@ -207,6 +216,16 @@ class LocalRegistry:
                     conn.outbox.put_nowait(message["data"])
                 except asyncio.QueueFull:
                     self._drop_wedged(conn)
+            # Hand control back so the writers above can actually drain.
+            #
+            # get_message() returns already-buffered messages without suspending, and
+            # awaiting a coroutine that returns immediately does NOT yield in asyncio.
+            # So a backlog — anything that stalled this worker for a moment, including
+            # the very stalls this queue exists to survive — would be drained here in
+            # one tight loop, filling a HEALTHY socket's outbox and getting it closed
+            # for a burst it could have absorbed. With this yield, queue depth measures
+            # how slow a socket is rather than how bursty the reader was.
+            await asyncio.sleep(0)
 
     def local_socket_count(self) -> int:
         return sum(len(b) for b in self.connections.values())
