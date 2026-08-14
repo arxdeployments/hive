@@ -372,6 +372,12 @@ async def test_starred_and_pinned_survive_a_reply_to_another_row_in_the_page(cli
     pinned = await client.get(f"/api/conversations/{conv}/pinned")
     assert pinned.status_code == 200, pinned.text
     assert {d["_id"] for d in pinned.json()["data"]} == {original["_id"], reply["_id"]}
+    # Assert the preview on THIS endpoint too, not just on /starred. The two paths
+    # order differently and reach reply_targets with different pages, so a status
+    # code alone would let a null preview through here while /starred stayed right.
+    pinned_doc = next(d for d in pinned.json()["data"] if d["_id"] == reply["_id"])
+    assert pinned_doc["reply_to_message"]["_id"] == original["_id"]
+    assert pinned_doc["reply_to_message"]["content"] == "the original"
 
 
 async def test_media_type_link_extracts_urls_without_fetching(client, two_orgs_with_users):
