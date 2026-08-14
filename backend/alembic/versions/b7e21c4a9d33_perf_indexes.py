@@ -26,11 +26,18 @@ block every login, every refresh and every heartbeat in the fleet for the length
 of a full table scan.
 
 CONCURRENTLY cannot run inside a transaction, hence the autocommit block, which
-costs this migration its atomicity — so each statement is preceded by a DROP IF
-EXISTS. A failed concurrent build leaves an INVALID index behind, and a plain
-CREATE ... IF NOT EXISTS would mistake that for a finished one and report success
-while the index enforced and accelerated nothing. Same pattern, and the same
-reasoning, as c5d81e37a204.
+costs this migration its atomicity — so each build is preceded by a DROP INDEX
+CONCURRENTLY IF EXISTS. A failed concurrent build leaves an INVALID index behind,
+and a plain CREATE ... IF NOT EXISTS would mistake that for a finished one and
+report success while the index enforced and accelerated nothing. Same pattern,
+and the same reasoning, as c5d81e37a204.
+
+The DROPs are concurrent for the same reason the CREATEs are. A plain DROP INDEX
+takes ACCESS EXCLUSIVE on the parent table, which is precisely the lock this
+migration exists to avoid taking on users. In the ordinary case the drop is a
+no-op with nothing to lock, but the case it is written for — clearing an INVALID
+index left by an earlier failed build — is exactly the case where the table is
+live and the lock would be felt.
 """
 
 from alembic import op
@@ -43,9 +50,9 @@ depends_on = None
 
 def upgrade() -> None:
     with op.get_context().autocommit_block():
-        op.execute("DROP INDEX IF EXISTS ix_users_org_display_name")
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_users_org_display_name")
         op.execute("CREATE INDEX CONCURRENTLY ix_users_org_display_name ON users (org_id, display_name)")
-        op.execute("DROP INDEX IF EXISTS ix_message_attachments_message_id")
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_message_attachments_message_id")
         op.execute(
             "CREATE INDEX CONCURRENTLY ix_message_attachments_message_id ON message_attachments (message_id)"
         )
@@ -53,5 +60,5 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     with op.get_context().autocommit_block():
-        op.execute("DROP INDEX IF EXISTS ix_message_attachments_message_id")
-        op.execute("DROP INDEX IF EXISTS ix_users_org_display_name")
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_message_attachments_message_id")
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_users_org_display_name")

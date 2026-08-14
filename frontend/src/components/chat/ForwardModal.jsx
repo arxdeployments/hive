@@ -50,6 +50,12 @@ export const ForwardModal = ({ message, messages, isOpen, onClose }) => {
   useEffect(() => {
     if (!isOpen) { setSelected([]); setSearch(''); return undefined; }
     let cancelled = false;
+    // Drop the previous query's rows before waiting out the debounce. The list
+    // below no longer filters locally, so keeping them would leave people who do
+    // not match what is now typed on screen AND selectable for those 300ms. The
+    // Contacts block is rendered only when non-empty, so this collapses the
+    // section rather than flashing an empty state.
+    setContacts([]);
     const timer = setTimeout(() => {
       client.get('/api/users/contacts', { params: { search } })
         .then(r => { if (!cancelled) setContacts(r.data); })

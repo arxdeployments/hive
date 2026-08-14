@@ -168,6 +168,22 @@ async def groups_in_common(user_id: str, tenant: TenantContext = Depends(get_ten
         .where(
             Conversation.is_active.is_(True),
             Conversation.type.in_((ConversationType.group, ConversationType.cross_org)),
+            # The same tenancy predicate list_conversations applies. Redundant
+            # today rather than load-bearing, and kept deliberately: the `mine`
+            # join already restricts this to conversations the CALLER belongs to,
+            # and both write paths make membership imply org scope — groups.py
+            # refuses a member whose org differs from the group's (on create and
+            # on add), and a cross-org group auto-appends a new member's org to
+            # allowed_org_ids and never removes one. So there is no reachable id
+            # this excludes. It is here because that invariant lives in two other
+            # files, and a reader of this query cannot see it from here.
+            or_(
+                Conversation.org_id == tenant.user.org_id,
+                and_(
+                    Conversation.type == ConversationType.cross_org,
+                    Conversation.allowed_org_ids.contains([str(tenant.user.org_id)]),
+                ),
+            ),
         )
         .order_by(Conversation.last_message_at.desc().nulls_last())
         .limit(_GROUPS_IN_COMMON_LIMIT)

@@ -181,6 +181,11 @@ export const ContactInfoPanel = ({
       return;
     }
     let cancelled = false;
+    // Nothing resolved for THIS target yet, so show nothing for it. Without this
+    // the previous contact's email and department stay on screen for the length of
+    // the request whenever targetId changes and the store has no cached row —
+    // attributed to whoever the panel is now open on.
+    setDirectory(null);
     // One record, asked for by id.
     //
     // This used to GET the entire org roster and run `rows.find(c => c.id === …)`
