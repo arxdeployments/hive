@@ -337,6 +337,43 @@ async def test_delete_conversation_is_delete_for_me_only(client, two_orgs_with_u
         assert his and his[0]["last_message"]["content"] == "keep me for bob"
 
 
+async def test_starred_and_pinned_survive_a_reply_to_another_row_in_the_page(client, two_orgs_with_users):
+    """A page whose reply target is ALSO in the page must not expire that row.
+
+    serialize_message used to re-read each reply target with populate_existing and
+    only sender/attachments in its options, which refreshed the target whenever it
+    was a page member and expired the reactions collection MESSAGE_LOAD_OPTIONS had
+    loaded for it. /messages escaped it — a reply target is always older and that
+    endpoint reverses to oldest-first, so the clobbered row was already serialized.
+    /starred and /pinned order newest-first and do not reverse, so they reached it
+    afterwards, lazy-loaded under asyncio and raised MissingGreenlet: a 500.
+
+    Starring or pinning a message together with a reply to it is the whole
+    reproduction, and /pinned is fetched on every conversation open, where the
+    client's catch turns the failure into a permanently blank banner rather than
+    anything a user could report.
+    """
+    users = two_orgs_with_users
+    await login(client, "alice@a.com")
+    conv = await _direct(client, users["bob"].id)
+    original = await _send(client, conv, "the original")
+    reply = await _send(client, conv, "a reply to it", reply_to=original["_id"])
+
+    for msg_id in (original["_id"], reply["_id"]):
+        assert (await client.post(f"/api/conversations/messages/{msg_id}/star")).status_code == 200
+        assert (await client.post(f"/api/conversations/messages/{msg_id}/pin")).status_code == 200
+
+    starred = await client.get(f"/api/conversations/{conv}/starred")
+    assert starred.status_code == 200, starred.text
+    starred_doc = next(d for d in starred.json()["data"] if d["_id"] == reply["_id"])
+    assert starred_doc["reply_to_message"]["_id"] == original["_id"]
+    assert starred_doc["reply_to_message"]["content"] == "the original"
+
+    pinned = await client.get(f"/api/conversations/{conv}/pinned")
+    assert pinned.status_code == 200, pinned.text
+    assert {d["_id"] for d in pinned.json()["data"]} == {original["_id"], reply["_id"]}
+
+
 async def test_media_type_link_extracts_urls_without_fetching(client, two_orgs_with_users):
     users = two_orgs_with_users
     await login(client, "alice@a.com")
