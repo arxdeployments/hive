@@ -501,6 +501,26 @@ async def message_info(msg_id: str, tenant: TenantContext = Depends(get_tenant))
     me = await db.get(ConversationParticipant, (msg.conversation_id, tenant.user.id))
     if me is None:
         raise HTTPException(status_code=404, detail="Message not found")
+    # Revocation, ahead of the sender check for the same reason membership is:
+    # a cut-off caller gets 404, not a 403 that confirms the message is theirs.
+    # This route reads no message content, so it was missed when the gate went on
+    # the content paths — but it still answers with every other participant's
+    # display name and the times they read it, out of a group the caller has been
+    # removed from. Same lever, same leak, smaller payload.
+    #
+    # The org half mirrors _require_org_access rather than being stricter than
+    # it: a cross_org conversation passes on membership alone, because a member's
+    # org is appended to allowed_org_ids when they are added and never removed
+    # (api/cross_org.py), so membership already implies the org is in scope.
+    # 404 rather than _require_org_access's 403, because this route deliberately
+    # 404s before it 403s — see the membership check above.
+    conv = await db.get(Conversation, msg.conversation_id)
+    if (
+        conv is None
+        or not conv.is_active
+        or (conv.type.value != "cross_org" and conv.org_id != tenant.user.org_id)
+    ):
+        raise HTTPException(status_code=404, detail="Message not found")
     if msg.sender_id != tenant.user.id:
         raise HTTPException(status_code=403, detail="Can only view info for your own messages")
 
