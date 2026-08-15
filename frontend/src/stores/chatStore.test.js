@@ -17,6 +17,10 @@ import useChatStore from './chatStore.js';
 
 const store = () => useChatStore.getState();
 
+/** The store's data keys, snapshotted at import before any test writes to it. */
+const dataKeys = (s) => Object.fromEntries(Object.entries(s).filter(([, v]) => typeof v !== 'function'));
+const INITIAL = dataKeys(useChatStore.getState());
+
 /** Put the store in the state an ordinary session leaves behind. */
 function fillSignedInState() {
   store().setConversations([
@@ -85,6 +89,38 @@ describe('chatStore.reset', () => {
     store().reset();
     assert.deepEqual(store().conversations, []);
     assert.equal(store().activeConversationId, null);
+  });
+
+  it('restores every data key, including ones added to the store later', () => {
+    // The drift guard. `reset` is a shallow merge over a hand-written object, so
+    // a field declared anywhere other than emptyState is a field it silently
+    // cannot clear — which is how pinnedVersion, added later beside its own
+    // action, survived the first version of this. Rather than naming the fields,
+    // this dirties whatever the store actually has and demands all of it back,
+    // so the next field added outside emptyState fails here instead of shipping.
+    const dirty = {};
+    for (const [key, initial] of Object.entries(INITIAL)) {
+      if (Array.isArray(initial)) dirty[key] = [{ _id: 'dirty' }];
+      else if (initial !== null && typeof initial === 'object') dirty[key] = { 'conv-a': 'dirty' };
+      else if (typeof initial === 'boolean') dirty[key] = !initial;
+      else dirty[key] = 'dirty';
+    }
+    useChatStore.setState(dirty);
+    // precondition: every key really did change
+    assert.notDeepEqual(dataKeys(useChatStore.getState()), INITIAL);
+
+    store().reset();
+
+    assert.deepEqual(dataKeys(useChatStore.getState()), INITIAL);
+  });
+
+  it('clears pinnedVersion, which is keyed by the previous user\'s conversations', () => {
+    store().bumpPinnedVersion('conv-a');
+    assert.equal(store().pinnedVersion['conv-a'], 1);
+
+    store().reset();
+
+    assert.deepEqual(store().pinnedVersion, {});
   });
 
   it('leaves the store usable for the next session', () => {

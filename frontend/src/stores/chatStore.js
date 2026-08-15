@@ -55,6 +55,14 @@ export const sortConversations = (convs) => {
  * message bodies inside them, their colleagues, who is typing. It is the only
  * place the app holds that, and until `reset` existed there was no way to put
  * it down — see the docblock on `reset` for why that mattered.
+ *
+ * EVERY piece of state belongs in here, not inline further down beside the
+ * action that writes it. `reset` is a shallow merge, so a field declared
+ * anywhere else is a field `reset` cannot clear — which is exactly how
+ * pinnedVersion, added later and next to its own action, survived the first
+ * version of this. chatStore.test.js walks the store's data keys and fails if
+ * one of them is not restored, so a field added outside this object is caught
+ * rather than discovered.
  */
 const emptyState = () => ({
   conversations: [],
@@ -64,6 +72,10 @@ const emptyState = () => ({
   typingUsers: {},
   wsConnected: false,
   wsConnecting: false,
+  // Per-conversation counter that makes the pinned-message banner self-healing;
+  // see bumpPinnedVersion below for what it is for. Keyed by conversation id, so
+  // left unreset it is a map of the previous user's threads.
+  pinnedVersion: {},
 });
 
 const useChatStore = create((set) => ({
@@ -297,7 +309,6 @@ const useChatStore = create((set) => ({
    * enough to make the fetch self-healing without teaching the socket layer about
    * the banner's data shape.
    */
-  pinnedVersion: {},
   bumpPinnedVersion: (convId) => set((state) => ({
     pinnedVersion: { ...state.pinnedVersion, [convId]: (state.pinnedVersion[convId] || 0) + 1 },
   })),
