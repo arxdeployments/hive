@@ -949,9 +949,7 @@ async def bulk_user_action(
             set(
                 (
                     await db.execute(
-                        select(User.org_id).where(
-                            User.id.in_(affected_ids), User.org_id.is_not(None)
-                        )
+                        select(User.org_id).where(User.id.in_(affected_ids), User.org_id.is_not(None))
                     )
                 )
                 .scalars()

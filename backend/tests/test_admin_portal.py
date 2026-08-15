@@ -180,9 +180,9 @@ async def test_admin_stats_survives_a_redis_outage(client, monkeypatch):
     # real rows behind the Postgres-backed tiles, so "still answers" means
     # something (total_users deliberately excludes superadmins)
     org_id = (await client.post("/api/admin/organizations", json={"name": "Outage Co"})).json()["_id"]
-    dept_id = (
-        await client.post("/api/admin/departments", json={"org_id": org_id, "name": "Ops"})
-    ).json()["_id"]
+    dept_id = (await client.post("/api/admin/departments", json={"org_id": org_id, "name": "Ops"})).json()[
+        "_id"
+    ]
     resp = await client.post(
         "/api/admin/users",
         json={
@@ -223,9 +223,9 @@ async def test_bulk_action_audit_record_is_attributed_and_accurate(client):
 
     await _superadmin_client(client)
     org_id = (await client.post("/api/admin/organizations", json={"name": "Bulk Audit Co"})).json()["_id"]
-    dept_id = (
-        await client.post("/api/admin/departments", json={"org_id": org_id, "name": "Ops"})
-    ).json()["_id"]
+    dept_id = (await client.post("/api/admin/departments", json={"org_id": org_id, "name": "Ops"})).json()[
+        "_id"
+    ]
     member = (
         await client.post(
             "/api/admin/users",
@@ -249,12 +249,16 @@ async def test_bulk_action_audit_record_is_attributed_and_accurate(client):
 
     async with SessionLocal() as db:
         log = (
-            await db.execute(
-                select(AuditLog).where(AuditLog.action == "bulk_deactivate").order_by(
-                    AuditLog.created_at.desc()
+            (
+                await db.execute(
+                    select(AuditLog)
+                    .where(AuditLog.action == "bulk_deactivate")
+                    .order_by(AuditLog.created_at.desc())
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         assert log is not None
         # attributed to the org, so the org-admin activity feed can find it
         assert log.org_id == _uuid.UUID(org_id)
@@ -277,9 +281,9 @@ async def test_org_suspension_survives_user_create_and_activate(client):
 
     await _superadmin_client(client)
     org_id = (await client.post("/api/admin/organizations", json={"name": "Suspend Co"})).json()["_id"]
-    dept_id = (
-        await client.post("/api/admin/departments", json={"org_id": org_id, "name": "Ward"})
-    ).json()["_id"]
+    dept_id = (await client.post("/api/admin/departments", json={"org_id": org_id, "name": "Ward"})).json()[
+        "_id"
+    ]
 
     async def _new_user(email: str):
         return await client.post(
