@@ -39,6 +39,11 @@ def serialize_audit(log: AuditLog) -> dict:
         "action": log.action,
         "target": log.target or "",
         "details": log.details or {},
+        # Always empty: audit_logs has no ip_address column, and nothing on the
+        # write path has the Request to read one from. The key is kept because
+        # both portals render the column, so dropping it would 500 the activity
+        # feed — but it is a stub, not a redacted value. Capturing the source
+        # address needs a migration plus a Request on every log_audit call site.
         "ip_address": "",
         "timestamp": iso_z(log.created_at),
     }

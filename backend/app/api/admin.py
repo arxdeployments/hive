@@ -11,6 +11,10 @@ Deliberate contract-preserving fixes (coordinated with the frontend):
   users' refresh tokens, closing the refresh-forever hole.
 - Org reactivation (PUT is_active=true) restores the ORG only — it no longer
   blanket-reactivates users, so individually-deactivated accounts stay off.
+- A suspended org stays suspended: creating a user in one is refused, and
+  activating a member (singly or in bulk) is refused/skipped. Nothing on the
+  login path reads Organization.is_active, so the suspension is carried by the
+  users.is_active cascade alone and these are the routes that could undo it.
 - reset-password sets must_change_password and revokes sessions; the
   temporary password is still returned per contract.
 - Create/update user validates the department exists in the target org;
@@ -25,7 +29,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,7 +38,7 @@ from app.core.deps import require_superadmin
 from app.core.security import PasswordPolicyError, enforce_password_policy, hash_password
 from app.db.models import AuditLog, Department, Organization, RefreshToken, User, UserRole
 from app.db.session import get_db
-from app.realtime.redis_bus import get_redis
+from app.realtime.redis_bus import degrade_on_outage, get_redis
 from app.services import presence
 from app.services.audit import log_audit, serialize_audit
 from app.utils import generate_password, iso_z, now_utc, parse_uuid, sanitize_text, slugify
@@ -245,17 +249,73 @@ async def _deactivate_org_users(db: AsyncSession, org_id: uuid.UUID) -> int:
 
 
 async def _count_online_users() -> int:
-    """Currently-online users = live presence keys in Redis."""
-    redis = get_redis()
+    """Currently-online users = live presence keys in Redis.
+
+    Best-effort, like every other presence read in the product: get_statuses and
+    is_online both sit inside degrade_on_outage so an outage costs a green dot
+    rather than the request. This one did not, so a Redis blip 500'd the whole
+    superadmin dashboard — including the four tiles that come from Postgres and
+    were never in doubt. The org-admin dashboard, which reads presence through
+    get_statuses, stayed up through the same outage.
+
+    The count is assigned only after the scan completes, so a failure part-way
+    through reports 0 (the degraded value) rather than a plausible-looking
+    partial tally.
+
+    Cost note: SCAN walks the whole keyspace — MATCH filters server-side, it does
+    not narrow the iteration — so this is O(total keys), and the keyspace also
+    holds ratelimit:, call:, direct: and user: entries. Fine at current scale;
+    if it stops being fine, the fix is an index of online users (a sorted set
+    scored by last heartbeat), not a bigger COUNT hint.
+    """
     count = 0
-    async for _key in redis.scan_iter(match="presence:*", count=500):
-        count += 1
+    async with degrade_on_outage("admin.count_online_users"):
+        redis = get_redis()
+        scanned = 0
+        async for _key in redis.scan_iter(match="presence:*", count=500):
+            scanned += 1
+        count = scanned
     return count
 
 
-async def _get_org_or_404(db: AsyncSession, org_id: str) -> Organization:
+async def _lock_orgs(db: AsyncSession, org_ids) -> dict[uuid.UUID, Organization]:
+    """SELECT ... FOR UPDATE the given organisations, in a deterministic order.
+
+    Reading Organization.is_active without a lock only settles the sequential
+    case. Under READ COMMITTED — which is what this engine runs, no isolation
+    level is set — a suspension can commit between another request's read of the
+    org and its own write, and the cascade in _deactivate_org_users only touches
+    the users that existed when it ran. So a create or activate that checked an
+    org it saw as active could still land an active user inside a suspended one.
+
+    Every writer that reads or changes an org's active state takes this lock, so
+    suspension and activation serialise against each other. Ordering by id keeps
+    two multi-org batches from deadlocking on the same pair in opposite orders;
+    single-org callers satisfy it for free.
+    """
+    ids = sorted(set(org_ids))
+    if not ids:
+        return {}
+    rows = (
+        (
+            await db.execute(
+                select(Organization)
+                .where(Organization.id.in_(ids))
+                .order_by(Organization.id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {o.id: o for o in rows}
+
+
+async def _get_org_or_404(db: AsyncSession, org_id: str, *, lock: bool = False) -> Organization:
+    """Resolve an organisation. `lock` for callers that go on to write it or to
+    decide something from its active state; plain reads skip the lock."""
     oid = _uuid_or_400(org_id, "Invalid organization ID")
-    org = await db.get(Organization, oid)
+    org = (await _lock_orgs(db, [oid])).get(oid) if lock else await db.get(Organization, oid)
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
     return org
@@ -422,7 +482,9 @@ async def update_organization(
     db: AsyncSession = Depends(get_db),
     actor: User = Depends(require_superadmin),
 ):
-    org = await _get_org_or_404(db, org_id)
+    # Locked: this is the writer that suspends an org, and it has to serialise
+    # against the create/activate paths that read is_active to decide.
+    org = await _get_org_or_404(db, org_id, lock=True)
     update_data = {k: v for k, v in body.model_dump().items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -469,7 +531,8 @@ async def delete_organization(
     db: AsyncSession = Depends(get_db),
     actor: User = Depends(require_superadmin),
 ):
-    org = await _get_org_or_404(db, org_id)
+    # Locked for the same reason as update_organization: this is a suspension.
+    org = await _get_org_or_404(db, org_id, lock=True)
     org.is_active = False
     deactivated = await _deactivate_org_users(db, org.id)
     await log_audit(
@@ -775,9 +838,20 @@ async def create_user(
 ):
     oid = _uuid_or_400(body.org_id, "Invalid org_id")
     did = _uuid_or_400(body.dept_id, "Invalid dept_id")
-    org = await db.get(Organization, oid)
+    # Locked, and held until this request commits: an unlocked read could see an
+    # org a concurrent suspension is about to close, and that suspension's
+    # cascade would never reach the row inserted below.
+    org = (await _lock_orgs(db, [oid])).get(oid)
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
+    # Suspending an org deactivates its members, but nothing on the login path
+    # re-reads Organization.is_active — so an account minted here after the
+    # suspension would sign in normally against a tenant that is shut off.
+    if not org.is_active:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot create a user in a suspended organization",
+        )
     dept = (
         await db.execute(select(Department).where(Department.id == did, Department.org_id == oid))
     ).scalar_one_or_none()
@@ -835,32 +909,55 @@ async def bulk_user_action(
         raise HTTPException(status_code=400, detail="No valid user IDs")
 
     if body.action in ("deactivate", "activate"):
-        ids = list(
-            (
-                await db.execute(
-                    select(User.id).where(User.id.in_(valid_ids), User.role != UserRole.superadmin)
+        stmt = select(User.id).where(User.id.in_(valid_ids), User.role != UserRole.superadmin)
+        if body.action == "activate":
+            # An org suspension deactivated these accounts deliberately, and the
+            # login path never re-checks the org — so a bulk activate is the one
+            # call that can quietly bring a whole suspended tenant back online.
+            # Members of suspended orgs are skipped rather than failing the batch;
+            # `count` in the response already reports what actually changed.
+            #
+            # Two passes, because the eligibility filter reads org state and this
+            # batch can span organisations: the first pass only says which orgs
+            # are in play, then those are locked in id order, and only then is
+            # eligibility decided — against org rows a concurrent suspension can
+            # no longer move underneath us. Doing it in one query would settle
+            # eligibility on an unlocked read of exactly the column at issue.
+            candidate_org_ids = (
+                (
+                    await db.execute(
+                        select(User.org_id).where(
+                            User.id.in_(valid_ids),
+                            User.role != UserRole.superadmin,
+                            User.org_id.is_not(None),
+                        )
+                    )
                 )
+                .scalars()
+                .all()
             )
-            .scalars()
-            .all()
-        )
-        if ids:
+            await _lock_orgs(db, candidate_org_ids)
+            stmt = stmt.outerjoin(Organization, User.org_id == Organization.id).where(
+                or_(User.org_id.is_(None), Organization.is_active.is_(True))
+            )
+        affected_ids = list((await db.execute(stmt)).scalars().all())
+        if affected_ids:
             await db.execute(
                 update(User)
-                .where(User.id.in_(ids))
+                .where(User.id.in_(affected_ids))
                 .values(is_active=(body.action == "activate"))
                 .execution_options(synchronize_session=False)
             )
             if body.action == "deactivate":
                 # Fix: bulk deactivation revokes the targets' sessions too.
-                await _revoke_refresh_tokens(db, ids)
-        count = len(ids)
+                await _revoke_refresh_tokens(db, affected_ids)
+        count = len(affected_ids)
         message = f"{count} users {body.action}d"
     elif body.action in ("grant_mobile", "revoke_mobile"):
         # Approving a department's worth of people one modal at a time is the kind
         # of chore that ends in nobody being approved, so the grant is bulk-able.
         granting = body.action == "grant_mobile"
-        ids = list(
+        affected_ids = list(
             (
                 await db.execute(
                     select(User.id).where(User.id.in_(valid_ids), User.role != UserRole.superadmin)
@@ -869,16 +966,16 @@ async def bulk_user_action(
             .scalars()
             .all()
         )
-        if ids:
+        if affected_ids:
             await db.execute(
                 update(User)
-                .where(User.id.in_(ids))
+                .where(User.id.in_(affected_ids))
                 .values(mobile_access=granting)
                 .execution_options(synchronize_session=False)
             )
             if not granting:
-                await _revoke_refresh_tokens(db, ids, client="mobile")
-        count = len(ids)
+                await _revoke_refresh_tokens(db, affected_ids, client="mobile")
+        count = len(affected_ids)
         message = f"Mobile access {'granted for' if granting else 'revoked for'} {count} users"
     elif body.action == "change_dept":
         if not body.dept_id:
@@ -892,15 +989,35 @@ async def bulk_user_action(
             .scalars()
             .all()
         )
-        count = 0
+        affected_ids = []
         for u in users:
             # Fix: only move users whose org owns the target department.
             if u.org_id == dept.org_id:
                 u.dept_id = dept.id
-                count += 1
+                affected_ids.append(u.id)
+        count = len(affected_ids)
         message = f"{count} users moved"
     else:
         raise HTTPException(status_code=400, detail="Invalid action")
+
+    # Which organisations this batch actually landed in. Every other log_audit
+    # call in this module passes org_id; this one never did, because a bulk
+    # action is the only one that can span tenants. Leaving it NULL meant the
+    # org-admin activity feed — which filters on audit_logs.org_id — showed
+    # nothing for the bulk deactivation that had just emptied the org.
+    affected_org_ids: list[uuid.UUID] = []
+    if affected_ids:
+        affected_org_ids = sorted(
+            set(
+                (
+                    await db.execute(
+                        select(User.org_id).where(User.id.in_(affected_ids), User.org_id.is_not(None))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        )
 
     await log_audit(
         db,
@@ -908,7 +1025,19 @@ async def bulk_user_action(
         actor_type="superadmin",
         action=f"bulk_{body.action}",
         target="users",
-        details={"count": count, "user_ids": [str(i) for i in valid_ids]},
+        # The ids actually affected, not every id asked for. activate skips
+        # members of suspended orgs and change_dept skips other tenants, so the
+        # requested set overstates what happened — and `count` beside it, which
+        # is derived from the same list, then disagreed with it.
+        details={
+            "count": count,
+            "user_ids": [str(i) for i in affected_ids],
+            "org_ids": [str(o) for o in affected_org_ids],
+        },
+        # Attributed whenever the batch stayed inside one organisation, which is
+        # what the portal's own org filter produces. A genuinely cross-tenant
+        # batch stays NULL and carries the full list in details.
+        org_id=affected_org_ids[0] if len(affected_org_ids) == 1 else None,
     )
     await db.commit()
     return {"message": message}
@@ -958,6 +1087,19 @@ async def update_user(
             # session is untouched (see _revoke_refresh_tokens).
             await _revoke_refresh_tokens(db, [user.id], client="mobile")
     if "is_active" in update_data:
+        # The org suspension that deactivated this account is only ever enforced
+        # through users.is_active; flipping it back here restores login to a
+        # tenant that is supposed to be shut off. Checked before the assignment
+        # so the refusal lands before any state changes.
+        if update_data["is_active"] is True and user.org_id is not None:
+            # Locked: an unlocked read races a concurrent suspension, whose
+            # cascade has already passed over this row by the time we write it.
+            org = (await _lock_orgs(db, [user.org_id])).get(user.org_id)
+            if org is not None and not org.is_active:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot activate a user in a suspended organization",
+                )
         user.is_active = update_data["is_active"]
         if update_data["is_active"] is False:
             # Fix: deactivation revokes the user's refresh sessions.
