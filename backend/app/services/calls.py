@@ -79,6 +79,13 @@ RING_TIMEOUT_SECONDS = 45
 # client well inside the time a user would wait before giving up and redialling.
 RECONNECT_GRACE_SECONDS = 40
 
+# How long a deadline waits before being tried again after its handler raised.
+# Claiming is destructive — claim_due ZREMs before the handler runs — so without
+# putting it back a failed fire is a lost fire, and the row it was going to
+# resolve stays mid-state forever. Short, because everything a deadline resolves
+# is something a user is actively waiting on.
+DEADLINE_RETRY_SECONDS = 5
+
 GROUP_CALL_CAP = 32
 _CALL_TTL = 24 * 3600
 # Long enough to outlive any grace window, short enough that a leaked key expires
@@ -1455,16 +1462,45 @@ handle_user_disconnect = handle_user_link_down
 
 async def sweep_due_deadlines() -> int:
     """Fire every ring/grace deadline that has come due. Safe to call from any
-    worker, as often as you like. Returns how many fired, for the tests."""
+    worker, as often as you like. Returns how many fired, for the tests.
+
+    A handler that raises gets its deadline put back rather than dropped.
+    claim_due is destructive by design — it ZREMs in the same Lua script that
+    reads, so exactly one worker owns each firing — which means an exception
+    after the claim is a deadline that no longer exists anywhere. That is the
+    third failure mode call_deadlines was written to eliminate, reached through
+    the error path instead of a restart: nothing left to sweep, and a call stuck
+    ringing until someone fixes the row by hand.
+
+    Re-firing is safe by construction, which is what makes putting it back the
+    right move rather than a risk: every handler re-reads its row and no-ops
+    unless the state it acts on is still true, so a retry against a call that was
+    answered in the meantime does nothing.
+
+    Retries are not bounded, deliberately. There is no attempt counter to bound
+    them with — the sorted set holds a score and nothing else — and the failures
+    this recovers are transient by nature (a database blip, an exhausted pool,
+    Redis refusing the link read in _grace_expired). A handler that keeps raising
+    means the infrastructure under it is still down, which is exactly when the
+    deadline should still be waiting.
+
+    What this does NOT recover is a Redis outage: the deadline sets live in
+    Redis, so schedule() degrades to a no-op in the same outage that made the
+    handler fail, and the deadline is gone regardless.
+    """
     fired = 0
     for member in await call_deadlines.claim_due(call_deadlines.RING):
         call_id = _parse_uuid(member)
         if call_id is None:
+            # Unparseable members can never succeed; dropping is the fix, and
+            # claim_due has already done it.
             continue
         try:
             await _ring_timeout(call_id)
         except Exception:
-            logger.exception("ring timeout failed call_id=%s", call_id)
+            logger.exception("ring timeout failed, retrying call_id=%s", call_id)
+            await call_deadlines.schedule(call_deadlines.RING, member, DEADLINE_RETRY_SECONDS)
+            continue
         fired += 1
     for member in await call_deadlines.claim_due(call_deadlines.GRACE):
         call_part, _, user_part = member.partition(":")
@@ -1474,7 +1510,9 @@ async def sweep_due_deadlines() -> int:
         try:
             await _grace_expired(call_id, user_id)
         except Exception:
-            logger.exception("grace expiry failed call_id=%s user_id=%s", call_id, user_id)
+            logger.exception("grace expiry failed, retrying call_id=%s user_id=%s", call_id, user_id)
+            await call_deadlines.schedule(call_deadlines.GRACE, member, DEADLINE_RETRY_SECONDS)
+            continue
         fired += 1
     return fired
 
