@@ -50,7 +50,13 @@ export const sortConversations = (convs) => {
   return sorted;
 };
 
-const useChatStore = create((set) => ({
+/**
+ * Everything in this store belongs to one signed-in person: their threads, the
+ * message bodies inside them, their colleagues, who is typing. It is the only
+ * place the app holds that, and until `reset` existed there was no way to put
+ * it down — see the docblock on `reset` for why that mattered.
+ */
+const emptyState = () => ({
   conversations: [],
   activeConversationId: null,
   messages: {},
@@ -58,6 +64,35 @@ const useChatStore = create((set) => ({
   typingUsers: {},
   wsConnected: false,
   wsConnecting: false,
+});
+
+const useChatStore = create((set) => ({
+  ...emptyState(),
+
+  /**
+   * Drop every trace of the signed-in user's chat data.
+   *
+   * Signing out had two shapes and only one of them cleared this. An expired
+   * session is torn down by api/client.js with `window.location.href`, a full
+   * document navigation that destroys the heap along with everything in it. The
+   * sign-out BUTTON is a React Router transition: `logout()` clears the cached
+   * user and the route guard renders <Navigate to="/login">, and the JS heap —
+   * this store included — is carried straight into the next session in that tab.
+   *
+   * Which is the wrong way round, because the button is the deliberate one. On a
+   * shared clinical workstation it is the end of a shift, and the next person to
+   * sign in inherited the tab: activeConversationId still pointed at the last
+   * thread the previous user had open, and ChatPanel renders
+   * `messages[conversationId]` straight from here, so their messages painted
+   * before the refetch that would have replaced them had returned.
+   *
+   * websocket.js already had to reason about this — its `disconnect` docblock
+   * describes a 'failed' row written "into a store nothing clears on logout —
+   * which the next login's first fetch would then carry over into someone else's
+   * thread". That workaround stays correct; this removes what it was working
+   * around.
+   */
+  reset: () => set(() => emptyState()),
 
   setConversations: (conversations) => set((state) => (
     sameConversationList(state.conversations, conversations) ? state : { conversations }
