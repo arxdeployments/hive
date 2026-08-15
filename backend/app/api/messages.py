@@ -501,6 +501,15 @@ async def message_info(msg_id: str, tenant: TenantContext = Depends(get_tenant))
     me = await db.get(ConversationParticipant, (msg.conversation_id, tenant.user.id))
     if me is None:
         raise HTTPException(status_code=404, detail="Message not found")
+    # Revocation, ahead of the sender check for the same reason membership is:
+    # a cut-off caller gets 404, not a 403 that confirms the message is theirs.
+    # This route reads no message content, so it was missed when the gate went on
+    # the content paths — but it still answers with every other participant's
+    # display name and the times they read it, out of a group the caller has been
+    # removed from. Same lever, same leak, smaller payload.
+    conv = await db.get(Conversation, msg.conversation_id)
+    if conv is None or not conv.is_active:
+        raise HTTPException(status_code=404, detail="Message not found")
     if msg.sender_id != tenant.user.id:
         raise HTTPException(status_code=403, detail="Can only view info for your own messages")
 

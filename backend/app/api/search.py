@@ -214,6 +214,17 @@ async def global_search(
                 ),
             )
             .where(
+                # The same revocation gate _require_org_access applies to the
+                # message read paths (api/messages.py) and the media drawer
+                # (api/media.py). Deactivation is the only lever a superadmin has
+                # to cut a tenant off from a cross-org group — DELETE and the
+                # archive route both just set is_active = False and leave the
+                # participant rows in place — so without this the join on
+                # ConversationParticipant still matched and full message content
+                # from a revoked group kept coming back here. The conversations
+                # bucket above has always filtered it; the two halves of one
+                # response disagreed, and this was the half that leaked.
+                Conversation.is_active.is_(True),
                 Message.type == MessageType.text,
                 Message.deleted_at.is_(None),
                 MessageDeletion.message_id.is_(None),
