@@ -328,6 +328,89 @@ async def test_a_deadline_in_the_future_is_not_claimed():
     assert await call_deadlines.remaining(call_deadlines.RING, "later") is None
 
 
+async def test_a_failed_ring_timeout_is_retried_not_lost(two_orgs_with_users, monkeypatch):
+    """A handler that raises must not take the deadline down with it.
+
+    claim_due ZREMs in the same script that reads, so an exception after the claim
+    leaves the deadline existing nowhere — the same "nothing to sweep" state a
+    lost asyncio timer used to produce, and the call stays ringing forever.
+    """
+    users = two_orgs_with_users
+    call = await _seed_call(users, status=CallStatus.ringing)
+    await call_deadlines.schedule(call_deadlines.RING, str(call.id), -1)
+
+    calls = {"n": 0}
+    real = calls_service._ring_timeout
+
+    async def _flaky(call_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("database blip")
+        return await real(call_id)
+
+    monkeypatch.setattr(calls_service, "_ring_timeout", _flaky)
+
+    swept = await calls_service.sweep_due_deadlines()
+
+    # The deadline survived its handler: back on the set, due again shortly.
+    left = await call_deadlines.remaining(call_deadlines.RING, str(call.id))
+    assert left is not None, "the deadline was lost when its handler raised"
+    assert 0 < left <= calls_service.DEADLINE_RETRY_SECONDS
+    # Nothing fired, and the call is untouched, still waiting to be resolved.
+    assert swept == 0
+    assert await _status_of(call.id) == CallStatus.ringing
+
+    # Once it is due again the retry lands, and the call finally resolves.
+    await call_deadlines.schedule(call_deadlines.RING, str(call.id), -1)
+    assert await calls_service.sweep_due_deadlines() == 1
+    assert calls["n"] == 2
+    assert await _status_of(call.id) == CallStatus.missed
+    assert await call_deadlines.remaining(call_deadlines.RING, str(call.id)) is None
+
+
+async def test_a_failed_grace_expiry_is_retried_not_lost(two_orgs_with_users, monkeypatch):
+    """Same guarantee on the other deadline kind.
+
+    This one has a live way to fail that the ring path does not: _grace_expired
+    reads the Redis link key outside any degrade guard, deliberately, because
+    neither answer is safe to assume.
+    """
+    users = two_orgs_with_users
+    call = await _seed_call(users, status=CallStatus.connected)
+    await calls_service._set_in_call([users["alice"].id, users["bob"].id], call.id)
+    await calls_service.handle_user_link_down(users["bob"])
+    member = calls_service._grace_member(call.id, users["bob"].id)
+    await call_deadlines.schedule(call_deadlines.GRACE, member, -1)
+
+    calls = {"n": 0}
+    real = calls_service._grace_expired
+
+    async def _flaky(call_id, user_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("redis refused the link read")
+        return await real(call_id, user_id)
+
+    monkeypatch.setattr(calls_service, "_grace_expired", _flaky)
+
+    swept = await calls_service.sweep_due_deadlines()
+
+    # The deadline survived its handler, and nothing about the call moved.
+    left = await call_deadlines.remaining(call_deadlines.GRACE, member)
+    assert left is not None, "the grace deadline was lost when its handler raised"
+    assert 0 < left <= calls_service.DEADLINE_RETRY_SECONDS
+    assert swept == 0
+    assert await _status_of(call.id) == CallStatus.connected
+
+    # Once due again the retry lands, resolving the call without the absent
+    # participant and consuming the deadline for good.
+    await call_deadlines.schedule(call_deadlines.GRACE, member, -1)
+    assert await calls_service.sweep_due_deadlines() == 1
+    assert calls["n"] == 2
+    assert await _status_of(call.id) == CallStatus.answered
+    assert await call_deadlines.remaining(call_deadlines.GRACE, member) is None
+
+
 # ---------------------------------------------------------------------------
 # Accept / join, and the errors that used to be silence
 # ---------------------------------------------------------------------------
