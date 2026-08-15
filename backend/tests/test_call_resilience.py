@@ -382,18 +382,33 @@ async def test_a_failed_grace_expiry_is_retried_not_lost(two_orgs_with_users, mo
     member = calls_service._grace_member(call.id, users["bob"].id)
     await call_deadlines.schedule(call_deadlines.GRACE, member, -1)
 
-    async def _boom(call_id, user_id):
-        raise RuntimeError("redis refused the link read")
+    calls = {"n": 0}
+    real = calls_service._grace_expired
 
-    monkeypatch.setattr(calls_service, "_grace_expired", _boom)
+    async def _flaky(call_id, user_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("redis refused the link read")
+        return await real(call_id, user_id)
+
+    monkeypatch.setattr(calls_service, "_grace_expired", _flaky)
 
     swept = await calls_service.sweep_due_deadlines()
 
+    # The deadline survived its handler, and nothing about the call moved.
     left = await call_deadlines.remaining(call_deadlines.GRACE, member)
     assert left is not None, "the grace deadline was lost when its handler raised"
     assert 0 < left <= calls_service.DEADLINE_RETRY_SECONDS
     assert swept == 0
     assert await _status_of(call.id) == CallStatus.connected
+
+    # Once due again the retry lands, resolving the call without the absent
+    # participant and consuming the deadline for good.
+    await call_deadlines.schedule(call_deadlines.GRACE, member, -1)
+    assert await calls_service.sweep_due_deadlines() == 1
+    assert calls["n"] == 2
+    assert await _status_of(call.id) == CallStatus.answered
+    assert await call_deadlines.remaining(call_deadlines.GRACE, member) is None
 
 
 # ---------------------------------------------------------------------------
