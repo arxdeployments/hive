@@ -38,7 +38,6 @@ from app.core.deps import require_superadmin
 from app.core.security import PasswordPolicyError, enforce_password_policy, hash_password
 from app.db.models import AuditLog, Department, Organization, RefreshToken, User, UserRole
 from app.db.session import get_db
-from app.realtime.redis_bus import degrade_on_outage, get_redis
 from app.services import presence
 from app.services.audit import log_audit, serialize_audit
 from app.utils import generate_password, iso_z, now_utc, parse_uuid, sanitize_text, slugify
@@ -249,33 +248,18 @@ async def _deactivate_org_users(db: AsyncSession, org_id: uuid.UUID) -> int:
 
 
 async def _count_online_users() -> int:
-    """Currently-online users = live presence keys in Redis.
+    """Currently-online users, read from the presence index.
 
-    Best-effort, like every other presence read in the product: get_statuses and
-    is_online both sit inside degrade_on_outage so an outage costs a green dot
-    rather than the request. This one did not, so a Redis blip 500'd the whole
-    superadmin dashboard — including the four tiles that come from Postgres and
-    were never in doubt. The org-admin dashboard, which reads presence through
-    get_statuses, stayed up through the same outage.
+    Was a SCAN for presence:* — which walks the entire keyspace, because MATCH
+    filters server-side rather than narrowing the iteration, so the cost was the
+    size of Redis (ratelimit:, call:, direct: and user: keys included) rather
+    than the number of people online. It is now a trim plus a ZCARD against the
+    sorted set maintained by app/services/presence.py.
 
-    The count is assigned only after the scan completes, so a failure part-way
-    through reports 0 (the degraded value) rather than a plausible-looking
-    partial tally.
-
-    Cost note: SCAN walks the whole keyspace — MATCH filters server-side, it does
-    not narrow the iteration — so this is O(total keys), and the keyspace also
-    holds ratelimit:, call:, direct: and user: entries. Fine at current scale;
-    if it stops being fine, the fix is an index of online users (a sorted set
-    scored by last heartbeat), not a bigger COUNT hint.
+    Still best-effort, as it was: presence degrades to 0 rather than taking the
+    four Postgres-backed tiles down with it.
     """
-    count = 0
-    async with degrade_on_outage("admin.count_online_users"):
-        redis = get_redis()
-        scanned = 0
-        async for _key in redis.scan_iter(match="presence:*", count=500):
-            scanned += 1
-        count = scanned
-    return count
+    return await presence.count_online()
 
 
 async def _lock_orgs(db: AsyncSession, org_ids) -> dict[uuid.UUID, Organization]:

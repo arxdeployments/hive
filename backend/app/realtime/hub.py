@@ -439,7 +439,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # gauge upward permanently, and skipped handle_user_link_down so a call the
     # user was in never got its grace window.
     try:
-        came_online = await presence.mark_online(user.id, conn_id)
+        came_online = await presence.mark_online(user.id, conn_id, org_id=user.org_id)
         if came_online:
             async with SessionLocal() as db:
                 db_user = await db.get(User, user.id)
@@ -541,7 +541,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     break
 
             if data["type"] == "ping":
-                await presence.refresh(user.id)
+                await presence.refresh(user.id, org_id=user.org_id)
                 await registry.send_to(
                     user.id, conn_id, json.dumps({"type": "pong", "timestamp": iso_z(now_utc())})
                 )
@@ -559,7 +559,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         pass
     finally:
         await registry.remove(user.id, conn_id)
-        went_offline = await presence.mark_offline(user.id, conn_id)
+        went_offline = await presence.mark_offline(user.id, conn_id, org_id=user.org_id)
         if went_offline:
             async with SessionLocal() as db:
                 db_user = await db.get(User, user.id)

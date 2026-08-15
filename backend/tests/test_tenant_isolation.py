@@ -151,6 +151,39 @@ async def test_org_admin_portal_is_org_scoped(client, two_orgs_with_users):
     assert resp.status_code == 404
 
 
+async def test_org_stats_counts_only_its_own_tenant_as_online(client, two_orgs_with_users):
+    """active_today is org-scoped, and now reads the presence index.
+
+    It used to load every active user id in the tenant and issue one Redis EXISTS
+    per row. The index answers it directly, so this pins the thing that actually
+    matters through the endpoint: a neighbouring tenant's traffic never lands on
+    this org's tile.
+    """
+    from app.db.models import User, UserRole
+    from app.db.session import SessionLocal
+    from app.services import presence
+
+    users = two_orgs_with_users
+    async with SessionLocal() as db:
+        alice = await db.get(User, users["alice"].id)
+        alice.role = UserRole.org_admin
+        await db.commit()
+    await login(client, "alice@a.com")
+
+    assert (await client.get("/api/org-admin/stats")).json()["active_today"] == 0
+
+    # Bob connects in this org; Carol connects in the other one.
+    await presence.mark_online(users["bob"].id, "c-bob", org_id=users["org_a"].id)
+    await presence.mark_online(users["carol"].id, "c-carol", org_id=users["org_b"].id)
+
+    body = (await client.get("/api/org-admin/stats")).json()
+    assert body["active_today"] == 1, "the other tenant's session was counted here"
+    assert body["total_users"] == 2  # alice + bob, unchanged by any of this
+
+    await presence.mark_offline(users["bob"].id, "c-bob", org_id=users["org_a"].id)
+    assert (await client.get("/api/org-admin/stats")).json()["active_today"] == 0
+
+
 async def test_superadmin_rejected_from_org_admin_portal(client, two_orgs_with_users):
     from app.db.models import UserRole
     from tests.conftest import make_user

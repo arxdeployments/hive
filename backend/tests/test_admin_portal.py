@@ -227,6 +227,9 @@ async def test_admin_stats_survives_a_redis_outage(client, monkeypatch):
     get_statuses and is_online both sit inside degrade_on_outage, so a Redis
     outage costs a green dot. _count_online_users did not, so the same outage
     500'd /api/admin/stats — including the four tiles that come from Postgres.
+
+    The counting moved into app/services/presence.py behind the online index, so
+    the outage is now injected there; the guarantee under test is unchanged.
     """
     await _superadmin_client(client)
     # real rows behind the Postgres-backed tiles, so "still answers" means
@@ -250,7 +253,7 @@ async def test_admin_stats_survives_a_redis_outage(client, monkeypatch):
     def _redis_is_down():
         raise ConnectionError("redis unavailable")
 
-    monkeypatch.setattr("app.api.admin.get_redis", _redis_is_down)
+    monkeypatch.setattr("app.services.presence.get_redis", _redis_is_down)
 
     resp = await client.get("/api/admin/stats")
     assert resp.status_code == 200, resp.text
