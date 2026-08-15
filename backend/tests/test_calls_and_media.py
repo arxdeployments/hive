@@ -8,7 +8,7 @@ import jwt
 from httpx import ASGITransport, AsyncClient
 
 from app.core.config import get_settings
-from app.db.models import Call, CallParticipant, CallStatus, CallType, Message
+from app.db.models import Call, CallParticipant, CallStatus, CallType, Conversation, Message
 from app.db.session import SessionLocal
 from app.main import app
 from app.services.calls import room_name_for, user_id_from_identity
@@ -444,6 +444,29 @@ async def test_every_per_asset_route_404s_for_a_non_member_and_a_tombstoned_mess
         for route in routes:
             resp = await carol.get(route, follow_redirects=False)
             assert resp.status_code == 404, f"{route} -> {resp.status_code}"
+
+    # Deactivating the conversation must revoke the BYTES, not only the listings.
+    #
+    # Deactivation is the only lever a superadmin has to cut a tenant off from a
+    # cross-org group: it leaves the participant rows in place, so membership alone
+    # outlives the revocation. /messages and the media drawer already honoured the
+    # flag and this path did not — measured before the fix as /messages 404 and
+    # /media 404 while the attachment served 307 and /meta served 200, so anyone
+    # holding an id kept reading files out of a group they had been removed from.
+    async with SessionLocal() as db:
+        row = await db.get(Conversation, uuid.UUID(conv))
+        row.is_active = False
+        await db.commit()
+
+    async with _client_for("alice@a.com") as alice:
+        for route in routes:
+            resp = await alice.get(route, follow_redirects=False)
+            assert resp.status_code == 404, f"deactivated {route} -> {resp.status_code}"
+
+    async with SessionLocal() as db:
+        row = await db.get(Conversation, uuid.UUID(conv))
+        row.is_active = True
+        await db.commit()
 
     # Tombstone the message: the owner now 404s too, on every route.
     async with SessionLocal() as db:

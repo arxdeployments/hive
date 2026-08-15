@@ -13,14 +13,16 @@ from urllib.parse import urlparse
 import anyio
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import RedirectResponse
-from sqlalchemy import and_, func, literal_column, select
+from sqlalchemy import and_, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.deps import TenantContext, get_current_user, get_tenant
 from app.core.rate_limit import upload_limiter
 from app.db.models import (
+    Conversation,
     ConversationParticipant,
+    ConversationType,
     Message,
     MessageAttachment,
     MessageDeletion,
@@ -239,14 +241,31 @@ async def _member_attachment(db: AsyncSession, attachment_id: str, user: User) -
     # and the gap widens with network distance because it is round trips rather than
     # work.
     #
-    # The inner joins reproduce the three 404 conditions exactly — no attachment, no
-    # message or a tombstoned one, no membership — and all three stay
-    # indistinguishable to the caller. Still returns a session-attached row, which
-    # _ensure_pdf_preview depends on: it mutates thumbnail_key/page_count and commits.
+    # The joins reproduce every 404 condition at once — no attachment, no message or a
+    # tombstoned one, no membership, a revoked conversation, the wrong org — and all of
+    # them stay indistinguishable to the caller. Still returns a session-attached row,
+    # which _ensure_pdf_preview depends on: it mutates thumbnail_key/page_count and
+    # commits.
+    #
+    # is_active and the org rule are the SAME gate _require_org_access applies to the
+    # messages themselves (app/api/messages.py), and they are here because media was
+    # missed when that gate was added. Deactivation is the only lever a superadmin has
+    # to cut a tenant off from a cross-org group — it leaves the participant rows in
+    # place — and it revoked the message list and the media drawer while the bytes kept
+    # serving: /messages 404, /media 404, but the attachment 307 and /meta 200. Anyone
+    # holding an attachment id went on reading files out of a group they had been
+    # removed from, which is exactly what that comment says the flag exists to prevent.
+    #
+    # The org half mirrors _require_org_access rather than being stricter than it: a
+    # cross_org conversation passes on membership. Adding an allowed_org_ids test here
+    # would make media 404 for a caller whose messages still render, and membership
+    # already implies the org is in that list (groups.py refuses a cross-org member on
+    # create and on add; cross_org.py only ever appends to allowed_org_ids).
     attachment = (
         await db.execute(
             select(MessageAttachment)
             .join(Message, Message.id == MessageAttachment.message_id)
+            .join(Conversation, Conversation.id == Message.conversation_id)
             .join(
                 ConversationParticipant,
                 and_(
@@ -254,7 +273,15 @@ async def _member_attachment(db: AsyncSession, attachment_id: str, user: User) -
                     ConversationParticipant.user_id == user.id,
                 ),
             )
-            .where(MessageAttachment.id == att_id, Message.deleted_at.is_(None))
+            .where(
+                MessageAttachment.id == att_id,
+                Message.deleted_at.is_(None),
+                Conversation.is_active.is_(True),
+                or_(
+                    Conversation.type == ConversationType.cross_org,
+                    Conversation.org_id == user.org_id,
+                ),
+            )
         )
     ).scalar_one_or_none()
     if attachment is None:
