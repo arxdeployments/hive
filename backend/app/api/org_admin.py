@@ -192,13 +192,16 @@ async def org_stats(
     total_users = (
         await db.execute(select(func.count()).select_from(User).where(User.org_id == org_id))
     ).scalar_one()
-    active_ids = (
-        (await db.execute(select(User.id).where(User.org_id == org_id, User.is_active.is_(True))))
-        .scalars()
-        .all()
-    )
-    statuses = await presence.get_statuses(list(active_ids))
-    active_today = sum(1 for s in statuses.values() if s == "online")
+    # Was: read every active user id in the tenant out of Postgres, then issue one
+    # Redis EXISTS per user — both O(tenant), on every dashboard load. The online
+    # index answers it with one trim and one ZCARD.
+    #
+    # Slight semantic change, in the direction of the tile's own label: this counts
+    # everyone from the org with a live socket, where the old version intersected
+    # that with users.is_active. The two differ only for an account deactivated
+    # while it still holds an open connection, which is a window of seconds and
+    # which the old count arguably got wrong — they are, in fact, online.
+    active_today = await presence.count_online_in_org(org_id)
     total_departments = (
         await db.execute(select(func.count()).select_from(Department).where(Department.org_id == org_id))
     ).scalar_one()
