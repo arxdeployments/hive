@@ -57,13 +57,35 @@ async def _index_add(user_id, org_id) -> None:
         await pipe.execute()
 
 
+# Compare-and-delete against the authority, in one round trip.
+#
+# mark_offline decides a user is gone from a SCARD, and only then removes them
+# here — two awaits apart, which is room enough for that user's next socket to
+# register in between. The removal would then land on a user who is online
+# again: the presence key holds the new socket while the index has dropped them,
+# and the count stays one short until their next heartbeat re-adds them.
+#
+# So the count is not what decides. This re-reads presence:{user_id} — the same
+# key is_online answers from — inside the script, and removes only if it is
+# genuinely gone. A reconnect that beat us here recreated that key, and the
+# removal correctly does nothing.
+_REMOVE_IF_GONE = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  return 0
+end
+for i = 2, #KEYS do
+  redis.call('ZREM', KEYS[i], ARGV[1])
+end
+return 1
+"""
+
+
 async def _index_remove(user_id, org_id) -> None:
     async with degrade_on_outage("presence.index_remove"):
-        pipe = get_redis().pipeline()
-        pipe.zrem(_INDEX, str(user_id))
+        keys = [_key(user_id), _INDEX]
         if org_id is not None:
-            pipe.zrem(_org_index(org_id), str(user_id))
-        await pipe.execute()
+            keys.append(_org_index(org_id))
+        await get_redis().eval(_REMOVE_IF_GONE, len(keys), *keys, str(user_id))
 
 
 async def _count(key: str) -> int:

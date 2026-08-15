@@ -111,6 +111,39 @@ async def test_a_heartbeat_rescores_so_a_long_call_is_not_aged_out():
     assert await presence.count_online_in_org(org) == 1
 
 
+async def test_a_stale_disconnect_cannot_evict_a_user_who_reconnected():
+    """The interleaving that the count alone could not survive.
+
+    mark_offline decides a user is gone from a SCARD and removes them from the
+    index two awaits later. In between, that user's next socket can register —
+    a refresh, a handover, a flaky network — and the removal would then land on
+    someone who is online again, leaving the presence key holding the new socket
+    while the index has dropped them.
+
+    The removal re-reads the presence key instead of trusting that count, so it
+    no-ops when a reconnect beat it. Driven in the exact order here rather than
+    raced, so it fails deterministically if that guard goes.
+    """
+    org = uuid.uuid4()
+    user = uuid.uuid4()
+
+    await presence.mark_online(user, "old-socket", org_id=org)
+    # The old socket drops: index entry goes, as it should.
+    assert await presence.mark_offline(user, "old-socket", org_id=org) is True
+    assert await presence.count_online() == 0
+
+    # The new socket lands.
+    await presence.mark_online(user, "new-socket", org_id=org)
+    assert await presence.count_online() == 1
+
+    # ...and only now does the old disconnect's removal get its turn.
+    await presence._index_remove(user, org)
+
+    assert await presence.is_online(user) is True
+    assert await presence.count_online() == 1, "a stale disconnect evicted a live user"
+    assert await presence.count_online_in_org(org) == 1
+
+
 async def test_the_index_is_advisory_and_cannot_break_presence(monkeypatch):
     """Every index write is best-effort, and the counts degrade to 0.
 
