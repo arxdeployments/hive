@@ -8,7 +8,7 @@ import jwt
 from httpx import ASGITransport, AsyncClient
 
 from app.core.config import get_settings
-from app.db.models import Call, CallParticipant, CallStatus, CallType
+from app.db.models import Call, CallParticipant, CallStatus, CallType, Conversation, Message
 from app.db.session import SessionLocal
 from app.main import app
 from app.services.calls import room_name_for, user_id_from_identity
@@ -398,3 +398,83 @@ async def test_mark_seen_still_clears_calls_that_have_finished(client, two_orgs_
         assert (await bob.get("/api/calls/missed-count")).json()["count"] == 1
         assert (await bob.post("/api/calls/mark-seen")).status_code == 200
         assert (await bob.get("/api/calls/missed-count")).json()["count"] == 0
+
+
+async def test_every_per_asset_route_404s_for_a_non_member_and_a_tombstoned_message(
+    client, two_orgs_with_users
+):
+    """The attachment authorisation gate, on all four routes that use it.
+
+    _member_attachment resolves attachment -> message -> membership. It used to do
+    that as three sequential db.get calls and is now a single join, so the three 404
+    conditions it encodes are worth pinning rather than trusting: the existing media
+    test only covered a non-member against the bytes route, leaving /thumb, /meta and
+    /page/{n} — and the tombstone condition entirely — unasserted.
+
+    All three failures must stay indistinguishable from one another: 404 everywhere,
+    never a 403, so the endpoint cannot be used to prove an attachment exists.
+    """
+    users = two_orgs_with_users
+    async with _client_for("alice@a.com") as alice:
+        files = {"file": ("pic.png", io.BytesIO(_png_bytes()), "image/png")}
+        up = (await alice.post("/api/upload", files=files)).json()
+        conv = (
+            await alice.post("/api/conversations/direct", json={"participant_id": str(users["bob"].id)})
+        ).json()["_id"]
+        msg = (
+            await alice.post(
+                f"/api/conversations/{conv}/messages",
+                json={"content": "", "type": "image", "media_url": up["file_url"], "temp_id": "auth1"},
+            )
+        ).json()
+        attachment_id = msg["media_url"].rsplit("/", 1)[-1]
+
+        routes = [
+            f"/api/media/{attachment_id}",
+            f"/api/media/{attachment_id}/thumb",
+            f"/api/media/{attachment_id}/meta",
+            f"/api/media/{attachment_id}/page/1",
+        ]
+        # A participant is served (or 404s only because a PNG has no PDF pages).
+        assert (await alice.get(routes[0], follow_redirects=False)).status_code == 307
+        assert (await alice.get(routes[2])).status_code == 200
+
+    # Foreign org: every route, same answer.
+    async with _client_for("carol@b.com") as carol:
+        for route in routes:
+            resp = await carol.get(route, follow_redirects=False)
+            assert resp.status_code == 404, f"{route} -> {resp.status_code}"
+
+    # Deactivating the conversation must revoke the BYTES, not only the listings.
+    #
+    # Deactivation is the only lever a superadmin has to cut a tenant off from a
+    # cross-org group: it leaves the participant rows in place, so membership alone
+    # outlives the revocation. /messages and the media drawer already honoured the
+    # flag and this path did not — measured before the fix as /messages 404 and
+    # /media 404 while the attachment served 307 and /meta served 200, so anyone
+    # holding an id kept reading files out of a group they had been removed from.
+    async with SessionLocal() as db:
+        row = await db.get(Conversation, uuid.UUID(conv))
+        row.is_active = False
+        await db.commit()
+
+    async with _client_for("alice@a.com") as alice:
+        for route in routes:
+            resp = await alice.get(route, follow_redirects=False)
+            assert resp.status_code == 404, f"deactivated {route} -> {resp.status_code}"
+
+    async with SessionLocal() as db:
+        row = await db.get(Conversation, uuid.UUID(conv))
+        row.is_active = True
+        await db.commit()
+
+    # Tombstone the message: the owner now 404s too, on every route.
+    async with SessionLocal() as db:
+        row = await db.get(Message, uuid.UUID(msg["_id"]))
+        row.deleted_at = now_utc()
+        await db.commit()
+
+    async with _client_for("alice@a.com") as alice:
+        for route in routes:
+            resp = await alice.get(route, follow_redirects=False)
+            assert resp.status_code == 404, f"tombstoned {route} -> {resp.status_code}"
