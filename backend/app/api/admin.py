@@ -38,7 +38,7 @@ from app.core.deps import require_superadmin
 from app.core.security import PasswordPolicyError, enforce_password_policy, hash_password
 from app.db.models import AuditLog, Department, Organization, RefreshToken, User, UserRole
 from app.db.session import get_db
-from app.realtime.redis_bus import get_redis
+from app.realtime.redis_bus import degrade_on_outage, get_redis
 from app.services import presence
 from app.services.audit import log_audit, serialize_audit
 from app.utils import generate_password, iso_z, now_utc, parse_uuid, sanitize_text, slugify
@@ -249,11 +249,32 @@ async def _deactivate_org_users(db: AsyncSession, org_id: uuid.UUID) -> int:
 
 
 async def _count_online_users() -> int:
-    """Currently-online users = live presence keys in Redis."""
-    redis = get_redis()
+    """Currently-online users = live presence keys in Redis.
+
+    Best-effort, like every other presence read in the product: get_statuses and
+    is_online both sit inside degrade_on_outage so an outage costs a green dot
+    rather than the request. This one did not, so a Redis blip 500'd the whole
+    superadmin dashboard — including the four tiles that come from Postgres and
+    were never in doubt. The org-admin dashboard, which reads presence through
+    get_statuses, stayed up through the same outage.
+
+    The count is assigned only after the scan completes, so a failure part-way
+    through reports 0 (the degraded value) rather than a plausible-looking
+    partial tally.
+
+    Cost note: SCAN walks the whole keyspace — MATCH filters server-side, it does
+    not narrow the iteration — so this is O(total keys), and the keyspace also
+    holds ratelimit:, call:, direct: and user: entries. Fine at current scale;
+    if it stops being fine, the fix is an index of online users (a sorted set
+    scored by last heartbeat), not a bigger COUNT hint.
+    """
     count = 0
-    async for _key in redis.scan_iter(match="presence:*", count=500):
-        count += 1
+    async with degrade_on_outage("admin.count_online_users"):
+        redis = get_redis()
+        scanned = 0
+        async for _key in redis.scan_iter(match="presence:*", count=500):
+            scanned += 1
+        count = scanned
     return count
 
 
@@ -857,24 +878,24 @@ async def bulk_user_action(
             stmt = stmt.outerjoin(Organization, User.org_id == Organization.id).where(
                 or_(User.org_id.is_(None), Organization.is_active.is_(True))
             )
-        ids = list((await db.execute(stmt)).scalars().all())
-        if ids:
+        affected_ids = list((await db.execute(stmt)).scalars().all())
+        if affected_ids:
             await db.execute(
                 update(User)
-                .where(User.id.in_(ids))
+                .where(User.id.in_(affected_ids))
                 .values(is_active=(body.action == "activate"))
                 .execution_options(synchronize_session=False)
             )
             if body.action == "deactivate":
                 # Fix: bulk deactivation revokes the targets' sessions too.
-                await _revoke_refresh_tokens(db, ids)
-        count = len(ids)
+                await _revoke_refresh_tokens(db, affected_ids)
+        count = len(affected_ids)
         message = f"{count} users {body.action}d"
     elif body.action in ("grant_mobile", "revoke_mobile"):
         # Approving a department's worth of people one modal at a time is the kind
         # of chore that ends in nobody being approved, so the grant is bulk-able.
         granting = body.action == "grant_mobile"
-        ids = list(
+        affected_ids = list(
             (
                 await db.execute(
                     select(User.id).where(User.id.in_(valid_ids), User.role != UserRole.superadmin)
@@ -883,16 +904,16 @@ async def bulk_user_action(
             .scalars()
             .all()
         )
-        if ids:
+        if affected_ids:
             await db.execute(
                 update(User)
-                .where(User.id.in_(ids))
+                .where(User.id.in_(affected_ids))
                 .values(mobile_access=granting)
                 .execution_options(synchronize_session=False)
             )
             if not granting:
-                await _revoke_refresh_tokens(db, ids, client="mobile")
-        count = len(ids)
+                await _revoke_refresh_tokens(db, affected_ids, client="mobile")
+        count = len(affected_ids)
         message = f"Mobile access {'granted for' if granting else 'revoked for'} {count} users"
     elif body.action == "change_dept":
         if not body.dept_id:
@@ -906,15 +927,37 @@ async def bulk_user_action(
             .scalars()
             .all()
         )
-        count = 0
+        affected_ids = []
         for u in users:
             # Fix: only move users whose org owns the target department.
             if u.org_id == dept.org_id:
                 u.dept_id = dept.id
-                count += 1
+                affected_ids.append(u.id)
+        count = len(affected_ids)
         message = f"{count} users moved"
     else:
         raise HTTPException(status_code=400, detail="Invalid action")
+
+    # Which organisations this batch actually landed in. Every other log_audit
+    # call in this module passes org_id; this one never did, because a bulk
+    # action is the only one that can span tenants. Leaving it NULL meant the
+    # org-admin activity feed — which filters on audit_logs.org_id — showed
+    # nothing for the bulk deactivation that had just emptied the org.
+    affected_org_ids: list[uuid.UUID] = []
+    if affected_ids:
+        affected_org_ids = sorted(
+            set(
+                (
+                    await db.execute(
+                        select(User.org_id).where(
+                            User.id.in_(affected_ids), User.org_id.is_not(None)
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        )
 
     await log_audit(
         db,
@@ -922,7 +965,19 @@ async def bulk_user_action(
         actor_type="superadmin",
         action=f"bulk_{body.action}",
         target="users",
-        details={"count": count, "user_ids": [str(i) for i in valid_ids]},
+        # The ids actually affected, not every id asked for. activate skips
+        # members of suspended orgs and change_dept skips other tenants, so the
+        # requested set overstates what happened — and `count` beside it, which
+        # is derived from the same list, then disagreed with it.
+        details={
+            "count": count,
+            "user_ids": [str(i) for i in affected_ids],
+            "org_ids": [str(o) for o in affected_org_ids],
+        },
+        # Attributed whenever the batch stayed inside one organisation, which is
+        # what the portal's own org filter produces. A genuinely cross-tenant
+        # batch stays NULL and carries the full list in details.
+        org_id=affected_org_ids[0] if len(affected_org_ids) == 1 else None,
     )
     await db.commit()
     return {"message": message}
