@@ -278,9 +278,44 @@ async def _count_online_users() -> int:
     return count
 
 
-async def _get_org_or_404(db: AsyncSession, org_id: str) -> Organization:
+async def _lock_orgs(db: AsyncSession, org_ids) -> dict[uuid.UUID, Organization]:
+    """SELECT ... FOR UPDATE the given organisations, in a deterministic order.
+
+    Reading Organization.is_active without a lock only settles the sequential
+    case. Under READ COMMITTED — which is what this engine runs, no isolation
+    level is set — a suspension can commit between another request's read of the
+    org and its own write, and the cascade in _deactivate_org_users only touches
+    the users that existed when it ran. So a create or activate that checked an
+    org it saw as active could still land an active user inside a suspended one.
+
+    Every writer that reads or changes an org's active state takes this lock, so
+    suspension and activation serialise against each other. Ordering by id keeps
+    two multi-org batches from deadlocking on the same pair in opposite orders;
+    single-org callers satisfy it for free.
+    """
+    ids = sorted(set(org_ids))
+    if not ids:
+        return {}
+    rows = (
+        (
+            await db.execute(
+                select(Organization)
+                .where(Organization.id.in_(ids))
+                .order_by(Organization.id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {o.id: o for o in rows}
+
+
+async def _get_org_or_404(db: AsyncSession, org_id: str, *, lock: bool = False) -> Organization:
+    """Resolve an organisation. `lock` for callers that go on to write it or to
+    decide something from its active state; plain reads skip the lock."""
     oid = _uuid_or_400(org_id, "Invalid organization ID")
-    org = await db.get(Organization, oid)
+    org = (await _lock_orgs(db, [oid])).get(oid) if lock else await db.get(Organization, oid)
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
     return org
@@ -447,7 +482,9 @@ async def update_organization(
     db: AsyncSession = Depends(get_db),
     actor: User = Depends(require_superadmin),
 ):
-    org = await _get_org_or_404(db, org_id)
+    # Locked: this is the writer that suspends an org, and it has to serialise
+    # against the create/activate paths that read is_active to decide.
+    org = await _get_org_or_404(db, org_id, lock=True)
     update_data = {k: v for k, v in body.model_dump().items() if v is not None}
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
@@ -494,7 +531,8 @@ async def delete_organization(
     db: AsyncSession = Depends(get_db),
     actor: User = Depends(require_superadmin),
 ):
-    org = await _get_org_or_404(db, org_id)
+    # Locked for the same reason as update_organization: this is a suspension.
+    org = await _get_org_or_404(db, org_id, lock=True)
     org.is_active = False
     deactivated = await _deactivate_org_users(db, org.id)
     await log_audit(
@@ -800,7 +838,10 @@ async def create_user(
 ):
     oid = _uuid_or_400(body.org_id, "Invalid org_id")
     did = _uuid_or_400(body.dept_id, "Invalid dept_id")
-    org = await db.get(Organization, oid)
+    # Locked, and held until this request commits: an unlocked read could see an
+    # org a concurrent suspension is about to close, and that suspension's
+    # cascade would never reach the row inserted below.
+    org = (await _lock_orgs(db, [oid])).get(oid)
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
     # Suspending an org deactivates its members, but nothing on the login path
@@ -875,6 +916,27 @@ async def bulk_user_action(
             # call that can quietly bring a whole suspended tenant back online.
             # Members of suspended orgs are skipped rather than failing the batch;
             # `count` in the response already reports what actually changed.
+            #
+            # Two passes, because the eligibility filter reads org state and this
+            # batch can span organisations: the first pass only says which orgs
+            # are in play, then those are locked in id order, and only then is
+            # eligibility decided — against org rows a concurrent suspension can
+            # no longer move underneath us. Doing it in one query would settle
+            # eligibility on an unlocked read of exactly the column at issue.
+            candidate_org_ids = (
+                (
+                    await db.execute(
+                        select(User.org_id).where(
+                            User.id.in_(valid_ids),
+                            User.role != UserRole.superadmin,
+                            User.org_id.is_not(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await _lock_orgs(db, candidate_org_ids)
             stmt = stmt.outerjoin(Organization, User.org_id == Organization.id).where(
                 or_(User.org_id.is_(None), Organization.is_active.is_(True))
             )
@@ -1030,7 +1092,9 @@ async def update_user(
         # tenant that is supposed to be shut off. Checked before the assignment
         # so the refusal lands before any state changes.
         if update_data["is_active"] is True and user.org_id is not None:
-            org = await db.get(Organization, user.org_id)
+            # Locked: an unlocked read races a concurrent suspension, whose
+            # cascade has already passed over this row by the time we write it.
+            org = (await _lock_orgs(db, [user.org_id])).get(user.org_id)
             if org is not None and not org.is_active:
                 raise HTTPException(
                     status_code=400,

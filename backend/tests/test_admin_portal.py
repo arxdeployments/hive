@@ -2,6 +2,7 @@
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import AuditLog, RefreshToken, User, UserRole
 from app.db.session import SessionLocal
@@ -169,6 +170,57 @@ async def test_bulk_change_dept_skips_cross_org(client):
     assert "0" in resp.json()["message"]
 
 
+async def test_org_state_decisions_take_a_row_lock(client, monkeypatch):
+    """The suspension guards decide from Organization.is_active, so they have to
+    read it under FOR UPDATE.
+
+    The engine sets no isolation level, so it runs READ COMMITTED: an unlocked
+    read lets a suspension commit between the read and the write, and the
+    cascade in _deactivate_org_users only touches users that existed when it
+    ran. Both sides of that race — the suspension and the create/activate —
+    therefore take the same lock. This asserts the lock is actually requested,
+    because losing it would be silent and the resulting race is timing-dependent.
+    """
+    await _superadmin_client(client)
+    org_id = (await client.post("/api/admin/organizations", json={"name": "Locking Co"})).json()["_id"]
+    dept_id = (await client.post("/api/admin/departments", json={"org_id": org_id, "name": "Ops"})).json()[
+        "_id"
+    ]
+
+    seen: list[str] = []
+    original = AsyncSession.execute
+
+    async def _recording(self, statement, *args, **kwargs):
+        seen.append(str(statement))
+        return await original(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", _recording)
+
+    def _locked_org_read() -> bool:
+        return any("FROM organizations" in s and "FOR UPDATE" in s for s in seen)
+
+    # the create path reads is_active to decide, so it locks
+    seen.clear()
+    resp = await client.post(
+        "/api/admin/users",
+        json={
+            "org_id": org_id,
+            "dept_id": dept_id,
+            "email": "locked@locking.co",
+            "display_name": "Locked",
+            "password": "GoodPass1234",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert _locked_org_read(), "create_user read Organization.is_active without FOR UPDATE"
+
+    # the suspension path writes it, and must take the same lock
+    seen.clear()
+    resp = await client.put(f"/api/admin/organizations/{org_id}", json={"is_active": False})
+    assert resp.status_code == 200, resp.text
+    assert _locked_org_read(), "update_organization suspended an org without FOR UPDATE"
+
+
 async def test_admin_stats_survives_a_redis_outage(client, monkeypatch):
     """The superadmin dashboard was the one presence reader that did not degrade.
 
@@ -328,13 +380,36 @@ async def test_org_suspension_survives_user_create_and_activate(client):
     assert resp.status_code == 400, resp.text
 
     # ...nor in bulk, which is the call that could restore a whole tenant at once.
-    # The batch succeeds and skips them, so a mixed batch still does its real work.
+    # Mixed batch: a deactivated user in a HEALTHY org rides along, to prove the
+    # suspended pair is skipped rather than the whole request being refused.
+    other_org = (await client.post("/api/admin/organizations", json={"name": "Bystander Co"})).json()["_id"]
+    other_dept = (
+        await client.post("/api/admin/departments", json={"org_id": other_org, "name": "Clinic"})
+    ).json()["_id"]
+    bystander = (
+        await client.post(
+            "/api/admin/users",
+            json={
+                "org_id": other_org,
+                "dept_id": other_dept,
+                "email": "bystander@ok.co",
+                "display_name": "Bystander",
+                "password": "GoodPass1234",
+            },
+        )
+    ).json()["_id"]
+    assert (await client.put(f"/api/admin/users/{bystander}", json={"is_active": False})).status_code == 200
+
     resp = await client.post(
-        "/api/admin/users/bulk-action", json={"user_ids": [first, second], "action": "activate"}
+        "/api/admin/users/bulk-action",
+        json={"user_ids": [first, second, bystander], "action": "activate"},
     )
     assert resp.status_code == 200
-    assert "0 users" in resp.json()["message"]
+    # exactly one changed: the bystander, not the two in the suspended org
+    assert "1 users" in resp.json()["message"]
     await _assert_active(False)
+    async with SessionLocal() as db:
+        assert (await db.get(User, _uuid.UUID(bystander))).is_active is True
     assert (await _login_first()).status_code == 401
 
     # the guard tracks the org's current state rather than freezing the accounts:
