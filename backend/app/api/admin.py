@@ -11,6 +11,10 @@ Deliberate contract-preserving fixes (coordinated with the frontend):
   users' refresh tokens, closing the refresh-forever hole.
 - Org reactivation (PUT is_active=true) restores the ORG only — it no longer
   blanket-reactivates users, so individually-deactivated accounts stay off.
+- A suspended org stays suspended: creating a user in one is refused, and
+  activating a member (singly or in bulk) is refused/skipped. Nothing on the
+  login path reads Organization.is_active, so the suspension is carried by the
+  users.is_active cascade alone and these are the routes that could undo it.
 - reset-password sets must_change_password and revokes sessions; the
   temporary password is still returned per contract.
 - Create/update user validates the department exists in the target org;
@@ -25,7 +29,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -778,6 +782,14 @@ async def create_user(
     org = await db.get(Organization, oid)
     if org is None:
         raise HTTPException(status_code=404, detail="Organization not found")
+    # Suspending an org deactivates its members, but nothing on the login path
+    # re-reads Organization.is_active — so an account minted here after the
+    # suspension would sign in normally against a tenant that is shut off.
+    if not org.is_active:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot create a user in a suspended organization",
+        )
     dept = (
         await db.execute(select(Department).where(Department.id == did, Department.org_id == oid))
     ).scalar_one_or_none()
@@ -835,15 +847,17 @@ async def bulk_user_action(
         raise HTTPException(status_code=400, detail="No valid user IDs")
 
     if body.action in ("deactivate", "activate"):
-        ids = list(
-            (
-                await db.execute(
-                    select(User.id).where(User.id.in_(valid_ids), User.role != UserRole.superadmin)
-                )
+        stmt = select(User.id).where(User.id.in_(valid_ids), User.role != UserRole.superadmin)
+        if body.action == "activate":
+            # An org suspension deactivated these accounts deliberately, and the
+            # login path never re-checks the org — so a bulk activate is the one
+            # call that can quietly bring a whole suspended tenant back online.
+            # Members of suspended orgs are skipped rather than failing the batch;
+            # `count` in the response already reports what actually changed.
+            stmt = stmt.outerjoin(Organization, User.org_id == Organization.id).where(
+                or_(User.org_id.is_(None), Organization.is_active.is_(True))
             )
-            .scalars()
-            .all()
-        )
+        ids = list((await db.execute(stmt)).scalars().all())
         if ids:
             await db.execute(
                 update(User)
@@ -958,6 +972,17 @@ async def update_user(
             # session is untouched (see _revoke_refresh_tokens).
             await _revoke_refresh_tokens(db, [user.id], client="mobile")
     if "is_active" in update_data:
+        # The org suspension that deactivated this account is only ever enforced
+        # through users.is_active; flipping it back here restores login to a
+        # tenant that is supposed to be shut off. Checked before the assignment
+        # so the refusal lands before any state changes.
+        if update_data["is_active"] is True and user.org_id is not None:
+            org = await db.get(Organization, user.org_id)
+            if org is not None and not org.is_active:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot activate a user in a suspended organization",
+                )
         user.is_active = update_data["is_active"]
         if update_data["is_active"] is False:
             # Fix: deactivation revokes the user's refresh sessions.

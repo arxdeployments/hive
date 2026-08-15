@@ -167,3 +167,85 @@ async def test_bulk_change_dept_skips_cross_org(client):
     )
     assert resp.status_code == 200
     assert "0" in resp.json()["message"]
+
+
+async def test_org_suspension_survives_user_create_and_activate(client):
+    """A suspended org must stay suspended.
+
+    Nothing on the login path reads Organization.is_active — the suspension is
+    carried entirely by the users.is_active cascade — so any route that creates
+    or reactivates an account inside a suspended org silently restores login to
+    a tenant that is supposed to be shut off.
+    """
+    import uuid as _uuid
+
+    await _superadmin_client(client)
+    org_id = (await client.post("/api/admin/organizations", json={"name": "Suspend Co"})).json()["_id"]
+    dept_id = (
+        await client.post("/api/admin/departments", json={"org_id": org_id, "name": "Ward"})
+    ).json()["_id"]
+
+    async def _new_user(email: str):
+        return await client.post(
+            "/api/admin/users",
+            json={
+                "org_id": org_id,
+                "dept_id": dept_id,
+                "email": email,
+                "display_name": email.split("@")[0],
+                "password": "GoodPass1234",
+            },
+        )
+
+    first = (await _new_user("first@suspend.co")).json()["_id"]
+    second = (await _new_user("second@suspend.co")).json()["_id"]
+
+    async def _assert_active(expected: bool):
+        async with SessionLocal() as db:
+            for uid in (first, second):
+                assert (await db.get(User, _uuid.UUID(uid))).is_active is expected
+
+    async def _login_first():
+        return await client.post(
+            "/api/auth/login", json={"email": "first@suspend.co", "password": "GoodPass1234"}
+        )
+
+    async def _set_org_active(active: bool):
+        resp = await client.put(f"/api/admin/organizations/{org_id}", json={"is_active": active})
+        assert resp.status_code == 200, resp.text
+
+    # suspending the org cascades to its members, who can no longer sign in
+    await _set_org_active(False)
+    await _assert_active(False)
+    assert (await _login_first()).status_code == 401
+
+    # a fresh account may not be minted inside the suspended org
+    resp = await _new_user("backdoor@suspend.co")
+    assert resp.status_code == 400, resp.text
+
+    # nor may an existing one be reactivated, one at a time...
+    resp = await client.put(f"/api/admin/users/{first}", json={"is_active": True})
+    assert resp.status_code == 400, resp.text
+
+    # ...nor in bulk, which is the call that could restore a whole tenant at once.
+    # The batch succeeds and skips them, so a mixed batch still does its real work.
+    resp = await client.post(
+        "/api/admin/users/bulk-action", json={"user_ids": [first, second], "action": "activate"}
+    )
+    assert resp.status_code == 200
+    assert "0 users" in resp.json()["message"]
+    await _assert_active(False)
+    assert (await _login_first()).status_code == 401
+
+    # the guard tracks the org's current state rather than freezing the accounts:
+    # restoring the org makes both activation paths work again.
+    await _set_org_active(True)
+    resp = await client.put(f"/api/admin/users/{first}", json={"is_active": True})
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        "/api/admin/users/bulk-action", json={"user_ids": [second], "action": "activate"}
+    )
+    assert resp.status_code == 200
+    assert "1 users" in resp.json()["message"]
+    await _assert_active(True)
+    assert (await _login_first()).status_code == 200
