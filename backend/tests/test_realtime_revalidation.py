@@ -22,6 +22,8 @@ session keeps RECEIVING; the check below is what stops it SENDING, and it is the
 security-relevant half.
 """
 
+import asyncio
+import json
 import uuid
 
 from httpx import ASGITransport, AsyncClient
@@ -30,6 +32,7 @@ from app.db.models import User
 from app.db.session import SessionLocal
 from app.main import app
 from app.realtime import hub
+from app.realtime.redis_bus import publish_to_users
 from app.services.messaging import SendError, send_message
 from tests.conftest import CSRF, login, make_org, make_user
 
@@ -89,3 +92,235 @@ async def test_an_active_sender_is_unaffected(client):
         conv = (await c.post("/api/conversations/direct", json={"participant_id": str(b.id)})).json()["_id"]
         sent = await c.post(f"/api/conversations/{conv}/messages", json={"content": "fine"})
         assert sent.status_code == 200, sent.text
+
+
+class _WedgedSocket:
+    """A client that has stopped reading: its send never completes until released.
+
+    Not artificial. uvicorn's ASGI websocket send awaits the transport drain, so a
+    real socket behaves exactly like this once a non-reading peer's buffers fill —
+    measured at ~0.8MB on loopback, and it stays pending until TCP gives up.
+    """
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.closed: tuple[int, str] | None = None
+
+    async def send_text(self, data: str) -> None:
+        self.entered.set()
+        await self.release.wait()
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.closed = (code, reason)
+
+
+class _HealthySocket:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+        self.closed: tuple[int, str] | None = None
+
+    async def send_text(self, data: str) -> None:
+        self.sent.append(data)
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.closed = (code, reason)
+
+
+async def test_one_stalled_socket_does_not_block_delivery_to_other_users():
+    """A worker's fan-out must not serialise behind its slowest socket.
+
+    _reader is ONE task per worker. It used to `await ws.send_text(...)` inline, so a
+    client that stopped reading stalled delivery for EVERY user that worker served —
+    no messages, no typing, no presence, no call ring — until TCP gave up, which is
+    minutes rather than seconds. Measured against the old code: the bystander below
+    received 0 of its events during the stall and all of them only once the wedged
+    socket was released, at 2.0s latency.
+
+    Uses the real LocalRegistry and the real Redis pub/sub; only the sockets are
+    stubs, because the behaviour under test is what the registry does with a send
+    that does not return.
+    """
+    registry = hub.LocalRegistry()
+    await registry.start()
+    stalled, bystander = _WedgedSocket(), _HealthySocket()
+    user_a, user_b = uuid.uuid4(), uuid.uuid4()
+    try:
+        await registry.add(user_a, "conn-a", stalled)
+        await registry.add(user_b, "conn-b", bystander)
+        await asyncio.sleep(0.3)  # let SUBSCRIBE take effect
+
+        await publish_to_users([user_a], {"type": "wedge"})
+        await asyncio.wait_for(stalled.entered.wait(), timeout=5)
+
+        for i in range(5):
+            await publish_to_users([user_b], {"type": "for_b", "n": i})
+        for _ in range(40):  # up to 4s, but returns as soon as they land
+            if len(bystander.sent) == 5:
+                break
+            await asyncio.sleep(0.1)
+
+        assert len(bystander.sent) == 5, (
+            f"only {len(bystander.sent)}/5 events reached a second user while one "
+            "socket was stalled — the worker's fan-out is head-of-line blocked"
+        )
+        assert bystander.closed is None
+    finally:
+        stalled.release.set()
+        await registry.stop()
+
+
+async def test_a_socket_that_never_drains_is_dropped_rather_than_waited_for():
+    """Overflow closes the wedged socket, and only it.
+
+    Dropping frames silently would leave a client that looks connected and receives
+    nothing. 1011 rather than 4001 because both clients treat 4001 as "refresh the
+    session" and any other code as a plain disconnect to retry with backoff — so the
+    close is what makes this self-heal via reconnect-and-refetch.
+    """
+    registry = hub.LocalRegistry()
+    await registry.start()
+    stalled, bystander = _WedgedSocket(), _HealthySocket()
+    user_a, user_b = uuid.uuid4(), uuid.uuid4()
+    try:
+        await registry.add(user_a, "conn-a", stalled)
+        await registry.add(user_b, "conn-b", bystander)
+        await asyncio.sleep(0.3)
+
+        overflow_by = 10
+        total = hub.OUTBOX_MAX_FRAMES + overflow_by
+        for i in range(total):
+            await publish_to_users([user_a], {"n": i})
+            await publish_to_users([user_b], {"n": i})
+        for _ in range(60):  # up to 6s
+            if stalled.closed is not None and len(bystander.sent) == total:
+                break
+            await asyncio.sleep(0.1)
+
+        assert stalled.closed is not None, "a socket that never drains was never dropped"
+        assert stalled.closed[0] == 1011, stalled.closed
+        assert bystander.closed is None, "the healthy socket must not be collateral"
+        assert len(bystander.sent) == total, f"{len(bystander.sent)}/{total} reached the healthy socket"
+    finally:
+        stalled.release.set()
+        await registry.stop()
+
+
+async def test_a_burst_larger_than_the_outbox_does_not_close_a_healthy_socket_over_real_redis():
+    """Queue depth must measure socket slowness, not reader burstiness.
+
+    INTEGRATION check, and deliberately not the guard: a pipeline batches the
+    PUBLISH commands but does not synchronise the SUBSCRIBER socket with the last of
+    them, so the burst may still arrive incrementally and let _reader suspend between
+    frames. It therefore cannot be relied on to fail when the yield is removed — the
+    deterministic version of this is the test below. This one is kept because it
+    exercises the real pub/sub path end to end.
+    """
+    registry = hub.LocalRegistry()
+    await registry.start()
+    healthy = _HealthySocket()
+    user = uuid.uuid4()
+    try:
+        await registry.add(user, "conn", healthy)
+        await asyncio.sleep(0.3)
+
+        # ONE pipeline, one round trip: Redis then hands the reader a buffered run of
+        # messages, which is the condition that makes get_message stop suspending.
+        # Publishing them one await at a time would yield between each and never
+        # reproduce it — the mistake this test was written wrong with the first time.
+        burst = hub.OUTBOX_MAX_FRAMES * 3
+        await publish_to_users([user] * burst, {"burst": True})
+        for _ in range(80):  # up to 8s
+            if len(healthy.sent) == burst:
+                break
+            await asyncio.sleep(0.1)
+
+        assert healthy.closed is None, f"a healthy socket was dropped: {healthy.closed}"
+        assert len(healthy.sent) == burst, f"{len(healthy.sent)}/{burst} delivered"
+    finally:
+        await registry.stop()
+
+
+class _PreloadedPubSub:
+    """A pub/sub whose get_message NEVER suspends while frames remain.
+
+    This is the condition the real broker only reaches sometimes: a run of messages
+    already buffered, returned back to back. Awaiting a coroutine that returns
+    immediately does not yield in asyncio, so a reader without an explicit yield
+    drains the whole run in one tight loop.
+    """
+
+    def __init__(self, messages: list[dict]) -> None:
+        self._messages = list(messages)
+
+    # noqa signature, not style: it has to match the call _reader makes on the real
+    # redis pubsub, so the keyword names and defaults are fixed by that contract.
+    async def get_message(
+        self,
+        ignore_subscribe_messages: bool = True,
+        timeout: float = 1.0,  # noqa: ASYNC109
+    ):
+        if self._messages:
+            return self._messages.pop(0)
+        await asyncio.sleep(0.02)
+        return None
+
+    async def subscribe(self, *_a) -> None: ...
+    async def unsubscribe(self, *_a) -> None: ...
+    async def aclose(self) -> None: ...
+
+
+async def test_reader_yields_so_a_buffered_run_cannot_close_a_healthy_socket():
+    """The deterministic guard for the reader's yield.
+
+    No Redis and no timing: the pub/sub source hands _reader a buffered run of
+    OUTBOX_MAX_FRAMES * 3 frames with no suspension between them. Without the yield
+    the reader enqueues the whole run before any writer is scheduled, the outbox hits
+    its ceiling and a perfectly healthy socket is closed with 1011.
+    """
+    user = uuid.uuid4()
+    burst = hub.OUTBOX_MAX_FRAMES * 3
+    frames = [{"channel": f"user:{user}", "data": json.dumps({"n": i})} for i in range(burst)]
+
+    registry = hub.LocalRegistry()
+    registry._pubsub = _PreloadedPubSub(frames)
+    healthy = _HealthySocket()
+    try:
+        await registry.add(user, "conn", healthy)
+        registry._pubsub_task = asyncio.create_task(registry._reader())
+        for _ in range(200):  # up to 4s, returns as soon as the run is delivered
+            if len(healthy.sent) == burst:
+                break
+            await asyncio.sleep(0.02)
+
+        assert healthy.closed is None, f"a healthy socket was dropped: {healthy.closed}"
+        assert len(healthy.sent) == burst, f"{len(healthy.sent)}/{burst} delivered"
+    finally:
+        await registry.stop()
+
+
+async def test_send_to_reaches_the_socket_and_reports_an_unknown_one():
+    """The endpoint's own frames now travel this way, including `pong`.
+
+    pong is the heartbeat reply, so a send_to that silently failed would let clients
+    time out at HEARTBEAT_TIMEOUT while the socket looked healthy from the server side.
+    The False return matters for the same reason: a caller must never be told a frame
+    was queued for a socket that has gone.
+    """
+    registry = hub.LocalRegistry()
+    healthy = _HealthySocket()
+    user, gone = uuid.uuid4(), uuid.uuid4()
+    try:
+        await registry.add(user, "conn", healthy)
+
+        assert await registry.send_to(user, "conn", '{"type":"pong"}') is True
+        for _ in range(50):
+            if healthy.sent:
+                break
+            await asyncio.sleep(0.02)
+        assert healthy.sent == ['{"type":"pong"}']
+
+        assert await registry.send_to(user, "no-such-conn", "x") is False
+        assert await registry.send_to(gone, "conn", "x") is False
+    finally:
+        await registry.stop()

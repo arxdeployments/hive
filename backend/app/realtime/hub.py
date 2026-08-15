@@ -42,6 +42,43 @@ HEARTBEAT_TIMEOUT = 65
 # revoked session keeps RECEIVING.
 REVALIDATE_SECONDS = 30
 
+# How far behind one socket may fall before it is dropped rather than waited for.
+# A healthy socket's outbox is empty between events, so this is only ever reached by
+# a client that has stopped draining. 128 small frames bounds what a wedged client
+# can pin in memory while being far more headroom than any client legitimately uses.
+OUTBOX_MAX_FRAMES = 128
+
+
+class _Conn:
+    """One socket, its outbound queue, and the single task that drains it.
+
+    The queue exists because _reader is ONE task per worker. Awaiting send_text
+    there serialised delivery for every user behind the slowest socket, and a client
+    that stops reading does not fail fast: uvicorn's websocket send awaits the
+    transport drain, so the await stays pending until TCP gives up — minutes, not
+    seconds. Measured on the real registry with one socket wedged, a second user
+    received 0 of 5 events for the whole stall and all 5 only once it was released.
+
+    One writer task per socket means the socket has exactly ONE sender, so its frames
+    keep their order without a lock. That covers the whole outbound stream, not just
+    the pub/sub half: websocket_endpoint queues its own `pong` and protocol-error
+    frames through registry.send_to rather than writing to the socket, so nothing
+    races the reader's frames.
+
+    The single exception is `connected`, and it is deliberate — it is written directly
+    BEFORE the socket is registered, when no writer exists and nothing can have been
+    queued yet, which is what makes it provably the first frame rather than merely
+    usually first. Everything after registration goes through this queue.
+    """
+
+    __slots__ = ("ws", "outbox", "writer", "closing")
+
+    def __init__(self, ws: WebSocket) -> None:
+        self.ws = ws
+        self.outbox: asyncio.Queue[str] = asyncio.Queue(maxsize=OUTBOX_MAX_FRAMES)
+        self.writer: asyncio.Task | None = None
+        self.closing = False
+
 
 class LocalRegistry:
     """Sockets held by THIS worker. Multiple tabs per user are allowed —
@@ -49,7 +86,7 @@ class LocalRegistry:
     caused reconnect wars)."""
 
     def __init__(self) -> None:
-        self.connections: dict[str, dict[str, WebSocket]] = {}
+        self.connections: dict[str, dict[str, _Conn]] = {}
         self._pubsub_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
@@ -66,16 +103,22 @@ class LocalRegistry:
         if self._pubsub is not None and str(user_id) not in self.connections:
             with contextlib.suppress(Exception):
                 await self._pubsub.subscribe(user_channel(user_id))
+        conn = _Conn(ws)
+        conn.writer = asyncio.create_task(self._writer(conn))
         async with self._lock:
-            self.connections.setdefault(str(user_id), {})[conn_id] = ws
+            self.connections.setdefault(str(user_id), {})[conn_id] = conn
 
     async def remove(self, user_id: uuid.UUID, conn_id: str) -> None:
         async with self._lock:
             bucket = self.connections.get(str(user_id), {})
-            bucket.pop(conn_id, None)
+            conn = bucket.pop(conn_id, None)
             last_for_user = not bucket
             if last_for_user:
                 self.connections.pop(str(user_id), None)
+        # The writer holds a reference to the socket and would otherwise sit awaiting
+        # an outbox nothing will fill again.
+        if conn is not None and conn.writer is not None:
+            conn.writer.cancel()
         if last_for_user and self._pubsub is not None:
             with contextlib.suppress(Exception):
                 await self._pubsub.unsubscribe(user_channel(user_id))
@@ -105,9 +148,78 @@ class LocalRegistry:
             self._pubsub_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._pubsub_task
+        async with self._lock:
+            writers = [c.writer for bucket in self.connections.values() for c in bucket.values() if c.writer]
+        for writer in writers:
+            writer.cancel()
         if self._pubsub is not None:
             with contextlib.suppress(Exception):
                 await self._pubsub.aclose()
+
+    async def send_to(self, user_id: uuid.UUID, conn_id: str, payload: str) -> bool:
+        """Queue one frame for ONE socket, through that socket's writer.
+
+        This is how websocket_endpoint writes its own frames — pong and the protocol
+        errors — so that every frame a registered socket receives goes through a single
+        sender and the whole stream is ordered, not just the pub/sub half of it.
+
+        Returns False when the socket is gone or has just been dropped for being
+        wedged, so a caller is never told a frame was queued when it was not.
+
+        Lookup, the closing check and the enqueue are ONE critical section, because
+        that return value is a promise. Releasing the lock in between let `remove` pop
+        the connection and cancel its writer before the enqueue landed, and this then
+        answered True for a frame no live writer would ever pick up.
+
+        _reader deliberately does not take the lock for its own enqueue: it makes no
+        promise to anyone, so the worst a removal race costs there is a frame left in
+        the outbox of a connection about to be collected — and taking this lock per
+        message would put every event on the worker behind add/remove.
+        """
+        async with self._lock:
+            conn = self.connections.get(str(user_id), {}).get(conn_id)
+            if conn is None or conn.closing:
+                return False
+            try:
+                conn.outbox.put_nowait(payload)
+            except asyncio.QueueFull:
+                # Safe under the lock: _drop_wedged never awaits.
+                self._drop_wedged(conn)
+                return False
+            return True
+
+    async def _writer(self, conn: _Conn) -> None:
+        """Drain one socket's outbox. The only place send_text is called."""
+        while True:
+            data = await conn.outbox.get()
+            try:
+                await conn.ws.send_text(data)
+            except Exception:
+                return  # dead socket; the endpoint's finally block deregisters it
+
+    def _drop_wedged(self, conn: _Conn) -> None:
+        """Close a socket that has fallen OUTBOX_MAX_FRAMES behind.
+
+        Dropping the frame instead would leave a client that looks connected and
+        silently receives nothing. Closing makes it reconnect and refetch, which is
+        how every other lost-frame case in this file already self-heals. Code 1011,
+        not 4001: both clients treat 4001 as "refresh the session" and any other code
+        as a plain disconnect to retry with backoff.
+
+        Never awaited, and that is the point — close() sends a frame too, so on a
+        socket that is already not draining it can block exactly like send_text, and
+        awaiting it here would hand the stall straight back to _reader.
+        """
+        if conn.closing:
+            return
+        conn.closing = True
+        if conn.writer is not None:
+            conn.writer.cancel()
+        asyncio.create_task(self._close_quietly(conn))
+
+    async def _close_quietly(self, conn: _Conn) -> None:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(conn.ws.close(code=1011, reason="Outbound backlog exceeded"), timeout=5)
 
     async def _reader(self) -> None:
         while True:
@@ -125,14 +237,26 @@ class LocalRegistry:
             if not channel.startswith("user:"):
                 continue
             target_user = channel.removeprefix("user:")
-            sockets = list(self.connections.get(target_user, {}).values())
-            if not sockets:
+            conns = list(self.connections.get(target_user, {}).values())
+            if not conns:
                 continue
-            for ws in sockets:
+            # ENQUEUE, never send. This loop is the worker's only pub/sub consumer,
+            # so anything awaited here is awaited on behalf of every other user too.
+            for conn in conns:
                 try:
-                    await ws.send_text(message["data"])
-                except Exception:
-                    pass  # dead socket; its receive loop will clean up
+                    conn.outbox.put_nowait(message["data"])
+                except asyncio.QueueFull:
+                    self._drop_wedged(conn)
+            # Hand control back so the writers above can actually drain.
+            #
+            # get_message() returns already-buffered messages without suspending, and
+            # awaiting a coroutine that returns immediately does NOT yield in asyncio.
+            # So a backlog — anything that stalled this worker for a moment, including
+            # the very stalls this queue exists to survive — would be drained here in
+            # one tight loop, filling a HEALTHY socket's outbox and getting it closed
+            # for a burst it could have absorbed. With this yield, queue depth measures
+            # how slow a socket is rather than how bursty the reader was.
+            await asyncio.sleep(0)
 
     def local_socket_count(self) -> int:
         return sum(len(b) for b in self.connections.values())
@@ -285,6 +409,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     user, token_exp, client = auth
 
     await websocket.accept()
+    # `connected` goes out BEFORE the socket is registered, and that ordering is the
+    # point. Once registry.add subscribes the user's channel and starts the writer, a
+    # published event can be queued for this socket at any moment — so a `connected`
+    # sent after registration is not reliably the first frame on the wire. Sent here
+    # there is no writer yet and nothing can be queued, which makes it provably first;
+    # every frame after it goes through registry.send_to or the pub/sub path, so the
+    # socket's whole stream has exactly one sender and one order.
+    #
+    # Safe to sit outside the try below: nothing has been registered yet, so a client
+    # that vanished mid-handshake leaves nothing to tear down.
+    await websocket.send_text(
+        json.dumps({"type": "connected", "user_id": str(user.id), "timestamp": iso_z(now_utc())})
+    )
     last_active_check = now_utc()
     conn_id = uuid.uuid4().hex
     await registry.add(user.id, conn_id, websocket)
@@ -310,10 +447,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     db_user.last_seen_at = now_utc()
                     await db.commit()
             await _broadcast_presence(user, "online")
-
-        await websocket.send_text(
-            json.dumps({"type": "connected", "user_id": str(user.id), "timestamp": iso_z(now_utc())})
-        )
 
         # A socket coming up is the only moment we can repair call state this user missed
         # while it was down: closing any grace window a previous drop opened, and
@@ -348,7 +481,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 break
 
             if len(raw) > MAX_MESSAGE_BYTES:
-                await websocket.send_text(json.dumps({"type": "error", "detail": "Message too large"}))
+                await registry.send_to(
+                    user.id, conn_id, json.dumps({"type": "error", "detail": "Message too large"})
+                )
                 continue
 
             now = now_utc()
@@ -356,7 +491,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 window_start, window_count = now, 0
             window_count += 1
             if window_count > RATE_LIMIT_PER_MINUTE:
-                await websocket.send_text(json.dumps({"type": "error", "detail": "Rate limited"}))
+                await registry.send_to(
+                    user.id, conn_id, json.dumps({"type": "error", "detail": "Rate limited"})
+                )
                 continue
 
             try:
@@ -364,7 +501,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 if not isinstance(data, dict) or not isinstance(data.get("type"), str):
                     raise ValueError
             except ValueError:
-                await websocket.send_text(json.dumps({"type": "error", "detail": "Invalid frame"}))
+                await registry.send_to(
+                    user.id, conn_id, json.dumps({"type": "error", "detail": "Invalid frame"})
+                )
                 continue
 
             # REVALIDATION — on every frame, not only on ping.
@@ -403,7 +542,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
             if data["type"] == "ping":
                 await presence.refresh(user.id)
-                await websocket.send_text(json.dumps({"type": "pong", "timestamp": iso_z(now_utc())}))
+                await registry.send_to(
+                    user.id, conn_id, json.dumps({"type": "pong", "timestamp": iso_z(now_utc())})
+                )
                 continue
 
             try:
@@ -411,7 +552,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             except Exception:
                 logger.exception("error handling ws frame type=%s", data.get("type"))
                 with contextlib.suppress(Exception):
-                    await websocket.send_text(json.dumps({"type": "error", "detail": "Internal error"}))
+                    await registry.send_to(
+                        user.id, conn_id, json.dumps({"type": "error", "detail": "Internal error"})
+                    )
     except WebSocketDisconnect:
         pass
     finally:
