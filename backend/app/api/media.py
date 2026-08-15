@@ -229,14 +229,35 @@ async def _member_attachment(db: AsyncSession, attachment_id: str, user: User) -
     att_id = parse_uuid(attachment_id)
     if att_id is None:
         raise _not_found()
-    attachment = await db.get(MessageAttachment, att_id)
+    # ONE round trip, not three. This ran as three sequential db.get calls —
+    # attachment, then its message, then the caller's participant row — and every
+    # per-asset route goes through it: the bytes, the thumbnail, /meta and every PDF
+    # page. Each lookup was an index hit but they were serialised, so a chat pane
+    # showing thirty images spent ninety round trips purely on authorisation, each
+    # holding one of the ten pooled connections. Measured over 40 requests with a
+    # fresh session apiece: 120 queries and 1.23ms each, against 40 and 0.67ms here,
+    # and the gap widens with network distance because it is round trips rather than
+    # work.
+    #
+    # The inner joins reproduce the three 404 conditions exactly — no attachment, no
+    # message or a tombstoned one, no membership — and all three stay
+    # indistinguishable to the caller. Still returns a session-attached row, which
+    # _ensure_pdf_preview depends on: it mutates thumbnail_key/page_count and commits.
+    attachment = (
+        await db.execute(
+            select(MessageAttachment)
+            .join(Message, Message.id == MessageAttachment.message_id)
+            .join(
+                ConversationParticipant,
+                and_(
+                    ConversationParticipant.conversation_id == Message.conversation_id,
+                    ConversationParticipant.user_id == user.id,
+                ),
+            )
+            .where(MessageAttachment.id == att_id, Message.deleted_at.is_(None))
+        )
+    ).scalar_one_or_none()
     if attachment is None:
-        raise _not_found()
-    msg = await db.get(Message, attachment.message_id)
-    if msg is None or msg.deleted_at is not None:
-        raise _not_found()
-    membership = await db.get(ConversationParticipant, (msg.conversation_id, user.id))
-    if membership is None:
         raise _not_found()
     return attachment
 
