@@ -40,6 +40,13 @@ final class AuthStore: ObservableObject {
     /// immediately after I signed back in", which is unreproducible on demand.
     private var sessionGeneration = 0
 
+    /// The stores holding the signed-in person's data, so a session ending can
+    /// clear them. Weak, and registered by the stores themselves in their own
+    /// `attach` — mirroring how each already takes its reference to this one, and
+    /// keeping this class from having to know when they are built.
+    private weak var chat: ChatStore?
+    private weak var calls: CallStore?
+
     /// Set when a launch could not reach the server. The session was never
     /// disproved, so the app stays signed in optimistically and retries; without
     /// this, opening the app in a lift or on a plane is a one-way trip to sign-in.
@@ -129,6 +136,7 @@ final class AuthStore: ObservableObject {
                     // and department ids; `revalidateSession` already drops it for the
                     // same denial mid-session.
                     RememberedUser.clear()
+                    endSessionData()
                     sessionGeneration &+= 1
                     phase = .accessDenied(reason: error.userMessage, denial: denial)
                     return
@@ -146,6 +154,7 @@ final class AuthStore: ObservableObject {
                 if error.endsSession {
                     await api.clearSessionCookies()
                     RememberedUser.clear()
+                    endSessionData()
                 }
                 unreachable = error.isRetryable
                 log.notice("Session restore failed: \(String(describing: error), privacy: .public)")
@@ -244,6 +253,7 @@ final class AuthStore: ObservableObject {
         await api.clearSessionCookies()
         sessionGeneration &+= 1
         RememberedUser.clear()
+        endSessionData()
         phase = .signedOut
         signInError = nil
     }
@@ -254,6 +264,29 @@ final class AuthStore: ObservableObject {
     }
 
     // MARK: - Internals
+
+    /// Called by each session-scoped store as it attaches at launch.
+    func registerSessionStore(chat: ChatStore? = nil, calls: CallStore? = nil) {
+        if let chat { self.chat = chat }
+        if let calls { self.calls = calls }
+    }
+
+    /// Put down everything the ending session was holding in memory.
+    ///
+    /// Sits beside `RememberedUser.clear()` at every boundary, and for the same
+    /// reason: that call has always dropped the persisted account record — email,
+    /// display name, avatar, org and department — while the far larger in-memory
+    /// copy next to it, the person's threads and the message bodies in them, had
+    /// nothing that dropped it and simply carried into whoever signed in next.
+    ///
+    /// Also called on the pre-sign-in refusal at `signIn`, where there is nothing
+    /// to clear. That is deliberate: it makes the guarantee "a session never
+    /// begins holding the last one's data" rather than "every exit remembered to
+    /// tidy up", which would depend on having found every exit.
+    private func endSessionData() {
+        chat?.reset()
+        calls?.resetSessionState()
+    }
 
     private func enterSignedIn(_ user: CurrentUser) {
         sessionGeneration &+= 1
@@ -282,6 +315,7 @@ final class AuthStore: ObservableObject {
                 await api.clearSessionCookies()
                 sessionGeneration &+= 1
                 RememberedUser.clear()
+                endSessionData()
                 realtime.disconnect()
                 phase = .accessDenied(reason: error.userMessage, denial: denial)
                 return .rejected
@@ -309,6 +343,7 @@ final class AuthStore: ObservableObject {
         guard generation == sessionGeneration, case .signedIn = phase else { return }
         sessionGeneration &+= 1
         RememberedUser.clear()
+        endSessionData()
 
         // A withdrawn mobile grant has its own screen and its own sentence, written
         // precisely so the user does not sit there retyping a password that will
