@@ -140,16 +140,28 @@ final class SessionTeardownTests: XCTestCase {
     }
 
     /// A sign-out that lands during a live call must not tear the call down — the
-    /// LiveKit session would be left connected with its signalling gone.
-    func testCallStoreClearsWhenIdleAndIsLeftAloneOtherwise() {
+    /// LiveKit session would be left connected with its signalling gone. But
+    /// `.ended` is not a live call: it is the two-second "Call ended" card, shown
+    /// only after `teardown(to:)` has already awaited `session.leave()`. Guarding
+    /// on `case .idle` treated it as one and carried the badge into the next
+    /// account; `hasLiveCall` is the predicate that draws the line correctly.
+    func testCallStoreClearsUnlessACallIsActuallyLive() throws {
         let calls = CallStore()
 
         calls.applyForTesting(missedCallCount: 4)
         calls.resetSessionState()
         XCTAssertEqual(calls.missedCallCount, 0, "an idle store drops the previous account's badge")
 
-        calls.applyForTesting(missedCallCount: 2, phase: .ended)
+        // The epitaph. Nothing left to strand, so it must clear.
+        calls.applyForTesting(missedCallCount: 3, phase: .ended)
         calls.resetSessionState()
-        XCTAssertEqual(calls.missedCallCount, 2, "a non-idle store is left entirely alone")
+        XCTAssertEqual(calls.missedCallCount, 0, "a terminal .ended phase kept the previous account's badge")
+
+        // Genuinely live: leave every last thing alone.
+        let ringing = try decode("{}", as: CallSignal.self)
+        calls.applyForTesting(missedCallCount: 2, phase: .incoming(ringing))
+        calls.resetSessionState()
+        XCTAssertEqual(calls.missedCallCount, 2, "a live call must be left entirely alone")
     }
+
 }

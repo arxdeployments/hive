@@ -183,31 +183,6 @@ final class CallStore: ObservableObject {
     /// to `ChatStore`, which drops them. Everything below is additionally written to be
     /// idempotent and to re-derive from the room and from REST where it can, so a
     /// missed frame degrades latency rather than correctness.
-    /// Drop the session-scoped state at a sign-out.
-    ///
-    /// Narrower than `ChatStore.reset`, on purpose. The three fields below belong
-    /// to the person who was signed in — the badge is fetched per account, and the
-    /// other two carry participant names — but `phase`, its media and the LiveKit
-    /// session belong to a CALL, which can still be live when a sign-out lands.
-    /// Tearing that down from here would strand the SFU connection with its
-    /// signalling gone, so a store that is not idle keeps everything and this does
-    /// nothing.
-    #if DEBUG
-    /// Seed the session-scoped fields directly; they are all `private(set)` and
-    /// their real writers need a socket and an SFU.
-    func applyForTesting(missedCallCount: Int, phase: Phase = .idle) {
-        self.missedCallCount = missedCallCount
-        self.phase = phase
-    }
-    #endif
-
-    func resetSessionState() {
-        guard case .idle = phase else { return }
-        missedCallCount = 0
-        activeGroupCalls = [:]
-        pendingInvitees = []
-    }
-
     func attach(auth: AuthStore, chat: ChatStore, toasts: ToastCenter) {
         self.auth = auth
         self.chat = chat
@@ -287,6 +262,40 @@ final class CallStore: ObservableObject {
             }
         }
     }
+
+    /// Drop the session-scoped state at a sign-out.
+    ///
+    /// Narrower than `ChatStore.reset`, on purpose. The three fields below belong
+    /// to the person who was signed in — the badge is fetched per account, and the
+    /// other two carry participant names — but `phase`, its media and the LiveKit
+    /// session belong to a CALL, which can still be live when a sign-out lands.
+    /// Tearing that down from here would strand the SFU connection with its
+    /// signalling gone, so a live call keeps everything and this does nothing.
+    ///
+    /// `hasLiveCall` rather than `case .idle`, and the difference is `.ended`. That
+    /// phase is a two-second epitaph, reached only after `teardown(to:)` has
+    /// already awaited `session.leave()`: there is no SFU connection left to
+    /// strand, and its delayed hop to `.idle` does not come back through here.
+    /// Guarding on idle alone skipped the clear for a sign-out landing on the
+    /// "Call ended" card, and carried the previous account's badge into the next
+    /// one. `hasLiveCall` is the predicate this module already wrote for exactly
+    /// this question, down to a docblock saying it is deliberately false for
+    /// `.ended`.
+    func resetSessionState() {
+        guard !hasLiveCall else { return }
+        missedCallCount = 0
+        activeGroupCalls = [:]
+        pendingInvitees = []
+    }
+
+    #if DEBUG
+    /// Seed the session-scoped fields directly; they are all `private(set)` and
+    /// their real writers need a socket and an SFU.
+    func applyForTesting(missedCallCount: Int, phase: Phase = .idle) {
+        self.missedCallCount = missedCallCount
+        self.phase = phase
+    }
+    #endif
 
     /// Ask the server what call this client should be in, and adopt the answer.
     ///
