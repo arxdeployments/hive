@@ -24,7 +24,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import pytest
 from sqlalchemy import text
@@ -94,12 +94,18 @@ def _percent_encode_password(url: str) -> str:
     `%` in RXHIVE_DATABASE_URL is the normal case rather than a corrupt value. The
     DSN still resolves to the same credentials — SQLAlchemy unquotes it — so a
     passing run proves the URL survived config parsing, not that it was ignored.
+
+    Decoded before it is re-encoded, because urlsplit hands back the password
+    still escaped. A configured DSN that already carried one — which is precisely
+    the deployment this test speaks for — would otherwise come back with `%40`
+    turned into `%2540`, i.e. different credentials, and the subprocess would fail
+    on authentication rather than on the interpolation this is here to catch.
     """
     parts = urlsplit(url)
-    password = parts.password
+    password = unquote(parts.password or "")
     if not password or not password.isascii():
         pytest.skip("configured DSN has no ASCII password to percent-encode")
-    encoded = f"%{ord(password[0]):02X}{password[1:]}"
+    encoded = f"%{ord(password[0]):02X}{quote(password[1:], safe='-._~')}"
     netloc = f"{parts.username}:{encoded}@{parts.hostname}"
     if parts.port:
         netloc = f"{netloc}:{parts.port}"
