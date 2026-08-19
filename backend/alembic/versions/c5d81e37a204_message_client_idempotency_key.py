@@ -66,8 +66,19 @@ def upgrade() -> None:
     # enforces nothing — the exact duplicate row this revision exists to prevent,
     # now with a unique index apparently standing guard over it. Dropping first
     # costs nothing when the index isn't there and re-does the work when it is.
+    #
+    # The drop is CONCURRENTLY for the same reason the create is. A plain DROP
+    # INDEX takes ACCESS EXCLUSIVE on messages — every read and every write
+    # queued behind it — which is the one lock this whole block is written to
+    # avoid taking on the highest-volume table in the schema. It is easy to read
+    # the drop as the harmless half because it is usually a no-op, but the case
+    # it exists for is the retry after a failed build, and that is exactly the
+    # case where the index IS there, is INVALID, and the table is live. Since
+    # production boots with `alembic upgrade head && ... && uvicorn`
+    # (infra/docker-compose.prod.yml), blocking here does not merely stall
+    # sends — the API never finishes starting.
     with op.get_context().autocommit_block():
-        op.execute("DROP INDEX IF EXISTS uq_messages_client_msg_id")
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS uq_messages_client_msg_id")
         op.execute(
             """CREATE UNIQUE INDEX CONCURRENTLY uq_messages_client_msg_id
                ON messages (conversation_id, sender_id, client_msg_id)
@@ -76,5 +87,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Not CONCURRENTLY, unlike upgrade(): drop_column below takes ACCESS EXCLUSIVE
+    # on messages regardless, so a concurrent drop here would buy nothing and
+    # would cost this function the ability to run in one transaction.
     op.execute("DROP INDEX IF EXISTS uq_messages_client_msg_id")
     op.drop_column("messages", "client_msg_id")
