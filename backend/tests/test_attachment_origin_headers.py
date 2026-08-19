@@ -83,7 +83,15 @@ def test_the_mime_allow_list_still_excludes_renderable_types():
     from app.services import storage
 
     renderable = {"text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml"}
-    offenders = {ext: mime for ext, mime in storage.MIME_BY_EXT.items() if mime in renderable}
+    # Compare the media type alone. A value carrying parameters — the ordinary
+    # shape for text types, "text/html; charset=utf-8" — is the same document to
+    # the browser and would slide past an equality test against the bare name,
+    # which is exactly the regression this exists to catch.
+    offenders = {
+        ext: mime
+        for ext, mime in storage.MIME_BY_EXT.items()
+        if mime.split(";", 1)[0].strip().lower() in renderable
+    }
     assert not offenders, (
         f"MIME_BY_EXT maps {offenders} — a type the browser renders as a document. "
         "Attachments are served same-origin with Content-Disposition: inline."

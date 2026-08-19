@@ -32,14 +32,15 @@ handle /api/* {
 # virtual-host style, so the upstream must see <bucket>.s3.<region>.amazonaws.com
 # or S3 answers SignatureDoesNotMatch.
 handle_path /s3/* {
-	# The attachment bytes themselves, and the ONE response on this origin that
-	# carries no security headers.
+	# The attachment bytes themselves: the one response on this origin that gets
+	# its security headers HERE rather than inheriting them.
 	#
 	# app/main.py stamps nosniff, X-Frame-Options: DENY and Referrer-Policy on
-	# every API response, and the SPA gets the same four plus a CSP from
-	# frontend/nginx-security-headers.conf. This route reaches neither: it is
-	# Caddy straight to object storage, so the response arrives with whatever the
-	# store sends and nothing else.
+	# every API response, and the SPA gets those plus a CSP from
+	# frontend/nginx-security-headers.conf. This route reaches neither — it is
+	# Caddy straight to object storage — so whatever is not declared in this block
+	# is simply whatever the store chose to send. Hence the header directive below;
+	# before it there was nothing.
 	#
 	# /api/media/* stamping them on its 307 does not help. Response headers do not
 	# survive a redirect — the browser follows it and renders THIS response, which
