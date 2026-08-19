@@ -556,9 +556,52 @@ class PushSubscription(Base):
     created_at: Mapped[dt.datetime] = _now()
 
 
-# Full-text search over messages is a generated tsvector column + GIN index,
-# created in the Alembic migration (see alembic/versions/0001_initial.py):
+# Schema the MIGRATIONS own outright, deliberately absent from the metadata above.
+#
+# `alembic revision --autogenerate` diffs the live database against
+# Base.metadata, so every object listed here reads to it as something to DROP.
+# That is not hypothetical: bdbf829f823f records deleting exactly such a drop out
+# of a generated migration by hand, and back then the set was two entries. Three
+# batches have added to it since, and the only safeguard was still whoever
+# remembered to re-read the generated file. include_in_autogenerate() below is
+# what alembic/env.py hands to alembic's include_object hook so the drops are
+# never proposed in the first place; tests/test_migrations.py asserts this set
+# stays exactly as wide as reality.
+#
+# Full-text search over messages is a GENERATED tsvector column plus its GIN
+# index, created as raw DDL in 09c892c227fc_initial_schema.py:
 #   ALTER TABLE messages ADD COLUMN search_tsv tsvector
 #     GENERATED ALWAYS AS (to_tsvector('simple', coalesce(content, ''))) STORED;
 #   CREATE INDEX ix_messages_search_tsv ON messages USING gin (search_tsv);
-MESSAGES_FTS_SQL = text("SELECT 1")  # placeholder anchor for grep; real DDL lives in the migration
+# Losing that column is not a performance regression — it takes the message
+# results out of /api/search entirely.
+MIGRATION_OWNED_COLUMNS = frozenset({("messages", "search_tsv")})
+
+# Indexes that are a QUERY SHAPE rather than a property of the schema, which is
+# why they are declared in their migration and nowhere else:
+#   ix_messages_search_tsv          the GIN index over the column above
+#   ix_messages_links               the Links tab's own ILIKE predicate (4471a6d661d3)
+#   ix_users_org_display_name       the capped roster's ORDER BY (b7e21c4a9d33)
+#   ix_message_attachments_message_id  the attachment foreign key (b7e21c4a9d33)
+MIGRATION_OWNED_INDEXES = frozenset(
+    {
+        "ix_messages_search_tsv",
+        "ix_messages_links",
+        "ix_users_org_display_name",
+        "ix_message_attachments_message_id",
+    }
+)
+
+
+def include_in_autogenerate(object_, name, type_, reflected, compare_to) -> bool:
+    """alembic's `include_object` hook: keep autogenerate off the two sets above.
+
+    Scoped as narrowly as possible on purpose. An over-wide filter here would be
+    worse than no filter at all: it would hide REAL drift — a model column that
+    never got a migration — behind a clean autogenerate run.
+    """
+    if type_ == "index":
+        return name not in MIGRATION_OWNED_INDEXES
+    if type_ == "column":
+        return (object_.table.name, name) not in MIGRATION_OWNED_COLUMNS
+    return True

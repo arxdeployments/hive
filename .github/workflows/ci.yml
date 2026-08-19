@@ -274,31 +274,63 @@ jobs:
             exit 1
           fi
 
-      # `--with-deps` shells out to apt, and apt's defaults are built for a
-      # desktop that can wait: a long per-connection timeout, retried, against
-      # each mirror in turn. When azure.archive.ubuntu.com black-holes — which it
-      # did on 2026-08-19, run 32226387155 — that arithmetic runs to 38 minutes in
-      # this one step, and the job dies on its own 40-minute timeout having never
-      # started a test. The failure is also unattributable from the outside: the
-      # run reports "cancelled", not "the mirror was down".
+      # `--with-deps` shells out to apt, and apt is the least reliable thing in
+      # this job. Two distinct failures now, both of which spent the step's whole
+      # budget and reported nothing but a timeout:
       #
-      # Short timeouts and explicit retries let a dead mirror fail over to the
-      # canonical archive in seconds instead of minutes. The step cap is the
-      # backstop for whatever this does not anticipate — it turns a 40-minute
-      # mystery into a fast, clearly-attributed failure, and leaves most of the
-      # job's budget intact rather than spending all of it here. Generous: this
-      # step normally takes about two minutes.
+      #   * azure.archive.ubuntu.com black-holed (2026-08-19, run 32226387155).
+      #     apt's desktop defaults — a long per-connection timeout, retried,
+      #     against each mirror in turn — ran to 38 minutes in this one step.
+      #     The Acquire settings below fixed that: the fail-over now takes ~30s.
+      #
+      #   * The canonical archive then stalled MID-TRANSFER (run 32270826562,
+      #     twice in a row). apt fetched every InRelease and went silent for
+      #     eleven and a half minutes. The Acquire settings cannot help here and
+      #     never could: Acquire::*::Timeout is an INACTIVITY timeout, so a mirror
+      #     that trickles bytes never trips it, and Acquire::Retries makes it
+      #     worse by doing it three times.
+      #
+      # So apt gets a wall-clock bound it has no setting for, and stops being
+      # able to fail this job at all. Three changes, in order:
+      #
+      # 1. The browser BINARY is installed on its own. It comes from Playwright's
+      #    CDN rather than apt, and it is the half that genuinely cannot be
+      #    skipped, so it must not share a failure domain with the mirrors.
+      # 2. The system libraries — the apt half — are bounded with `timeout` and
+      #    made non-fatal. ubuntu-24.04 ships Chromium's dependencies already;
+      #    this run is belt-and-braces, not a prerequisite, and it had no business
+      #    being able to take the job down.
+      # 3. Which makes the launch check the real gate. If a library IS missing,
+      #    chromium fails to launch here, once, with the reason — instead of
+      #    taking out all 40-odd specs one confusing failure at a time, which is
+      #    exactly the silent-skip shape the LiveKit step above exists to prevent.
+      #
+      # The step cap stays as the backstop for whatever this still does not
+      # anticipate. Generous: this step normally takes about two minutes.
       - name: Install frontend + browsers
         timeout-minutes: 12
         working-directory: frontend
         run: |
+          set -euo pipefail
+
           sudo tee /etc/apt/apt.conf.d/99-ci-resilience >/dev/null <<'APTCONF'
           Acquire::Retries "3";
           Acquire::http::Timeout "20";
           Acquire::https::Timeout "20";
           APTCONF
+
           npm ci
-          npx playwright install --with-deps chromium
+          npx playwright install chromium
+
+          # `sudo timeout`, not `timeout sudo`: timeout signals its direct child,
+          # and with sudo in between it is sudo that gets the TERM rather than the
+          # apt holding the lock.
+          sudo timeout 180 apt-get update \
+            || echo "::warning::apt-get update timed out or failed — falling back to the runner's preinstalled libraries"
+          timeout 240 npx playwright install-deps chromium \
+            || echo "::warning::playwright install-deps timed out or failed — falling back to the runner's preinstalled libraries"
+
+          node -e "require('@playwright/test').chromium.launch().then(b => b.close()).then(() => console.log('chromium launches'))"
 
       # global-setup waits for /api/health and fails loudly if the stack is down.
       # Chromium fake media devices make the calling tests hardware-free.
