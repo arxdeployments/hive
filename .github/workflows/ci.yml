@@ -274,9 +274,29 @@ jobs:
             exit 1
           fi
 
+      # `--with-deps` shells out to apt, and apt's defaults are built for a
+      # desktop that can wait: a long per-connection timeout, retried, against
+      # each mirror in turn. When azure.archive.ubuntu.com black-holes — which it
+      # did on 2026-08-19, run 32226387155 — that arithmetic runs to 38 minutes in
+      # this one step, and the job dies on its own 40-minute timeout having never
+      # started a test. The failure is also unattributable from the outside: the
+      # run reports "cancelled", not "the mirror was down".
+      #
+      # Short timeouts and explicit retries let a dead mirror fail over to the
+      # canonical archive in seconds instead of minutes. The step cap is the
+      # backstop for whatever this does not anticipate — it turns a 40-minute
+      # mystery into a fast, clearly-attributed failure, and leaves most of the
+      # job's budget intact rather than spending all of it here. Generous: this
+      # step normally takes about two minutes.
       - name: Install frontend + browsers
+        timeout-minutes: 12
         working-directory: frontend
         run: |
+          sudo tee /etc/apt/apt.conf.d/99-ci-resilience >/dev/null <<'APTCONF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          APTCONF
           npm ci
           npx playwright install --with-deps chromium
 

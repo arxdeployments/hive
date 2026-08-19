@@ -51,6 +51,8 @@ final class ChatStore: ObservableObject {
 
     func attach(auth: AuthStore) {
         self.auth = auth
+        // The reciprocal half: a session ending has to be able to clear this store.
+        auth.registerSessionStore(chat: self)
         eventTask?.cancel()
         eventTask = Task { [weak self] in
             // `subscribe()`, not a shared stream: `CallStore` consumes these events
@@ -62,6 +64,83 @@ final class ChatStore: ObservableObject {
             }
         }
     }
+
+    // MARK: - Session teardown
+
+    /// Drop everything belonging to the person who was signed in.
+    ///
+    /// This store is a `@StateObject` on `RxHiveApp`, so it lives for the whole
+    /// process: signing out swaps the root view, it does not rebuild this. Until
+    /// this method existed nothing could put the data down — there was no reset
+    /// here, and `AuthStore` held no reference to this store to call one with.
+    ///
+    /// So a sign-out left the previous person's threads and message bodies in
+    /// memory and handed them to whoever signed in next on the device. Not merely
+    /// retained, either: `ConversationsListView` renders `chat.conversations`
+    /// directly and only shows its spinner while that array is EMPTY, so a
+    /// carry-over skips the spinner and paints the previous user's conversation
+    /// list — names and last-message previews — until the new session's first
+    /// fetch returns.
+    ///
+    /// `RememberedUser.clear()` is called at every one of those boundaries already,
+    /// to drop the persisted account record. This is the in-memory half, which was
+    /// missing.
+    ///
+    /// Deliberately leaves `eventTask` and `auth` alone. The realtime subscription
+    /// is established once in `attach` at launch and has to survive into the next
+    /// session; cancelling it here would leave the second sign-in with no live
+    /// events at all.
+    func reset() {
+        conversations = []
+        isLoadingConversations = false
+        conversationsError = nil
+        hasMoreConversations = false
+        messages = [:]
+        loadingThreads = []
+        hasMoreHistory = [:]
+        typingUsers = [:]
+        presence = [:]
+        pendingSends = []
+        failedSends = []
+
+        // Live tasks rather than data: each is a pending "stop typing" for a
+        // conversation of the session being ended. Left running they fire against
+        // the next one and write into `typingUsers` after this has emptied it.
+        for timer in typingTimers.values { timer.cancel() }
+        typingTimers = [:]
+        outgoingTypingSentAt = [:]
+    }
+
+    #if DEBUG
+    /// Seed the store directly. Every field above is `private(set)`, and the real
+    /// writers need a live socket and API; `reset` is about what is in the store,
+    /// not how it got there.
+    func applyForTesting(
+        conversations: [Conversation] = [],
+        messages: [String: [Message]] = [:],
+        typingUsers: [String: [String: String]] = [:],
+        presence: [String: PresenceStatus] = [:],
+        pendingSends: Set<String> = [],
+        failedSends: Set<String> = [],
+        loadingThreads: Set<String> = [],
+        hasMoreHistory: [String: Bool] = [:],
+        isLoadingConversations: Bool = false,
+        hasMoreConversations: Bool = false,
+        conversationsError: String? = nil
+    ) {
+        self.conversations = conversations
+        self.messages = messages
+        self.typingUsers = typingUsers
+        self.presence = presence
+        self.pendingSends = pendingSends
+        self.failedSends = failedSends
+        self.loadingThreads = loadingThreads
+        self.hasMoreHistory = hasMoreHistory
+        self.isLoadingConversations = isLoadingConversations
+        self.hasMoreConversations = hasMoreConversations
+        self.conversationsError = conversationsError
+    }
+    #endif
 
     // MARK: - Conversations
 
