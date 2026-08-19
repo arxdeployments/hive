@@ -24,6 +24,39 @@ handle /ws* {
 # Which showed up as every sent image failing to render, since /api/media/{id}
 # 307-redirects to this route. Must match the signed host and port exactly.
 handle_path /s3/* {
+	# The attachment bytes themselves, and the ONE response on this origin that
+	# carries no security headers.
+	#
+	# app/main.py stamps nosniff, X-Frame-Options: DENY and Referrer-Policy on
+	# every API response, and the SPA gets the same four plus a CSP from
+	# frontend/nginx-security-headers.conf. This route reaches neither: it is
+	# Caddy straight to object storage, so the response arrives with whatever the
+	# store sends and nothing else.
+	#
+	# /api/media/* stamping them on its 307 does not help. Response headers do not
+	# survive a redirect — the browser follows it and renders THIS response, which
+	# is the one holding the file. (The comment in PdfViewer.jsx reasons from the
+	# 307 carrying DENY; true of the redirect, not of what the browser ends up
+	# displaying.)
+	#
+	# And this is user-uploaded content on the app's own origin, which is
+	# deliberate rather than incidental: media has to be same-origin because CSP
+	# is enforced against redirect targets and `img-src 'self'` blocks a
+	# cross-origin one, so every attachment would fail to render.
+	#
+	# Nothing here is a live hole today. api/media.py resolves the Content-Type
+	# from MIME_BY_EXT and falls back to application/octet-stream, and uploads are
+	# unrestricted by extension ("any format may be sent") — so a .html or .svg
+	# arrives as octet-stream, which browsers download rather than execute. That
+	# allow-list is the entire barrier, and nosniff is what stops it being
+	# load-bearing: one future entry for text/html or image/svg+xml, or a store or
+	# CDN that rewrites the type, turns a stored file into a same-origin document
+	# with nothing left in the way.
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+	}
 	reverse_proxy minio:9000 {
 		header_up Host minio:9000
 	}
