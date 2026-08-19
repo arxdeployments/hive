@@ -1,5 +1,20 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import client, { setSignOutReason } from '../api/client';
+import useChatStore from '../stores/chatStore';
+
+/**
+ * Both sign-outs that stay inside the SPA end up here.
+ *
+ * The third one does not need it: api/client.js tears an expired session down
+ * with `window.location.href`, and a document navigation takes the heap with it.
+ * These two are React Router transitions, so the previous user's threads and
+ * message bodies would otherwise still be in memory when the next person signs
+ * in on the same tab. Call it before setUser(null), so nothing renders from the
+ * old data on the frame the route guard redirects.
+ */
+const dropSessionData = () => {
+  useChatStore.getState().reset();
+};
 
 const AuthContext = createContext(null);
 
@@ -42,6 +57,7 @@ export const AuthProvider = ({ children }) => {
       const status = err.response?.status;
       if (status === 401 || status === 403) {
         localStorage.removeItem('user');
+        dropSessionData();
         // This path is a SOFT sign-out — the route guards render
         // <Navigate to="/login">, a React transition rather than a document
         // navigation — so unlike client.js the message could have lived in
@@ -63,6 +79,11 @@ export const AuthProvider = ({ children }) => {
 
   const login = async (email, password) => {
     const { data } = await client.post('/api/auth/login', { email, password });
+    // Belt as well as braces. Signing out clears this, so by here it is normally
+    // already empty — but that makes the guarantee "every sign-out remembered to
+    // clean up", and this makes it "a session always starts empty", which does
+    // not depend on having found every way a session can end.
+    dropSessionData();
     localStorage.setItem('user', JSON.stringify(data.user));
     setUser(data.user);
     return data.user;
@@ -75,6 +96,7 @@ export const AuthProvider = ({ children }) => {
       // ignore — cookies are cleared server-side; local state resets regardless
     }
     localStorage.removeItem('user');
+    dropSessionData();
     setUser(null);
   };
 
