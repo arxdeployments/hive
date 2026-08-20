@@ -7,6 +7,7 @@ short-lived presigned URL.
 
 import datetime as dt
 import io
+import logging
 import uuid
 from functools import lru_cache
 from urllib.parse import urlsplit
@@ -18,6 +19,8 @@ from minio.credentials import IamAwsProvider
 from PIL import Image, ImageFile
 
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 # Decompression-bomb guard: cap decoded pixels well below a memory-exhaustion
 # threshold. A crafted small file can otherwise claim huge dimensions.
@@ -251,6 +254,29 @@ THUMB_PX = 720
 # content is entirely type and the cost is demonstrably low.
 THUMB_QUALITY = 85
 
+# Concurrent image decodes, bounded separately from anyio's shared pool.
+#
+# MAX_IMAGE_PIXELS bounds ONE thumbnail; nothing bounded how many run at once,
+# and this is the memory-dominant step in the whole upload path. Measured with a
+# source just under the 40 MP cap (6300x6300), which is the worst case the guard
+# admits: one thumbnail grows RSS by about 290 MB, eight concurrently peaked at
+# 3.0 GB. anyio's default limiter allows 40, and API_WORKERS is 2, so the box
+# would admit 80 of them — on an m7i-flex.large with 8 GiB.
+#
+# The trigger costs nothing to send. 6300x6300 encodes to 70 KB as WebP, far
+# under THUMBNAIL_SOURCE_LIMIT's 64 MB, because that limit bounds the ENCODED
+# bytes and the cost here is in decoded pixels. So the cheap half of the guard
+# chain is the half an attacker controls.
+#
+# 4 puts a worker's worst case near 1.2 GB and the box's near 2.4 GB, which
+# leaves room for the rest of the process. Its own limiter rather than the
+# default one for the reason batch 32 established: sharing the default 40 tokens
+# would let this starve every attachment put, presign and push send.
+#
+# Distinct from _PDF_LIMITER below, which is 1 for a different reason entirely —
+# PDFium is not thread-safe. This one is arithmetic, not correctness.
+_IMAGE_LIMITER = anyio.CapacityLimiter(4)
+
 
 async def make_thumbnail(data: bytes) -> bytes | None:
     """Bubble-sized JPEG thumbnail, transparent pixels flattened onto the app bg."""
@@ -260,6 +286,12 @@ async def make_thumbnail(data: bytes) -> bytes | None:
             img = Image.open(io.BytesIO(data))
             # Reject decompression bombs by declared dimensions before decoding.
             if img.size[0] * img.size[1] > Image.MAX_IMAGE_PIXELS:
+                logger.info(
+                    "thumbnail skipped: %sx%s exceeds the %s pixel cap",
+                    img.size[0],
+                    img.size[1],
+                    Image.MAX_IMAGE_PIXELS,
+                )
                 return None
             # LANCZOS explicitly: Pillow's default for thumbnail() is BICUBIC,
             # which is visibly softer on the fine detail this is meant to keep.
@@ -275,9 +307,16 @@ async def make_thumbnail(data: bytes) -> bytes | None:
             img.save(buf, "JPEG", quality=THUMB_QUALITY, optimize=True)
             return buf.getvalue()
         except Exception:
+            # Returning None is correct — a file that will not decode simply has
+            # no preview, and that must not fail the upload. Doing it SILENTLY was
+            # not: this module's own MAXBLOCK note records a real bug that hid
+            # here, where raising the thumbnail size broke two of nineteen local
+            # images and the only symptom was a missing picture. Same outcome,
+            # now with a trail.
+            logger.warning("thumbnail generation failed (%d source bytes)", len(data), exc_info=True)
             return None
 
-    return await anyio.to_thread.run_sync(_thumb)
+    return await anyio.to_thread.run_sync(_thumb, limiter=_IMAGE_LIMITER)
 
 
 # --- PDF rasterisation -------------------------------------------------------
