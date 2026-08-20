@@ -6,14 +6,16 @@ import UIKit
 ///
 /// ## What gates what
 ///
-/// The three permission booleans are the *stored* group policy, but only one of
-/// them is enforced on a write path: `send_messages` is `admin_only_messages`
-/// inverted and the message routes honour it. `edit_info` and `add_members` are
-/// stored and broadcast, while `PUT /{id}/group` and `POST /{id}/members` both go
-/// through `_require_group_admin` (`api/groups.py`) — a plain member with
-/// `edit_info` on still gets a 403. So the edit and add affordances here are gated
-/// on *role*, not on the permission, exactly as the web panel gates them. Showing a
-/// control that always fails is worse than not showing it.
+/// One permission boolean, and it is the one that is enforced: `send_messages` is
+/// `admin_only_messages` inverted and the message routes honour it.
+///
+/// `edit_info` and `add_members` were stored and broadcast while
+/// `PUT /{id}/group` and `POST /{id}/members` both went through
+/// `_require_group_admin` (`api/groups.py`) — a plain member with `edit_info` on
+/// still got a 403. This file already gated its edit and add affordances on
+/// *role* for that reason, and the toggles themselves have now been withdrawn
+/// server-side too, so there is nothing left to show. Showing a control that
+/// always fails is worse than not showing it.
 ///
 /// ## cross_org
 ///
@@ -338,16 +340,10 @@ struct GroupInfoView: View {
                     }
 
                     InfoCard {
-                        InfoToggleRow(
-                            title: "Edit group settings",
-                            subtitle: "Change the group name, icon and description",
-                            isOn: permissions.editInfo,
-                            isEnabled: isAdmin,
-                            isBusy: savingPermission == "edit_info"
-                        ) { next in
-                            Task { await setPermission(key: "edit_info", value: next) }
-                        }
-                        InfoRowDivider(inset: Theme.Layout.spacing4)
+                        // One row, because one permission is enforced. "Edit group
+                        // settings" and "Add other members" used to sit either side
+                        // of this and changed nothing when flipped — see
+                        // GroupPermissions.
                         InfoToggleRow(
                             title: "Send new messages",
                             subtitle: "When off, only the creator and admins can post here",
@@ -356,16 +352,6 @@ struct GroupInfoView: View {
                             isBusy: savingPermission == "send_messages"
                         ) { next in
                             Task { await setPermission(key: "send_messages", value: next) }
-                        }
-                        InfoRowDivider(inset: Theme.Layout.spacing4)
-                        InfoToggleRow(
-                            title: "Add other members",
-                            subtitle: "Bring other people in this organization into the group",
-                            isOn: permissions.addMembers,
-                            isEnabled: isAdmin,
-                            isBusy: savingPermission == "add_members"
-                        ) { next in
-                            Task { await setPermission(key: "add_members", value: next) }
                         }
                     }
                 }
@@ -670,18 +656,19 @@ struct GroupInfoView: View {
 
         // Optimistic, then replaced by whatever the server answers — the response is
         // the whole permission set, so a rejected key corrects itself.
+        //
+        // editInfo / addMembers are carried through untouched: they are decode-only
+        // now, present so an older payload does not throw, and no caller sets them.
         permissions = GroupPermissions(
-            editInfo: key == "edit_info" ? value : current.editInfo,
-            addMembers: key == "add_members" ? value : current.addMembers,
+            editInfo: current.editInfo,
+            addMembers: current.addMembers,
             sendMessages: key == "send_messages" ? value : current.sendMessages
         )
 
         do {
             permissions = try await RxHiveAPI.updateGroupPermissions(
                 conversationID: live.id,
-                editInfo: key == "edit_info" ? value : nil,
-                sendMessages: key == "send_messages" ? value : nil,
-                addMembers: key == "add_members" ? value : nil
+                sendMessages: key == "send_messages" ? value : nil
             )
             // `send_messages` is `admin_only_messages` inverted, and the composer
             // reads that off the conversation — so the conversation has to be

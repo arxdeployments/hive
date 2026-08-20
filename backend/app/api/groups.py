@@ -59,11 +59,17 @@ class AddMembersRequest(BaseModel):
 class PermissionsRequest(BaseModel):
     """Every field optional — a PUT applies only the keys actually sent."""
 
-    # send_history / invite_via_link / approve_new_members are intentionally gone:
+    # send_history / invite_via_link / approve_new_members were intentionally gone:
     # nothing enforced them, so accepting them was a success response for a no-op.
-    edit_info: bool | None = None
+    #
+    # edit_info and add_members now join them, for the same reason and after the
+    # same check: neither perm_edit_info nor perm_add_members was read anywhere
+    # outside the model, so this route was storing and broadcasting a policy that
+    # update_group and add_members never consulted. Extra keys are ignored rather
+    # than rejected (pydantic's default), so a client that has not been updated
+    # gets the same 200 it always did — it simply no longer gets a policy back
+    # that the server was never applying.
     send_messages: bool | None = None
-    add_members: bool | None = None
 
 
 class ChangeRoleRequest(BaseModel):
@@ -242,9 +248,6 @@ async def update_permissions(
         raise HTTPException(status_code=404, detail="Group not found")
 
     data = body.model_dump(exclude_unset=True, exclude_none=True)
-    for name, column in enrich.PERMISSION_COLUMNS.items():
-        if name in data:
-            setattr(conv, column, bool(data[name]))
     if "send_messages" in data:
         # send_messages is admin_only_messages inverted — one stored source of truth.
         conv.admin_only_messages = not bool(data["send_messages"])

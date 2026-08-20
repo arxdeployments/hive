@@ -273,23 +273,31 @@ async def serialize_conversation(
     return doc
 
 
-# Wire permission name -> Conversation column. `send_messages` is deliberately
-# absent: it maps to the existing admin_only_messages column, INVERTED.
-# Only enforced permissions are exposed. perm_send_history / perm_invite_via_link /
-# perm_approve_new_members are stored but no read path honours them (a later member
-# still sees the full pre-join history via messages, search, starred, pinned, media
-# and export), so serving them would advertise privacy the server does not provide.
-PERMISSION_COLUMNS = {
-    "edit_info": "perm_edit_info",
-    "add_members": "perm_add_members",
-}
-
-
 def serialize_permissions(conv: Conversation) -> dict:
-    """The three-boolean permissions object the group settings UI reads/writes."""
-    doc = {name: bool(getattr(conv, column)) for name, column in PERMISSION_COLUMNS.items()}
-    doc["send_messages"] = not conv.admin_only_messages
-    return doc
+    """The group policy the settings UI reads/writes: one boolean, because one is
+    all the server enforces.
+
+    `send_messages` is `admin_only_messages` INVERTED — one stored source of truth,
+    and the message routes honour it.
+
+    `edit_info` and `add_members` used to be here too, described as the enforced
+    ones. They were not enforced by anything: `perm_edit_info` and
+    `perm_add_members` appeared nowhere outside the model and this function, while
+    PUT /{id}/group and POST /{id}/members both gate on _require_group_admin alone.
+    Since both columns default to TRUE, the permissive setting was the one that did
+    nothing — a member shown "Edit group settings: enabled" got a 403.
+
+    Withdrawn rather than implemented, which is the rule this module and
+    groups.PermissionsRequest already apply to perm_send_history,
+    perm_invite_via_link and perm_approve_new_members: nothing enforces them, so
+    serving them advertises a policy the server does not apply. Implementing them
+    instead would have loosened access on every existing group, because that TRUE
+    default was a migration backfill rather than anyone's choice.
+
+    The columns stay in the schema, inert, exactly as the other three do. Dropping
+    them would be a destructive migration for no gain.
+    """
+    return {"send_messages": not conv.admin_only_messages}
 
 
 def attachment_thumb_url(a: MessageAttachment) -> str | None:
