@@ -40,19 +40,50 @@ resource "aws_db_instance" "main" {
   # minor version here would just create drift every time AWS deprecates one.
   engine_version = "16"
 
-  # WARNING, only if you drop var.db_backup_retention_period to 0: RDS takes the
-  # pre-upgrade and post-upgrade snapshots that make a minor-version upgrade
-  # reversible ONLY when retention > 0. At 0, an unattended Sunday upgrade has
-  # no rollback point and engine upgrades cannot be reverted. If you must run at
-  # 0, set this to false and apply minor upgrades by hand after a manual
-  # snapshot. At the default of 1 this is safe as written.
-  auto_minor_version_upgrade  = true
+  # DERIVED, not hardcoded, because these two settings are not independent. RDS
+  # takes the pre-upgrade and post-upgrade snapshots that make a minor-version
+  # upgrade reversible ONLY when retention > 0. At 0 an unattended Sunday upgrade
+  # of this instance has no rollback point, no PITR to fall back on, and no way
+  # to revert the engine — and multi_az is false, so it is the only copy.
+  #
+  # This was a hardcoded `true` carrying a WARNING that told the operator to set
+  # it to false by hand if they ever ran at 0. Production then ran at 0 —
+  # variables.tf documents `-var 'db_backup_retention_period=0'` as the Free plan
+  # fallback and that is what was applied — with this still true: precisely the
+  # combination the warning existed to prevent. An invariant spanning two
+  # attributes cannot be held by a comment addressed to whoever changes one of
+  # them; it has to be an expression.
+  #
+  # At 0 this switches auto-upgrade off, which means minor engine patches stop
+  # arriving on their own: take a manual snapshot and apply them deliberately.
+  # That is the correct trade at 0 — an unrevertable automatic upgrade of an
+  # unbackuppable database is a worse exposure than a late patch.
+  auto_minor_version_upgrade  = var.db_backup_retention_period > 0
   allow_major_version_upgrade = false
 
   instance_class    = var.db_instance_class
   allocated_storage = var.db_allocated_storage
   storage_type      = "gp3"
   storage_encrypted = true
+
+  # Storage autoscaling. Unset (the default, 0) the volume is FIXED at
+  # allocated_storage, and a full one does not slow the database down — it puts
+  # the instance into `storage-full`, where every write fails until an operator
+  # modifies the instance and waits for it to come back. There is no CloudWatch
+  # alarm anywhere in this stack, so the first symptom is the API being down.
+  #
+  # Reaching full is a matter of time rather than of load, because nothing in the
+  # app prunes the tables that only ever grow: refresh_tokens gains a row per
+  # login AND per rotation (access tokens last 15 minutes, so one active session
+  # mints a row four times an hour and expired rows are never deleted), and
+  # audit_logs, notifications and uploads are swept by nothing at all —
+  # app/db/models.py notes a cleanup job "can" purge unclaimed uploads, and none
+  # exists. Retention policy for those tables is a separate decision; this is the
+  # cheap half, and it turns a hard outage into a bill.
+  #
+  # Costs nothing at rest: RDS only grows the volume when it is actually near
+  # full, and never shrinks it back.
+  max_allocated_storage = var.db_max_allocated_storage
 
   db_name = "rxhive"
   # The API's first Alembic migration runs `CREATE EXTENSION citext` (the users
@@ -106,6 +137,40 @@ resource "aws_db_instance" "main" {
     Project     = "rxhive"
     Environment = var.environment
     Name        = "rxhive-${var.environment}"
+  }
+
+  lifecycle {
+    # RDS rejects a max equal to allocated_storage, and the rejection arrives
+    # from the API mid-apply rather than from the plan. Catch it at plan time.
+    precondition {
+      condition     = var.db_max_allocated_storage == 0 || var.db_max_allocated_storage > var.db_allocated_storage
+      error_message = "db_max_allocated_storage must be 0 (autoscaling off) or strictly greater than db_allocated_storage."
+    }
+  }
+}
+
+# A warning, not a failed plan. On an AWS Free plan account 0 may be the only
+# retention RDS will accept, and refusing to apply would leave the operator
+# unable to manage the stack at all. What must not happen is running that way
+# without it being said out loud on every plan: at 0 there are no automated
+# snapshots and no point-in-time recovery, so a bad migration, a wrong DELETE or
+# a destroyed instance is permanent — and multi_az is false, so this is the sole
+# copy of every message, user and audit record in the product.
+check "database_can_be_restored" {
+  assert {
+    condition     = var.environment != "prod" || var.db_backup_retention_period > 0
+    error_message = <<-EOT
+      rxhive-${var.environment} has automated backups DISABLED
+      (db_backup_retention_period = 0): no point-in-time recovery, no automated
+      snapshots, and a single-AZ instance. auto_minor_version_upgrade is derived
+      from this and is therefore OFF, so minor engine patches now need a manual
+      snapshot and a deliberate apply.
+
+      Raise db_backup_retention_period to 1 or more as soon as the account plan
+      allows it, and re-check with:
+        aws rds describe-db-instances --db-instance-identifier rxhive-${var.environment} \
+          --query 'DBInstances[0].BackupRetentionPeriod'
+    EOT
   }
 }
 

@@ -156,6 +156,68 @@ jobs:
       - name: Validate
         run: terraform validate -no-color
 
+  compose:
+    # The compose files had no automated check of any kind, and the production
+    # one is not merely a convenience: user_data.sh.tftpl runs
+    # `docker compose up -d --build` against it on every boot and every
+    # bootstrap re-run, so a YAML error, a bad anchor or a mistyped
+    # interpolation means the stack simply never comes up — discovered on the
+    # box, after the deploy, with the previous containers already stopped.
+    #
+    # `config` is a pure parse-and-resolve: it renders the merged model without
+    # pulling an image, building anything or contacting a daemon registry.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the dev stack
+        working-directory: infra
+        # Required variables (${VAR:?...}) are supplied as throwaway values: this
+        # checks the file's shape, not the deployment's secrets.
+        run: docker compose -f docker-compose.yml config --quiet
+        env:
+          POSTGRES_PASSWORD: ci
+          MINIO_ROOT_PASSWORD: ci
+          LIVEKIT_API_SECRET: ci
+          RXHIVE_SECRET_KEY: ci
+      - name: Validate the production stack
+        working-directory: infra
+        run: docker compose -f docker-compose.prod.yml config --quiet
+        env:
+          RXHIVE_DATABASE_URL: postgresql+asyncpg://ci:ci@127.0.0.1:5432/ci
+          RXHIVE_S3_BUCKET: ci
+          AWS_REGION: us-east-1
+          RXHIVE_SECRET_KEY: ci
+          LIVEKIT_API_SECRET: ci
+          SITE_ADDRESS: ci.example.com
+      - name: Every long-lived container caps its logs
+        working-directory: infra
+        # Docker's json-file driver is unbounded by default and these containers
+        # run for the life of the box, so an uncapped service fills the 40 GB
+        # root volume and stops the stack. Asserted per service rather than by
+        # grepping for the anchor: a service added later without `logging:` is
+        # exactly the regression worth catching, and it would not mention it.
+        run: |
+          docker compose -f docker-compose.prod.yml config --format json \
+            | python3 -c '
+          import json, sys
+          services = json.load(sys.stdin)["services"]
+          missing = sorted(
+              name for name, svc in services.items()
+              if not (svc.get("logging") or {}).get("options", {}).get("max-size")
+          )
+          if missing:
+              sys.exit(f"services with uncapped logs: {missing}")
+          print(f"all {len(services)} services cap their logs")
+          '
+        env:
+          RXHIVE_DATABASE_URL: postgresql+asyncpg://ci:ci@127.0.0.1:5432/ci
+          RXHIVE_S3_BUCKET: ci
+          AWS_REGION: us-east-1
+          RXHIVE_SECRET_KEY: ci
+          LIVEKIT_API_SECRET: ci
+          SITE_ADDRESS: ci.example.com
+
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 40  # full stack + LiveKit + Playwright; the suite runs ~4 min locally

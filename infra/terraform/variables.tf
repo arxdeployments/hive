@@ -86,6 +86,31 @@ variable "db_allocated_storage" {
   default     = 20
 }
 
+variable "db_max_allocated_storage" {
+  description = <<-EOT
+    Upper bound (GB) for RDS storage autoscaling. 0 disables autoscaling and
+    pins the volume at db_allocated_storage, which is the RDS default and what
+    this stack ran with: a full volume then means `storage-full`, where every
+    write fails until an operator modifies the instance by hand.
+
+    Must be 0 or strictly greater than db_allocated_storage — RDS rejects an
+    equal value, and data.tf has a precondition that catches it at plan time
+    rather than mid-apply.
+
+    100 GB against a 20 GB allocation is five times the headroom for a volume
+    nothing prunes. Autoscaling is not itself billable and RDS only grows the
+    volume when it is genuinely near full, so this costs nothing until it is
+    needed; note that it never shrinks back, so growth is one-way.
+  EOT
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.db_max_allocated_storage == 0 || (var.db_max_allocated_storage >= 20 && var.db_max_allocated_storage <= 65536)
+    error_message = "db_max_allocated_storage must be 0 (disabled) or between 20 and 65536 GB."
+  }
+}
+
 variable "db_backup_retention_period" {
   description = <<-EOT
     Days of RDS automated backups. Non-zero is what enables point-in-time
