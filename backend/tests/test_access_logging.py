@@ -13,10 +13,20 @@ attribute it to. These tests pin the formatter, the wiring that installs it, and
 the one field in that payload a caller controls.
 """
 
+import io
 import json
 import logging
+import logging.handlers
+import queue
+import threading
+import time
 
-from app.core.observability import JsonLogFormatter, _request_id
+from app.core.observability import (
+    LOG_QUEUE_MAXSIZE,
+    JsonLogFormatter,
+    _request_id,
+    install_json_logging,
+)
 
 
 class _Req:
@@ -111,19 +121,135 @@ def test_an_unserializable_extra_does_not_take_the_log_line_down():
     assert payload["request_id"] == "r1"
 
 
-def test_the_formatter_is_actually_installed_on_the_root_logger():
+def test_the_root_logger_enqueues_rather_than_writing_on_the_caller():
     """The wiring, not just the class.
 
     Worth its own test because the bug being fixed was exactly this shape: the
     structure existed and nothing was configured to emit it. A JsonLogFormatter
     that no handler uses would reproduce the finding with more code.
+
+    What is asserted is a QueueHandler, because that is the whole point of the
+    arrangement: AccessLogMiddleware logs from the event loop once per request,
+    and a StreamHandler there formats and writes to stderr synchronously. The
+    JsonLogFormatter belongs on the LISTENER's sink, off the loop.
     """
     import app.main  # noqa: F401 - imported for its logging side effect
 
-    formatters = [h.formatter for h in logging.getLogger().handlers]
-    assert any(isinstance(f, JsonLogFormatter) for f in formatters), (
-        f"root handlers carry {[type(f).__name__ for f in formatters]}"
+    handlers = logging.getLogger().handlers
+    queue_handlers = [h for h in handlers if isinstance(h, logging.handlers.QueueHandler)]
+    assert queue_handlers, f"root handlers are {[type(h).__name__ for h in handlers]}"
+    assert queue_handlers[0].queue.maxsize == LOG_QUEUE_MAXSIZE, (
+        "an unbounded queue trades a stalled sink for unbounded memory"
     )
+
+
+def test_a_record_logged_from_the_event_loop_reaches_the_sink_as_json():
+    """End to end through the real arrangement: enqueue here, format and write there.
+
+    Built on a private root logger rather than the app's, so the assertion does
+    not depend on what else the session has configured, and torn down so it does
+    not leave a listener thread behind.
+    """
+    stream = io.StringIO()
+    sink = logging.StreamHandler(stream)
+    sink.setFormatter(JsonLogFormatter())
+    record_queue: queue.Queue = queue.Queue(maxsize=LOG_QUEUE_MAXSIZE)
+    listener = logging.handlers.QueueListener(record_queue, sink, respect_handler_level=True)
+    listener.start()
+
+    logger = logging.getLogger("rxhive.test.queue")
+    logger.handlers = [logging.handlers.QueueHandler(record_queue)]
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    try:
+        logger.info("access", extra={"request_id": "q1", "path": "/api/health", "status": 200})
+        listener.stop()  # drains the queue, which is what makes this deterministic
+    finally:
+        logger.handlers = []
+
+    payload = json.loads(stream.getvalue().strip())
+    assert payload["request_id"] == "q1"
+    assert payload["path"] == "/api/health"
+    assert payload["status"] == 200
+
+
+def test_a_blocked_sink_does_not_block_the_caller():
+    """The finding: the log sink was an availability dependency of every request.
+
+    The sink here holds its write for far longer than any request should wait. The
+    caller must return immediately anyway, because it only enqueues — under the
+    previous arrangement the same call would have waited out the whole write.
+    """
+    released = threading.Event()
+
+    class _WedgedStream(io.StringIO):
+        def write(self, value):  # noqa: D102
+            released.wait(5)
+            return super().write(value)
+
+    sink = logging.StreamHandler(_WedgedStream())
+    sink.setFormatter(JsonLogFormatter())
+    record_queue: queue.Queue = queue.Queue(maxsize=LOG_QUEUE_MAXSIZE)
+    listener = logging.handlers.QueueListener(record_queue, sink, respect_handler_level=True)
+    listener.start()
+
+    logger = logging.getLogger("rxhive.test.wedged")
+    logger.handlers = [logging.handlers.QueueHandler(record_queue)]
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    try:
+        started = time.monotonic()
+        for _ in range(20):
+            logger.info("access", extra={"request_id": "wedged"})
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.5, f"logging blocked the caller for {elapsed:.2f}s"
+    finally:
+        released.set()
+        listener.stop()
+        logger.handlers = []
+
+
+def test_stopping_the_listener_flushes_what_is_still_queued():
+    """Why lifespan shutdown stops it.
+
+    Without the stop, the queue is dropped on the floor along with whatever the
+    shutdown path itself logged — which is exactly the part an operator reads to
+    find out why the process went down.
+    """
+    stream = io.StringIO()
+    sink = logging.StreamHandler(stream)
+    sink.setFormatter(JsonLogFormatter())
+    record_queue: queue.Queue = queue.Queue(maxsize=LOG_QUEUE_MAXSIZE)
+    listener = logging.handlers.QueueListener(record_queue, sink, respect_handler_level=True)
+    listener.start()
+
+    logger = logging.getLogger("rxhive.test.flush")
+    logger.handlers = [logging.handlers.QueueHandler(record_queue)]
+    logger.propagate = False
+    logger.setLevel(logging.INFO)
+    try:
+        for i in range(50):
+            logger.info("shutting down", extra={"seq": i})
+        listener.stop()
+    finally:
+        logger.handlers = []
+
+    lines = [line for line in stream.getvalue().splitlines() if line.strip()]
+    assert len(lines) == 50, f"only {len(lines)} of 50 records survived the stop"
+    assert json.loads(lines[-1])["seq"] == 49
+
+
+def test_install_json_logging_is_idempotent_enough_to_call_once_per_process():
+    """It uses force=True, so a second call must not leave two sinks stacked."""
+    listener = install_json_logging()
+    try:
+        handlers = logging.getLogger().handlers
+        assert len(handlers) == 1
+        assert isinstance(handlers[0], logging.handlers.QueueHandler)
+    finally:
+        listener.stop()
+        # Put the session's own arrangement back for the tests that follow.
+        install_json_logging()
 
 
 def test_a_sane_inbound_request_id_is_honoured():

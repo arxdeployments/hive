@@ -17,6 +17,8 @@ being computed and then discarded at the last step.
 
 import json
 import logging
+import logging.handlers
+import queue
 import re
 import time
 import uuid
@@ -60,6 +62,45 @@ class JsonLogFormatter(logging.Formatter):
         if record.stack_info:
             payload["stack"] = self.formatStack(record.stack_info)
         return json.dumps(payload, default=str)
+
+
+# Records buffered between the event loop and the sink. Bounded on purpose: a
+# stderr that has stopped draining should cost log records, not unbounded memory
+# in the process serving requests. 10k is minutes of traffic at this app's rate.
+LOG_QUEUE_MAXSIZE = 10_000
+
+
+def install_json_logging(level: int = logging.INFO) -> logging.handlers.QueueListener:
+    """Put JSON logging on the root logger, with the WRITE off the event loop.
+
+    logging.StreamHandler formats and writes SYNCHRONOUSLY. Called from
+    AccessLogMiddleware.dispatch — which is on the event loop, once per request —
+    that makes the log sink an availability dependency: a stderr that blocks
+    stalls the worker, and every request behind it, for as long as the write takes.
+    In a container stderr is a pipe to the log driver, so "blocks" means the
+    collector is wedged rather than anything exotic.
+
+    That was survivable while the access log emitted the single word "access".
+    This batch makes it emit a few hundred bytes per request instead, which is
+    the point of the batch and also a tenfold increase in what the event loop is
+    waiting on, so the two changes belong together.
+
+    QueueHandler only enqueues; a QueueListener thread does the formatting and the
+    write. Returns the listener so lifespan shutdown can stop it — that is what
+    drains the queue, and skipping it loses whatever is still buffered, including
+    the log lines explaining why the process is going down.
+
+    force=True because basicConfig is a no-op when the root logger already has a
+    handler, and the point here is to be certain WHICH handler is installed rather
+    than to depend on import order.
+    """
+    sink = logging.StreamHandler()
+    sink.setFormatter(JsonLogFormatter())
+    record_queue: queue.Queue = queue.Queue(maxsize=LOG_QUEUE_MAXSIZE)
+    logging.basicConfig(level=level, handlers=[logging.handlers.QueueHandler(record_queue)], force=True)
+    listener = logging.handlers.QueueListener(record_queue, sink, respect_handler_level=True)
+    listener.start()
+    return listener
 
 
 # An inbound request id is honoured so a proxy or client can correlate across a
