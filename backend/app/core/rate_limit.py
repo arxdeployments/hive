@@ -19,14 +19,38 @@ from app.realtime.redis_bus import degrade_on_outage, get_redis
 
 
 def _client_ip(request: Request) -> str:
-    """Real client IP. Behind our own reverse proxy (Caddy) the peer is the
-    proxy, so trust the first X-Forwarded-For hop; otherwise use the peer.
+    """Real client IP. Behind our own reverse proxy (Caddy) the peer is the proxy,
+    so the address has to come out of X-Forwarded-For; otherwise use the peer.
     Without this, every request shares the proxy's IP and the limiter degrades
-    into a single global bucket."""
+    into a single global bucket.
+
+    THE LAST HOP, NOT THE FIRST. A proxy APPENDS to X-Forwarded-For, so the
+    header a request arrives with is `<whatever the client sent>, <peer Caddy
+    saw>`. The leftmost entry is therefore supplied by the caller and means
+    nothing; reading it made every limiter in this module opt-in, because one
+    header the attacker chooses per request mints a fresh counter per request.
+    The rightmost entry is the one Caddy wrote from the TCP peer, and is the only
+    value in the header the caller cannot forge.
+
+    This is correct for exactly one trusted proxy in front of the app, which is
+    what trust_proxy already documents as its precondition (Caddy is the sole
+    ingress — see infra/Caddyfile.prod and the security group in
+    infra/terraform/network.tf). Adding a second proxy layer means taking the
+    (n+1)th hop from the right, and this function would have to learn the count.
+
+    Deliberately parsed here rather than taken from request.client.host, which
+    looks like the safe option and is not: production runs uvicorn with
+    --forwarded-allow-ips='*' (the peer is Caddy on a container IP that compose
+    assigns, so it cannot be enumerated), and in that mode uvicorn's
+    _TrustedHosts.get_trusted_client_host returns hosts[0] — the same forgeable
+    leftmost entry. Its reverse walk only runs when the trust list is explicit.
+    """
     if get_settings().trust_proxy:
         xff = request.headers.get("x-forwarded-for")
         if xff:
-            return xff.split(",")[0].strip()
+            hops = [hop.strip() for hop in xff.split(",") if hop.strip()]
+            if hops:
+                return hops[-1]
     return request.client.host if request.client else "unknown"
 
 
@@ -96,3 +120,9 @@ login_limiter = RateLimiter("login", default_times=10)
 refresh_limiter = RateLimiter("refresh", default_times=30)
 password_limiter = RateLimiter("password", default_times=5)
 upload_limiter = RateLimiter("upload", default_times=30)
+# POST /api/notifications/subscribe hands a caller-chosen hostname to the
+# blocking libc resolver on a worker thread. One call is bounded by a deadline;
+# the number of calls in flight was bounded by nothing, and each one that is
+# still resolving holds a thread. Low by design — a browser subscribes once per
+# subscription change, not once per page.
+push_subscribe_limiter = RateLimiter("push_subscribe", default_times=10)

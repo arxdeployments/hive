@@ -44,9 +44,12 @@ class Settings(BaseSettings):
 
     cors_origins: str = ""  # comma-separated exact origins; empty = same-origin only
 
-    # True when running behind a trusted reverse proxy (the bundled Caddy):
-    # the real client IP is taken from the first X-Forwarded-For hop for
-    # rate limiting. Only enable when the proxy is the sole ingress.
+    # True when running behind a trusted reverse proxy (the bundled Caddy): the
+    # real client IP is taken from the LAST X-Forwarded-For hop for rate limiting
+    # — the one the proxy appended from the TCP peer, and the only entry in that
+    # header a caller cannot forge. See core/rate_limit._client_ip. Only enable
+    # when the proxy is the sole ingress, which is what makes "last" the right
+    # hop to take.
     trust_proxy: bool = False
 
     # Per-IP requests allowed per 60s window. 0 disables that limiter.
@@ -55,6 +58,7 @@ class Settings(BaseSettings):
     rate_limit_refresh: int = 30
     rate_limit_password: int = 5
     rate_limit_upload: int = 30
+    rate_limit_push_subscribe: int = 10
 
     s3_endpoint: str = "http://localhost:9000"
     # Endpoint the *browser* uses for presigned URLs. May be a bare path like "/s3"

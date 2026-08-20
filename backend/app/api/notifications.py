@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.deps import get_current_user
+from app.core.rate_limit import push_subscribe_limiter
 from app.db.models import Notification, PushSubscription, User
 from app.db.session import get_db
 from app.utils import iso_z
@@ -19,6 +20,20 @@ router = APIRouter(prefix="/api/notifications", tags=["notifications"])
 # service (Google/Mozilla resolve in single-digit ms) and short enough that a
 # deliberately slow nameserver costs one request rather than the worker.
 PUSH_ENDPOINT_RESOLVE_TIMEOUT = 2.0
+
+# Concurrent resolver threads, bounded separately from anyio's shared pool.
+#
+# Needed because of what makes the deadline below work: abandon_on_cancel hands
+# the request back on time but cannot stop the thread, which stays in
+# getaddrinfo until libc gives up — for as long as resolv.conf allows. Those
+# abandoned threads have to be capped somewhere, and it must not be the default
+# limiter, because that is the same 40 tokens serving every attachment upload,
+# presign, thumbnail and web push send (services/storage.py, services/push.py).
+# Filling it would stall all of them.
+#
+# 4 is generous for the real traffic: a browser calls this once per subscription
+# change, and a real push service resolves in single-digit milliseconds.
+_RESOLVE_LIMITER = anyio.CapacityLimiter(4)
 
 
 @router.get("/vapid-key")
@@ -79,6 +94,7 @@ async def subscribe(
     body: SubscribeRequest,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    _rl: None = Depends(push_subscribe_limiter),
 ):
     from app.services.push import validate_push_endpoint
 
@@ -94,8 +110,27 @@ async def subscribe(
     # user could point it at a black-holing nameserver and freeze this worker —
     # every HTTP request, every WebSocket, and the call-deadline sweeper — for the
     # tens of seconds resolv.conf allows.
+    #
+    # abandon_on_cancel is what makes that deadline real, and it is not the
+    # default. anyio.to_thread.run_sync defaults to abandon_on_cancel=False, which
+    # means a cancelled scope WAITS for the worker to return before the
+    # cancellation propagates — so move_on_after could not interrupt an
+    # uninterruptible getaddrinfo, and this budget bounded nothing at all. It read
+    # as a timeout and behaved as a comment: measured, a 1s deadline around a 4s
+    # blocking call returned after 4.01s with cancelled_caught FALSE, so even the
+    # 400 below was unreachable by that path.
+    #
+    # True does not stop the thread — nothing can — it stops the REQUEST waiting
+    # on it, which is the part that was holding a connection and a DB session. The
+    # thread is then bounded by _RESOLVE_LIMITER instead of by the shared pool.
+    endpoint_ok = False
     with anyio.move_on_after(PUSH_ENDPOINT_RESOLVE_TIMEOUT) as scope:
-        endpoint_ok = await anyio.to_thread.run_sync(validate_push_endpoint, endpoint)
+        endpoint_ok = await anyio.to_thread.run_sync(
+            validate_push_endpoint,
+            endpoint,
+            abandon_on_cancel=True,
+            limiter=_RESOLVE_LIMITER,
+        )
     if scope.cancelled_caught or not endpoint_ok:
         raise HTTPException(status_code=400, detail="Invalid push endpoint")
     existing = (
