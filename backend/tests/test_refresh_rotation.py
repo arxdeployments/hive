@@ -229,17 +229,46 @@ async def test_family_revocation_spares_the_other_client(client):
 # ---------------------------------------------------------------------------
 
 
+_REFUSED = "Error 111 connecting to redis:6379. Connection refused."
+
+
+class _DeadPipeline:
+    """Queueing is local, so only execute() can fail — same as redis-py.
+
+    This stub used to be missing entirely, and that mattered: the limiter moved
+    from two round-trips to one MULTI/EXEC in 6dcc4db, so `incr`/`expire` on the
+    client below stopped being called and `pipeline()` started being called
+    instead. The stub was never updated, so these tests raised AttributeError
+    rather than a connection failure — and passed anyway, because
+    degrade_on_outage caught bare Exception. They certified fail-open while
+    exercising a hole in the guard instead of the outage path. Now that the guard
+    only catches Redis and socket errors, the stub has to be honest.
+    """
+
+    def incr(self, *_args, **_kwargs):
+        return self
+
+    def expire(self, *_args, **_kwargs):
+        return self
+
+    async def execute(self):
+        raise ConnectionError(_REFUSED)
+
+
 class _DeadRedis:
     """Every call raises, the way a client with no reachable server does."""
 
+    def pipeline(self, *_args, **_kwargs):
+        return _DeadPipeline()
+
     async def incr(self, *_args, **_kwargs):
-        raise ConnectionError("Error 111 connecting to redis:6379. Connection refused.")
+        raise ConnectionError(_REFUSED)
 
     async def expire(self, *_args, **_kwargs):
-        raise ConnectionError("Error 111 connecting to redis:6379. Connection refused.")
+        raise ConnectionError(_REFUSED)
 
     async def ttl(self, *_args, **_kwargs):
-        raise ConnectionError("Error 111 connecting to redis:6379. Connection refused.")
+        raise ConnectionError(_REFUSED)
 
 
 @pytest.fixture
