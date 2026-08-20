@@ -14,10 +14,31 @@ name: rxhive
 # Both containers and both of their volumes are gone; the only stateful things
 # left on this box are Caddy's certificates.
 
+# Docker's json-file driver has NO size cap by default, and these five containers
+# run under `restart: unless-stopped` for the life of the box. Caddy logs a line
+# per HTTP request and uvicorn logs one per API call, so on the 40 GB root volume
+# — shared with the OS, the built images and Caddy's certificate store — the logs
+# are the one thing here that grows without bound and nothing rotates them.
+#
+# A full root volume does not degrade this stack, it stops it: Docker cannot write
+# so the containers fail, and the SSM agent that is the only way onto the box is
+# fighting for the same disk. 10 MB x 5 files x 5 services caps the total at
+# 250 MB.
+#
+# Declared here rather than in /etc/docker/daemon.json so the limit lives in the
+# file that declares the containers, survives a docker reinstall, and is visible
+# to anyone reading the service it applies to.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    logging: *logging
     # Presence, pub/sub fan-out and rate-limit counters only. All of it is
     # rebuildable from Postgres or simply re-established by reconnecting
     # clients, so persistence is off and there is no volume: losing this
@@ -32,6 +53,7 @@ services:
   livekit:
     image: livekit/livekit-server:latest
     restart: unless-stopped
+    logging: *logging
     # See docker-compose.yml for why the config is templated rather than mounted
     # as-is: webhook.api_key must equal LIVEKIT_API_KEY, and livekit-server does not
     # expand env vars in its config file, so a hardcoded key crash-loops the SFU.
@@ -68,6 +90,7 @@ services:
     build:
       context: ../backend
     restart: unless-stopped
+    logging: *logging
     env_file: [.env]
     environment:
       # Production mode enforces real secrets (config.py refuses to boot on a
@@ -165,6 +188,7 @@ services:
     build:
       context: ../frontend
     restart: unless-stopped
+    logging: *logging
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1/"]
       interval: 30s
@@ -174,6 +198,7 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    logging: *logging
     ports:
       # Both are required for Let's Encrypt: :80 for the HTTP-01 challenge and
       # the HTTPS redirect, :443 for the real traffic.
