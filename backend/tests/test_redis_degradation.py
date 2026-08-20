@@ -63,30 +63,50 @@ async def app_client_pointed_at(port: int, monkeypatch) -> AsyncIterator[aioredi
     arguments proves redis-py honours them, not that this application passes
     them. Going through get_redis() is what ties the assertion to shipped code.
 
-    _redis is a module global the whole session shares, so it is cleared on the
-    way in and on the way out, along with the lru_cached settings — otherwise
-    every later test inherits a client aimed at a socket that no longer exists.
+    _redis is a module global the whole session shares, so it is closed and
+    cleared on the way in and on the way out, along with the lru_cached settings —
+    otherwise every later test inherits a client aimed at a socket that no longer
+    exists.
+
+    close_redis() rather than monkeypatch.setattr on _redis: saving the reference
+    and restoring it later only looks like isolation. The teardown then has a
+    client it must discard anyway (its URL is a port that has stopped existing),
+    so the session's original client would be orphaned with its connection pool
+    still open. close_redis() is the module's own accessor for this — it closes
+    and clears in one step — so both the incoming and outgoing client are shut
+    down properly and the next get_redis() rebuilds lazily against the real URL.
     """
+    await redis_bus.close_redis()
     monkeypatch.setenv("RXHIVE_REDIS_URL", f"redis://127.0.0.1:{port}/0")
-    monkeypatch.setattr(redis_bus, "_redis", None)
     get_settings.cache_clear()
     client = redis_bus.get_redis()
     try:
         assert client.connection_pool.connection_kwargs["port"] == port
         yield client
     finally:
-        await client.aclose()
+        await redis_bus.close_redis()
         monkeypatch.undo()
         get_settings.cache_clear()
-        redis_bus._redis = None
 
 
 async def test_the_shared_client_carries_a_read_and_connect_deadline():
-    """redis-py defaults both to None, which is the whole finding."""
-    kwargs = get_redis().connection_pool.connection_kwargs
-    assert kwargs.get("socket_timeout") == SOCKET_TIMEOUT_SECONDS
-    assert kwargs.get("socket_connect_timeout") == SOCKET_TIMEOUT_SECONDS
-    assert kwargs.get("health_check_interval") == HEALTH_CHECK_INTERVAL_SECONDS
+    """redis-py defaults both to None, which is the whole finding.
+
+    Built fresh rather than inspected wherever it happens to be. get_redis()
+    caches into a module global, so reading it as-found asserts against whatever
+    client an earlier test left there — including, if the ordering changed, one
+    aimed at the dead port used below. The claim here is about what get_redis()
+    CONSTRUCTS, so the cache is cleared on both sides and the client this test
+    creates is not left behind for the next one.
+    """
+    await redis_bus.close_redis()
+    try:
+        kwargs = get_redis().connection_pool.connection_kwargs
+        assert kwargs.get("socket_timeout") == SOCKET_TIMEOUT_SECONDS
+        assert kwargs.get("socket_connect_timeout") == SOCKET_TIMEOUT_SECONDS
+        assert kwargs.get("health_check_interval") == HEALTH_CHECK_INTERVAL_SECONDS
+    finally:
+        await redis_bus.close_redis()
 
 
 async def test_the_deadline_stays_above_the_pubsub_polling_interval():
