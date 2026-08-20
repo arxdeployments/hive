@@ -1,9 +1,23 @@
 """Lightweight observability: request-id + structured access logs, an in-process
 metrics counter, and a /metrics endpoint. No external APM dependency for v1;
 the log format is JSON so it drops straight into any log aggregator.
+
+The JSON is produced by JsonLogFormatter below, which app/main.py installs on the
+root logger. That is load-bearing rather than decorative: every field this module
+records is passed through logging's `extra=`, and `extra` only reaches the output
+if the FORMATTER emits it. Under the default format string
+("%(levelname)s:%(name)s:%(message)s") every access log line in production read
+
+    INFO:rxhive.access:access
+
+with no method, no path, no status, no latency and no request id — and the error
+branch logged a traceback with nothing to attribute it to. The structure was all
+being computed and then discarded at the last step.
 """
 
+import json
 import logging
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -12,6 +26,58 @@ from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = logging.getLogger("rxhive.access")
+
+# Attributes logging puts on every record itself. Anything NOT in here arrived
+# through `extra=` and is what this formatter exists to emit. Derived from a real
+# record rather than hardcoded, so a new stdlib attribute (taskName arrived in
+# 3.12) does not start showing up as if it were application data.
+_STANDARD_RECORD_ATTRS = frozenset(
+    vars(logging.LogRecord(name="", level=0, pathname="", lineno=0, msg="", args=(), exc_info=None))
+) | {"message", "asctime", "taskName"}
+
+
+class JsonLogFormatter(logging.Formatter):
+    """One JSON object per line: the standard fields, plus everything from `extra`.
+
+    default=str on the dump because `extra` carries whatever a caller passed and a
+    log line must never be the thing that raises. Exceptions are rendered into the
+    same object rather than trailing after it, so a traceback cannot be split from
+    its request id by line-based log collection.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key not in _STANDARD_RECORD_ATTRS and not key.startswith("_"):
+                payload[key] = value
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            payload["stack"] = self.formatStack(record.stack_info)
+        return json.dumps(payload, default=str)
+
+
+# An inbound request id is honoured so a proxy or client can correlate across a
+# hop, but only when it is short and boring. It is caller-controlled and lands in
+# two places — the response header and every log line for that request — so
+# without a bound this hands anyone who can reach the port a way to write ~16 KB
+# (uvicorn's per-header ceiling) of chosen text into the logs on every request.
+# That was dormant only because the formatter above was dropping the field
+# entirely; making the logs work is what makes the bound necessary.
+_REQUEST_ID_PATTERN = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
+
+
+def _request_id(request: Request) -> str:
+    supplied = request.headers.get("x-request-id", "")
+    if _REQUEST_ID_PATTERN.match(supplied):
+        return supplied
+    return uuid.uuid4().hex[:12]
+
 
 _counters: dict[str, int] = defaultdict(int)
 _latency_ms_total: dict[str, float] = defaultdict(float)
@@ -39,7 +105,7 @@ def snapshot() -> dict:
 
 class AccessLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        request_id = _request_id(request)
         start = time.perf_counter()
         try:
             response = await call_next(request)
