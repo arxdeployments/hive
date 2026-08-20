@@ -68,22 +68,24 @@ const ROLE_ORDER = { creator: 0, admin: 1, member: 2 };
 /**
  * "Members can:" rows, in WhatsApp's order.
  *
- * Only permissions the backend actually enforces are listed. `send_history`,
- * `invite_via_link` and `approve_new_members` were switches that saved happily
- * and changed nothing — a member added later still read the entire pre-join
- * history through the message list, search, starred, pinned, media and export.
- * A privacy control that silently does nothing is worse than none at all, so
- * they stay hidden until a read path enforces them.
+ * Only permissions the backend actually enforces are listed, and that is exactly
+ * one. `send_messages` maps to `admin_only_messages` inverted and the message
+ * routes honour it.
+ *
+ * `send_history`, `invite_via_link` and `approve_new_members` were switches that
+ * saved happily and changed nothing — a member added later still read the entire
+ * pre-join history through the message list, search, starred, pinned, media and
+ * export. `edit_info` and `add_members` were the same story and were listed here
+ * anyway: nothing read `perm_edit_info` or `perm_add_members`, because
+ * `PUT /{id}/group` and `POST /{id}/members` gate on group-admin role alone. Both
+ * columns default to true, so the permissive setting was the one that did nothing
+ * — this panel showed "Edit group settings: enabled" to a member who then got a
+ * 403.
+ *
+ * A control that silently does nothing is worse than none at all, so they stay
+ * hidden until a write path enforces them.
  */
-const MEMBER_PERMISSIONS = [
-  {
-    key: 'edit_info',
-    label: 'Edit group settings',
-    description: 'Change the group name, icon and description',
-  },
-  { key: 'send_messages', label: 'Send new messages' },
-  { key: 'add_members', label: 'Add other members' },
-];
+const MEMBER_PERMISSIONS = [{ key: 'send_messages', label: 'Send new messages' }];
 
 export const GroupInfoPanel = ({
   conversation,

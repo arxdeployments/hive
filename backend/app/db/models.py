@@ -166,7 +166,7 @@ class Conversation(Base):
     perm_edit_info: Mapped[bool] = mapped_column(default=True)
     perm_add_members: Mapped[bool] = mapped_column(default=True)
     # RESERVED — stored but NOT ENFORCED anywhere, and deliberately not exposed on
-    # the wire (see PERMISSION_COLUMNS in services/enrich.py). No read path honours
+    # the wire (see serialize_permissions in services/enrich.py). No read path honours
     # perm_send_history, so a member added later still sees the whole pre-join
     # history through messages, search, starred, pinned, media/links and export.
     # Do not re-expose these until the read paths actually check them.

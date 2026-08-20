@@ -5,10 +5,12 @@ module re-runs the whole surface as a foreign-org caller and demands a 404.
 """
 
 import contextlib
+import uuid
 
 from httpx import ASGITransport, AsyncClient
 
-from app.db.models import UserRole
+from app.db.models import Conversation, UserRole
+from app.db.session import SessionLocal
 from app.main import app
 from tests.conftest import CSRF, login, make_user
 
@@ -202,23 +204,17 @@ async def test_permissions_read_write_and_non_admin_403(client, two_orgs_with_us
 
     resp = await client.get(f"/api/conversations/{group}/permissions")
     assert resp.status_code == 200, resp.text
-    # Only enforced permissions are on the wire: send_history / invite_via_link /
-    # approve_new_members were removed because nothing honoured them.
-    assert resp.json() == {
-        "edit_info": True,
-        "send_messages": True,
-        "add_members": True,
-    }
+    # ONE key on the wire: the only permission the server enforces. edit_info and
+    # add_members joined send_history / invite_via_link / approve_new_members for
+    # the same reason — nothing honoured them.
+    assert resp.json() == {"send_messages": True}
 
     resp = await client.put(
         f"/api/conversations/{group}/permissions",
-        json={"send_messages": False, "add_members": False},
+        json={"send_messages": False},
     )
     assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["send_messages"] is False
-    assert body["add_members"] is False
-    assert body["edit_info"] is True  # untouched keys keep their value
+    assert resp.json() == {"send_messages": False}
 
     # send_messages=False is admin_only_messages=True: a plain member is refused.
     async with _client_for("bob@a.com") as bob:
@@ -232,6 +228,76 @@ async def test_permissions_read_write_and_non_admin_403(client, two_orgs_with_us
 
     resp = await client.get(f"/api/conversations/{group}/permissions")
     assert resp.json()["send_messages"] is False  # bob's 403 changed nothing
+
+
+async def test_the_withdrawn_permission_keys_are_accepted_and_ignored(client, two_orgs_with_users):
+    """A client that has not been updated still gets its 200, and still no policy.
+
+    edit_info and add_members were stored and broadcast while nothing read
+    perm_edit_info or perm_add_members, so the PUT was a success response for a
+    no-op. Extra keys are ignored rather than rejected, which is what keeps an old
+    web or iOS build working — but they must not come back on the wire, or the
+    server is advertising a policy again.
+    """
+    users = two_orgs_with_users
+    await login(client, "alice@a.com")
+    group = await _group_with_bob_and_erin(client, users)
+
+    resp = await client.put(
+        f"/api/conversations/{group}/permissions",
+        json={"edit_info": False, "add_members": False, "send_messages": True},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"send_messages": True}
+
+    assert (await client.get(f"/api/conversations/{group}/permissions")).json() == {"send_messages": True}
+
+    # Read the COLUMNS, not the serializer. Now that serialize_permissions omits
+    # both keys unconditionally, the two assertions above cannot tell "ignored"
+    # from "written and no longer shown" — they would pass just as happily if the
+    # PUT had set perm_edit_info=False. The stored row is the only thing that
+    # separates them, and "accepted and ignored" is what this test claims.
+    async with SessionLocal() as db:
+        conv = await db.get(Conversation, uuid.UUID(group))
+        assert conv is not None
+        assert conv.perm_edit_info is True, "the withdrawn key was written after all"
+        assert conv.perm_add_members is True, "the withdrawn key was written after all"
+
+
+async def test_group_info_and_membership_stay_admin_only(client, two_orgs_with_users):
+    """The behaviour the withdrawn toggles misdescribed, pinned.
+
+    perm_edit_info and perm_add_members both default to TRUE, and the settings UI
+    read that as "members may". The server never did: both routes gate on
+    _require_group_admin. This test is what makes re-enforcing those columns a
+    deliberate act rather than an accident — implementing them would loosen access
+    on every existing group, and it would have to change this test to do it.
+    """
+    users = two_orgs_with_users
+    await login(client, "alice@a.com")
+    group = await _group_with_bob_and_erin(client, users)
+
+    # Same org, not yet a member: so a refusal can only be the admin gate, not the
+    # tenant gate. carol would have 404'd on org scoping and proved nothing.
+    frank = await make_user("frank@a.com", org_id=users["org_a"].id, display_name="Frank")
+
+    async with _client_for("bob@a.com") as bob:
+        renamed = await bob.put(f"/api/conversations/{group}/group", json={"name": "Bob's rename"})
+        assert renamed.status_code == 403, renamed.text
+
+        added = await bob.post(
+            f"/api/conversations/{group}/members",
+            json={"user_ids": [str(frank.id)]},
+        )
+        assert added.status_code == 403, added.text
+
+    # The admin can do both, so the 403s above are about role and nothing else.
+    assert (
+        await client.put(f"/api/conversations/{group}/group", json={"name": "Ops renamed"})
+    ).status_code == 200
+    assert (
+        await client.post(f"/api/conversations/{group}/members", json={"user_ids": [str(frank.id)]})
+    ).status_code == 200
 
 
 async def test_cross_org_group_admin_gets_404_from_permissions(client, two_orgs_with_users):

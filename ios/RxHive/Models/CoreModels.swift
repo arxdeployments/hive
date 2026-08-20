@@ -251,14 +251,23 @@ struct LastMessage: Codable, Hashable {
 
 /// `enrich.serialize_permissions` — the group settings object.
 ///
-/// Only three keys, and only two of them map to their own column: `send_messages`
-/// is `admin_only_messages` inverted. The backend deliberately does not expose
-/// `send_history` / `invite_via_link` / `approve_new_members` because no read path
-/// enforces them, so this app must not offer them either — showing a privacy
-/// toggle the server ignores is worse than not having it.
+/// ONE key. `send_messages` is `admin_only_messages` inverted, and the message
+/// routes honour it. The backend deliberately does not expose `send_history` /
+/// `invite_via_link` / `approve_new_members` because no read path enforces them,
+/// and `edit_info` / `add_members` have now joined them for the same reason:
+/// nothing read `perm_edit_info` or `perm_add_members`, because `PUT /{id}/group`
+/// and `POST /{id}/members` gate on group-admin role alone. Showing a toggle the
+/// server ignores is worse than not having it.
+///
+/// `editInfo` and `addMembers` are kept as OPTIONALS rather than deleted, and that
+/// is deliberate. They were non-optional with a synthesized decoder, so a payload
+/// without them throws `keyNotFound` and takes the whole group panel down — the
+/// same failure `MediaItem.id` caused before it was fixed. Optional means this
+/// build decodes both the old wire and the new one, so the app and the server can
+/// be deployed in either order. Nothing reads them; they exist to not crash.
 struct GroupPermissions: Codable, Hashable {
-    let editInfo: Bool
-    let addMembers: Bool
+    let editInfo: Bool?
+    let addMembers: Bool?
     let sendMessages: Bool
 
     enum CodingKeys: String, CodingKey {
