@@ -165,33 +165,38 @@ jobs:
     # box, after the deploy, with the previous containers already stopped.
     #
     # `config` is a pure parse-and-resolve: it renders the merged model without
-    # pulling an image, building anything or contacting a daemon registry.
+    # pulling an image, building anything or contacting a registry.
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: infra
     steps:
       - uses: actions/checkout@v4
+      - name: Seed infra/.env from the committed example
+        # Both compose files carry a service-level `env_file: [.env]`, and
+        # compose requires that file to EXIST — without it `config` fails with
+        # "env file /…/infra/.env not found" before it parses anything.
+        #
+        # Copying the example rather than touching an empty file is the more
+        # useful of the two: it also asserts that the file README tells a new
+        # contributor to copy still carries every variable the dev stack marks
+        # required, so the two cannot drift apart unnoticed. Its placeholder
+        # secrets are fine — nothing in this job starts a container.
+        run: cp .env.example .env
       - name: Validate the dev stack
-        working-directory: infra
-        # Required variables (${VAR:?...}) are supplied as throwaway values: this
-        # checks the file's shape, not the deployment's secrets.
         run: docker compose -f docker-compose.yml config --quiet
-        env:
-          POSTGRES_PASSWORD: ci
-          MINIO_ROOT_PASSWORD: ci
-          LIVEKIT_API_SECRET: ci
-          RXHIVE_SECRET_KEY: ci
       - name: Validate the production stack
-        working-directory: infra
+        # The values user_data.sh.tftpl assembles on the box from SSM are not in
+        # .env.example, so they are supplied here as throwaways: this checks the
+        # file's shape, not the deployment's secrets.
         run: docker compose -f docker-compose.prod.yml config --quiet
         env:
           RXHIVE_DATABASE_URL: postgresql+asyncpg://ci:ci@127.0.0.1:5432/ci
           RXHIVE_S3_BUCKET: ci
           AWS_REGION: us-east-1
-          RXHIVE_SECRET_KEY: ci
-          LIVEKIT_API_SECRET: ci
           SITE_ADDRESS: ci.example.com
       - name: Every long-lived container caps its logs
-        working-directory: infra
         # Docker's json-file driver is unbounded by default and these containers
         # run for the life of the box, so an uncapped service fills the 40 GB
         # root volume and stops the stack. Asserted per service rather than by
@@ -214,8 +219,6 @@ jobs:
           RXHIVE_DATABASE_URL: postgresql+asyncpg://ci:ci@127.0.0.1:5432/ci
           RXHIVE_S3_BUCKET: ci
           AWS_REGION: us-east-1
-          RXHIVE_SECRET_KEY: ci
-          LIVEKIT_API_SECRET: ci
           SITE_ADDRESS: ci.example.com
 
   e2e:
