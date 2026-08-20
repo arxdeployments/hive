@@ -5,10 +5,12 @@ module re-runs the whole surface as a foreign-org caller and demands a 404.
 """
 
 import contextlib
+import uuid
 
 from httpx import ASGITransport, AsyncClient
 
-from app.db.models import UserRole
+from app.db.models import Conversation, UserRole
+from app.db.session import SessionLocal
 from app.main import app
 from tests.conftest import CSRF, login, make_user
 
@@ -248,8 +250,18 @@ async def test_the_withdrawn_permission_keys_are_accepted_and_ignored(client, tw
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"send_messages": True}
 
-    # And nothing was stored under them either: the read is still one key.
     assert (await client.get(f"/api/conversations/{group}/permissions")).json() == {"send_messages": True}
+
+    # Read the COLUMNS, not the serializer. Now that serialize_permissions omits
+    # both keys unconditionally, the two assertions above cannot tell "ignored"
+    # from "written and no longer shown" — they would pass just as happily if the
+    # PUT had set perm_edit_info=False. The stored row is the only thing that
+    # separates them, and "accepted and ignored" is what this test claims.
+    async with SessionLocal() as db:
+        conv = await db.get(Conversation, uuid.UUID(group))
+        assert conv is not None
+        assert conv.perm_edit_info is True, "the withdrawn key was written after all"
+        assert conv.perm_add_members is True, "the withdrawn key was written after all"
 
 
 async def test_group_info_and_membership_stay_admin_only(client, two_orgs_with_users):
