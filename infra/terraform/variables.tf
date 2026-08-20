@@ -93,9 +93,11 @@ variable "db_max_allocated_storage" {
     this stack ran with: a full volume then means `storage-full`, where every
     write fails until an operator modifies the instance by hand.
 
-    Must be 0 or strictly greater than db_allocated_storage — RDS rejects an
-    equal value, and data.tf has a precondition that catches it at plan time
-    rather than mid-apply.
+    Must be 0, or at least 10% greater than db_allocated_storage: that is an RDS
+    requirement, not a rounding allowance, and it is enforced by the API
+    mid-apply rather than by the plan. So against the default 20 GB allocation
+    the smallest accepted value is 22, not 21. data.tf carries a precondition
+    that catches it at plan time.
 
     100 GB against a 20 GB allocation is five times the headroom for a volume
     nothing prunes. Autoscaling is not itself billable and RDS only grows the

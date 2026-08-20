@@ -14,6 +14,14 @@ on:
 permissions:
   contents: read
 
+# Every `uses:` below is pinned to a full commit SHA, with the tag it resolved
+# from in the trailing comment. A tag is a mutable pointer the action's owner
+# can move, so `@v4` is a promise about intent rather than about bytes: the
+# same workflow can run different third-party code on two consecutive days,
+# and a compromised upstream account is enough to change it. A SHA cannot be
+# moved. The cost is that these no longer pick up fixes on their own — bump
+# them deliberately (Dependabot handles pinned SHAs and rewrites the comment).
+
 # One run per ref. Without this, three pushes to a branch in quick succession
 # run three full pipelines to completion — and this pipeline boots Postgres,
 # Redis, MinIO, a LiveKit SFU and a browser. Superseded PR runs are cancelled;
@@ -66,8 +74,14 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This workflow only ever reads the tree. Left at the default,
+          # checkout leaves the job's token in .git/config for everything
+          # that runs afterwards — including third-party actions, a remote
+          # install script and a browser.
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
           cache: pip
@@ -99,8 +113,14 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This workflow only ever reads the tree. Left at the default,
+          # checkout leaves the job's token in .git/config for everything
+          # that runs afterwards — including third-party actions, a remote
+          # install script and a browser.
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -121,8 +141,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10  # a pip install and one text scan
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This workflow only ever reads the tree. Left at the default,
+          # checkout leaves the job's token in .git/config for everything
+          # that runs afterwards — including third-party actions, a remote
+          # install script and a browser.
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
           cache: pip
@@ -141,8 +167,14 @@ jobs:
       run:
         working-directory: infra/terraform
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This workflow only ever reads the tree. Left at the default,
+          # checkout leaves the job's token in .git/config for everything
+          # that runs afterwards — including third-party actions, a remote
+          # install script and a browser.
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: "1.9"
           terraform_wrapper: false
@@ -172,7 +204,13 @@ jobs:
       run:
         working-directory: infra
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This workflow only ever reads the tree. Left at the default,
+          # checkout leaves the job's token in .git/config for everything
+          # that runs afterwards — including third-party actions, a remote
+          # install script and a browser.
+          persist-credentials: false
       - name: Seed infra/.env from the committed example
         # Both compose files carry a service-level `env_file: [.env]`, and
         # compose requires that file to EXIST — without it `config` fails with
@@ -199,21 +237,58 @@ jobs:
       - name: Every long-lived container caps its logs
         # Docker's json-file driver is unbounded by default and these containers
         # run for the life of the box, so an uncapped service fills the 40 GB
-        # root volume and stops the stack. Asserted per service rather than by
-        # grepping for the anchor: a service added later without `logging:` is
-        # exactly the regression worth catching, and it would not mention it.
+        # root volume and stops the stack.
+        #
+        # Asserted per service rather than by grepping for the YAML anchor: a
+        # service added later without `logging:` is exactly the regression worth
+        # catching, and it would not mention the anchor.
+        #
+        # The budget, not the literal values. Requiring max-size == "10m" would
+        # fail a deliberate retune to 20m that is still perfectly bounded, while
+        # merely requiring max-size to be PRESENT would pass "100g", which is
+        # unbounded in every sense that matters here. So the check resolves
+        # max-size x max-file per service and holds the fleet total against a
+        # ceiling — which is the property the root volume actually cares about.
         run: |
           docker compose -f docker-compose.prod.yml config --format json \
             | python3 -c '
           import json, sys
+
+          # Docker accepts a k/m/g suffix on max-size; no suffix means bytes.
+          UNITS = {"": 1, "b": 1, "k": 1024, "m": 1024**2, "g": 1024**3}
+          MIB = 1024**2
+          TOTAL_BUDGET_MIB = 1024
+
+          def to_bytes(value):
+              text = str(value).strip().lower()
+              digits = text.rstrip("bkmg")
+              suffix = text[len(digits):].rstrip("b") if digits else ""
+              return int(float(digits) * UNITS[suffix])
+
           services = json.load(sys.stdin)["services"]
-          missing = sorted(
-              name for name, svc in services.items()
-              if not (svc.get("logging") or {}).get("options", {}).get("max-size")
-          )
-          if missing:
-              sys.exit(f"services with uncapped logs: {missing}")
-          print(f"all {len(services)} services cap their logs")
+          problems = []
+          total = 0
+          for name, svc in sorted(services.items()):
+              logging = svc.get("logging") or {}
+              options = logging.get("options") or {}
+              driver = logging.get("driver")
+              size = options.get("max-size")
+              files = options.get("max-file")
+              if driver != "json-file":
+                  problems.append(name + ": driver is " + repr(driver) + ", expected json-file")
+                  continue
+              if not size or not files:
+                  problems.append(name + ": json-file without both max-size and max-file, so unbounded")
+                  continue
+              budget = to_bytes(size) * int(files)
+              total += budget
+              print("  {}: {} x {} = {} MiB".format(name, size, files, budget // MIB))
+          if problems:
+              sys.exit("uncapped or unexpected logging:" + "".join("\n  " + p for p in problems))
+          total_mib = total // MIB
+          print("total log budget across {} services: {} MiB".format(len(services), total_mib))
+          if total_mib > TOTAL_BUDGET_MIB:
+              sys.exit("total {} MiB exceeds the {} MiB ceiling for a 40 GB root volume".format(total_mib, TOTAL_BUDGET_MIB))
           '
         env:
           RXHIVE_DATABASE_URL: postgresql+asyncpg://ci:ci@127.0.0.1:5432/ci
@@ -272,13 +347,19 @@ jobs:
       E2E_API_URL: http://127.0.0.1:8000
       E2E_SUPERADMIN_PASSWORD: CiSuperadminPass123
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This workflow only ever reads the tree. Left at the default,
+          # checkout leaves the job's token in .git/config for everything
+          # that runs afterwards — including third-party actions, a remote
+          # install script and a browser.
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: backend/requirements.txt
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -405,7 +486,7 @@ jobs:
 
       - name: Upload report on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: playwright-report
           path: frontend/test-results/
@@ -416,7 +497,13 @@ jobs:
     timeout-minutes: 25  # two image builds from cold
     needs: [backend, frontend]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This workflow only ever reads the tree. Left at the default,
+          # checkout leaves the job's token in .git/config for everything
+          # that runs afterwards — including third-party actions, a remote
+          # install script and a browser.
+          persist-credentials: false
       - name: Build backend image
         run: docker build -t rxhive-api ./backend
       - name: Build frontend image

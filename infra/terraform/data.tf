@@ -140,11 +140,15 @@ resource "aws_db_instance" "main" {
   }
 
   lifecycle {
-    # RDS rejects a max equal to allocated_storage, and the rejection arrives
-    # from the API mid-apply rather than from the plan. Catch it at plan time.
+    # RDS does not merely require the max to EXCEED allocated_storage — it
+    # requires at least 10% more, and rejects anything less from the API
+    # mid-apply rather than from the plan. `> allocated` would therefore have let
+    # 21 against a 20 GB allocation through the check and straight into the
+    # failure the check exists to prevent. ceil() because allocated_storage is
+    # whole gigabytes and 10% of an odd value is not.
     precondition {
-      condition     = var.db_max_allocated_storage == 0 || var.db_max_allocated_storage > var.db_allocated_storage
-      error_message = "db_max_allocated_storage must be 0 (autoscaling off) or strictly greater than db_allocated_storage."
+      condition     = var.db_max_allocated_storage == 0 || var.db_max_allocated_storage >= ceil(var.db_allocated_storage * 1.1)
+      error_message = "db_max_allocated_storage must be 0 (autoscaling off) or at least 10% greater than db_allocated_storage, which RDS requires."
     }
   }
 }
