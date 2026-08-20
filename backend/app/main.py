@@ -12,7 +12,7 @@ from sqlalchemy import text
 from app.core.config import get_settings
 from app.core.deps import require_superadmin
 from app.core.errors import CodedHTTPException, coded_http_exception_handler
-from app.core.observability import AccessLogMiddleware, snapshot
+from app.core.observability import AccessLogMiddleware, install_json_logging, snapshot
 from app.db.models import User
 from app.db.session import engine
 from app.realtime import hub
@@ -20,7 +20,17 @@ from app.realtime.redis_bus import close_redis, get_redis
 from app.utils import iso_z, now_utc
 
 logger = logging.getLogger("rxhive")
-logging.basicConfig(level=logging.INFO)
+
+# JSON on stdout, and the write off the event loop. core/observability's access
+# log has always assumed both and had neither: `basicConfig(level=INFO)` alone
+# installs the default "%(levelname)s:%(name)s:%(message)s" format, and every
+# field this app records goes through `extra=` — which that format string does not
+# emit. So each request logged the single word "access", and errors logged a
+# traceback with no request id and no path to attribute it to.
+#
+# The listener is returned so lifespan shutdown can drain the queue; see
+# install_json_logging for why the write must not happen on the loop.
+_log_listener = install_json_logging()
 
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # Cookie-authed browsers must present the custom header (CSRF defense: cross-site
@@ -74,6 +84,10 @@ async def lifespan(app: FastAPI):
     await hub.registry.stop()
     await close_redis()
     await engine.dispose()
+    # Last, and after everything above has had its say: stopping the listener is
+    # what drains the queue, so anything the shutdown path logged is still
+    # buffered until this runs.
+    _log_listener.stop()
 
 
 settings = get_settings()
