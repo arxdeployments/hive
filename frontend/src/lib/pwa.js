@@ -49,7 +49,18 @@ export async function enablePushNotifications() {
  * `storage` is deliberately not passed: this is the Settings toggle, which owns
  * `rxhive_desktop_notif` itself and writes it as the user flips the switch.
  * Clearing it from in here would fight that effect.
+ *
+ * Throws when a subscription existed and could not be revoked, because the caller
+ * is a toggle that rolls itself back on failure. tearDownPush never throws — that
+ * is its contract, and the right one for a sign-out, which must complete either
+ * way — so the failure has to be raised here or the switch would move to "off"
+ * over a subscription that is still live and still delivering.
+ *
+ * A missing subscription is not a failure: there was nothing to turn off.
  */
 export async function disablePushNotifications() {
-  await tearDownPush({ nav: navigator, api: client });
+  const { hadSubscription, unsubscribed } = await tearDownPush({ nav: navigator, api: client });
+  if (hadSubscription && !unsubscribed) {
+    throw new Error('Could not turn off notifications on this device');
+  }
 }

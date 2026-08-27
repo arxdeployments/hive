@@ -89,7 +89,7 @@ describe('tearDownPush', () => {
       'delete /api/notifications/subscribe https://push.example.test/f/abc123',
       'unsubscribe',
     ]);
-    assert.deepEqual(result, { serverCleared: true, unsubscribed: true });
+    assert.deepEqual(result, { hadSubscription: true, serverCleared: true, unsubscribed: true });
   });
 
   it('clears the notification preferences the next user would inherit', async () => {
@@ -122,7 +122,7 @@ describe('tearDownPush', () => {
     });
 
     assert.ok(calls.includes('unsubscribe'), 'a failed DELETE skipped the unsubscribe');
-    assert.deepEqual(result, { serverCleared: false, unsubscribed: true });
+    assert.deepEqual(result, { hadSubscription: true, serverCleared: false, unsubscribed: true });
   });
 
   it('unsubscribes without touching the API when no client is supplied', async () => {
@@ -133,7 +133,7 @@ describe('tearDownPush', () => {
     });
 
     assert.deepEqual(calls, ['getSubscription', 'unsubscribe']);
-    assert.deepEqual(result, { serverCleared: false, unsubscribed: true });
+    assert.deepEqual(result, { hadSubscription: true, serverCleared: false, unsubscribed: true });
   });
 
   it('gives up instead of hanging when the service worker never becomes ready', async () => {
@@ -150,7 +150,7 @@ describe('tearDownPush', () => {
     });
 
     assert.deepEqual(calls, [], 'nothing should have been called');
-    assert.deepEqual(result, { serverCleared: false, unsubscribed: false });
+    assert.deepEqual(result, { hadSubscription: false, serverCleared: false, unsubscribed: false });
   });
 
   it('does nothing when this browser has no subscription', async () => {
@@ -162,7 +162,7 @@ describe('tearDownPush', () => {
     });
 
     assert.deepEqual(calls, ['getSubscription']);
-    assert.deepEqual(result, { serverCleared: false, unsubscribed: false });
+    assert.deepEqual(result, { hadSubscription: false, serverCleared: false, unsubscribed: false });
   });
 
   it('reports failure rather than throwing when the subscription refuses', async () => {
@@ -179,15 +179,18 @@ describe('tearDownPush', () => {
       storage: fakeStorage(),
     });
 
+    // Both halves matter: this is the case disablePushNotifications turns into a
+    // throw, and it can only tell it apart from "nothing to do" by hadSubscription.
+    assert.equal(result.hadSubscription, true);
     assert.equal(result.unsubscribed, false);
   });
 
   it('survives an environment with no service worker at all', async () => {
-    const result = await tearDownPush({ nav: {}, api: fakeApi([]), storage: fakeStorage() });
-    assert.deepEqual(result, { serverCleared: false, unsubscribed: false });
+    const none = { hadSubscription: false, serverCleared: false, unsubscribed: false };
+    assert.deepEqual(await tearDownPush({ nav: {}, api: fakeApi([]), storage: fakeStorage() }), none);
 
     // And with no navigator whatsoever, which is how this runs under SSR or a test.
-    assert.deepEqual(await tearDownPush(), { serverCleared: false, unsubscribed: false });
+    assert.deepEqual(await tearDownPush(), none);
   });
 
   it('survives storage that throws, as it does in private mode', () => {

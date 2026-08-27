@@ -71,7 +71,12 @@ async function withTimeout(promise, ms) {
  * expired-session paths a DELETE would 401 and re-enter the refresh interceptor
  * for a session that is already over.
  *
- * @returns {Promise<{serverCleared: boolean, unsubscribed: boolean}>}
+ * `hadSubscription` is reported separately from `unsubscribed` so a caller can
+ * tell "there was nothing to do" from "there was, and it failed". The sign-out
+ * paths do not care; the Settings toggle does, because those two have to move the
+ * switch in opposite directions.
+ *
+ * @returns {Promise<{hadSubscription: boolean, serverCleared: boolean, unsubscribed: boolean}>}
  */
 export async function tearDownPush({
   nav,
@@ -80,7 +85,7 @@ export async function tearDownPush({
   readyTimeoutMs = SW_READY_TIMEOUT_MS,
 } = {}) {
   clearNotificationPrefs(storage);
-  const result = { serverCleared: false, unsubscribed: false };
+  const result = { hadSubscription: false, serverCleared: false, unsubscribed: false };
   if (!nav || !('serviceWorker' in nav)) return result;
   try {
     const reg = await withTimeout(nav.serviceWorker.ready, readyTimeoutMs);
@@ -88,6 +93,7 @@ export async function tearDownPush({
       ? await withTimeout(reg.pushManager.getSubscription(), readyTimeoutMs)
       : null;
     if (!sub?.endpoint) return result;
+    result.hadSubscription = true;
     // The server row goes first, and only then the browser subscription: DELETE
     // /api/notifications/subscribe authenticates as the caller, so it has to
     // happen before the logout POST clears the cookies. A row left behind keeps
