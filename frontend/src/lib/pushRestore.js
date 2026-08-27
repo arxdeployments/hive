@@ -132,6 +132,7 @@ export async function restorePushSubscription({
   getPermission,
   wantsPush,
   subscribe,
+  tearDown,
   isCancelled = () => false,
   timeoutMs = RESTORE_TIMEOUT_MS,
 }) {
@@ -153,6 +154,21 @@ export async function restorePushSubscription({
     if (!restore) return false;
 
     await subscribe();
+
+    // The checks above did NOT close the window, they only moved it. subscribe()
+    // is several network round trips — the VAPID key, the push service, then the
+    // POST that registers the endpoint — so a session can end inside it too.
+    //
+    // And this is the worst place for that to happen. Sign-out runs the teardown
+    // BEFORE the logout request, so it looks for a subscription that does not
+    // exist yet, deletes nothing, and returns; then this POST lands with cookies
+    // that are still valid and persists a subscription bound to the user who has
+    // just left. Teardown cannot protect against something created after it ran,
+    // so the restore has to clean up after itself.
+    if (isCancelled() || !wantsPush()) {
+      if (tearDown) await tearDown();
+      return false;
+    }
     return true;
   } catch {
     // The user's own next visit to Settings is the fallback.

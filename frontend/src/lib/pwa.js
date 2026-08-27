@@ -110,6 +110,10 @@ export async function healPushSubscription({ isCancelled } = {}) {
     getPermission: () => (typeof Notification === 'undefined' ? 'default' : Notification.permission),
     wantsPush: wantsDesktopNotifications,
     subscribe: subscribeToPush,
+    // Undoes a subscription this restore created after its session had already
+    // ended. No `storage`: the sign-out teardown has cleared those keys already,
+    // and this must not touch a preference it does not own.
+    tearDown: () => tearDownPush({ nav: navigator, api: client }),
     isCancelled,
   });
 }
