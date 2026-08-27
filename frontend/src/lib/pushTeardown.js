@@ -25,8 +25,15 @@ export const SESSION_NOTIFICATION_KEYS = [
   'rxhive_notif_asked',
 ];
 
-/** Bound on each await below. See withTimeout. */
-export const SW_READY_TIMEOUT_MS = 3000;
+/**
+ * Wall-clock budget for the WHOLE teardown, not per step.
+ *
+ * Each await below is bounded, and they share this one deadline rather than
+ * getting 3s each: four sequential steps with their own budget is a twelve-second
+ * sign-out in the worst case, which is a hang as far as the person clicking is
+ * concerned.
+ */
+export const TEARDOWN_TIMEOUT_MS = 3000;
 
 /** Drop the departing user's notification preferences. Never throws. */
 export function clearNotificationPrefs(storage) {
@@ -41,12 +48,19 @@ export function clearNotificationPrefs(storage) {
 }
 
 /**
- * `navigator.serviceWorker.ready` never resolves when no worker is registered —
- * it is not a rejected promise, it is a permanently pending one. Awaited
- * unguarded on a sign-out path that is a sign-out button which hangs forever,
- * and failed SW registration is not exotic: a corporate proxy serving the wrong
- * content type for /sw.js, or storage blocked by policy, both do it, and
- * registerServiceWorker() only console.warns when they do.
+ * Resolve `undefined` instead of waiting forever. Two of the awaits below can
+ * hang outright rather than fail:
+ *
+ *   - `navigator.serviceWorker.ready` is a PERMANENTLY PENDING promise when no
+ *     worker is registered, not a rejected one, and registration is what fails
+ *     behind a proxy serving /sw.js as the wrong content type — where
+ *     registerServiceWorker() only console.warns.
+ *   - the axios instance in api/client.js sets no `timeout`, and axios defaults
+ *     to 0, meaning never. A black-holed API therefore leaves the DELETE pending
+ *     for as long as the socket lives.
+ *
+ * Either one, awaited unguarded on this path, is a sign-out button that does not
+ * come back.
  */
 async function withTimeout(promise, ms) {
   let timer;
@@ -82,15 +96,20 @@ export async function tearDownPush({
   nav,
   api,
   storage,
-  readyTimeoutMs = SW_READY_TIMEOUT_MS,
+  timeoutMs = TEARDOWN_TIMEOUT_MS,
 } = {}) {
   clearNotificationPrefs(storage);
   const result = { hadSubscription: false, serverCleared: false, unsubscribed: false };
   if (!nav || !('serviceWorker' in nav)) return result;
+
+  // One deadline for everything that follows. Each step gets what is left of it.
+  const expiry = Date.now() + timeoutMs;
+  const remaining = () => Math.max(0, expiry - Date.now());
+
   try {
-    const reg = await withTimeout(nav.serviceWorker.ready, readyTimeoutMs);
+    const reg = await withTimeout(nav.serviceWorker.ready, remaining());
     const sub = reg?.pushManager
-      ? await withTimeout(reg.pushManager.getSubscription(), readyTimeoutMs)
+      ? await withTimeout(reg.pushManager.getSubscription(), remaining())
       : null;
     if (!sub?.endpoint) return result;
     result.hadSubscription = true;
@@ -101,17 +120,28 @@ export async function tearDownPush({
     // has just left.
     if (api) {
       try {
-        await api.delete('/api/notifications/subscribe', { data: { endpoint: sub.endpoint } });
-        result.serverCleared = true;
+        // Bounded, and the .then(true) is what distinguishes a completed DELETE
+        // from a timed-out one: withTimeout resolves undefined when it gives up,
+        // which must not be recorded as the row having been cleared.
+        const cleared = await withTimeout(
+          api
+            .delete('/api/notifications/subscribe', { data: { endpoint: sub.endpoint } })
+            .then(() => true),
+          remaining(),
+        );
+        result.serverCleared = cleared === true;
       } catch {
         // Expired session, offline, or the API is down. The unsubscribe below
         // still stops delivery to this browser, which is the part that matters.
       }
     }
-    // The half that actually stops delivery here, and the reason a failed server
-    // call is survivable: once the endpoint is gone the push service answers
-    // 404/410 and services/push.py prunes the row on the next send.
-    result.unsubscribed = (await withTimeout(sub.unsubscribe(), readyTimeoutMs)) === true;
+    // The half that actually stops delivery here, and the reason a failed or
+    // abandoned server call is survivable: once the endpoint is gone the push
+    // service answers 404/410 and services/push.py prunes the row on the next
+    // send. Given its own remaining budget rather than being skipped when the
+    // DELETE used all of it — this is the step worth spending the last of the
+    // deadline on.
+    result.unsubscribed = (await withTimeout(sub.unsubscribe(), Math.max(remaining(), 250))) === true;
   } catch {
     // Best-effort by contract. Whatever happened, the sign-out proceeds.
   }

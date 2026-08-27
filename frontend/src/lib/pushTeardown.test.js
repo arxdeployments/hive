@@ -48,13 +48,16 @@ function fakeNav(calls, { sub = null, ready, getSubscription } = {}) {
   };
 }
 
-/** An axios-shaped client that records the DELETE, or fails it. */
-function fakeApi(calls, { fail = false } = {}) {
+/** An axios-shaped client that records the DELETE, or fails it, or hangs. */
+function fakeApi(calls, { fail = false, hang = false } = {}) {
   return {
-    delete: async (url, config) => {
+    delete: (url, config) => {
       calls.push(`delete ${url} ${config?.data?.endpoint}`);
-      if (fail) throw new Error('401');
-      return { data: {} };
+      // The axios instance in api/client.js sets no `timeout` and axios defaults
+      // to 0 — never — so a black-holed API really does leave this pending.
+      if (hang) return new Promise(() => {});
+      if (fail) return Promise.reject(new Error('401'));
+      return Promise.resolve({ data: {} });
     },
   };
 }
@@ -146,11 +149,33 @@ describe('tearDownPush', () => {
       nav: fakeNav(calls, { ready: new Promise(() => {}) }),
       api: fakeApi(calls),
       storage: fakeStorage(),
-      readyTimeoutMs: 5,
+      timeoutMs: 5,
     });
 
     assert.deepEqual(calls, [], 'nothing should have been called');
     assert.deepEqual(result, { hadSubscription: false, serverCleared: false, unsubscribed: false });
+  });
+
+  it('unsubscribes anyway when the server DELETE never answers', async () => {
+    // The whole reason the teardown is bounded rather than merely try/caught. A
+    // request that hangs is not a request that fails: awaited unguarded this is a
+    // sign-out button that never comes back, and the unsubscribe below it — the
+    // step that actually stops delivery to this machine — never runs at all.
+    const calls = [];
+    const started = Date.now();
+    const result = await tearDownPush({
+      nav: fakeNav(calls, { sub: fakeSubscription(calls) }),
+      api: fakeApi(calls, { hang: true }),
+      storage: fakeStorage(),
+      timeoutMs: 40,
+    });
+
+    assert.ok(calls.includes('unsubscribe'), 'a hung DELETE swallowed the unsubscribe');
+    assert.equal(result.serverCleared, false, 'a timed-out DELETE must not count as cleared');
+    assert.equal(result.unsubscribed, true);
+    // Bounded by the deadline, not by the request. Generous upper bound so this
+    // does not go flaky on a loaded runner; the point is that it returns at all.
+    assert.ok(Date.now() - started < 2000, 'the teardown outlived its deadline');
   });
 
   it('does nothing when this browser has no subscription', async () => {
