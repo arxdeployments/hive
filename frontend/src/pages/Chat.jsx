@@ -3,7 +3,9 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { ChatSidebar } from '../components/chat/ChatSidebar';
 import { ChatPanel } from '../components/chat/ChatPanel';
 import { ChatErrorBoundary } from '../components/shared/ErrorBoundary';
+import { toast } from 'sonner';
 import useChatStore from '../stores/chatStore';
+import { enablePushNotifications } from '../lib/pwa';
 
 export default function Chat() {
   // Narrow selectors. This component renders the whole chat surface, so
@@ -76,12 +78,41 @@ export default function Chat() {
     return () => clearTimeout(timer);
   }, [notifAsked]);
 
-  const handleEnableNotifications = () => {
-    if (typeof Notification !== 'undefined') {
-      Notification.requestPermission();
-    }
+  /**
+   * The banner's Enable, which used to request the OS permission and stop there.
+   *
+   * That is the same inert path Settings.jsx was moved off: permission alone
+   * creates no PushSubscription row, so services/push.py had nothing to send to
+   * and push_to_users short-circuited on an empty subscription set. The banner
+   * vanished, the permission was granted, and the user had every reason to think
+   * notifications were on while receiving none — including, per
+   * services/calls.py:_dispatch_call_push, no ring at all for a call arriving
+   * while their socket is down, which is the one case push exists to cover.
+   *
+   * enablePushNotifications() requests the permission itself as its first act, so
+   * calling it straight from the click keeps that inside the user gesture —
+   * Safari rejects Notification.requestPermission() outside one.
+   */
+  const handleEnableNotifications = async () => {
+    // Dismissed up front and regardless of the outcome: a banner that returns
+    // while the permission prompt is still open is worse than one the user has to
+    // re-find in Settings, and a denial is not something to keep asking about.
     localStorage.setItem('rxhive_notif_asked', 'true');
     setNotifAsked(true);
+    try {
+      await enablePushNotifications();
+      // Settings reads this back as the state of its own toggle. Written on
+      // success only, so a failed subscribe does not leave the switch claiming
+      // one exists.
+      localStorage.setItem('rxhive_desktop_notif', 'true');
+      toast.success('Notifications enabled');
+    } catch (err) {
+      // Each message is separately actionable — permission denied, unsupported
+      // browser, VAPID not provisioned server-side — so it is shown verbatim,
+      // matching the Settings toggle. Silence here is what let a denial read as
+      // success.
+      toast.error(err?.message || 'Could not enable notifications');
+    }
   };
 
   const handleDismissNotifications = () => {
