@@ -81,6 +81,22 @@ describe('Web Push subscription state', () => {
       /const\s+desktopNotif\s*=[^;]*desktopNotifPref[^;]*pushSubscribed|const\s+desktopNotif\s*=[^;]*pushSubscribed[^;]*desktopNotifPref/,
       'the toggle value is not derived from both the preference and the subscription.',
     );
+    // And the mount lookup must not land on top of a deliberate toggle. Its
+    // `cancelled` flag only flips on unmount, so without a separate guard the late
+    // answer — false, correctly, because nothing was subscribed at mount — beat
+    // the optimistic true and left the switch off after a SUCCESSFUL subscribe.
+    // Asserted as wiring because the behaviour needs a React harness this repo
+    // does not have; the logic it guards is one boolean.
+    assert.match(
+      source,
+      /!\s*notifTouched\.current/,
+      'the mount lookup can overwrite a user action: it is not guarded against one.',
+    );
+    assert.match(
+      source,
+      /notifTouched\.current\s*=\s*true/,
+      'nothing ever marks the toggle as touched, so the guard above can never fire.',
+    );
   });
 
   it('the session restores a subscription the user asked for and lost', () => {

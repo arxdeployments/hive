@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { ArrowLeft, Bell, BellOff, Keyboard, Type, Lock, Eye, EyeOff } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -142,12 +142,28 @@ export default function SettingsPage() {
    */
   const desktopNotif = pushSubscribed === null ? desktopNotifPref : (desktopNotifPref && pushSubscribed);
 
-  // Ground truth, asked once on mount. Nothing is written back: the answer is the
-  // browser's, and persisting it is what created the drift.
+  // Set as soon as the user touches the toggle, and never unset. It exists to
+  // stop the mount lookup below from landing on top of a deliberate action.
+  const notifTouched = useRef(false);
+
+  /**
+   * Ground truth, asked once on mount. Nothing is written back: the answer is the
+   * browser's, and persisting it is what created the drift this batch fixes.
+   *
+   * `cancelled` alone was not enough, because it only flips on UNMOUNT. Toggle the
+   * switch while this lookup is still out and the late answer — false, correctly,
+   * because there was no subscription when the page mounted — overwrote the
+   * optimistic true that handleDesktopNotif had just set. The subscribe then
+   * SUCCEEDED, the toast said so, and the switch sat there reading off.
+   *
+   * So a user action wins over an in-flight lookup, permanently: after the first
+   * touch, handleDesktopNotif owns this value and the mount answer is stale by
+   * definition.
+   */
   useEffect(() => {
     let cancelled = false;
     pushSubscriptionExists().then((exists) => {
-      if (!cancelled) setPushSubscribed(exists);
+      if (!cancelled && !notifTouched.current) setPushSubscribed(exists);
     });
     return () => { cancelled = true; };
   }, []);
@@ -177,6 +193,9 @@ export default function SettingsPage() {
    */
   const handleDesktopNotif = async (val) => {
     if (notifBusy) return;
+    // Before anything else: from here on the mount lookup must not write to
+    // pushSubscribed, whatever order the two finish in.
+    notifTouched.current = true;
     setNotifBusy(true);
     // Both, optimistically: the preference because the user just expressed it,
     // and the subscription because that is what the call below is about to do.
