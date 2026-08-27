@@ -1,6 +1,9 @@
 // Service-worker registration + Web Push subscription helpers.
 import client from '../api/client';
 import { tearDownPush } from './pushTeardown';
+import { hasPushSubscription, restorePushSubscription } from './pushRestore';
+import { wantsDesktopNotifications } from '../utils/notificationPrefs';
+import { withTimeout } from './withTimeout';
 
 export function registerServiceWorker() {
   if (!('serviceWorker' in navigator)) return;
@@ -11,6 +14,9 @@ export function registerServiceWorker() {
   });
 }
 
+/** Bound on the service-worker await inside subscribeToPush. */
+const SUBSCRIBE_TIMEOUT_MS = 3000;
+
 function urlBase64ToUint8Array(base64String) {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
   const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
@@ -18,17 +24,38 @@ function urlBase64ToUint8Array(base64String) {
   return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
 }
 
-export async function enablePushNotifications() {
-  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+/** serviceWorker + PushManager both present. */
+export function pushSupported() {
+  return typeof navigator !== 'undefined'
+    && 'serviceWorker' in navigator
+    && typeof window !== 'undefined'
+    && 'PushManager' in window;
+}
+
+/**
+ * Create the subscription and register it with the API. Does NOT prompt.
+ *
+ * Split out of enablePushNotifications so the silent restore below can reuse the
+ * subscribe half without the permission half: requestPermission() must run
+ * inside a user gesture for Safari to honour it, and the restore has no gesture
+ * behind it. Requires permission to be granted already, and says so rather than
+ * prompting.
+ */
+export async function subscribeToPush() {
+  if (!pushSupported()) {
     throw new Error('Push notifications are not supported in this browser');
   }
-  const permission = await Notification.requestPermission();
-  if (permission !== 'granted') throw new Error('Notification permission denied');
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
+    throw new Error('Notification permission denied');
+  }
 
   const { data } = await client.get('/api/notifications/vapid-key');
   if (!data.public_key) throw new Error('Push is not configured on the server');
 
-  const reg = await navigator.serviceWorker.ready;
+  // Bounded: serviceWorker.ready never resolves when no worker is registered,
+  // and this now runs on an app-start effect as well as behind a click.
+  const reg = await withTimeout(navigator.serviceWorker.ready, SUBSCRIBE_TIMEOUT_MS);
+  if (!reg?.pushManager) throw new Error('The service worker is not available');
   const sub = await reg.pushManager.subscribe({
     userVisibleOnly: true,
     applicationServerKey: urlBase64ToUint8Array(data.public_key),
@@ -40,6 +67,51 @@ export async function enablePushNotifications() {
     keys: json.keys,
   });
   return true;
+}
+
+export async function enablePushNotifications() {
+  if (!pushSupported()) {
+    throw new Error('Push notifications are not supported in this browser');
+  }
+  // First, and before any await that is not this one, so it stays inside the
+  // click that called us.
+  const permission = await Notification.requestPermission();
+  if (permission !== 'granted') throw new Error('Notification permission denied');
+  return subscribeToPush();
+}
+
+/**
+ * Does this browser hold a subscription? `null` means "could not find out".
+ *
+ * Settings uses it to stop reporting a subscription that does not exist.
+ */
+export function pushSubscriptionExists() {
+  return hasPushSubscription({ nav: typeof navigator === 'undefined' ? undefined : navigator });
+}
+
+/**
+ * Re-create a subscription for somebody who already asked for one and lost it.
+ *
+ * A thin binder over restorePushSubscription, which owns the rules and is where
+ * they are tested. Silent by design: never prompts, never throws, and does
+ * nothing unless the stored preference is an explicit yes and the OS permission
+ * is already granted.
+ *
+ * `isCancelled` is supplied by the caller's effect cleanup so a session ending
+ * mid-flight aborts the restore — see restorePushSubscription for why the
+ * preference and the permission are read as functions rather than values.
+ *
+ * @returns {Promise<boolean>} whether a subscription was actually created
+ */
+export async function healPushSubscription({ isCancelled } = {}) {
+  return restorePushSubscription({
+    nav: typeof navigator === 'undefined' ? undefined : navigator,
+    pushSupported: pushSupported(),
+    getPermission: () => (typeof Notification === 'undefined' ? 'default' : Notification.permission),
+    wantsPush: wantsDesktopNotifications,
+    subscribe: subscribeToPush,
+    isCancelled,
+  });
 }
 
 /**

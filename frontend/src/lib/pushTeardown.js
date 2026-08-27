@@ -1,12 +1,19 @@
 /**
  * Web Push teardown, shared by every sign-out path.
  *
- * Deliberately imports nothing. api/client.js reads `import.meta.env` at module
- * scope, which is a Vite construct, so importing the axios instance from here
- * would make this file unloadable under `npm run test:unit` — Node's own runner,
- * no bundler. The client and the browser globals are passed in instead, which is
- * also what lets the unit tests drive the failure paths.
+ * Imports nothing outside this directory, and nothing that reaches api/client.js
+ * — that module reads `import.meta.env` at module scope, which is a Vite
+ * construct, so importing the axios instance from here would make this file
+ * unloadable under `npm run test:unit` (Node's own runner, no bundler). The
+ * client and the browser globals are passed in instead, which is also what lets
+ * the unit tests drive the failure paths.
+ *
+ * The `.js` on the import below is required, not stylistic: Vite resolves
+ * extensionless specifiers, Node's ESM loader does not, so dropping it fails the
+ * unit suite with ERR_MODULE_NOT_FOUND while `vite build` stays perfectly green.
  */
+
+import { withTimeout } from './withTimeout.js';
 
 /**
  * The localStorage keys that record THIS user's notification choices.
@@ -44,35 +51,6 @@ export function clearNotificationPrefs(storage) {
     } catch {
       // Private mode, or storage blocked by policy. Nothing to clean up then.
     }
-  }
-}
-
-/**
- * Resolve `undefined` instead of waiting forever. Two of the awaits below can
- * hang outright rather than fail:
- *
- *   - `navigator.serviceWorker.ready` is a PERMANENTLY PENDING promise when no
- *     worker is registered, not a rejected one, and registration is what fails
- *     behind a proxy serving /sw.js as the wrong content type — where
- *     registerServiceWorker() only console.warns.
- *   - the axios instance in api/client.js sets no `timeout`, and axios defaults
- *     to 0, meaning never. A black-holed API therefore leaves the DELETE pending
- *     for as long as the socket lives.
- *
- * Either one, awaited unguarded on this path, is a sign-out button that does not
- * come back.
- */
-async function withTimeout(promise, ms) {
-  let timer;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((resolve) => {
-        timer = setTimeout(() => resolve(undefined), ms);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
   }
 }
 
