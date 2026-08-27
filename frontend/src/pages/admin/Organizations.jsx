@@ -34,6 +34,21 @@ export default function Organizations() {
   const ticketRef = useRef(null);
   ticketRef.current ??= createRequestTicket();
 
+  // Imperative reloads — after create, edit, delete, bulk — go through a nonce the
+  // load effect depends on, rather than calling the loader directly.
+  //
+  // Those handlers are async: they await a mutation and then reload. Calling the
+  // loader directly calls the closure captured at the render the handler was
+  // created in, so a page or filter change DURING that await leaves them holding a
+  // loader built over the OLD query — which then takes the newest ticket and wins
+  // with rows the search box no longer describes. That is the same defect this file
+  // was just fixed for, arriving through a different door.
+  //
+  // Bumping a nonce hands the load back to the effect, which always re-runs with
+  // current state. setReloadNonce is stable, so no handler can capture a stale one.
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const reloadOrgs = useCallback(() => setReloadNonce((n) => n + 1), []);
+
   const fetchOrgs = useCallback(async () => {
     const seq = ticketRef.current.take();
     setLoading(true);
@@ -58,7 +73,7 @@ export default function Organizations() {
     // Disowned on the way out: a response arriving for a screen that is gone
     // writes nothing. See utils/latestRequest.
     return () => ticketRef.current.invalidate();
-  }, [fetchOrgs]);
+  }, [fetchOrgs, reloadNonce]);
 
   // Debounced name validation
   useEffect(() => {
@@ -126,7 +141,7 @@ export default function Organizations() {
         toast.success('Organization created');
       }
       closeModal();
-      fetchOrgs();
+      reloadOrgs();
     } catch (err) {
       toast.error(apiError(err, 'Failed to save'));
     } finally {
@@ -138,7 +153,7 @@ export default function Organizations() {
     try {
       await client.put(`/api/admin/organizations/${org._id}`, { is_active: !org.is_active });
       toast.success(`Organization ${org.is_active ? 'deactivated' : 'activated'}`);
-      fetchOrgs();
+      reloadOrgs();
     } catch {
       toast.error('Failed to update status');
     }
@@ -151,7 +166,7 @@ export default function Organizations() {
       toast.success('Organization deactivated');
       setDeleteOrg(null);
       setDeleteConfirmName('');
-      fetchOrgs();
+      reloadOrgs();
     } catch (err) {
       toast.error(apiError(err, 'Failed to delete'));
     }

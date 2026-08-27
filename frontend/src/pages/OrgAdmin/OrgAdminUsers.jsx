@@ -51,6 +51,21 @@ export default function OrgAdminUsers() {
   const ticketRef = useRef(null);
   ticketRef.current ??= createRequestTicket();
 
+  // Imperative reloads — after create, edit, delete, bulk — go through a nonce the
+  // load effect depends on, rather than calling the loader directly.
+  //
+  // Those handlers are async: they await a mutation and then reload. Calling the
+  // loader directly calls the closure captured at the render the handler was
+  // created in, so a page or filter change DURING that await leaves them holding a
+  // loader built over the OLD query — which then takes the newest ticket and wins
+  // with rows the search box no longer describes. That is the same defect this file
+  // was just fixed for, arriving through a different door.
+  //
+  // Bumping a nonce hands the load back to the effect, which always re-runs with
+  // current state. setReloadNonce is stable, so no handler can capture a stale one.
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const reloadUsers = useCallback(() => setReloadNonce((n) => n + 1), []);
+
   const fetchUsers = useCallback(async () => {
     const seq = ticketRef.current.take();
     setLoading(true);
@@ -72,7 +87,7 @@ export default function OrgAdminUsers() {
     // Disowned on the way out: a response arriving for a screen that is gone
     // writes nothing. See utils/latestRequest.
     return () => ticketRef.current.invalidate();
-  }, [fetchUsers]);
+  }, [fetchUsers, reloadNonce]);
 
   const openCreate = () => {
     setFormEmail(''); setFormName(''); setFormDept(depts[0]?._id || '');
@@ -100,7 +115,7 @@ export default function OrgAdminUsers() {
         description: `Password: ${formPassword}`, duration: 10000,
         action: { label: 'Copy', onClick: () => { navigator.clipboard.writeText(formPassword); toast.success('Copied!'); } }
       });
-      setShowCreate(false); fetchUsers();
+      setShowCreate(false); reloadUsers();
     } catch (err) { toast.error(apiError(err, 'Failed')); }
     finally { setSaving(false); }
   };
@@ -121,7 +136,7 @@ export default function OrgAdminUsers() {
       await client.put(`/api/org-admin/users/${editUser._id}`, {
         display_name: name, role: editRole, is_active: editActive, dept_id: editDept
       });
-      toast.success('User updated'); setEditUser(null); fetchUsers();
+      toast.success('User updated'); setEditUser(null); reloadUsers();
     } catch (err) { toast.error(apiError(err, 'Failed')); }
   };
 

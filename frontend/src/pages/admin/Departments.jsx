@@ -45,6 +45,21 @@ export default function Departments() {
   const ticketRef = useRef(null);
   ticketRef.current ??= createRequestTicket();
 
+  // Imperative reloads — after create, edit, delete, bulk — go through a nonce the
+  // load effect depends on, rather than calling the loader directly.
+  //
+  // Those handlers are async: they await a mutation and then reload. Calling the
+  // loader directly calls the closure captured at the render the handler was
+  // created in, so a page or filter change DURING that await leaves them holding a
+  // loader built over the OLD query — which then takes the newest ticket and wins
+  // with rows the search box no longer describes. That is the same defect this file
+  // was just fixed for, arriving through a different door.
+  //
+  // Bumping a nonce hands the load back to the effect, which always re-runs with
+  // current state. setReloadNonce is stable, so no handler can capture a stale one.
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const reloadDepts = useCallback(() => setReloadNonce((n) => n + 1), []);
+
   const fetchDepts = useCallback(async () => {
     if (!selectedOrg) return;
     const seq = ticketRef.current.take();
@@ -70,7 +85,7 @@ export default function Departments() {
     // Disowned on the way out: a response arriving for a screen that is gone
     // writes nothing. See utils/latestRequest.
     return () => ticketRef.current.invalidate();
-  }, [fetchDepts]);
+  }, [fetchDepts, reloadNonce]);
 
   const openCreate = () => {
     setFormName('');
@@ -103,7 +118,7 @@ export default function Departments() {
         toast.success('Department created');
       }
       closeModal();
-      fetchDepts();
+      reloadDepts();
     } catch (err) {
       toast.error(apiError(err, 'Failed to save'));
     } finally {
@@ -116,7 +131,7 @@ export default function Departments() {
       await client.delete(`/api/admin/departments/${deleteDept._id}`);
       toast.success('Department deleted');
       setDeleteDept(null);
-      fetchDepts();
+      reloadDepts();
     } catch (err) {
       toast.error(apiError(err, 'Failed to delete'));
     }

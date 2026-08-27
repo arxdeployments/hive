@@ -94,6 +94,21 @@ export default function UsersPage() {
   const ticketRef = useRef(null);
   ticketRef.current ??= createRequestTicket();
 
+  // Imperative reloads — after create, edit, delete, bulk — go through a nonce the
+  // load effect depends on, rather than calling the loader directly.
+  //
+  // Those handlers are async: they await a mutation and then reload. Calling the
+  // loader directly calls the closure captured at the render the handler was
+  // created in, so a page or filter change DURING that await leaves them holding a
+  // loader built over the OLD query — which then takes the newest ticket and wins
+  // with rows the search box no longer describes. That is the same defect this file
+  // was just fixed for, arriving through a different door.
+  //
+  // Bumping a nonce hands the load back to the effect, which always re-runs with
+  // current state. setReloadNonce is stable, so no handler can capture a stale one.
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const reloadUsers = useCallback(() => setReloadNonce((n) => n + 1), []);
+
   /**
    * One list load. Each takes a ticket from `ticketRef` and only the holder
    * of the newest may write — the same request-token scheme the window fetches
@@ -147,7 +162,7 @@ export default function UsersPage() {
     // Bumping on the way out keeps what the per-run flag did on unmount: a
     // response arriving for a screen that is gone writes nothing.
     return () => ticketRef.current.invalidate();
-  }, [fetchUsers]);
+  }, [fetchUsers, reloadNonce]);
 
   // Load create depts when org changes
   useEffect(() => {
@@ -238,7 +253,7 @@ export default function UsersPage() {
         }
       });
       setShowCreate(false);
-      fetchUsers();
+      reloadUsers();
     } catch (err) {
       toast.error(apiError(err, 'Failed to create user'));
     } finally {
@@ -260,7 +275,7 @@ export default function UsersPage() {
       await client.put(`/api/admin/users/${editUser._id}`, payload);
       toast.success('User updated');
       setEditUser(null);
-      fetchUsers();
+      reloadUsers();
     } catch (err) {
       toast.error(apiError(err, 'Failed to update user'));
     } finally {
@@ -326,7 +341,7 @@ export default function UsersPage() {
       });
       toast.success(data.message);
       setSelectedIds([]);
-      fetchUsers();
+      reloadUsers();
     } catch (err) {
       toast.error(apiError(err, 'Bulk action failed'));
     }
