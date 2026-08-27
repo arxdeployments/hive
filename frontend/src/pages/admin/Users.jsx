@@ -10,6 +10,7 @@ import { PageTransition } from '../../components/common/PageTransition';
 import client from '../../api/client';
 
 import { generatePassword } from '../../utils/generatePassword';
+import { createRequestTicket } from '../../utils/latestRequest';
 import { apiError } from '../../utils/helpers';
 
 export default function UsersPage() {
@@ -88,10 +89,28 @@ export default function UsersPage() {
   }, [selectedOrg]);
 
   // One counter for every load below, effect-driven and imperative alike.
-  const fetchSeqRef = useRef(0);
+  // The scheme the comment beneath describes now lives in utils/latestRequest,
+  // shared with the three sibling admin lists that were missing it entirely.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
+  // Imperative reloads — after create, edit, delete, bulk — go through a nonce the
+  // load effect depends on, rather than calling the loader directly.
+  //
+  // Those handlers are async: they await a mutation and then reload. Calling the
+  // loader directly calls the closure captured at the render the handler was
+  // created in, so a page or filter change DURING that await leaves them holding a
+  // loader built over the OLD query — which then takes the newest ticket and wins
+  // with rows the search box no longer describes. That is the same defect this file
+  // was just fixed for, arriving through a different door.
+  //
+  // Bumping a nonce hands the load back to the effect, which always re-runs with
+  // current state. setReloadNonce is stable, so no handler can capture a stale one.
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const reloadUsers = useCallback(() => setReloadNonce((n) => n + 1), []);
 
   /**
-   * One list load. Each takes a ticket from `fetchSeqRef` and only the holder
+   * One list load. Each takes a ticket from `ticketRef` and only the holder
    * of the newest may write — the same request-token scheme the window fetches
    * in ChatPanel use.
    *
@@ -115,7 +134,7 @@ export default function UsersPage() {
    * table. One shared counter orders all four call sites against each other.
    */
   const fetchUsers = useCallback(async () => {
-    const seq = ++fetchSeqRef.current;
+    const seq = ticketRef.current.take();
     setLoading(true);
     try {
       const params = { page, limit, search };
@@ -124,17 +143,17 @@ export default function UsersPage() {
       if (statusFilter) params.status = statusFilter;
       if (mobileFilter) params.mobile = mobileFilter;
       const { data } = await client.get('/api/admin/users', { params });
-      if (seq !== fetchSeqRef.current) return;
+      if (!ticketRef.current.isCurrent(seq)) return;
       setUsers(data.data);
       setTotal(data.total);
     } catch {
       // A superseded load's failure is not this screen's failure any more:
       // toasting it would report an error against a query nobody is looking at.
-      if (seq === fetchSeqRef.current) toast.error('Failed to load users');
+      if (ticketRef.current.isCurrent(seq)) toast.error('Failed to load users');
     } finally {
       // Guarded too, or a slow superseded response would clear the spinner
       // while the load the user IS waiting for is still in flight.
-      if (seq === fetchSeqRef.current) setLoading(false);
+      if (ticketRef.current.isCurrent(seq)) setLoading(false);
     }
   }, [selectedOrg, selectedDept, statusFilter, mobileFilter, page, search]);
 
@@ -142,8 +161,8 @@ export default function UsersPage() {
     fetchUsers();
     // Bumping on the way out keeps what the per-run flag did on unmount: a
     // response arriving for a screen that is gone writes nothing.
-    return () => { fetchSeqRef.current++; };
-  }, [fetchUsers]);
+    return () => ticketRef.current.invalidate();
+  }, [fetchUsers, reloadNonce]);
 
   // Load create depts when org changes
   useEffect(() => {
@@ -234,7 +253,7 @@ export default function UsersPage() {
         }
       });
       setShowCreate(false);
-      fetchUsers();
+      reloadUsers();
     } catch (err) {
       toast.error(apiError(err, 'Failed to create user'));
     } finally {
@@ -256,7 +275,7 @@ export default function UsersPage() {
       await client.put(`/api/admin/users/${editUser._id}`, payload);
       toast.success('User updated');
       setEditUser(null);
-      fetchUsers();
+      reloadUsers();
     } catch (err) {
       toast.error(apiError(err, 'Failed to update user'));
     } finally {
@@ -322,7 +341,7 @@ export default function UsersPage() {
       });
       toast.success(data.message);
       setSelectedIds([]);
-      fetchUsers();
+      reloadUsers();
     } catch (err) {
       toast.error(apiError(err, 'Bulk action failed'));
     }

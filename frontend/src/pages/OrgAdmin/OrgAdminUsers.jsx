@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { Plus, Search, Pencil, Loader2, RefreshCw, Copy, X, Info } from 'lucide-react';
 import { toast } from 'sonner';
@@ -8,6 +8,7 @@ import client from '../../api/client';
 
 import { generatePassword as genPassword } from '../../utils/generatePassword';
 import { apiError } from '../../utils/helpers';
+import { createRequestTicket } from '../../utils/latestRequest';
 
 export default function OrgAdminUsers() {
   const { user: me } = useAuth();
@@ -45,19 +46,48 @@ export default function OrgAdminUsers() {
     try { const { data } = await client.get('/api/org-admin/departments'); setDepts(data); } catch {}
   }, []);
 
+  // One counter for every load below, effect-driven and imperative alike: only
+  // the holder of the newest ticket may write. See utils/latestRequest.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
+  // Imperative reloads — after create, edit, delete, bulk — go through a nonce the
+  // load effect depends on, rather than calling the loader directly.
+  //
+  // Those handlers are async: they await a mutation and then reload. Calling the
+  // loader directly calls the closure captured at the render the handler was
+  // created in, so a page or filter change DURING that await leaves them holding a
+  // loader built over the OLD query — which then takes the newest ticket and wins
+  // with rows the search box no longer describes. That is the same defect this file
+  // was just fixed for, arriving through a different door.
+  //
+  // Bumping a nonce hands the load back to the effect, which always re-runs with
+  // current state. setReloadNonce is stable, so no handler can capture a stale one.
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const reloadUsers = useCallback(() => setReloadNonce((n) => n + 1), []);
+
   const fetchUsers = useCallback(async () => {
+    const seq = ticketRef.current.take();
     setLoading(true);
     try {
       const params = { page, limit, search };
       if (deptFilter) params.dept_id = deptFilter;
       const { data } = await client.get('/api/org-admin/users', { params });
+      if (!ticketRef.current.isCurrent(seq)) return;
       setUsers(data.data); setTotal(data.total);
-    } catch { toast.error('Failed to load users'); }
-    finally { setLoading(false); }
+    } catch { if (ticketRef.current.isCurrent(seq)) toast.error('Failed to load users'); }
+    // The spinner belongs to the newest load as much as the rows do: clearing it
+    // from a superseded one shows the stale table as if it were loaded.
+    finally { if (ticketRef.current.isCurrent(seq)) setLoading(false); }
   }, [page, search, deptFilter]);
 
   useEffect(() => { fetchDepts(); }, [fetchDepts]);
-  useEffect(() => { fetchUsers(); }, [fetchUsers]);
+  useEffect(() => {
+    fetchUsers();
+    // Disowned on the way out: a response arriving for a screen that is gone
+    // writes nothing. See utils/latestRequest.
+    return () => ticketRef.current.invalidate();
+  }, [fetchUsers, reloadNonce]);
 
   const openCreate = () => {
     setFormEmail(''); setFormName(''); setFormDept(depts[0]?._id || '');
@@ -85,7 +115,7 @@ export default function OrgAdminUsers() {
         description: `Password: ${formPassword}`, duration: 10000,
         action: { label: 'Copy', onClick: () => { navigator.clipboard.writeText(formPassword); toast.success('Copied!'); } }
       });
-      setShowCreate(false); fetchUsers();
+      setShowCreate(false); reloadUsers();
     } catch (err) { toast.error(apiError(err, 'Failed')); }
     finally { setSaving(false); }
   };
@@ -106,7 +136,7 @@ export default function OrgAdminUsers() {
       await client.put(`/api/org-admin/users/${editUser._id}`, {
         display_name: name, role: editRole, is_active: editActive, dept_id: editDept
       });
-      toast.success('User updated'); setEditUser(null); fetchUsers();
+      toast.success('User updated'); setEditUser(null); reloadUsers();
     } catch (err) { toast.error(apiError(err, 'Failed')); }
   };
 
