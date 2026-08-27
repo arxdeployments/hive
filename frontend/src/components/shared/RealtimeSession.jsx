@@ -54,8 +54,16 @@ export const RealtimeSession = () => {
    * an explicit yes and the OS permission is already granted.
    */
   useEffect(() => {
-    if (!userId) return;
-    healPushSubscription();
+    if (!userId) return undefined;
+    // Cancelled on cleanup, which is what runs on sign-out. The lookup inside
+    // waits on serviceWorker.ready and can take seconds; a restore that outlived
+    // its session would subscribe again straight after the sign-out teardown had
+    // revoked the subscription, re-binding push to the user who just left.
+    let cancelled = false;
+    healPushSubscription({ isCancelled: () => cancelled });
+    return () => {
+      cancelled = true;
+    };
   }, [userId]);
 
   useEffect(() => {

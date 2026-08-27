@@ -94,10 +94,21 @@ describe('Web Push subscription state', () => {
       /import\s*\{[^}]*\bhealPushSubscription\b[^}]*\}\s*from\s*'\.\.\/\.\.\/lib\/pwa'/,
       'RealtimeSession does not import healPushSubscription.',
     );
+    // Deliberately not anchored to the argument list: the call gained an
+    // `isCancelled` option after review, and a guard that has to be edited
+    // whenever the signature moves is a guard people stop trusting.
     assert.match(
       source,
-      /healPushSubscription\(\)/,
+      /healPushSubscription\(/,
       'healPushSubscription is imported but never called.',
+    );
+    // The cancellation itself, though, is load-bearing — without it a restore can
+    // outlive the session that started it and re-subscribe the user who just
+    // signed out.
+    assert.match(
+      source,
+      /isCancelled\s*:/,
+      'the restore is started without a cancellation hook, so a sign-out cannot stop it.',
     );
   });
 });

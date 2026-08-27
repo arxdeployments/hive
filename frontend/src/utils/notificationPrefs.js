@@ -16,15 +16,23 @@ const OFF_VALUES = new Set(['false', 'off']);
 const ON_VALUES = new Set(['true', 'on']);
 
 function isOff(key) {
-  return OFF_VALUES.has(localStorage.getItem(key));
+  return isExplicitOff(localStorage.getItem(key));
 }
 
 /**
- * Pure, and exported so the distinction below can be tested without a DOM.
+ * Pure, and exported so the distinctions here can be tested without a DOM.
  *
- * Note what this is NOT: the negation of isOff. An ABSENT value is neither — it
- * is off by this test and on by isOff's, and that asymmetry is the point.
+ * Note what isExplicitOn is NOT: the negation of isExplicitOff. An ABSENT value
+ * is neither — off by the first test and on by the second — and that asymmetry is
+ * the point. 'off' is the value where a raw `!== 'false'` comparison gets it
+ * wrong, which is why callers must use these rather than compare strings: a
+ * legacy profile storing 'off' read as ENABLED, and Settings then persisted
+ * 'true' over it, silently re-enabling what the user had switched off.
  */
+export function isExplicitOff(value) {
+  return OFF_VALUES.has(value);
+}
+
 export function isExplicitOn(value) {
   return ON_VALUES.has(value);
 }

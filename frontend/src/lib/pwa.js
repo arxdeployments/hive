@@ -1,7 +1,7 @@
 // Service-worker registration + Web Push subscription helpers.
 import client from '../api/client';
 import { tearDownPush } from './pushTeardown';
-import { hasPushSubscription, shouldRestorePush } from './pushRestore';
+import { hasPushSubscription, restorePushSubscription } from './pushRestore';
 import { wantsDesktopNotifications } from '../utils/notificationPrefs';
 import { withTimeout } from './withTimeout';
 
@@ -92,33 +92,26 @@ export function pushSubscriptionExists() {
 /**
  * Re-create a subscription for somebody who already asked for one and lost it.
  *
- * Silent by design and best-effort: it never prompts, never throws, and does
- * nothing at all unless shouldRestorePush agrees on all four counts — see that
- * function for why an unset preference is not consent.
+ * A thin binder over restorePushSubscription, which owns the rules and is where
+ * they are tested. Silent by design: never prompts, never throws, and does
+ * nothing unless the stored preference is an explicit yes and the OS permission
+ * is already granted.
+ *
+ * `isCancelled` is supplied by the caller's effect cleanup so a session ending
+ * mid-flight aborts the restore — see restorePushSubscription for why the
+ * preference and the permission are read as functions rather than values.
  *
  * @returns {Promise<boolean>} whether a subscription was actually created
  */
-export async function healPushSubscription() {
-  try {
-    const supported = pushSupported();
-    // Skip the lookup entirely when the answer cannot matter; it costs a
-    // serviceWorker.ready await on every app start otherwise.
-    if (!supported || !wantsDesktopNotifications()) return false;
-    const subscribed = await pushSubscriptionExists();
-    const restore = shouldRestorePush({
-      intentIsExplicit: true,
-      permission: typeof Notification === 'undefined' ? 'default' : Notification.permission,
-      hasSubscription: subscribed,
-      pushSupported: supported,
-    });
-    if (!restore) return false;
-    await subscribeToPush();
-    return true;
-  } catch {
-    // The user's own next visit to Settings is the fallback. A failed silent
-    // restore must not surface as an error nobody asked for.
-    return false;
-  }
+export async function healPushSubscription({ isCancelled } = {}) {
+  return restorePushSubscription({
+    nav: typeof navigator === 'undefined' ? undefined : navigator,
+    pushSupported: pushSupported(),
+    getPermission: () => (typeof Notification === 'undefined' ? 'default' : Notification.permission),
+    wantsPush: wantsDesktopNotifications,
+    subscribe: subscribeToPush,
+    isCancelled,
+  });
 }
 
 /**

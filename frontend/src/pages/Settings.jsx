@@ -6,6 +6,7 @@ import { PageTransition } from '../components/common/PageTransition';
 import client from '../api/client';
 import { apiError } from '../utils/helpers';
 import { enablePushNotifications, disablePushNotifications, pushSubscriptionExists } from '../lib/pwa';
+import { isDesktopNotifDisabled } from '../utils/notificationPrefs';
 
 const FONT_PX = { small: '14px', medium: '16px', large: '18px' };
 
@@ -89,10 +90,14 @@ const Toggle = ({ checked, onChange, label }) => (
 export default function SettingsPage() {
   const navigate = useNavigate();
   const [notifSound, setNotifSound] = useState(() => localStorage.getItem('rxhive_notif_sound') !== 'false');
-  // The stored PREFERENCE. Unset counts as on, matching utils/notificationPrefs,
-  // whose isDesktopNotifDisabled gates whether an open tab may draw its own
-  // notification — a default this must not change.
-  const [desktopNotifPref, setDesktopNotifPref] = useState(() => localStorage.getItem('rxhive_desktop_notif') !== 'false');
+  // The stored PREFERENCE, read through the shared predicate rather than compared
+  // here. Unset still counts as on — that default gates whether an open tab may
+  // draw its own notification and must not change — but `!== 'false'` was not the
+  // same test: isDesktopNotifDisabled also honours the legacy 'off', which a raw
+  // comparison reads as ENABLED. The mount effect below then wrote 'true' over
+  // it, so a profile from an older build had notifications silently switched back
+  // on, and now would also authorise an automatic push subscribe.
+  const [desktopNotifPref, setDesktopNotifPref] = useState(() => !isDesktopNotifDisabled());
   // Whether a push subscription actually exists. `null` until the lookup answers,
   // and `null` for good if it cannot. Never persisted: the browser owns this fact
   // and the previous build's habit of inferring it from the preference is exactly

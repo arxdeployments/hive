@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { hasPushSubscription, shouldRestorePush } from './pushRestore.js';
-import { isExplicitOn } from '../utils/notificationPrefs.js';
+import { hasPushSubscription, restorePushSubscription, shouldRestorePush } from './pushRestore.js';
+import { isExplicitOff, isExplicitOn } from '../utils/notificationPrefs.js';
 
 /**
  * Run by Node's own test runner (`npm run test:unit`). No DOM: the navigator is
@@ -128,5 +128,157 @@ describe('hasPushSubscription', () => {
   it('says unknown where there is no service worker', async () => {
     assert.equal(await hasPushSubscription({ nav: {} }), null);
     assert.equal(await hasPushSubscription(), null);
+  });
+});
+
+describe('isExplicitOff', () => {
+  it('honours the legacy "off" that a raw !== \'false\' comparison gets wrong', () => {
+    // The one value where the two readings disagree, and the reason Settings must
+    // not compare the string itself: a profile from an older build storing 'off'
+    // read as ENABLED, and the mount effect then persisted 'true' over it — so
+    // notifications the user had switched off came back, and now would also
+    // authorise an automatic subscribe.
+    assert.equal(isExplicitOff('off'), true);
+    assert.equal(isExplicitOff('false'), true);
+    assert.equal(isExplicitOff(null), false, 'unset must stay ON for the in-page path');
+    // And it is never consent, whichever way it is read.
+    assert.equal(isExplicitOn('off'), false);
+  });
+});
+
+describe('restorePushSubscription', () => {
+  /** Facts aligned for a restore, each supplied as a getter. */
+  function deps(overrides = {}) {
+    const calls = [];
+    const base = {
+      nav: fakeNav({ sub: null }),
+      pushSupported: true,
+      getPermission: () => 'granted',
+      wantsPush: () => true,
+      subscribe: async () => {
+        calls.push('subscribe');
+        return true;
+      },
+      calls,
+    };
+    return { ...base, ...overrides, calls: overrides.calls || calls };
+  }
+
+  it('subscribes for someone who asked and lost it', async () => {
+    const d = deps();
+    assert.equal(await restorePushSubscription(d), true);
+    assert.deepEqual(d.calls, ['subscribe']);
+  });
+
+  it('does NOT subscribe when the preference is cleared while the lookup is out', async () => {
+    // The regression test for the sign-out race, and the reason every fact is a
+    // getter rather than a value.
+    //
+    // hasPushSubscription waits on serviceWorker.ready and can take seconds. Sign
+    // out inside that window and lib/pushTeardown.js clears the preference AND
+    // revokes the subscription — so the lookup returns "no subscription" precisely
+    // BECAUSE the sign-out removed it. Deciding on the pre-await preference would
+    // subscribe again and re-bind push to the user who just left, which is exactly
+    // the leak Batch 38 closed.
+    const calls = [];
+    let signedOut = false;
+    const d = deps({
+      calls,
+      // Flips during the await, the way a sign-out does.
+      wantsPush: () => !signedOut,
+      nav: fakeNav({
+        getSubscription: async () => {
+          signedOut = true;
+          return null;
+        },
+      }),
+      subscribe: async () => {
+        calls.push('subscribe');
+        return true;
+      },
+    });
+
+    assert.equal(await restorePushSubscription(d), false);
+    assert.deepEqual(calls, [], 'subscribed after the session had ended');
+  });
+
+  it('does NOT subscribe when the session is cancelled while the lookup is out', async () => {
+    // The same window, closed from the other side: RealtimeSession's effect
+    // cleanup runs on sign-out, and this must not outlive the session.
+    const calls = [];
+    let cancelled = false;
+    const d = deps({
+      calls,
+      isCancelled: () => cancelled,
+      nav: fakeNav({
+        getSubscription: async () => {
+          cancelled = true;
+          return null;
+        },
+      }),
+      subscribe: async () => {
+        calls.push('subscribe');
+        return true;
+      },
+    });
+
+    assert.equal(await restorePushSubscription(d), false);
+    assert.deepEqual(calls, []);
+  });
+
+  it('does NOT subscribe when permission is revoked while the lookup is out', async () => {
+    const calls = [];
+    let permission = 'granted';
+    const d = deps({
+      calls,
+      getPermission: () => permission,
+      nav: fakeNav({
+        getSubscription: async () => {
+          permission = 'denied';
+          return null;
+        },
+      }),
+      subscribe: async () => {
+        calls.push('subscribe');
+        return true;
+      },
+    });
+
+    assert.equal(await restorePushSubscription(d), false);
+    assert.deepEqual(calls, []);
+  });
+
+  it('never reaches the lookup when the preference is already off', async () => {
+    // The cheap gate: this runs on every app start, so it must not pay for a
+    // serviceWorker.ready await it cannot use.
+    const calls = [];
+    const d = deps({
+      calls,
+      wantsPush: () => false,
+      nav: fakeNav({
+        getSubscription: async () => {
+          calls.push('getSubscription');
+          return null;
+        },
+      }),
+    });
+
+    assert.equal(await restorePushSubscription(d), false);
+    assert.deepEqual(calls, []);
+  });
+
+  it('does nothing when a subscription is already there', async () => {
+    const d = deps({ nav: fakeNav({ sub: SUB }) });
+    assert.equal(await restorePushSubscription(d), false);
+    assert.deepEqual(d.calls, []);
+  });
+
+  it('reports false rather than throwing when the subscribe fails', async () => {
+    const d = deps({
+      subscribe: async () => {
+        throw new Error('Push is not configured on the server');
+      },
+    });
+    assert.equal(await restorePushSubscription(d), false);
   });
 });

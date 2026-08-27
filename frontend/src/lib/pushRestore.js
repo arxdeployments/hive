@@ -98,3 +98,64 @@ export function shouldRestorePush({
   if (hasSubscription !== false) return false;
   return true;
 }
+
+/**
+ * Decide and act: restore a subscription if the rules allow, otherwise do nothing.
+ *
+ * The orchestration lives here rather than in pwa.js so the cases below can be
+ * tested — pwa.js reaches api/client.js, which Node's runner cannot load. Every
+ * fact arrives as a FUNCTION, not a value, and that is the whole design:
+ *
+ * WHY THE FACTS ARE RE-READ AFTER THE AWAIT
+ *
+ * hasPushSubscription waits on serviceWorker.ready and can take seconds. A
+ * session can end inside that window, and signing out clears
+ * `rxhive_desktop_notif` and revokes the subscription (lib/pushTeardown.js). Read
+ * once up front, the values are then stale in the worst possible direction: the
+ * lookup returns "no subscription" precisely BECAUSE the sign-out just removed
+ * it, and a restore decided on the pre-await preference would subscribe again —
+ * re-binding push to the user who has just left, which is the leak Batch 38
+ * existed to close, reintroduced through a race.
+ *
+ * `isCancelled` covers the same window from the other side: RealtimeSession's
+ * effect cleanup runs on sign-out, and this must not outlive the session that
+ * started it.
+ *
+ * Never throws. A silent restore that fails must not surface as an error nobody
+ * asked for.
+ *
+ * @returns {Promise<boolean>} whether a subscription was actually created
+ */
+export async function restorePushSubscription({
+  nav,
+  pushSupported,
+  getPermission,
+  wantsPush,
+  subscribe,
+  isCancelled = () => false,
+  timeoutMs = RESTORE_TIMEOUT_MS,
+}) {
+  try {
+    // Cheap gate first: skip the serviceWorker.ready await entirely when the
+    // answer cannot matter, since this runs on every app start.
+    if (!pushSupported || !wantsPush()) return false;
+
+    const hasSubscription = await hasPushSubscription({ nav, timeoutMs });
+
+    if (isCancelled()) return false;
+    const restore = shouldRestorePush({
+      // Both re-read, deliberately, and never carried across the await above.
+      intentIsExplicit: wantsPush(),
+      permission: getPermission(),
+      hasSubscription,
+      pushSupported,
+    });
+    if (!restore) return false;
+
+    await subscribe();
+    return true;
+  } catch {
+    // The user's own next visit to Settings is the fallback.
+    return false;
+  }
+}
