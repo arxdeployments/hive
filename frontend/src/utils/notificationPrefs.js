@@ -13,9 +13,20 @@
  */
 
 const OFF_VALUES = new Set(['false', 'off']);
+const ON_VALUES = new Set(['true', 'on']);
 
 function isOff(key) {
   return OFF_VALUES.has(localStorage.getItem(key));
+}
+
+/**
+ * Pure, and exported so the distinction below can be tested without a DOM.
+ *
+ * Note what this is NOT: the negation of isOff. An ABSENT value is neither — it
+ * is off by this test and on by isOff's, and that asymmetry is the point.
+ */
+export function isExplicitOn(value) {
+  return ON_VALUES.has(value);
 }
 
 /** True when the user has turned notification sounds off. */
@@ -23,7 +34,31 @@ export function isSoundMuted() {
   return isOff('rxhive_notif_sound');
 }
 
-/** True when the user has turned desktop notifications off. */
+/**
+ * True when the user has turned desktop notifications off.
+ *
+ * Unset counts as ON, and that default is deliberate for THIS reader: it gates
+ * whether an open tab may draw its own notification, which costs nothing and
+ * needs no more than the OS permission the user has already granted.
+ */
 export function isDesktopNotifDisabled() {
   return isOff('rxhive_desktop_notif');
+}
+
+/**
+ * True only when the user has EXPLICITLY turned desktop notifications on.
+ *
+ * The same key, read to a deliberately stricter standard, because the two
+ * questions asked of it are not the same question:
+ *
+ *   isDesktopNotifDisabled — "may this tab draw a notification?" Unset means yes.
+ *   this                   — "may we create a server-side push subscription for
+ *                            this person without asking them?" Unset means no.
+ *
+ * Unset is the NORMAL state of a fresh sign-in, because the sign-out teardown in
+ * lib/pushTeardown.js clears the key. Reading unset as consent would subscribe
+ * whoever signed in next on a shared workstation to push they never asked for.
+ */
+export function wantsDesktopNotifications() {
+  return isExplicitOn(localStorage.getItem('rxhive_desktop_notif'));
 }

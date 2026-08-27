@@ -5,7 +5,7 @@ import { toast } from 'sonner';
 import { PageTransition } from '../components/common/PageTransition';
 import client from '../api/client';
 import { apiError } from '../utils/helpers';
-import { enablePushNotifications, disablePushNotifications } from '../lib/pwa';
+import { enablePushNotifications, disablePushNotifications, pushSubscriptionExists } from '../lib/pwa';
 
 const FONT_PX = { small: '14px', medium: '16px', large: '18px' };
 
@@ -89,7 +89,15 @@ const Toggle = ({ checked, onChange, label }) => (
 export default function SettingsPage() {
   const navigate = useNavigate();
   const [notifSound, setNotifSound] = useState(() => localStorage.getItem('rxhive_notif_sound') !== 'false');
-  const [desktopNotif, setDesktopNotif] = useState(() => localStorage.getItem('rxhive_desktop_notif') !== 'false');
+  // The stored PREFERENCE. Unset counts as on, matching utils/notificationPrefs,
+  // whose isDesktopNotifDisabled gates whether an open tab may draw its own
+  // notification — a default this must not change.
+  const [desktopNotifPref, setDesktopNotifPref] = useState(() => localStorage.getItem('rxhive_desktop_notif') !== 'false');
+  // Whether a push subscription actually exists. `null` until the lookup answers,
+  // and `null` for good if it cannot. Never persisted: the browser owns this fact
+  // and the previous build's habit of inferring it from the preference is exactly
+  // the bug — the toggle reported a subscription that had never been created.
+  const [pushSubscribed, setPushSubscribed] = useState(null);
   const [notifBusy, setNotifBusy] = useState(false);
   const [enterSends, setEnterSends] = useState(() => localStorage.getItem('rxhive_enter_sends') !== 'false');
   // Normalised on read as well as on apply. Without this a junk stored value
@@ -107,8 +115,37 @@ export default function SettingsPage() {
   const [changingPassword, setChangingPassword] = useState(false);
 
   useEffect(() => { localStorage.setItem('rxhive_notif_sound', notifSound); }, [notifSound]);
-  useEffect(() => { localStorage.setItem('rxhive_desktop_notif', desktopNotif); }, [desktopNotif]);
+  useEffect(() => { localStorage.setItem('rxhive_desktop_notif', desktopNotifPref); }, [desktopNotifPref]);
   useEffect(() => { localStorage.setItem('rxhive_enter_sends', enterSends); }, [enterSends]);
+
+  /**
+   * What the switch shows.
+   *
+   * The preference alone was the bug this replaces. `rxhive_desktop_notif`
+   * defaults to ON when unset — correct for the in-page notification path, which
+   * needs nothing but the OS permission — and Settings read that same default
+   * back as the state of the toggle that creates a PUSH SUBSCRIPTION. So the
+   * switch sat on for users who had never subscribed and, after Batch 38's
+   * sign-out teardown, for every user who had just signed in. Turning it off
+   * appeared to do something and turning it on was the action they actually
+   * needed.
+   *
+   * Both facts have to agree before this claims to be on. While the lookup is
+   * still out (`null`) the preference stands, so the switch does not flicker
+   * through a wrong position on mount; if the lookup can never answer it stays
+   * with the preference rather than reporting a confident "off".
+   */
+  const desktopNotif = pushSubscribed === null ? desktopNotifPref : (desktopNotifPref && pushSubscribed);
+
+  // Ground truth, asked once on mount. Nothing is written back: the answer is the
+  // browser's, and persisting it is what created the drift.
+  useEffect(() => {
+    let cancelled = false;
+    pushSubscriptionExists().then((exists) => {
+      if (!cancelled) setPushSubscribed(exists);
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   // Persist AND apply the font size (runs on mount too, so the setting takes effect app-wide).
   useEffect(() => {
@@ -136,7 +173,13 @@ export default function SettingsPage() {
   const handleDesktopNotif = async (val) => {
     if (notifBusy) return;
     setNotifBusy(true);
-    setDesktopNotif(val);
+    // Both, optimistically: the preference because the user just expressed it,
+    // and the subscription because that is what the call below is about to do.
+    // Moving only the preference would leave the switch reading its old position
+    // whenever the subscription state disagreed, which is the whole failure this
+    // pair replaces.
+    setDesktopNotifPref(val);
+    setPushSubscribed(val);
     try {
       if (val) {
         await enablePushNotifications();
@@ -146,7 +189,8 @@ export default function SettingsPage() {
         toast.success('Desktop notifications disabled');
       }
     } catch (err) {
-      setDesktopNotif(!val);
+      setDesktopNotifPref(!val);
+      setPushSubscribed(!val);
       toast.error(err?.message || 'Could not change notification settings');
     } finally {
       setNotifBusy(false);

@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
 import useCallStore from '../../stores/callStore';
 import wsClient from '../../services/websocket';
+import { healPushSubscription } from '../../lib/pwa';
 
 /**
  * Owns the realtime socket for as long as there is a session.
@@ -32,6 +33,30 @@ export const RealtimeSession = () => {
   // Keyed on the id, not the object: checkAuth() mints a new user object on
   // every profile refresh, which would otherwise cycle the socket needlessly.
   const userId = user?.id;
+
+  /**
+   * Put back a push subscription this user asked for and no longer has.
+   *
+   * Here rather than in a page for the same reason the socket is: it belongs to
+   * the SESSION. And it has to be somewhere, because nothing re-subscribed
+   * anywhere — pushManager.subscribe() had two call sites and both were a person
+   * clicking something, public/sw.js has no `pushsubscriptionchange` handler, and
+   * browsers rotate and expire subscriptions on their own.
+   *
+   * Batch 38 made that a certainty rather than a possibility: signing out now
+   * revokes the subscription on purpose, so somebody who explicitly enabled push
+   * lost it at the end of every shift and silently never got it back.
+   *
+   * Deliberately its own effect, not folded into the socket one below: this must
+   * not run again on a reconnect, and it must not be able to delay
+   * wsClient.connect(). healPushSubscription never throws, never prompts, and
+   * returns false without doing anything unless the user's stored preference is
+   * an explicit yes and the OS permission is already granted.
+   */
+  useEffect(() => {
+    if (!userId) return;
+    healPushSubscription();
+  }, [userId]);
 
   useEffect(() => {
     if (!userId) return undefined;

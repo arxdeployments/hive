@@ -54,3 +54,50 @@ describe('Web Push entry points', () => {
     });
   }
 });
+
+/**
+ * The other half of the lifecycle, added in Batch 39.
+ *
+ * These two are wiring assertions: the logic they guard is unit-tested in
+ * pushRestore.test.js, but logic nothing calls is the failure this whole file
+ * exists for — enablePushNotifications sat in the repo with zero call sites while
+ * a toggle claimed to use it.
+ */
+describe('Web Push subscription state', () => {
+  it('Settings derives the toggle from the subscription, not from the preference alone', () => {
+    const source = readFileSync(join(SRC, 'pages/Settings.jsx'), 'utf8');
+
+    assert.match(
+      source,
+      /import\s*\{[^}]*\bpushSubscriptionExists\b[^}]*\}\s*from\s*'\.\.\/lib\/pwa'/,
+      'Settings does not ask whether a subscription exists, so its toggle can only ' +
+        'be reporting the stored preference — which defaults to ON when unset.',
+    );
+    // Both facts have to reach the displayed value. The preference on its own is
+    // the bug: unset reads as ON, so the switch sat on for users who had never
+    // subscribed and for every user who had just signed in.
+    assert.match(
+      source,
+      /const\s+desktopNotif\s*=[^;]*desktopNotifPref[^;]*pushSubscribed|const\s+desktopNotif\s*=[^;]*pushSubscribed[^;]*desktopNotifPref/,
+      'the toggle value is not derived from both the preference and the subscription.',
+    );
+  });
+
+  it('the session restores a subscription the user asked for and lost', () => {
+    // Nothing re-subscribed anywhere: two call sites, both a person clicking, no
+    // pushsubscriptionchange handler in public/sw.js. Sign-out now revokes the
+    // subscription by design, so without this the loss is permanent and silent.
+    const source = readFileSync(join(SRC, 'components/shared/RealtimeSession.jsx'), 'utf8');
+
+    assert.match(
+      source,
+      /import\s*\{[^}]*\bhealPushSubscription\b[^}]*\}\s*from\s*'\.\.\/\.\.\/lib\/pwa'/,
+      'RealtimeSession does not import healPushSubscription.',
+    );
+    assert.match(
+      source,
+      /healPushSubscription\(\)/,
+      'healPushSubscription is imported but never called.',
+    );
+  });
+});
