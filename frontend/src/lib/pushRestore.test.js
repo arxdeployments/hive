@@ -273,6 +273,70 @@ describe('restorePushSubscription', () => {
     assert.deepEqual(d.calls, []);
   });
 
+  it('tears down a subscription it created after the session had ended', async () => {
+    // The last window, and the worst one: subscribe() is several network round
+    // trips, so a sign-out can land inside it. Sign-out runs the teardown BEFORE
+    // the logout request, so it looks for a subscription that does not exist yet,
+    // deletes nothing, and returns — then this POST lands with cookies that are
+    // still valid and leaves push bound to the user who just left. Teardown cannot
+    // protect against something created after it ran.
+    const calls = [];
+    let cancelled = false;
+    const d = deps({
+      calls,
+      isCancelled: () => cancelled,
+      subscribe: async () => {
+        calls.push('subscribe');
+        // The session ends while this is still in flight.
+        cancelled = true;
+      },
+      tearDown: async () => {
+        calls.push('tearDown');
+      },
+    });
+
+    assert.equal(await restorePushSubscription(d), false);
+    assert.deepEqual(calls, ['subscribe', 'tearDown']);
+  });
+
+  it('tears down when the preference is cleared during the subscribe', async () => {
+    // Same window, reached the other way: signing out clears the preference too,
+    // and the Settings toggle can clear it without any sign-out at all.
+    const calls = [];
+    let wanted = true;
+    const d = deps({
+      calls,
+      wantsPush: () => wanted,
+      subscribe: async () => {
+        calls.push('subscribe');
+        wanted = false;
+      },
+      tearDown: async () => {
+        calls.push('tearDown');
+      },
+    });
+
+    assert.equal(await restorePushSubscription(d), false);
+    assert.deepEqual(calls, ['subscribe', 'tearDown']);
+  });
+
+  it('leaves a subscription alone when the session is still good', async () => {
+    // The other half of the guard: it must not undo its own successful work.
+    const calls = [];
+    const d = deps({
+      calls,
+      subscribe: async () => {
+        calls.push('subscribe');
+      },
+      tearDown: async () => {
+        calls.push('tearDown');
+      },
+    });
+
+    assert.equal(await restorePushSubscription(d), true);
+    assert.deepEqual(calls, ['subscribe']);
+  });
+
   it('reports false rather than throwing when the subscribe fails', async () => {
     const d = deps({
       subscribe: async () => {
