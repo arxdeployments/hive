@@ -1,10 +1,11 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Plus, Search, Pencil, Trash2, FolderTree, Loader2, ChevronLeft, ChevronRight, ChevronDown } from 'lucide-react';
 import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
 import client from '../../api/client';
 import { apiError } from '../../utils/helpers';
+import { createRequestTicket } from '../../utils/latestRequest';
 
 export default function Departments() {
   const [orgs, setOrgs] = useState([]);
@@ -39,24 +40,36 @@ export default function Departments() {
     fetchOrgs();
   }, []);
 
+  // One counter for every load below, effect-driven and imperative alike: only
+  // the holder of the newest ticket may write. See utils/latestRequest.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
   const fetchDepts = useCallback(async () => {
     if (!selectedOrg) return;
+    const seq = ticketRef.current.take();
     setLoading(true);
     try {
       const { data } = await client.get('/api/admin/departments', {
         params: { org_id: selectedOrg._id, page, limit, search }
       });
+      if (!ticketRef.current.isCurrent(seq)) return;
       setDepts(data.data);
       setTotal(data.total);
     } catch {
-      toast.error('Failed to load departments');
+      if (ticketRef.current.isCurrent(seq)) toast.error('Failed to load departments');
     } finally {
-      setLoading(false);
+      // The spinner belongs to the newest load as much as the rows do: clearing
+      // it from a superseded one shows the stale table as if it were loaded.
+      if (ticketRef.current.isCurrent(seq)) setLoading(false);
     }
   }, [selectedOrg, page, search]);
 
   useEffect(() => {
     fetchDepts();
+    // Disowned on the way out: a response arriving for a screen that is gone
+    // writes nothing. See utils/latestRequest.
+    return () => ticketRef.current.invalidate();
   }, [fetchDepts]);
 
   const openCreate = () => {

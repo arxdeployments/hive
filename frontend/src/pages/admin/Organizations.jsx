@@ -1,10 +1,11 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Plus, Search, Pencil, Trash2, Building2, Loader2, ChevronLeft, ChevronRight } from 'lucide-react';
 import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
 import client from '../../api/client';
 import { apiError } from '../../utils/helpers';
+import { createRequestTicket } from '../../utils/latestRequest';
 
 export default function Organizations() {
   const [orgs, setOrgs] = useState([]);
@@ -28,23 +29,35 @@ export default function Organizations() {
   const [formSaving, setFormSaving] = useState(false);
   const [nameAvailable, setNameAvailable] = useState(null);
 
+  // One counter for every load below, effect-driven and imperative alike: only
+  // the holder of the newest ticket may write. See utils/latestRequest.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
   const fetchOrgs = useCallback(async () => {
+    const seq = ticketRef.current.take();
     setLoading(true);
     try {
       const { data } = await client.get('/api/admin/organizations', {
         params: { page, limit, search, sort: sortField, order: sortOrder }
       });
+      if (!ticketRef.current.isCurrent(seq)) return;
       setOrgs(data.data);
       setTotal(data.total);
     } catch {
-      toast.error('Failed to load organizations');
+      if (ticketRef.current.isCurrent(seq)) toast.error('Failed to load organizations');
     } finally {
-      setLoading(false);
+      // The spinner belongs to the newest load as much as the rows do: clearing
+      // it from a superseded one shows the stale table as if it were loaded.
+      if (ticketRef.current.isCurrent(seq)) setLoading(false);
     }
   }, [page, search, sortField, sortOrder]);
 
   useEffect(() => {
     fetchOrgs();
+    // Disowned on the way out: a response arriving for a screen that is gone
+    // writes nothing. See utils/latestRequest.
+    return () => ticketRef.current.invalidate();
   }, [fetchOrgs]);
 
   // Debounced name validation

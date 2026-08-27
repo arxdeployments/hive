@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { Plus, Search, Pencil, Loader2, RefreshCw, Copy, X, Info } from 'lucide-react';
 import { toast } from 'sonner';
@@ -8,6 +8,7 @@ import client from '../../api/client';
 
 import { generatePassword as genPassword } from '../../utils/generatePassword';
 import { apiError } from '../../utils/helpers';
+import { createRequestTicket } from '../../utils/latestRequest';
 
 export default function OrgAdminUsers() {
   const { user: me } = useAuth();
@@ -45,19 +46,33 @@ export default function OrgAdminUsers() {
     try { const { data } = await client.get('/api/org-admin/departments'); setDepts(data); } catch {}
   }, []);
 
+  // One counter for every load below, effect-driven and imperative alike: only
+  // the holder of the newest ticket may write. See utils/latestRequest.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
   const fetchUsers = useCallback(async () => {
+    const seq = ticketRef.current.take();
     setLoading(true);
     try {
       const params = { page, limit, search };
       if (deptFilter) params.dept_id = deptFilter;
       const { data } = await client.get('/api/org-admin/users', { params });
+      if (!ticketRef.current.isCurrent(seq)) return;
       setUsers(data.data); setTotal(data.total);
-    } catch { toast.error('Failed to load users'); }
-    finally { setLoading(false); }
+    } catch { if (ticketRef.current.isCurrent(seq)) toast.error('Failed to load users'); }
+    // The spinner belongs to the newest load as much as the rows do: clearing it
+    // from a superseded one shows the stale table as if it were loaded.
+    finally { if (ticketRef.current.isCurrent(seq)) setLoading(false); }
   }, [page, search, deptFilter]);
 
   useEffect(() => { fetchDepts(); }, [fetchDepts]);
-  useEffect(() => { fetchUsers(); }, [fetchUsers]);
+  useEffect(() => {
+    fetchUsers();
+    // Disowned on the way out: a response arriving for a screen that is gone
+    // writes nothing. See utils/latestRequest.
+    return () => ticketRef.current.invalidate();
+  }, [fetchUsers]);
 
   const openCreate = () => {
     setFormEmail(''); setFormName(''); setFormDept(depts[0]?._id || '');

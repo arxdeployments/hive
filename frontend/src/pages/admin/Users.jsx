@@ -10,6 +10,7 @@ import { PageTransition } from '../../components/common/PageTransition';
 import client from '../../api/client';
 
 import { generatePassword } from '../../utils/generatePassword';
+import { createRequestTicket } from '../../utils/latestRequest';
 import { apiError } from '../../utils/helpers';
 
 export default function UsersPage() {
@@ -88,10 +89,13 @@ export default function UsersPage() {
   }, [selectedOrg]);
 
   // One counter for every load below, effect-driven and imperative alike.
-  const fetchSeqRef = useRef(0);
+  // The scheme the comment beneath describes now lives in utils/latestRequest,
+  // shared with the three sibling admin lists that were missing it entirely.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
 
   /**
-   * One list load. Each takes a ticket from `fetchSeqRef` and only the holder
+   * One list load. Each takes a ticket from `ticketRef` and only the holder
    * of the newest may write — the same request-token scheme the window fetches
    * in ChatPanel use.
    *
@@ -115,7 +119,7 @@ export default function UsersPage() {
    * table. One shared counter orders all four call sites against each other.
    */
   const fetchUsers = useCallback(async () => {
-    const seq = ++fetchSeqRef.current;
+    const seq = ticketRef.current.take();
     setLoading(true);
     try {
       const params = { page, limit, search };
@@ -124,17 +128,17 @@ export default function UsersPage() {
       if (statusFilter) params.status = statusFilter;
       if (mobileFilter) params.mobile = mobileFilter;
       const { data } = await client.get('/api/admin/users', { params });
-      if (seq !== fetchSeqRef.current) return;
+      if (!ticketRef.current.isCurrent(seq)) return;
       setUsers(data.data);
       setTotal(data.total);
     } catch {
       // A superseded load's failure is not this screen's failure any more:
       // toasting it would report an error against a query nobody is looking at.
-      if (seq === fetchSeqRef.current) toast.error('Failed to load users');
+      if (ticketRef.current.isCurrent(seq)) toast.error('Failed to load users');
     } finally {
       // Guarded too, or a slow superseded response would clear the spinner
       // while the load the user IS waiting for is still in flight.
-      if (seq === fetchSeqRef.current) setLoading(false);
+      if (ticketRef.current.isCurrent(seq)) setLoading(false);
     }
   }, [selectedOrg, selectedDept, statusFilter, mobileFilter, page, search]);
 
@@ -142,7 +146,7 @@ export default function UsersPage() {
     fetchUsers();
     // Bumping on the way out keeps what the per-run flag did on unmount: a
     // response arriving for a screen that is gone writes nothing.
-    return () => { fetchSeqRef.current++; };
+    return () => ticketRef.current.invalidate();
   }, [fetchUsers]);
 
   // Load create depts when org changes
