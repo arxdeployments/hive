@@ -289,20 +289,20 @@ enum RxHiveAPI {
     }
 
     /// PATCH semantics on a PUT: only the keys sent are applied.
+    /// One key, because `send_messages` is the only permission the server enforces.
+    /// `edit_info` and `add_members` were withdrawn from `PermissionsRequest`
+    /// (`api/groups.py`) — nothing read `perm_edit_info` or `perm_add_members`, so
+    /// sending them was a 200 for a no-op.
     static func updateGroupPermissions(
         conversationID: String,
-        editInfo: Bool? = nil,
-        sendMessages: Bool? = nil,
-        addMembers: Bool? = nil
+        sendMessages: Bool? = nil
     ) async throws -> GroupPermissions {
         struct Body: Encodable {
-            let edit_info: Bool?
             let send_messages: Bool?
-            let add_members: Bool?
         }
         return try await api.send(
             .put, "/api/conversations/\(conversationID)/permissions",
-            body: Body(edit_info: editInfo, send_messages: sendMessages, add_members: addMembers),
+            body: Body(send_messages: sendMessages),
             as: GroupPermissions.self
         )
     }

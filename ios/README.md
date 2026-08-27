@@ -167,11 +167,14 @@ building UI for them would be building dead buttons.
 - **Super-admin screens.** Super admins cannot sign in here at all.
 - **Creating cross-org groups.** Super-admin-only, web portal only. The app displays
   cross-org groups it is a member of, with their purpose tag.
-- **Group permissions beyond three toggles.** The wire exposes `edit_info`,
-  `add_members`, and `send_messages` only. `send_history`, `invite_via_link` and
-  `approve_new_members` are stored but **no read path enforces them** — a member
-  added later still sees the full pre-join history — so surfacing them would
-  advertise privacy the server does not provide.
+- **Group permissions beyond one toggle.** The wire exposes `send_messages` only.
+  `send_history`, `invite_via_link` and `approve_new_members` are stored but **no
+  read path enforces them** — a member added later still sees the full pre-join
+  history — so surfacing them would advertise privacy the server does not provide.
+  `edit_info` and `add_members` were withdrawn for the same reason: nothing read
+  `perm_edit_info` or `perm_add_members`, because `PUT /{id}/group` and
+  `POST /{id}/members` gate on group-admin role alone, and both columns default to
+  true — so the permissive setting was the one that did nothing.
 
 ## Backend bug found while porting — since fixed
 
