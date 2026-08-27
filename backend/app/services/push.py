@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import socket
+from typing import NamedTuple
 from urllib.parse import urlsplit
 
 import anyio
@@ -79,43 +80,113 @@ def dispatch_push_to_users(user_ids, payload: dict) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-async def _push_in_background(user_ids, payload: dict) -> None:
-    # Own session: the request that triggered this has already returned and
-    # closed its own. Nothing may escape — push is best-effort, and an
-    # exception here has no caller left to surface it to.
-    try:
-        async with SessionLocal() as db:
-            await push_to_users(db, user_ids, payload)
-    except Exception:
-        logger.exception("background web push failed")
+class _Target(NamedTuple):
+    """What one send needs, detached from the ORM and from any session.
+
+    The fan-out used to pass PushSubscription instances into worker threads and
+    read `.endpoint` and `.keys` there. That only worked because the attributes
+    happened to be loaded and unexpired: an ORM attribute access that has to go
+    back to the database raises MissingGreenlet from a thread, and after the
+    change below there is deliberately no session left to go back to. A plain
+    tuple removes the whole class of problem rather than relying on it not
+    happening.
+    """
+
+    endpoint: str
+    keys: dict
 
 
-async def push_to_users(db: AsyncSession, user_ids, payload: dict) -> None:
-    settings = get_settings()
-    if not _HAS_WEBPUSH or not settings.vapid_private_key or not user_ids:
-        return
-    subs = (
+async def _load_targets(db: AsyncSession, user_ids) -> list[_Target]:
+    rows = (
         (await db.execute(select(PushSubscription).where(PushSubscription.user_id.in_(list(user_ids)))))
         .scalars()
         .all()
     )
-    if not subs:
-        return
+    return [_Target(endpoint=r.endpoint, keys=dict(r.keys or {})) for r in rows]
+
+
+async def _prune(db: AsyncSession, dead: list[str]) -> None:
+    await db.execute(delete(PushSubscription).where(PushSubscription.endpoint.in_(dead)))
+    await db.commit()
+
+
+async def _fan_out(targets: list[_Target], payload: dict) -> list[str]:
+    """Send to every target and report the endpoints the push service rejected.
+
+    Holds no database connection. That is the point — see _push_in_background.
+    """
+    settings = get_settings()
     data = json.dumps(payload)
     dead: list[str] = []
     # Concurrent, but bounded: a large group must not hand the whole worker
     # thread pool to one push fan-out.
     limiter = anyio.CapacityLimiter(_MAX_CONCURRENT_SENDS)
     async with anyio.create_task_group() as tg:
-        for sub in subs:
-            tg.start_soon(_deliver, sub, data, settings, limiter, dead)
+        for target in targets:
+            tg.start_soon(_deliver, target, data, settings, limiter, dead)
+    return dead
+
+
+async def _push_in_background(user_ids, payload: dict) -> None:
+    """Three phases, and the middle one holds no pooled connection.
+
+    dispatch_push_to_users moved the fan-out off the request precisely because
+    awaiting it inline "pinned the request's DB session (pool size 10) for their
+    whole duration". Giving the background task its own session moved that
+    pinning rather than removing it: the session was opened before the fan-out
+    and closed after it, so one pooled connection sat checked out — and idle —
+    for the entire run of remote HTTPS POSTs.
+
+    The duration is not small. Sends are bounded to _MAX_CONCURRENT_SENDS (10) and
+    each may spend SEND_TIMEOUT_SECONDS (5) against a black-holed endpoint, so the
+    wall time scales with the number of subscriptions: 2,000 of them is up to
+    ~17 minutes. And nothing caps that number — regular groups stop at
+    MAX_GROUP_MEMBERS, but app/api/cross_org.py bounds only the MINIMUM size, so a
+    cross-org group has no ceiling at all (services/messaging.py records the same
+    asymmetry making a different tail reachable). Every message to such a group
+    starts another one, so a handful of them concurrently exhausts a pool of 10
+    and the API stops being able to serve anything that needs a session, which is
+    every route.
+
+    So the connection is held only for the two operations that need it, and the
+    network happens in between with nothing checked out. Nothing may escape —
+    push is best-effort, and an exception here has no caller left to surface it to.
+    """
+    try:
+        settings = get_settings()
+        if not _HAS_WEBPUSH or not settings.vapid_private_key or not user_ids:
+            return
+        async with SessionLocal() as db:
+            targets = await _load_targets(db, user_ids)
+        if not targets:
+            return
+        dead = await _fan_out(targets, payload)
+        if dead:
+            async with SessionLocal() as db:
+                await _prune(db, dead)
+    except Exception:
+        logger.exception("background web push failed")
+
+
+async def push_to_users(db: AsyncSession, user_ids, payload: dict) -> None:
+    """Fan out using the CALLER's session, which it therefore pins for the whole
+    duration. Prefer dispatch_push_to_users, which does not — see
+    _push_in_background for why that matters. Kept for a caller that has no event
+    loop of its own to hand the work to, such as a management script.
+    """
+    settings = get_settings()
+    if not _HAS_WEBPUSH or not settings.vapid_private_key or not user_ids:
+        return
+    targets = await _load_targets(db, user_ids)
+    if not targets:
+        return
+    dead = await _fan_out(targets, payload)
     if dead:
-        await db.execute(delete(PushSubscription).where(PushSubscription.endpoint.in_(dead)))
-        await db.commit()
+        await _prune(db, dead)
 
 
 async def _deliver(
-    sub: PushSubscription, data: str, settings, limiter: anyio.CapacityLimiter, dead: list[str]
+    sub: _Target, data: str, settings, limiter: anyio.CapacityLimiter, dead: list[str]
 ) -> None:
     """Deliver to one subscription. Must never raise: an exception out of a
     task-group child cancels its siblings, so one bad endpoint would take down
@@ -132,7 +203,7 @@ async def _deliver(
         logger.exception("web push error")
 
 
-def _send_one(sub: PushSubscription, data: str, settings) -> None:
+def _send_one(sub: _Target, data: str, settings) -> None:
     webpush(
         subscription_info={"endpoint": sub.endpoint, "keys": sub.keys},
         data=data,
