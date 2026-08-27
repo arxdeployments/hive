@@ -7,11 +7,12 @@ import ipaddress
 import json
 import logging
 import socket
+import uuid
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
 import anyio
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -90,8 +91,12 @@ class _Target(NamedTuple):
     change below there is deliberately no session left to go back to. A plain
     tuple removes the whole class of problem rather than relying on it not
     happening.
+
+    `id` and `user_id` are carried for the prune, not for the send — see _prune.
     """
 
+    id: uuid.UUID
+    user_id: uuid.UUID
     endpoint: str
     keys: dict
 
@@ -102,22 +107,44 @@ async def _load_targets(db: AsyncSession, user_ids) -> list[_Target]:
         .scalars()
         .all()
     )
-    return [_Target(endpoint=r.endpoint, keys=dict(r.keys or {})) for r in rows]
+    return [_Target(id=r.id, user_id=r.user_id, endpoint=r.endpoint, keys=dict(r.keys or {})) for r in rows]
 
 
-async def _prune(db: AsyncSession, dead: list[str]) -> None:
-    await db.execute(delete(PushSubscription).where(PushSubscription.endpoint.in_(dead)))
+async def _prune(db: AsyncSession, dead: list[_Target]) -> None:
+    """Delete the subscriptions the push service rejected — but only the exact rows
+    that were loaded, still owned by whom they were loaded for.
+
+    Deleting by endpoint alone was wrong, and reachable. Endpoints are globally
+    unique and api/notifications.py RE-BINDS one to whoever presents it
+    ("Endpoints are globally unique; re-subscribing re-binds to the caller"), so
+    the row can change hands between _load_targets and a delayed 404/410 landing
+    here. It is the shared-workstation case again: if a sign-out teardown does not
+    complete, the browser keeps its subscription, the next person to sign in on
+    that profile gets the SAME endpoint back from pushManager.subscribe(), and the
+    route moves the row to them. A stale rejection from the previous user's
+    in-flight fan-out would then delete a live subscription belonging to another
+    user — in another organisation, in the general case — who silently stops
+    receiving push and has no way to know why.
+
+    Matching on (id, user_id) makes a re-bound row simply not match: same row, new
+    owner, left alone.
+    """
+    await db.execute(
+        delete(PushSubscription).where(
+            tuple_(PushSubscription.id, PushSubscription.user_id).in_([(t.id, t.user_id) for t in dead])
+        )
+    )
     await db.commit()
 
 
-async def _fan_out(targets: list[_Target], payload: dict) -> list[str]:
-    """Send to every target and report the endpoints the push service rejected.
+async def _fan_out(targets: list[_Target], payload: dict) -> list[_Target]:
+    """Send to every target and report the ones the push service rejected.
 
     Holds no database connection. That is the point — see _push_in_background.
     """
     settings = get_settings()
     data = json.dumps(payload)
-    dead: list[str] = []
+    dead: list[_Target] = []
     # Concurrent, but bounded: a large group must not hand the whole worker
     # thread pool to one push fan-out.
     limiter = anyio.CapacityLimiter(_MAX_CONCURRENT_SENDS)
@@ -186,7 +213,7 @@ async def push_to_users(db: AsyncSession, user_ids, payload: dict) -> None:
 
 
 async def _deliver(
-    sub: _Target, data: str, settings, limiter: anyio.CapacityLimiter, dead: list[str]
+    sub: _Target, data: str, settings, limiter: anyio.CapacityLimiter, dead: list[_Target]
 ) -> None:
     """Deliver to one subscription. Must never raise: an exception out of a
     task-group child cancels its siblings, so one bad endpoint would take down
@@ -196,7 +223,9 @@ async def _deliver(
     except WebPushException as exc:
         status = getattr(getattr(exc, "response", None), "status_code", None)
         if status in (404, 410):
-            dead.append(sub.endpoint)
+            # The whole target, not just its endpoint: _prune needs the identity
+            # and the owner it was loaded with.
+            dead.append(sub)
         else:
             logger.warning("web push failed: %s", exc)
     except Exception:

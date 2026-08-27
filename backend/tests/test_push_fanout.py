@@ -115,7 +115,9 @@ async def test_rejected_endpoints_are_pruned(push_configured, monkeypatch):
     await _add_subscription(user.id, "https://push.example.test/f/live")
 
     async def spy_fan_out(targets, payload):
-        return ["https://push.example.test/f/dead"]
+        # Rejections are reported as the loaded targets, so the prune can match on
+        # identity and owner rather than on an endpoint that may have changed hands.
+        return [t for t in targets if t.endpoint.endswith("/dead")]
 
     monkeypatch.setattr(push_mod, "_fan_out", spy_fan_out)
     await push_mod._push_in_background([user.id], {"title": "x"})
@@ -160,3 +162,47 @@ async def test_background_push_never_raises(push_configured, monkeypatch):
 
     # No assertion needed beyond this returning at all.
     await push_mod._push_in_background([user.id], {"title": "x"})
+
+
+async def test_prune_leaves_a_rebound_subscription_alone(push_configured, monkeypatch):
+    """A stale rejection must not delete a subscription that has changed hands.
+
+    Endpoints are globally unique and api/notifications.py re-binds one to whoever
+    presents it, so a row can move to another user — in another organisation —
+    between _load_targets and a delayed 404/410 arriving.
+
+    Reachable on a shared workstation: if a sign-out teardown does not complete the
+    browser keeps its subscription, the next person to sign in on that profile gets
+    the SAME endpoint back from pushManager.subscribe(), and the route moves the row
+    to them. Pruning by endpoint alone then deleted a live subscription belonging to
+    somebody else, who silently stopped receiving push with no way to know why.
+    """
+    endpoint = "https://push.example.test/f/shared-device"
+    org_a = await make_org("Rebind Org A")
+    org_b = await make_org("Rebind Org B")
+    alice = await make_user("rebind-alice@a.com", org_id=org_a.id)
+    bob = await make_user("rebind-bob@b.com", org_id=org_b.id)
+    await _add_subscription(alice.id, endpoint)
+
+    async def rebinding_fan_out(targets, payload):
+        # Mid-fan-out, the endpoint is re-bound to Bob — exactly what
+        # POST /api/notifications/subscribe does when he presents it.
+        async with SessionLocal() as db:
+            row = (
+                await db.execute(select(PushSubscription).where(PushSubscription.endpoint == endpoint))
+            ).scalar_one()
+            row.user_id = bob.id
+            await db.commit()
+        # Alice's send then comes back 410, reported against the target as LOADED.
+        return list(targets)
+
+    monkeypatch.setattr(push_mod, "_fan_out", rebinding_fan_out)
+    await push_mod._push_in_background([alice.id], {"title": "x"})
+
+    async with SessionLocal() as db:
+        row = (
+            await db.execute(select(PushSubscription).where(PushSubscription.endpoint == endpoint))
+        ).scalar_one_or_none()
+
+    assert row is not None, "a stale rejection deleted a subscription owned by another org's user"
+    assert row.user_id == bob.id, "the subscription should still belong to Bob"
