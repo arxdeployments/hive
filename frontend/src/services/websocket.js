@@ -7,6 +7,7 @@ import { refreshSession, sessionRejected, setSignOutReason } from '../api/client
 import { withDerivedStatus, applyReadReceipt } from '../utils/messageStatus';
 import { handleCallJoinError, notifyCameraUnavailable } from '../utils/callErrors';
 import { isDesktopNotifDisabled } from '../utils/notificationPrefs';
+import { tearDownPush } from '../lib/pushTeardown';
 
 /**
  * Join the SFU and surface what happened. Every join site shares this so a
@@ -538,6 +539,10 @@ class RxHiveWebSocket {
         // Anything else backs off and retries like a normal disconnect.
         if (sessionRejected(err)) {
           localStorage.removeItem('user');
+          // Matching client.js: the subscription has to be put down before the
+          // document navigation below discards this context, or the expired
+          // user's push keeps landing on this machine.
+          await tearDownPush({ nav: navigator, storage: localStorage });
           setSignOutReason('expired');
           // Guarded, matching client.js: already being on /login is not a reason
           // to navigate again, and a reload there would clear the form.

@@ -1,6 +1,7 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import client, { setSignOutReason } from '../api/client';
 import useChatStore from '../stores/chatStore';
+import { tearDownPush } from '../lib/pushTeardown';
 
 /**
  * Both sign-outs that stay inside the SPA end up here.
@@ -58,6 +59,12 @@ export const AuthProvider = ({ children }) => {
       if (status === 401 || status === 403) {
         localStorage.removeItem('user');
         dropSessionData();
+        // Same reason as logout(), minus the API call: this session is already
+        // refused, so a DELETE would 401 and re-enter the refresh interceptor for
+        // a session that is over. Unsubscribing the browser is the half that
+        // stops delivery anyway — the abandoned endpoint then answers 404/410 and
+        // services/push.py prunes the row on the next send.
+        await tearDownPush({ nav: navigator, storage: localStorage });
         // This path is a SOFT sign-out — the route guards render
         // <Navigate to="/login">, a React transition rather than a document
         // navigation — so unlike client.js the message could have lived in
@@ -90,6 +97,19 @@ export const AuthProvider = ({ children }) => {
   };
 
   const logout = async () => {
+    // Before the logout POST, not after: DELETE /api/notifications/subscribe
+    // authenticates as this user, and the POST below is what clears the cookies
+    // it needs. Awaited rather than fired off, because the whole point is that it
+    // finishes while the session still exists.
+    //
+    // Without this the browser stayed subscribed and the push_subscriptions row
+    // stayed bound to the user signing out, so every message sent to them went on
+    // arriving as an OS notification on this machine — sender's name in the title
+    // and 120 characters of the message body (services/messaging.py:_push_preview)
+    // — to whoever used it next, on the lock screen included. The heap teardown
+    // below never covered it: a push notification is delivered by the service
+    // worker, which outlives the tab.
+    await tearDownPush({ nav: navigator, api: client, storage: localStorage });
     try {
       await client.post('/api/auth/logout');
     } catch {

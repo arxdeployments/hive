@@ -1,5 +1,6 @@
 // Service-worker registration + Web Push subscription helpers.
 import client from '../api/client';
+import { tearDownPush } from './pushTeardown';
 
 export function registerServiceWorker() {
   if (!('serviceWorker' in navigator)) return;
@@ -41,13 +42,14 @@ export async function enablePushNotifications() {
   return true;
 }
 
+/**
+ * Turn push off for this device. One implementation, shared with every sign-out
+ * path — see lib/pushTeardown.js for the ordering and the timeouts.
+ *
+ * `storage` is deliberately not passed: this is the Settings toggle, which owns
+ * `rxhive_desktop_notif` itself and writes it as the user flips the switch.
+ * Clearing it from in here would fight that effect.
+ */
 export async function disablePushNotifications() {
-  if (!('serviceWorker' in navigator)) return;
-  const reg = await navigator.serviceWorker.ready;
-  const sub = await reg.pushManager.getSubscription();
-  if (sub) {
-    // DELETE carries a body here, so it must go in axios' `data` option.
-    await client.delete('/api/notifications/subscribe', { data: { endpoint: sub.endpoint } });
-    await sub.unsubscribe();
-  }
+  await tearDownPush({ nav: navigator, api: client });
 }

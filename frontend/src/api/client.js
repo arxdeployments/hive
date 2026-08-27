@@ -15,6 +15,7 @@
  *   session, so only that signs the user out.
  */
 import axios from 'axios';
+import { tearDownPush } from '../lib/pushTeardown';
 
 const API_BASE = import.meta.env.VITE_BACKEND_URL || '';
 
@@ -191,6 +192,13 @@ client.interceptors.response.use(
         processQueue(refreshError);
         if (sessionRejected(refreshError)) {
           localStorage.removeItem('user');
+          // Awaited BEFORE the navigation, and bounded inside. A document
+          // navigation kills pending JS, so an un-awaited unsubscribe here would
+          // usually not finish — and the subscription surviving is what kept the
+          // expired user's message previews arriving on this machine as OS
+          // notifications. No `api`: this session has just been refused, so a
+          // DELETE would 401 straight back into the branch we are standing in.
+          await tearDownPush({ nav: navigator, storage: localStorage });
           setSignOutReason('expired');
           if (window.location.pathname !== '/login') {
             window.location.href = '/login';
