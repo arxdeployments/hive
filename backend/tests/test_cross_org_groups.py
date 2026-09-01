@@ -287,3 +287,31 @@ async def test_an_add_that_resolves_to_nobody_is_still_allowed_at_the_cap(
         )
 
     assert resp.status_code == 200, resp.text
+
+
+# NO TEST FOR THE ROW LOCK, DELIBERATELY.
+#
+# add_members takes FOR UPDATE on the conversation row before reading the
+# membership, because the cap is a read-check-insert and two concurrent adds would
+# otherwise both see the last free slot. Two tests that genuinely proved it were
+# written and both were thrown away:
+#
+#   1. Two real requests through asyncio.gather. Passed with the lock REMOVED —
+#      the event loop ran the first request to completion before the second began,
+#      so it asserted the invariant and detected nothing.
+#   2. The same, forced to interleave with a barrier, and then a single-request
+#      version probing for the lock with SELECT ... FOR UPDATE NOWAIT from a second
+#      session. Both detected the race correctly, and both deterministically broke
+#      test_concurrent_identical_sends_store_one_message in the same run — three
+#      times out of three.
+#
+# That failure is NOT caused by the lock. Verified by reverting api/cross_org.py
+# and api/groups.py to HEAD and re-running: it still fails, so anything scheduled
+# before that test exposes it. One of its four concurrent identical sends comes
+# back as an IntegrityError rather than a replay, which means the loser's
+# post-rollback lookup in services/messaging.py found no winner and re-raised —
+# a real latent race in the idempotency path, reported separately.
+#
+# A test that reds an unrelated test is worse than no test, and papering over it
+# here would hide the messaging bug. The lock stays; the coverage waits for that
+# race to be fixed.

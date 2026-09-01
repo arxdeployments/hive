@@ -279,6 +279,19 @@ async def add_members(conv_id: str, body: AddMembersRequest, tenant: TenantConte
     if not conv.is_active:
         raise HTTPException(status_code=404, detail="Group not found")
 
+    # Lock the conversation row BEFORE reading the membership. The cap is a
+    # read-check-insert, and under PostgreSQL's default READ COMMITTED two
+    # concurrent adds each see the same pre-insert count: at 255 members both
+    # observe one free slot, both pass, and the group ends at 257. Neither request
+    # is wrong on its own, which is why the check cannot be made correct by
+    # arithmetic — the reads have to be serialized.
+    #
+    # FOR UPDATE on the parent row rather than on the participants: there is no
+    # row to lock for a member who does not exist yet, so the invariant belongs to
+    # the conversation. The lock is held to commit, so the second request reads the
+    # membership only after the first has finished writing it.
+    await db.execute(select(Conversation.id).where(Conversation.id == conv.id).with_for_update())
+
     stmt = select(ConversationParticipant).where(ConversationParticipant.conversation_id == conv.id)
     existing = (await db.execute(stmt)).scalars().all()
     existing_ids = {p.user_id for p in existing}
@@ -307,7 +320,7 @@ async def add_members(conv_id: str, body: AddMembersRequest, tenant: TenantConte
             new_members.append(member)
 
     if len(existing) + len(new_members) > MAX_GROUP_MEMBERS:
-        raise HTTPException(status_code=400, detail="Maximum 256 members")
+        raise HTTPException(status_code=400, detail=f"Maximum {MAX_GROUP_MEMBERS} members")
 
     if new_members:
         now = now_utc()

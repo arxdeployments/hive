@@ -485,6 +485,18 @@ async def add_members(
     db: AsyncSession = Depends(get_db),
 ):
     conv = await _load_group(db, group_id, active_only=True)
+    # Lock the conversation row BEFORE reading the membership. The cap is a
+    # read-check-insert, and under PostgreSQL's default READ COMMITTED two
+    # concurrent adds each see the same pre-insert count: at 255 members both
+    # observe one free slot, both pass, and the group ends at 257. Neither request
+    # is wrong on its own, which is why the check cannot be made correct by
+    # arithmetic — the reads have to be serialized.
+    #
+    # FOR UPDATE on the parent row rather than on the participants: there is no
+    # row to lock for a member who does not exist yet, so the invariant belongs to
+    # the conversation. The lock is held to commit, so the second request reads the
+    # membership only after the first has finished writing it.
+    await db.execute(select(Conversation.id).where(Conversation.id == conv.id).with_for_update())
     existing_ids = set(await participant_ids(db, conv.id))
 
     specs: list[tuple[uuid.UUID, str]] = []
