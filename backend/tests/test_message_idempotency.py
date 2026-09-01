@@ -225,3 +225,72 @@ async def test_concurrent_identical_sends_store_one_message(client, two_orgs_wit
 
     body = [m for m in await _history(client, conv) if m["content"] == "race"]
     assert len(body) == 1, f"expected one stored message, got {len(body)}"
+
+
+async def test_a_send_that_loses_the_insert_race_replays_instead_of_erroring(
+    client, two_orgs_with_users, monkeypatch
+):
+    """The idempotency backstop was guarding the wrong statement.
+
+    uq_messages_client_msg_id is a partial unique INDEX, not a constraint, so it
+    cannot be deferred and PostgreSQL enforces it when the INSERT runs — at
+    db.flush(). The `except IntegrityError` written for exactly this race was
+    attached to db.commit(). Session.commit() flushes first, but the explicit
+    flush had already emitted the INSERT, so there was nothing left for the commit
+    to raise: the backstop was unreachable for the one constraint its own comment
+    names, and the loser of a genuine race got an IntegrityError out of the
+    endpoint.
+
+    THE RACE IS FORCED, deliberately. test_concurrent_identical_sends_store_one_message
+    passes or fails depending on what ran before it in the same session — the
+    check-then-act lookup catches the common case, where the winner commits before
+    the loser gets that far, and only two genuinely overlapping sends skip it. This
+    holds both senders at the lookup until both have seen nothing, so both go on to
+    insert every time.
+    """
+    from app.services import messaging as messaging_mod
+
+    users = two_orgs_with_users
+    await login(client, "alice@a.com")
+    conv = await _direct(client, users["bob"].id)
+
+    original_find = messaging_mod._find_by_client_msg_id
+    lookups = {"n": 0}
+    both_have_looked = asyncio.Event()
+
+    async def barrier_find(db, **kwargs):
+        lookups["n"] += 1
+        nth = lookups["n"]
+        result = await original_find(db, **kwargs)
+        # Only the two PRE-CHECKS are held. Later calls are the loser's recovery
+        # lookup, which must not be delayed — and must be able to see the winner.
+        if nth == 1:
+            # NOT suppressed. If the second sender never reaches this lookup the
+            # race was not forced, and the assertions below would then be satisfied
+            # by an ordinary sequential replay — passing without ever exercising the
+            # flush-conflict recovery they exist to cover. Generous bound, because
+            # the point is to fail on "could not force it", not on a slow runner.
+            await asyncio.wait_for(both_have_looked.wait(), timeout=15.0)
+        elif nth == 2:
+            both_have_looked.set()
+        return result
+
+    monkeypatch.setattr(messaging_mod, "_find_by_client_msg_id", barrier_find)
+
+    async def send():
+        async with _client_for("alice@a.com") as c:
+            return await c.post(
+                f"/api/conversations/{conv}/messages",
+                json={"content": "forced race", "type": "text", "temp_id": "key-forced"},
+            )
+
+    results = await asyncio.gather(send(), send(), return_exceptions=True)
+
+    assert all(not isinstance(r, Exception) for r in results), results
+    assert all(r.status_code == 200 for r in results), [r.status_code for r in results]
+    # Both senders were told about the same message, which is what a replay means.
+    ids = {r.json()["_id"] for r in results}
+    assert len(ids) == 1, f"the two sends resolved to {len(ids)} different messages"
+
+    stored = [m for m in await _history(client, conv) if m["content"] == "forced race"]
+    assert len(stored) == 1, f"expected one stored message, got {len(stored)}"

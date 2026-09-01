@@ -9,6 +9,7 @@ import contextlib
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 
 from app.db.models import AuditLog, Conversation, UserRole
 from app.db.session import SessionLocal
@@ -289,29 +290,73 @@ async def test_an_add_that_resolves_to_nobody_is_still_allowed_at_the_cap(
     assert resp.status_code == 200, resp.text
 
 
-# NO TEST FOR THE ROW LOCK, DELIBERATELY.
-#
-# add_members takes FOR UPDATE on the conversation row before reading the
-# membership, because the cap is a read-check-insert and two concurrent adds would
-# otherwise both see the last free slot. Two tests that genuinely proved it were
-# written and both were thrown away:
-#
-#   1. Two real requests through asyncio.gather. Passed with the lock REMOVED —
-#      the event loop ran the first request to completion before the second began,
-#      so it asserted the invariant and detected nothing.
-#   2. The same, forced to interleave with a barrier, and then a single-request
-#      version probing for the lock with SELECT ... FOR UPDATE NOWAIT from a second
-#      session. Both detected the race correctly, and both deterministically broke
-#      test_concurrent_identical_sends_store_one_message in the same run — three
-#      times out of three.
-#
-# That failure is NOT caused by the lock. Verified by reverting api/cross_org.py
-# and api/groups.py to HEAD and re-running: it still fails, so anything scheduled
-# before that test exposes it. One of its four concurrent identical sends comes
-# back as an IntegrityError rather than a replay, which means the loser's
-# post-rollback lookup in services/messaging.py found no winner and re-raised —
-# a real latent race in the idempotency path, reported separately.
-#
-# A test that reds an unrelated test is worse than no test, and papering over it
-# here would hide the messaging bug. The lock stays; the coverage waits for that
-# race to be fixed.
+async def test_add_members_holds_a_row_lock_while_it_reads_the_membership(
+    client, two_orgs_with_users, monkeypatch
+):
+    """The cap is a read-check-insert, so it has to be serialized to be a cap.
+
+    Under PostgreSQL's default READ COMMITTED two concurrent adds each see the
+    same pre-insert count. With one slot free both observe it, both pass the
+    check, and the group ends up over the limit. add_members takes FOR UPDATE on
+    the conversation row before reading the membership.
+
+    RESTORED IN BATCH 42. This test was written in Batch 41 and withheld: it, and
+    every other design that actually proved the lock, deterministically broke
+    test_concurrent_identical_sends_store_one_message in the same run. That was
+    not this test's fault — the idempotency backstop was guarding db.commit()
+    while the unique index fires at db.flush(), so the loser of any forced race
+    got an IntegrityError out of the endpoint. Anything scheduled before that test
+    exposed it. Fixed in this batch, so the coverage can come back.
+
+    Asserted by probing for the lock from a SEPARATE transaction at the moment the
+    membership is read, rather than by racing two requests: SELECT ... FOR UPDATE
+    NOWAIT raises instead of blocking when the row is already locked, which makes
+    the observation deterministic. A racing version was tried first and passed with
+    the lock REMOVED, because the event loop ran the first request to completion
+    before the second began.
+    """
+    from app.api import cross_org as cross_org_mod
+    from app.db.models import Conversation
+
+    users = two_orgs_with_users
+    org_ids = [str(users["org_a"].id), str(users["org_b"].id)]
+    observed: dict = {}
+    original_participant_ids = cross_org_mod.participant_ids
+
+    async def probing_participant_ids(db, conv_id):
+        # A separate session is a separate transaction, which is the only way to
+        # see somebody else's row lock.
+        async with SessionLocal() as probe:
+            try:
+                await probe.execute(
+                    select(Conversation.id).where(Conversation.id == conv_id).with_for_update(nowait=True)
+                )
+                observed["locked"] = False
+            except DBAPIError as exc:
+                # ONLY 55P03 (lock_not_available) counts as evidence. A bare
+                # `except Exception` here would let a typo in the query, a dropped
+                # connection or a missing table read as "the row was locked", so the
+                # test would pass without ever observing contention — which is the
+                # same wrong-reason-green this whole batch is about.
+                if getattr(exc.orig, "sqlstate", None) != "55P03":
+                    raise
+                observed["locked"] = True
+            finally:
+                await probe.rollback()
+        return await original_participant_ids(db, conv_id)
+
+    async with _superadmin() as c:
+        created = await c.post("/api/admin/cross-org-groups", json=_payload(users, org_ids))
+        group_id = created.json()["_id"]
+
+        monkeypatch.setattr(cross_org_mod, "participant_ids", probing_participant_ids)
+        resp = await c.post(
+            f"/api/admin/cross-org-groups/{group_id}/members",
+            json={"members": [{"user_id": str(users["bob"].id), "role": "member"}]},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert observed.get("locked") is True, (
+        "the membership was read without holding the conversation row lock, so two "
+        "concurrent adds can both take the last slot"
+    )
