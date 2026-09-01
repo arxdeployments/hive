@@ -265,8 +265,12 @@ async def test_a_send_that_loses_the_insert_race_replays_instead_of_erroring(
         # Only the two PRE-CHECKS are held. Later calls are the loser's recovery
         # lookup, which must not be delayed — and must be able to see the winner.
         if nth == 1:
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(both_have_looked.wait(), timeout=3.0)
+            # NOT suppressed. If the second sender never reaches this lookup the
+            # race was not forced, and the assertions below would then be satisfied
+            # by an ordinary sequential replay — passing without ever exercising the
+            # flush-conflict recovery they exist to cover. Generous bound, because
+            # the point is to fail on "could not force it", not on a slow runner.
+            await asyncio.wait_for(both_have_looked.wait(), timeout=15.0)
         elif nth == 2:
             both_have_looked.set()
         return result

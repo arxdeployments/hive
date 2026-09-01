@@ -9,6 +9,7 @@ import contextlib
 
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 
 from app.db.models import AuditLog, Conversation, UserRole
 from app.db.session import SessionLocal
@@ -331,7 +332,14 @@ async def test_add_members_holds_a_row_lock_while_it_reads_the_membership(
                     select(Conversation.id).where(Conversation.id == conv_id).with_for_update(nowait=True)
                 )
                 observed["locked"] = False
-            except Exception:
+            except DBAPIError as exc:
+                # ONLY 55P03 (lock_not_available) counts as evidence. A bare
+                # `except Exception` here would let a typo in the query, a dropped
+                # connection or a missing table read as "the row was locked", so the
+                # test would pass without ever observing contention — which is the
+                # same wrong-reason-green this whole batch is about.
+                if getattr(exc.orig, "sqlstate", None) != "55P03":
+                    raise
                 observed["locked"] = True
             finally:
                 await probe.rollback()
