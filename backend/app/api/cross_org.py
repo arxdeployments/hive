@@ -35,7 +35,7 @@ from app.realtime.redis_bus import publish_to_users
 from app.services import presence
 from app.services.audit import log_audit
 from app.services.conversations import notify_conversation_created, participant_ids
-from app.services.messaging import send_system_message
+from app.services.messaging import send_system_message, send_system_messages
 from app.utils import iso_z, now_utc, parse_uuid, sanitize_text
 
 router = APIRouter(prefix="/api/admin/cross-org-groups", tags=["cross-org"])
@@ -370,9 +370,15 @@ async def create_group(
         )
     await db.commit()
 
-    await send_system_message(db, conv.id, f"Cross-org group {name} was created", broadcast=False)
-    for member, _role in valid:
-        await send_system_message(db, conv.id, f"Admin added {member.display_name}", broadcast=False)
+    await send_system_messages(
+        db,
+        conv.id,
+        [
+            f"Cross-org group {name} was created",
+            *(f"Admin added {member.display_name}" for member, _role in valid),
+        ],
+        broadcast=False,
+    )
 
     await notify_conversation_created(db, conv.id)
 
@@ -552,8 +558,12 @@ async def add_members(
     conv.last_message_at = now_utc()
     await db.commit()
 
-    for member in added:
-        await send_system_message(db, conv.id, f"Admin added {member.display_name}", broadcast=False)
+    await send_system_messages(
+        db,
+        conv.id,
+        [f"Admin added {member.display_name}" for member in added],
+        broadcast=False,
+    )
 
     enriched = await _enrich_group(db, conv)
     await notify_conversation_created(db, conv.id, only=[member.id for member in added])
