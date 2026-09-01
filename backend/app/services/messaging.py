@@ -144,6 +144,42 @@ async def _find_by_client_msg_id(
     )
 
 
+async def _replay_after_conflict(
+    db: AsyncSession,
+    *,
+    conversation_id: uuid.UUID,
+    sender_id: uuid.UUID,
+    client_msg_id: str | None,
+    temp_id: str | None,
+) -> dict | None:
+    """Turn the loser of an idempotency race into the replay it should have had.
+
+    Returns None when the conflict was not ours to swallow — a different
+    constraint — so the caller re-raises.
+
+    Both ids are taken as values, not as ORM instances, because the rollback below
+    expires every object in the session and re-reading an attribute off an expired
+    instance needs a lazy refresh async SQLAlchemy cannot perform.
+    """
+    await db.rollback()
+    if client_msg_id is None:
+        return None
+    conv = await db.get(Conversation, conversation_id)
+    sender = await db.get(User, sender_id)
+    if conv is None or sender is None:
+        return None
+    winner = await _find_by_client_msg_id(
+        db,
+        conversation_id=conversation_id,
+        sender_id=sender_id,
+        client_msg_id=client_msg_id,
+    )
+    if winner is None:
+        return None
+    participants = await _require_send_access(db, conv, sender)
+    return await _replay_doc(db, winner, participants=participants, sender=sender, temp_id=temp_id)
+
+
 async def _replay_doc(
     db: AsyncSession,
     msg: Message,
@@ -242,7 +278,39 @@ async def send_message(
         created_at=now,
     )
     db.add(msg)
-    await db.flush()
+    # Captured before the flush: the recovery below rolls back, which expires every
+    # instance in the session.
+    conversation_pk = conv.id
+    sender_pk = sender.id
+    try:
+        await db.flush()
+    except IntegrityError:
+        # THE point at which a duplicate is detected, and it was unguarded.
+        #
+        # uq_messages_client_msg_id is a partial unique INDEX, not a constraint, so
+        # it cannot be deferred and PostgreSQL enforces it when the INSERT runs —
+        # here, at the flush. The guard that exists for exactly this race was
+        # attached to db.commit() instead, and Session.commit() flushes first, so
+        # by the time it ran this flush had already emitted the INSERT and there
+        # was nothing left for the commit to raise. The backstop was therefore
+        # unreachable for the one constraint it names, and the loser of a genuine
+        # race got an IntegrityError out of the endpoint — a 500 where the design
+        # promises a replay.
+        #
+        # It only ever looked like it worked because the check-then-act lookup
+        # above catches the common case: when the winner commits before the loser
+        # reaches that lookup, the loser replays and never inserts. Two sends that
+        # genuinely overlap skip it.
+        replay = await _replay_after_conflict(
+            db,
+            conversation_id=conversation_pk,
+            sender_id=sender_pk,
+            client_msg_id=client_msg_id,
+            temp_id=temp_id,
+        )
+        if replay is None:
+            raise
+        return replay
 
     seen_keys: set[str] = set()
     for url in urls:
@@ -280,24 +348,21 @@ async def send_message(
         # overlaps the attempt it is retrying — can both reach here. The partial
         # unique index is what actually enforces the guarantee; this turns the
         # loser of that race into the same replay a sequential repeat would get.
-        await db.rollback()
-        if client_msg_id is None:
-            raise
-        conv = await db.get(Conversation, conversation_id)
-        sender = await db.get(User, sender_id)
-        if conv is None or sender is None:
-            raise
-        winner = await _find_by_client_msg_id(
+        #
+        # Kept, and now sharing the flush path's implementation. It is not the
+        # branch that catches the client_msg_id race — the flush above is — but it
+        # stays for anything that can still fail at commit, and so that removing
+        # the explicit flush one day cannot silently take the recovery with it.
+        replay = await _replay_after_conflict(
             db,
             conversation_id=conversation_id,
             sender_id=sender_id,
             client_msg_id=client_msg_id,
+            temp_id=temp_id,
         )
-        # Some other constraint failed — not ours to swallow.
-        if winner is None:
+        if replay is None:
             raise
-        participants = await _require_send_access(db, conv, sender)
-        return await _replay_doc(db, winner, participants=participants, sender=sender, temp_id=temp_id)
+        return replay
 
     loaded = await enrich.load_message(db, msg.id)
     doc = await enrich.serialize_message(
