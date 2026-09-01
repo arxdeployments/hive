@@ -184,3 +184,134 @@ async def test_archiving_still_round_trips_for_a_group_that_was_never_deleted(cl
         assert (await root.post(f"/api/admin/cross-org-groups/{group}/archive")).json()["is_active"] is True
         listing = (await root.get("/api/admin/cross-org-groups", params={"status": "active"})).json()
         assert [g["_id"] for g in listing["data"]] == [group]
+
+
+async def test_a_cross_org_group_cannot_be_created_above_the_member_cap(
+    client, two_orgs_with_users, monkeypatch
+):
+    """Cross-org creation had a floor and no ceiling.
+
+    Every size rule in this file is a minimum — two orgs, two members, one admin,
+    one member per org — while a same-org group has been capped at
+    MAX_GROUP_MEMBERS all along. That asymmetry is named in two other modules as
+    the reason their own tails were reachable: services/messaging.py measured a
+    per-recipient set rebuild at 703ms of event-loop time for 5,000 recipients and
+    says regular groups stayed in single-digit milliseconds only because of the
+    cap, and services/push.py notes the fan-out duration scales with a
+    subscription count nothing bounds.
+
+    The cap is patched down rather than creating 257 users, which would make this
+    test slower than the rest of the file put together.
+    """
+    from app.api import cross_org as cross_org_mod
+
+    monkeypatch.setattr(cross_org_mod, "MAX_GROUP_MEMBERS", 2)
+
+    users = two_orgs_with_users
+    org_ids = [str(users["org_a"].id), str(users["org_b"].id)]
+    payload = _payload(users, org_ids)
+    payload["members"] = [
+        {"user_id": str(users["alice"].id), "role": "admin"},
+        {"user_id": str(users["bob"].id), "role": "member"},
+        {"user_id": str(users["carol"].id), "role": "member"},
+    ]
+
+    async with _superadmin() as c:
+        resp = await c.post("/api/admin/cross-org-groups", json=payload)
+
+    assert resp.status_code == 400, resp.text
+    assert "Maximum 2 members" in resp.text
+
+    # And nothing was written on the way to refusing.
+    async with SessionLocal() as db:
+        rows = (
+            (await db.execute(select(Conversation).where(Conversation.name == "Joint Programme")))
+            .scalars()
+            .all()
+        )
+    assert rows == []
+
+
+async def test_members_cannot_be_added_past_the_cap(client, two_orgs_with_users, monkeypatch):
+    """The add path had no ceiling either, so a capped group could be grown past it.
+
+    Counted against the CURRENT membership, not against the request alone: two
+    members already in the group plus one more is over a cap of two.
+    """
+    from app.api import cross_org as cross_org_mod
+
+    users = two_orgs_with_users
+    org_ids = [str(users["org_a"].id), str(users["org_b"].id)]
+
+    async with _superadmin() as c:
+        created = await c.post("/api/admin/cross-org-groups", json=_payload(users, org_ids))
+        assert created.status_code in (200, 201), created.text
+        group_id = created.json()["_id"]
+
+        # The cap only comes down AFTER a legitimate two-member group exists, which
+        # is also the state a group predating this check would be in.
+        monkeypatch.setattr(cross_org_mod, "MAX_GROUP_MEMBERS", 2)
+
+        resp = await c.post(
+            f"/api/admin/cross-org-groups/{group_id}/members",
+            json={"members": [{"user_id": str(users["bob"].id), "role": "member"}]},
+        )
+
+    assert resp.status_code == 400, resp.text
+    assert "Maximum 2 members" in resp.text
+
+
+async def test_an_add_that_resolves_to_nobody_is_still_allowed_at_the_cap(
+    client, two_orgs_with_users, monkeypatch
+):
+    """The cap must not turn a no-op into an error.
+
+    Unknown, inactive and already-present ids are dropped before the count, so a
+    request that adds nobody stays a no-op even when the group is full. Checking
+    the raw request instead would have refused it.
+    """
+    from app.api import cross_org as cross_org_mod
+
+    users = two_orgs_with_users
+    org_ids = [str(users["org_a"].id), str(users["org_b"].id)]
+
+    async with _superadmin() as c:
+        created = await c.post("/api/admin/cross-org-groups", json=_payload(users, org_ids))
+        group_id = created.json()["_id"]
+        monkeypatch.setattr(cross_org_mod, "MAX_GROUP_MEMBERS", 2)
+
+        # Alice is already a member — she resolves away, so nothing is added.
+        resp = await c.post(
+            f"/api/admin/cross-org-groups/{group_id}/members",
+            json={"members": [{"user_id": str(users["alice"].id), "role": "member"}]},
+        )
+
+    assert resp.status_code == 200, resp.text
+
+
+# NO TEST FOR THE ROW LOCK, DELIBERATELY.
+#
+# add_members takes FOR UPDATE on the conversation row before reading the
+# membership, because the cap is a read-check-insert and two concurrent adds would
+# otherwise both see the last free slot. Two tests that genuinely proved it were
+# written and both were thrown away:
+#
+#   1. Two real requests through asyncio.gather. Passed with the lock REMOVED —
+#      the event loop ran the first request to completion before the second began,
+#      so it asserted the invariant and detected nothing.
+#   2. The same, forced to interleave with a barrier, and then a single-request
+#      version probing for the lock with SELECT ... FOR UPDATE NOWAIT from a second
+#      session. Both detected the race correctly, and both deterministically broke
+#      test_concurrent_identical_sends_store_one_message in the same run — three
+#      times out of three.
+#
+# That failure is NOT caused by the lock. Verified by reverting api/cross_org.py
+# and api/groups.py to HEAD and re-running: it still fails, so anything scheduled
+# before that test exposes it. One of its four concurrent identical sends comes
+# back as an IntegrityError rather than a replay, which means the loser's
+# post-rollback lookup in services/messaging.py found no winner and re-raised —
+# a real latent race in the idempotency path, reported separately.
+#
+# A test that reds an unrelated test is worse than no test, and papering over it
+# here would hide the messaging bug. The lock stays; the coverage waits for that
+# race to be fixed.
