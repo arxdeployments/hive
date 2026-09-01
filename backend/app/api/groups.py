@@ -133,8 +133,12 @@ async def create_group(body: CreateGroupRequest, tenant: TenantContext = Depends
         member_ids.append(member_id)
     if len(member_ids) < 2:
         raise HTTPException(status_code=400, detail="At least 2 members are required")
-    if len(member_ids) > 255:
-        raise HTTPException(status_code=400, detail="Maximum 256 members")
+    # Against the shared constant, not a literal. This read `> 255` — correct only
+    # because member_ids excludes the creator, and silently decoupled from
+    # MAX_GROUP_MEMBERS, which the add path below does use. Two caps for one rule,
+    # either of which could be retuned without the other.
+    if len(member_ids) + 1 > MAX_GROUP_MEMBERS:
+        raise HTTPException(status_code=400, detail=f"Maximum {MAX_GROUP_MEMBERS} members")
 
     rows = (await db.execute(select(User).where(User.id.in_(member_ids)))).scalars().all()
     by_id = {u.id: u for u in rows}

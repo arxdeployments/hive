@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.groups import MAX_GROUP_MEMBERS
 from app.core.deps import require_superadmin
 from app.db.models import (
     Conversation,
@@ -323,6 +324,20 @@ async def create_group(
     # Enforced AFTER filtering — the Mongo build counted the raw input.
     if len(valid) < 2:
         raise HTTPException(status_code=400, detail="At least 2 members required")
+    # A MAXIMUM, which this file had never had. Every other size rule here is a
+    # floor — two orgs, two members, one admin, one member per org — and nothing
+    # anywhere bounded the ceiling, while a same-org group has been capped at
+    # MAX_GROUP_MEMBERS all along.
+    #
+    # That asymmetry is not theoretical; it is cited as the reason two separate
+    # tails were reachable. services/messaging.py measured a per-recipient set
+    # rebuild at 703ms of event-loop time for 5,000 recipients and notes regular
+    # groups "stayed inside a couple of milliseconds" only because of their cap.
+    # services/push.py notes the fan-out's duration scales with the subscription
+    # count and that nothing caps it. Both fixed their own symptom; this is the
+    # cause. It also bounds the per-member loops below, which commit once each.
+    if len(valid) > MAX_GROUP_MEMBERS:
+        raise HTTPException(status_code=400, detail=f"Maximum {MAX_GROUP_MEMBERS} members")
     if not any(role == "admin" for _, role in valid):
         raise HTTPException(status_code=400, detail="At least 1 admin required")
     for org_uuid in org_uuids:
@@ -491,11 +506,25 @@ async def add_members(
         users_map = {u.id: u for u in user_rows}
 
     allowed = [str(o) for o in (conv.allowed_org_ids or [])]
-    added: list[User] = []
+    # Resolved BEFORE anything is inserted, so the cap below is checked against
+    # what would actually be added rather than against what was asked for —
+    # unknown, inactive and already-present ids are all dropped above.
+    resolved: list[tuple[User, str]] = []
     for uid, role in specs:
         member = users_map.get(uid)
         if member is None or member.org_id is None:
             continue
+        resolved.append((member, role))
+
+    # The same ceiling as creation and as a same-org group. Counted against the
+    # CURRENT membership, so a group already at or over the cap cannot grow —
+    # without breaking one that predates this check, which can still be read,
+    # messaged and pruned, just not extended.
+    if resolved and len(existing_ids) + len(resolved) > MAX_GROUP_MEMBERS:
+        raise HTTPException(status_code=400, detail=f"Maximum {MAX_GROUP_MEMBERS} members")
+
+    added: list[User] = []
+    for member, role in resolved:
         # A new member's org is auto-added to the group's org scope (contract).
         if str(member.org_id) not in allowed:
             allowed = [*allowed, str(member.org_id)]
