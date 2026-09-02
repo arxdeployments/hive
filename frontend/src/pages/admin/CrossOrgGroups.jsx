@@ -5,6 +5,7 @@ import { toast } from 'sonner';
 import { PageTransition } from '../../components/common/PageTransition';
 import client from '../../api/client';
 import { apiError } from '../../utils/helpers';
+import { toggleOrgSelection } from '../../utils/orgMemberSelection';
 
 export default function CrossOrgGroups() {
   const [groups, setGroups] = useState([]);
@@ -25,6 +26,9 @@ export default function CrossOrgGroups() {
   const [selectedOrgIds, setSelectedOrgIds] = useState([]);
   const [orgUsers, setOrgUsers] = useState({});
   const [selectedMembers, setSelectedMembers] = useState([]);
+  // Step 3's filter. The roster is capped server-side now, so this is how a
+  // member past the cap is reached at all — see loadOrgUsers.
+  const [memberSearch, setMemberSearch] = useState('');
   const [adminIds, setAdminIds] = useState([]);
   const [creating, setCreating] = useState(false);
   const [deleteGroup, setDeleteGroup] = useState(null);
@@ -53,18 +57,29 @@ export default function CrossOrgGroups() {
   };
 
   // Load users for selected orgs
-  const loadOrgUsers = async (orgId) => {
+  const loadOrgUsers = async (orgId, term = '') => {
     try {
-      const { data } = await client.get(`/api/admin/organizations/${orgId}/users`);
+      const { data } = await client.get(`/api/admin/organizations/${orgId}/users`, {
+        params: term ? { search: term } : {},
+      });
       setOrgUsers(prev => ({ ...prev, [orgId]: data }));
     } catch { /* ignore */ }
   };
 
+  // Refetched on the term, not filtered in the browser. The endpoint caps its
+  // response, so anyone past the cap only becomes reachable by narrowing it
+  // server-side — the reason the cap and this input had to land together.
+  //
+  // Debounced because this fires once per selected organization: typing eight
+  // characters with three organizations chosen would otherwise be 24 requests.
   useEffect(() => {
-    selectedOrgIds.forEach(oid => {
-      if (!orgUsers[oid]) loadOrgUsers(oid);
-    });
-  }, [selectedOrgIds]);
+    if (selectedOrgIds.length === 0) return undefined;
+    const term = memberSearch.trim();
+    const timer = setTimeout(() => {
+      selectedOrgIds.forEach(oid => loadOrgUsers(oid, term));
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [selectedOrgIds, memberSearch]);
 
   const openCreate = () => {
     setShowCreate(true);
@@ -75,24 +90,19 @@ export default function CrossOrgGroups() {
     setSelectedOrgIds([]);
     setSelectedMembers([]);
     setAdminIds([]);
+    setMemberSearch('');
     setOrgUsers({});
     loadOrgs();
   };
 
+  // Computed from one consistent snapshot rather than a functional update paired
+  // with a closure read of the value it was updating — see utils/orgMemberSelection
+  // for what that combination did on a deselect.
   const toggleOrg = (orgId) => {
-    setSelectedOrgIds(prev =>
-      prev.includes(orgId) ? prev.filter(id => id !== orgId) : [...prev, orgId]
-    );
-    // Clear members from deselected orgs
-    setSelectedMembers(prev =>
-      prev.filter(m => {
-        const memberOrgId = allOrgs.find(o => {
-          const depts = orgUsers[o._id] || [];
-          return depts.some(d => d.users.some(u => u.id === m.user_id));
-        })?._id;
-        return !memberOrgId || selectedOrgIds.includes(memberOrgId) || orgId !== memberOrgId;
-      })
-    );
+    const next = toggleOrgSelection({ selectedOrgIds, selectedMembers, adminIds }, orgId);
+    setSelectedOrgIds(next.selectedOrgIds);
+    setSelectedMembers(next.selectedMembers);
+    setAdminIds(next.adminIds);
   };
 
   const toggleMember = (userId, orgId) => {
@@ -370,6 +380,19 @@ export default function CrossOrgGroups() {
                     <div className="space-y-4">
                       <h3 className="text-lg font-semibold text-[#F5F5F5]">Step 3: Select Members</h3>
                       <p className="text-sm text-[#A3A3A3]">Choose at least 1 member from each organization</p>
+                      {/*
+                        The roster is capped server-side, so this is not a
+                        convenience — it is the only way to reach a member past the
+                        cap. Typing refetches each selected organization narrowed by
+                        the term.
+                      */}
+                      <input
+                        type="text"
+                        placeholder="Search members by name or email..."
+                        value={memberSearch}
+                        onChange={e => setMemberSearch(e.target.value)}
+                        className="w-full bg-[#0F0F0F] border border-[#1F1F1F] rounded-[6px] px-3 py-2 text-sm text-[#F5F5F5] placeholder-[#525252] focus:outline-none focus:border-[#10B981]"
+                      />
                       {selectedOrgIds.map(orgId => {
                         const org = allOrgs.find(o => o._id === orgId);
                         const depts = orgUsers[orgId] || [];
@@ -377,6 +400,13 @@ export default function CrossOrgGroups() {
                         return (
                           <div key={orgId} className="bg-[#0F0F0F] border border-[#1F1F1F] rounded-[8px] p-4">
                             <h4 className="text-sm font-medium text-[#F5F5F5] mb-3">{org?.name} ({orgMembers.length} selected)</h4>
+                            {depts.every(d => d.users.length === 0) && (
+                              <p className="text-xs text-[#525252]">
+                                {memberSearch.trim()
+                                  ? 'No members match that search.'
+                                  : 'No members in this organization.'}
+                              </p>
+                            )}
                             {depts.map(dept => (
                               <div key={dept.id} className="mb-2">
                                 <p className="text-xs text-[#A3A3A3] uppercase mb-1">{dept.name}</p>
