@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 import { toggleOrgSelection } from './orgMemberSelection.js';
@@ -83,5 +85,46 @@ describe('toggleOrgSelection', () => {
       selectedMembers: [],
       adminIds: [],
     });
+  });
+});
+
+describe('CrossOrgGroups roster loading', () => {
+  /**
+   * A wiring guard, in the style of lib/pushEntryPoints.test.js. The ordering
+   * mechanism itself is covered by latestRequest.test.js; what this pins is that
+   * the roster loads actually go through it.
+   *
+   * The debounce timer only cancels a load that has not STARTED. Once a request is
+   * open, clearing the timer does nothing and the response still writes — so a
+   * two-character prefix, which matches more rows and answers slower, could land
+   * after the five-character query typed after it and replace the roster with
+   * stale results. Flagged in review as Major.
+   */
+  const source = readFileSync(join(import.meta.dirname, '..', 'pages/admin/CrossOrgGroups.jsx'), 'utf8');
+
+  it('orders roster responses through the shared ticket', () => {
+    assert.match(
+      source,
+      /import\s*\{[^}]*\bcreateRequestTicket\b[^}]*\}\s*from\s*'\.\.\/\.\.\/utils\/latestRequest'/,
+      'the roster loads do not use the shared request ticket, so a slow earlier ' +
+        'search can overwrite a newer one.',
+    );
+    assert.match(source, /\.take\(\)/, 'nothing takes a ticket, so nothing can be ordered.');
+    assert.match(
+      source,
+      /isCurrent\([^)]*\)\)\s*return/,
+      'a response is written without first checking the ticket is still current.',
+    );
+  });
+
+  it('disowns loads in flight on unmount and on reopening the flow', () => {
+    // Two separate needs: a response after the screen is gone must not setState,
+    // and reopening the create flow clears orgUsers — a roster still in flight
+    // from the previous open would repopulate the map that was just cleared.
+    const invalidations = source.match(/\.invalidate\(\)/g) || [];
+    assert.ok(
+      invalidations.length >= 2,
+      `expected an invalidate on unmount and on reopen, found ${invalidations.length}`,
+    );
   });
 });

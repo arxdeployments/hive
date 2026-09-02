@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Plus, Search, Trash2, Globe, Archive, RotateCcw, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -6,6 +6,7 @@ import { PageTransition } from '../../components/common/PageTransition';
 import client from '../../api/client';
 import { apiError } from '../../utils/helpers';
 import { toggleOrgSelection } from '../../utils/orgMemberSelection';
+import { createRequestTicket } from '../../utils/latestRequest';
 
 export default function CrossOrgGroups() {
   const [groups, setGroups] = useState([]);
@@ -29,6 +30,14 @@ export default function CrossOrgGroups() {
   // Step 3's filter. The roster is capped server-side now, so this is how a
   // member past the cap is reached at all — see loadOrgUsers.
   const [memberSearch, setMemberSearch] = useState('');
+  // One counter for every roster load. The debounce timer only cancels a load that
+  // has not STARTED; once a request is open, cancelling the timer does nothing and
+  // the response still writes. So a two-character prefix — which matches far more
+  // rows and answers slower — could land after the five-character query typed
+  // after it and replace the current roster with stale results. Same scheme as the
+  // four admin lists in utils/latestRequest, for the same reason.
+  const rosterTicketRef = useRef(null);
+  rosterTicketRef.current ??= createRequestTicket();
   const [adminIds, setAdminIds] = useState([]);
   const [creating, setCreating] = useState(false);
   const [deleteGroup, setDeleteGroup] = useState(null);
@@ -57,11 +66,13 @@ export default function CrossOrgGroups() {
   };
 
   // Load users for selected orgs
-  const loadOrgUsers = async (orgId, term = '') => {
+  const loadOrgUsers = async (orgId, term = '', ticket = null) => {
     try {
       const { data } = await client.get(`/api/admin/organizations/${orgId}/users`, {
         params: term ? { search: term } : {},
       });
+      // Discarded rather than written if anything newer has started since.
+      if (ticket !== null && !rosterTicketRef.current.isCurrent(ticket)) return;
       setOrgUsers(prev => ({ ...prev, [orgId]: data }));
     } catch { /* ignore */ }
   };
@@ -76,10 +87,17 @@ export default function CrossOrgGroups() {
     if (selectedOrgIds.length === 0) return undefined;
     const term = memberSearch.trim();
     const timer = setTimeout(() => {
-      selectedOrgIds.forEach(oid => loadOrgUsers(oid, term));
+      // One ticket for the whole fan-out: every organization is refetched under
+      // the same term, so a newer run invalidates all of the previous run's
+      // responses together.
+      const seq = rosterTicketRef.current.take();
+      selectedOrgIds.forEach(oid => loadOrgUsers(oid, term, seq));
     }, 250);
     return () => clearTimeout(timer);
   }, [selectedOrgIds, memberSearch]);
+
+  // A response that arrives after this screen is gone must not call setState.
+  useEffect(() => () => rosterTicketRef.current.invalidate(), []);
 
   const openCreate = () => {
     setShowCreate(true);
@@ -92,6 +110,9 @@ export default function CrossOrgGroups() {
     setAdminIds([]);
     setMemberSearch('');
     setOrgUsers({});
+    // Otherwise a roster still in flight from a previous open repopulates the
+    // map we have just cleared.
+    rosterTicketRef.current.invalidate();
     loadOrgs();
   };
 
