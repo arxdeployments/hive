@@ -161,12 +161,14 @@ async def test_inactive_members_and_other_orgs_stay_out():
 
     # The DEPARTMENTS too, which is the half a user-only assertion cannot see.
     #
-    # These two predicates each mask the other's absence: with User.org_id removed
-    # the foreign users still cannot surface, because the response is built by
-    # iterating this organization's departments; with Department.org_id removed the
-    # foreign users are still filtered out, but every other organization's
-    # DEPARTMENT NAMES appear in the response. Verified both by removing each in
-    # turn — a user-identity assertion alone passes in both cases.
+    # Remove Department.org_id == oid and the foreign USERS are still filtered out
+    # by the user query, but every other organization's DEPARTMENT NAMES appear in
+    # the response. Verified by removing it: a user-identity assertion alone passes
+    # right through that leak, which is what the first version of this test did.
+    #
+    # The other predicate, User.org_id == oid, is NOT redundant, though this
+    # fixture cannot show it — see
+    # test_a_foreign_user_pointed_at_our_department_is_still_excluded.
     names = [d["name"] for d in resp.json()]
     assert sorted(names) == sorted(target["depts"]), names
     assert not set(names) & set(outsider["depts"]), "another organization's departments were served"
@@ -245,3 +247,52 @@ async def test_the_roster_query_filters_in_sql_and_never_reads_the_password_hash
     sql = roster[-1]
     assert "dept_id IS NOT NULL" in sql, f"department filter is not in SQL:\n{sql}"
     assert "password_hash" not in sql, f"the roster query still reads the password hash:\n{sql}"
+
+
+async def test_a_foreign_user_pointed_at_our_department_is_still_excluded():
+    """The case that makes `User.org_id == oid` load-bearing rather than decorative.
+
+    I first read that predicate as redundant: the reply is assembled by iterating
+    THIS organization's departments, so deleting it changed nothing I could observe
+    and every other test in this file still passed. That reasoning was wrong, and
+    the schema is why. users.dept_id is a plain foreign key to departments.id —
+    verified against the live schema, there is no composite key and no CHECK tying
+    users.org_id to the department's org_id — so a user in one organization holding
+    a dept_id that points at ANOTHER organization's department is a representable
+    state, and admin paths that move a user between organizations can produce it.
+
+    Such a user IS reachable through the department grouping, because their dept_id
+    matches a department this endpoint returns. Only User.org_id == oid keeps them
+    out. Verified: removing that predicate fails this test and nothing else.
+    """
+    org = await make_org("Ours Co")
+    other = await make_org("Theirs Co")
+    ours = await _seed(org, with_dept=2, without_dept=0)
+    await _seed(other, with_dept=1, without_dept=0)
+
+    pw = await hash_password("TestPass1234")
+    async with SessionLocal() as db:
+        # In `other`, but filed under one of OUR departments.
+        db.add(
+            User(
+                email="misfiled@theirs.com",
+                display_name="Misfiled Outsider",
+                password_hash=pw,
+                role=UserRole.member,
+                org_id=other.id,
+                dept_id=ours["dept_ids"][0],
+                is_active=True,
+            )
+        )
+        await db.commit()
+
+    async with _superadmin() as c:
+        resp = await c.get(f"/api/admin/organizations/{org.id}/users")
+
+    assert resp.status_code == 200, resp.text
+    served = [u["display_name"] for d in resp.json() for u in d["users"]]
+    assert "Misfiled Outsider" not in served, (
+        "a user from another organization was served because their dept_id "
+        "pointed at one of this organization's departments"
+    )
+    assert sorted(served) == sorted(ours["with_dept"]), served
