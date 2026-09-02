@@ -177,10 +177,17 @@ async def create_group(body: CreateGroupRequest, tenant: TenantContext = Depends
         )
     await db.commit()
 
-    await messaging.send_system_message(db, conv.id, f"You created group '{name}'", broadcast=False)
-    for member in members:
-        text = f"{user.display_name} added {member.display_name}"
-        await messaging.send_system_message(db, conv.id, text, broadcast=False)
+    # One commit for the whole batch. Per-message this cost 7 queries each, all of
+    # them producing a document this path discards.
+    await messaging.send_system_messages(
+        db,
+        conv.id,
+        [
+            f"You created group '{name}'",
+            *(f"{user.display_name} added {member.display_name}" for member in members),
+        ],
+        broadcast=False,
+    )
     await conv_service.notify_conversation_created(db, conv.id)
     return await _serialized(db, conv.id, user.id)
 
@@ -331,9 +338,13 @@ async def add_members(conv_id: str, body: AddMembersRequest, tenant: TenantConte
                 )
             )
         await db.commit()
-        for member in new_members:
-            text = f"{user.display_name} added {member.display_name}"
-            await messaging.send_system_message(db, conv.id, text)
+        # Still one frame per member — the batching is in the commit, not in what
+        # subscribers receive.
+        await messaging.send_system_messages(
+            db,
+            conv.id,
+            [f"{user.display_name} added {member.display_name}" for member in new_members],
+        )
         loaded = await enrich.load_conversation_with_participants(db, conv.id)
         for uid in existing_ids:
             doc = await enrich.serialize_conversation(db, loaded, uid)
