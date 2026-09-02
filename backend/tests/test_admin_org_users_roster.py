@@ -39,19 +39,25 @@ _seeds = itertools.count()
 async def _seed(org, *, with_dept: int, without_dept: int, inactive: int = 0, depts: int = 2):
     # Emails are globally unique, so each seeded organization needs its own
     # namespace — two orgs in one test collided on users_email_key otherwise.
+    # Names are namespaced as well as emails. Namespacing only the emails made the
+    # tenancy assertion below vacuous: both organizations produced "In 0000",
+    # "In 0001", ... so a query that returned the WRONG organization's three users
+    # satisfied the test. Caught in review.
     tag = next(_seeds)
     pw = await hash_password("TestPass1234")
+    created = {"with_dept": [], "without_dept": [], "inactive": [], "depts": []}
     async with SessionLocal() as db:
-        rows = [Department(org_id=org.id, name=f"Dept {i}") for i in range(depts)]
+        rows = [Department(org_id=org.id, name=f"Dept {tag}-{i}") for i in range(depts)]
         db.add_all(rows)
         await db.flush()
         dept_ids = [d.id for d in rows]
+        created["depts"] = [d.name for d in rows]
         users = []
         for i in range(with_dept):
             users.append(
                 User(
                     email=f"in{i}-{tag}@r.com",
-                    display_name=f"In {i:04d}",
+                    display_name=f"In {tag}-{i:04d}",
                     password_hash=pw,
                     role=UserRole.member,
                     org_id=org.id,
@@ -59,11 +65,12 @@ async def _seed(org, *, with_dept: int, without_dept: int, inactive: int = 0, de
                     is_active=True,
                 )
             )
+            created["with_dept"].append(f"In {tag}-{i:04d}")
         for i in range(without_dept):
             users.append(
                 User(
                     email=f"nodept{i}-{tag}@r.com",
-                    display_name=f"NoDept {i:04d}",
+                    display_name=f"NoDept {tag}-{i:04d}",
                     password_hash=pw,
                     role=UserRole.member,
                     org_id=org.id,
@@ -71,11 +78,12 @@ async def _seed(org, *, with_dept: int, without_dept: int, inactive: int = 0, de
                     is_active=True,
                 )
             )
+            created["without_dept"].append(f"NoDept {tag}-{i:04d}")
         for i in range(inactive):
             users.append(
                 User(
                     email=f"gone{i}-{tag}@r.com",
-                    display_name=f"Gone {i:04d}",
+                    display_name=f"Gone {tag}-{i:04d}",
                     password_hash=pw,
                     role=UserRole.member,
                     org_id=org.id,
@@ -83,9 +91,11 @@ async def _seed(org, *, with_dept: int, without_dept: int, inactive: int = 0, de
                     is_active=False,
                 )
             )
+            created["inactive"].append(f"Gone {tag}-{i:04d}")
         db.add_all(users)
         await db.commit()
-    return dept_ids
+    created["dept_ids"] = dept_ids
+    return created
 
 
 async def test_departmentless_users_are_excluded_by_the_query_not_by_the_loop():
@@ -100,15 +110,15 @@ async def test_departmentless_users_are_excluded_by_the_query_not_by_the_loop():
     departmentless users are absent, and everyone else is present.
     """
     org = await make_org("Roster Co")
-    await _seed(org, with_dept=6, without_dept=4)
+    seeded = await _seed(org, with_dept=6, without_dept=4)
 
     async with _superadmin() as c:
         resp = await c.get(f"/api/admin/organizations/{org.id}/users")
 
     assert resp.status_code == 200, resp.text
     served = [u["display_name"] for d in resp.json() for u in d["users"]]
-    assert sorted(served) == [f"In {i:04d}" for i in range(6)]
-    assert not any(n.startswith("NoDept") for n in served)
+    assert sorted(served) == sorted(seeded["with_dept"])
+    assert not set(served) & set(seeded["without_dept"])
 
 
 async def test_the_response_carries_no_credential_material():
@@ -135,15 +145,31 @@ async def test_the_response_carries_no_credential_material():
 async def test_inactive_members_and_other_orgs_stay_out():
     org = await make_org("Scoped Co")
     other = await make_org("Other Co")
-    await _seed(org, with_dept=3, without_dept=0, inactive=2)
-    await _seed(other, with_dept=3, without_dept=0)
+    target = await _seed(org, with_dept=3, without_dept=0, inactive=2)
+    outsider = await _seed(other, with_dept=3, without_dept=0)
 
     async with _superadmin() as c:
         resp = await c.get(f"/api/admin/organizations/{org.id}/users")
 
     served = [u["display_name"] for d in resp.json() for u in d["users"]]
-    assert len(served) == 3, served
-    assert not any(n.startswith("Gone") for n in served)
+    # Identity, not just a count. A count of three would also be satisfied by the
+    # WRONG organization's three users, which is what made the earlier version of
+    # this assertion prove nothing about the org_id predicate.
+    assert sorted(served) == sorted(target["with_dept"]), served
+    assert not set(served) & set(outsider["with_dept"]), "another organization's users were served"
+    assert not set(served) & set(target["inactive"]), "an inactive member was served"
+
+    # The DEPARTMENTS too, which is the half a user-only assertion cannot see.
+    #
+    # These two predicates each mask the other's absence: with User.org_id removed
+    # the foreign users still cannot surface, because the response is built by
+    # iterating this organization's departments; with Department.org_id removed the
+    # foreign users are still filtered out, but every other organization's
+    # DEPARTMENT NAMES appear in the response. Verified both by removing each in
+    # turn — a user-identity assertion alone passes in both cases.
+    names = [d["name"] for d in resp.json()]
+    assert sorted(names) == sorted(target["depts"]), names
+    assert not set(names) & set(outsider["depts"]), "another organization's departments were served"
 
 
 async def test_departments_with_no_members_are_still_listed():
