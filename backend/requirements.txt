@@ -1,7 +1,7 @@
-fastapi==0.115.12
+fastapi==0.141.1
 uvicorn[standard]==0.34.0
-pydantic==2.10.6
-pydantic-settings==2.7.1
+pydantic==2.13.5
+pydantic-settings==2.15.0
 SQLAlchemy[asyncio]==2.0.38
 asyncpg==0.30.0
 alembic==1.14.1
@@ -48,7 +48,7 @@ urllib3==2.7.0
 # starlette is reached for BaseHTTPMiddleware in app/core/observability.py, and
 # fastapi allows the whole 0.40-0.47 range.
 anyio==4.14.2
-starlette==0.46.2
+starlette==1.6.0
 cryptography==44.0.0
 # Same rule again, and this one arrived with a fix rather than a refactor.
 # services/calls.py constructs aiohttp.ClientTimeout directly, to hand the LiveKit
