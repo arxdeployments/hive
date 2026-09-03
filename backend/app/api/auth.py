@@ -264,6 +264,14 @@ async def _revoke_rotation_chain(db: AsyncSession, token: RefreshToken) -> int:
     because theft implies other stolen cookies; a logout implies nothing about the
     user's other sessions, so this revokes exactly the lineage of the token
     presented and leaves a second browser signed in.
+
+    ONE REQUIREMENT ON ANYONE WHO ADDS A RETENTION JOB. `replaced_by_id` is
+    `ON DELETE SET NULL`, so deleting an ancestor row silently clears the link to
+    its successor and a logout presenting that ancestor can no longer reach the
+    live descendant — the defect this function exists to fix, reintroduced by a
+    tidy-up. Nothing prunes refresh_tokens today. Anything that starts to must
+    either keep a chain whole for as long as any row in it can still be presented,
+    or revoke the reachable descendants before deleting an ancestor.
     """
     revoked = 0
     seen: set[uuid.UUID] = set()
@@ -307,7 +315,22 @@ async def _undelivered_successor(db: AsyncSession, token: RefreshToken) -> Refre
     just this row.
     """
     grace = dt.timedelta(seconds=get_settings().refresh_reuse_grace_seconds)
-    successor = await db.get(RefreshToken, token.replaced_by_id) if token.replaced_by_id else None
+    # FOR UPDATE, for the same reason the logout walk takes it on every node. This
+    # reads the successor's `revoked_at` to decide whether the rotation was
+    # undelivered, and then rotates from it — read it unlocked and a concurrent
+    # /refresh can lock and spend that successor in between, leaving this request
+    # to honour a grace window against state that no longer holds and fork a second
+    # live branch off it. Blocking here instead means the existing reuse policy is
+    # applied to the successor's committed state, whichever request got there first.
+    successor = (
+        (
+            await db.execute(
+                select(RefreshToken).where(RefreshToken.id == token.replaced_by_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if token.replaced_by_id
+        else None
+    )
     undelivered = (
         successor is not None
         and successor.revoked_at is None

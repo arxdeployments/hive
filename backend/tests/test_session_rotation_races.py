@@ -350,3 +350,70 @@ async def test_logout_follows_a_rotation_that_happens_further_down_the_chain(cli
             "the session at the end of the chain outlived the logout"
         )
     assert await _live_tokens(user.id) == []
+
+
+async def test_a_grace_replay_waits_for_a_rotation_of_its_successor(client):
+    """The grace path reads the successor to decide, then rotates from it.
+
+    Read it unlocked and a concurrent /refresh can lock and spend that successor in
+    between, leaving the replay to honour a grace window against state that no
+    longer holds and fork a second live branch off it. Blocking means the existing
+    reuse policy is applied to the successor's committed state — which, once the
+    successor has been spent, is the theft branch rather than the grace branch.
+    """
+    user = await make_user("grace-race@x.com")
+    await login(client, "grace-race@x.com")
+    lost = client.cookies.get(REFRESH_COOKIE)
+
+    assert (await client.post("/api/auth/refresh")).status_code == 200
+    successor = client.cookies.get(REFRESH_COOKIE)
+
+    holding = asyncio.Event()
+    release = asyncio.Event()
+
+    async def spend_the_successor() -> None:
+        """Rotate the successor while holding it, so only a locking read sees it spent."""
+        async with SessionLocal() as db:
+            row = (
+                await db.execute(
+                    select(RefreshToken)
+                    .where(RefreshToken.token_hash == hash_refresh_token(successor))
+                    .with_for_update()
+                )
+            ).scalar_one()
+            issued = RefreshToken(
+                user_id=row.user_id,
+                token_hash=hash_refresh_token("tail-of-grace-race"),
+                client=row.client,
+                expires_at=row.expires_at,
+            )
+            db.add(issued)
+            await db.flush()
+            row.revoked_at = dt.datetime.now(dt.UTC)
+            row.replaced_by_id = issued.id
+            holding.set()
+            await release.wait()
+            await db.commit()
+
+    task = asyncio.create_task(spend_the_successor())
+    await asyncio.wait_for(holding.wait(), timeout=5)
+
+    async def replay():
+        async with _fresh_client() as c:
+            return await _refresh_with(c, lost)
+
+    request = asyncio.create_task(replay())
+    await asyncio.sleep(0.5)
+    blocked = not request.done()
+    release.set()
+    await task
+    resp = await request
+
+    assert blocked, (
+        "the replay read its successor without locking it, so it decided the "
+        "grace question against a successor that was being spent"
+    )
+    # The successor was spent while this waited, so the committed state is reuse of
+    # a token that has already moved on: the theft branch, not the grace branch.
+    assert resp.status_code == 401, resp.text
+    assert await _live_tokens(user.id) == [], "the family should have been burned"
