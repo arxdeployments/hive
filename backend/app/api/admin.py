@@ -535,9 +535,32 @@ async def delete_organization(
 @router.get("/organizations/{org_id}/users")
 async def organization_users_by_department(
     org_id: str,
+    search: str = "",
+    limit: int = Query(200, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
     actor: User = Depends(require_superadmin),
 ):
+    """An organization's members grouped by department, for the cross-org picker.
+
+    NARROWED AND CAPPED, which it was not. This returned every active member of
+    the organization, and it was the last roster in the API without a ceiling:
+    org_admin.list_users and the admin user list both paginate at limit <= 100,
+    and api/contacts.list_contacts caps at 500 after measuring the unbounded
+    version at 24,999 rows and 5.5 MB on a 25,000-user tenant — 430ms during which
+    the worker served nothing else.
+
+    A cap alone would have been worse than the problem. The one caller,
+    pages/admin/CrossOrgGroups.jsx, fetched the whole roster and filtered it in the
+    browser, so truncating the response would have made every member past the
+    ceiling silently unpickable with nothing to indicate why. list_contacts states
+    the precondition: "Every picker in the app already narrows with `search`, which
+    is what makes a cap safe." This picker did not, so `search` lands here and the
+    debounced input lands in the same change.
+
+    Departments are unfiltered by `search` on purpose: the picker renders the tree,
+    and a department whose members are all filtered out still has to appear, or the
+    admin cannot tell an empty result from a missing group.
+    """
     oid = _uuid_or_400(org_id, "Invalid org ID")
     depts = (
         (await db.execute(select(Department).where(Department.org_id == oid).order_by(Department.name.asc())))
@@ -572,8 +595,19 @@ async def organization_users_by_department(
                 User.is_active.is_(True),
                 User.role != UserRole.superadmin,
                 User.dept_id.is_not(None),
+                *(
+                    [
+                        or_(
+                            User.display_name.ilike(_like_pattern(search), escape="\\"),
+                            User.email.ilike(_like_pattern(search), escape="\\"),
+                        )
+                    ]
+                    if search
+                    else []
+                ),
             )
             .order_by(User.display_name.asc())
+            .limit(limit)
         )
     ).all()
     by_dept: dict[uuid.UUID, list[dict]] = {}

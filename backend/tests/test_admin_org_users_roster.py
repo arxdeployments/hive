@@ -296,3 +296,88 @@ async def test_a_foreign_user_pointed_at_our_department_is_still_excluded():
         "pointed at one of this organization's departments"
     )
     assert sorted(served) == sorted(ours["with_dept"]), served
+
+
+async def test_the_roster_is_capped():
+    """The last roster in the API without a ceiling now has one.
+
+    org_admin.list_users and the admin user list paginate at limit <= 100;
+    contacts.list_contacts caps at 500 after measuring the unbounded version at
+    24,999 rows and 5.5 MB on a 25,000-user tenant. This one returned every active
+    member of an organization.
+    """
+    org = await make_org("Capped Co")
+    await _seed(org, with_dept=12, without_dept=0)
+
+    async with _superadmin() as c:
+        resp = await c.get(f"/api/admin/organizations/{org.id}/users", params={"limit": 5})
+
+    served = [u for d in resp.json() for u in d["users"]]
+    assert len(served) == 5, len(served)
+
+
+async def test_the_cap_has_a_ceiling_of_its_own():
+    """So a caller cannot opt back into the old behaviour with a large number —
+    the same reasoning contacts.list_contacts documents for its own le=500."""
+    org = await make_org("Ceiling Co")
+    await _seed(org, with_dept=1, without_dept=0)
+
+    async with _superadmin() as c:
+        assert (
+            await c.get(f"/api/admin/organizations/{org.id}/users", params={"limit": 501})
+        ).status_code == 422
+        assert (
+            await c.get(f"/api/admin/organizations/{org.id}/users", params={"limit": 0})
+        ).status_code == 422
+
+
+async def test_search_narrows_by_name_and_by_email():
+    """The cap is only safe because this exists.
+
+    Truncating the response while the caller filtered in the browser would have
+    made every member past the ceiling silently unpickable. contacts.list_contacts
+    states the precondition — "Every picker in the app already narrows with
+    `search`" — and this picker did not until now.
+    """
+    org = await make_org("Search Co")
+    seeded = await _seed(org, with_dept=6, without_dept=0)
+    wanted = seeded["with_dept"][3]  # "In <tag>-0003"
+
+    async with _superadmin() as c:
+        by_name = await c.get(f"/api/admin/organizations/{org.id}/users", params={"search": wanted})
+        by_email = await c.get(f"/api/admin/organizations/{org.id}/users", params={"search": "in3-"})
+
+    assert [u["display_name"] for d in by_name.json() for u in d["users"]] == [wanted]
+    emails = [u["email"] for d in by_email.json() for u in d["users"]]
+    assert emails and all("in3-" in e for e in emails), emails
+
+
+async def test_search_wildcards_are_matched_literally():
+    """A raw LIKE pattern would make `%` select the whole roster back."""
+    org = await make_org("Wildcard Co")
+    await _seed(org, with_dept=5, without_dept=0)
+
+    async with _superadmin() as c:
+        pct = await c.get(f"/api/admin/organizations/{org.id}/users", params={"search": "%"})
+        underscore = await c.get(f"/api/admin/organizations/{org.id}/users", params={"search": "_"})
+
+    assert [u for d in pct.json() for u in d["users"]] == [], "% behaved as a wildcard"
+    assert [u for d in underscore.json() for u in d["users"]] == [], "_ behaved as a wildcard"
+
+
+async def test_every_department_is_returned_even_when_the_search_empties_it():
+    """The picker renders the tree, so a department whose members are all filtered
+    out still has to appear — otherwise an admin cannot tell an empty result from a
+    department that has gone missing."""
+    org = await make_org("Tree Co")
+    seeded = await _seed(org, with_dept=4, without_dept=0, depts=4)
+
+    async with _superadmin() as c:
+        resp = await c.get(
+            f"/api/admin/organizations/{org.id}/users",
+            params={"search": seeded["with_dept"][0]},
+        )
+
+    body = resp.json()
+    assert len(body) == 4, "departments were filtered by the search term"
+    assert sum(len(d["users"]) for d in body) == 1
