@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import wire_role
 from app.core.deps import get_current_user
+from app.core.errors import conflict_as_400
 from app.core.rate_limit import password_limiter
 from app.core.security import PasswordPolicyError, enforce_password_policy, hash_password
 from app.db.models import (
@@ -341,7 +342,8 @@ async def create_user(
         created_at=now_utc(),
     )
     db.add(user)
-    await db.flush()
+    async with conflict_as_400(db, "Email already in use"):
+        await db.flush()
     await log_audit(
         db,
         actor_id=admin.id,
@@ -507,7 +509,8 @@ async def create_department(
     description = sanitize_text(body.description) if body.description is not None else None
     dept = Department(org_id=admin.org_id, name=name, description=description, created_at=now_utc())
     db.add(dept)
-    await db.flush()
+    async with conflict_as_400(db, "Department already exists"):
+        await db.flush()
     await log_audit(
         db,
         actor_id=admin.id,
@@ -569,7 +572,10 @@ async def update_department(
             details={"dept_id": str(dept.id), **changes},
             org_id=admin.org_id,
         )
-    await db.commit()
+    # Same constraint the pre-check above tests, and it raises from commit()
+    # because nothing is flushed explicitly on this path.
+    async with conflict_as_400(db, "Department already exists"):
+        await db.commit()
     return _serialize_department(dept)
 
 
@@ -670,5 +676,8 @@ async def update_org_settings(
             details=changes,
             org_id=org.id,
         )
-    await db.commit()
+    # Same constraint the pre-check above tests, and it raises from commit()
+    # because nothing is flushed explicitly on this path.
+    async with conflict_as_400(db, "Organization name already exists"):
+        await db.commit()
     return _serialize_org(org)

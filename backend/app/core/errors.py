@@ -14,8 +14,13 @@ frontend, the existing tests, any other consumer — sees a change.
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import AsyncIterator
+
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class CodedHTTPException(HTTPException):
@@ -49,3 +54,35 @@ async def coded_http_exception_handler(request: Request, exc: Exception) -> JSON
         content={"detail": exc.detail, "code": exc.code},
         headers=exc.headers,
     )
+
+
+@contextlib.asynccontextmanager
+async def conflict_as_400(db: AsyncSession, detail: str) -> AsyncIterator[None]:
+    """Turn a unique-constraint violation into the 400 the caller expected.
+
+    Every create and rename in the admin surfaces checks for a clash and then
+    writes. That check cannot be the whole answer — it is check-then-act, and two
+    requests can both pass it — so the database constraint is what actually
+    enforces uniqueness, and the loser of that race arrives here.
+
+    Wraps whichever statement raises, which is NOT the same statement everywhere.
+    A create with an explicit `await db.flush()` raises there; a rename that only
+    mutates the instance and commits raises from `commit()`, because that is when
+    the UPDATE is emitted. Batch 42 fixed a bug that was exactly this distinction
+    misread — a guard sitting on `commit()` while the INSERT had already been
+    flushed forty lines earlier, so the branch could never run.
+
+    Used as:
+
+        async with conflict_as_400(db, "Email already in use"):
+            await db.flush()
+
+    The rollback matters: without it the session is left in a failed transaction
+    and the next statement on it fails too, which turns one refused request into a
+    confusing second error.
+    """
+    try:
+        yield
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=detail) from exc
