@@ -65,6 +65,58 @@ updates:
     commit-message:
       prefix: deps
     groups:
+      # COUPLED CLUSTERS FIRST, AND WITHOUT AN update-types RESTRICTION.
+      #
+      # requirements.txt pins packages that constrain each other, and grouping only
+      # by update type let the two sides move independently. That is not a review
+      # convenience issue, it produces a manifest pip refuses to resolve. Two of the
+      # twenty-one PRs open on 2026-09-03 were stuck on exactly this, and neither was
+      # a broken dependency:
+      #
+      #   #71  starlette 0.46.2 -> 1.6.0, while fastapi 0.115.12 needs starlette<0.47.0
+      #   #67  pywebpush 2.5.0, which needs cryptography>=47.0.0, while cryptography
+      #        stayed at 44.0.0 because majors were excluded from the group
+      #
+      # Both failed at `pip install`, so nothing after it ran and the queue behind
+      # them stopped. Grouping a cluster lets Dependabot resolve it as a unit and
+      # propose the pair, which CI can then actually judge.
+      #
+      # These groups deliberately set no update-types. A cluster restricted to
+      # [minor, patch] lets a major bump of one member fall through to its own PR,
+      # which is how #71 happened. scripts/check_dependency_groups.py reads the
+      # couplings out of installed metadata and fails if a cluster can split.
+      python-asgi-stack:
+        patterns: [fastapi, starlette, "pydantic*", anyio]
+      python-http-stack:
+        patterns: [requests, urllib3, pywebpush, cryptography]
+      python-database:
+        patterns: [alembic, sqlalchemy, asyncpg]
+      python-livekit:
+        patterns: ["livekit*", pyjwt]
+      # pytest-asyncio 0.25.3 requires pytest<9 — an upper bound already in force.
+      # #70 (pytest 9.1.1) and #68 (pytest-asyncio 1.4.0) are the same coupling hit
+      # from opposite ends, and both failed at `pip install`. Grouped, this pair
+      # resolves on its own: pytest-asyncio 1.4.0 accepts pytest<10,>=8.4, so
+      # Dependabot can propose 9.1.1 with 1.4.0 and CI can judge the result.
+      python-pytest:
+        patterns: ["pytest*"]
+      # uvicorn[standard] pulls pyyaml>=5.1 and websockets>=10.4, both pinned in
+      # requirements-dev.txt. Only visible once the extras on a pin are honoured;
+      # the `extra == "standard"` markers evaluate False with no extra in context,
+      # silently, so dropping the extras dropped the whole cluster.
+      python-uvicorn-standard:
+        patterns: [uvicorn, pyyaml, websockets]
+      # Everything else: routine bumps together, majors on their own so they get
+      # individual review.
+      #
+      # Last by preference, not by necessity. First match wins, and because this
+      # group is restricted to [minor, patch] while the cluster groups above are
+      # not, the two partitions are disjoint by update type — putting this first
+      # would still keep each cluster whole, it would just move the clusters'
+      # routine bumps in here instead. Left last so a cluster travels as a cluster
+      # for every update type, which is the PR a reviewer can actually reason
+      # about. Ordering does become load-bearing between two cluster groups whose
+      # patterns overlap, and the check models that.
       python-minor-and-patch:
         patterns: ["*"]
         update-types: [minor, patch]
