@@ -33,4 +33,20 @@ pywebpush==2.0.3
 # still holds.
 requests==2.34.2
 urllib3==2.7.0
+# Pinned for the same reason, found by asking which OTHER packages app/ imports
+# without constraining. Both arrive transitively and both are reached directly by
+# our own code, so a resolver update changes behaviour with no source change here.
+#
+# anyio is the sharp one. app/api/notifications.py and app/services/push.py call
+# anyio.to_thread.run_sync(..., abandon_on_cancel=True), and that keyword arrived
+# in anyio 4.1 — before it, the parameter was `cancellable`. starlette constrains
+# only `anyio>=3.6.2,<5`, so every version from 3.6.2 to 4.0.x satisfies the
+# declared requirements and none of them accepts the call. notifications.py
+# records that abandon_on_cancel is what makes its SSRF resolve deadline real
+# rather than decorative, so this is not a cosmetic argument name.
+#
+# starlette is reached for BaseHTTPMiddleware in app/core/observability.py, and
+# fastapi allows the whole 0.40-0.47 range.
+anyio==4.14.2
+starlette==0.46.2
 cryptography==44.0.0
