@@ -396,3 +396,65 @@ async def test_a_join_on_a_live_call_is_still_recorded(client, two_orgs_with_use
         member = await db.get(CallParticipant, (uuid.UUID(call_id), bob))
         assert member.joined_at is not None
         assert member.left_at is None
+
+
+async def test_a_webhook_join_racing_a_finalize_does_not_mark_the_participant_present(
+    client, two_orgs_with_users, monkeypatch
+):
+    """The webhook's status check has to be under the same lock as its write.
+
+    Under READ COMMITTED an unlocked read leaves this interleaving: the handler
+    reads an active call, `_finalize` commits a terminal status, and the handler
+    then commits `joined_at` / `left_at = None` — a participant marked present on a
+    call that has ended, having passed the terminal branch that would have torn the
+    room down. That is the same defect the token endpoint had, by a second route.
+
+    Driven with a real second transaction, like the token test: what is under test
+    is whether the read takes the lock at all.
+    """
+    users = two_orgs_with_users
+    call_id = await _seed_connected_call(users)
+    bob = users["bob"].id
+    _stub_sfu(monkeypatch)
+
+    async with SessionLocal() as db:
+        room_name = (await db.get(Call, uuid.UUID(call_id))).room_name
+
+    holding = asyncio.Event()
+    release = asyncio.Event()
+
+    async def finalizer() -> None:
+        async with SessionLocal() as db:
+            call = (
+                await db.execute(select(Call).where(Call.id == uuid.UUID(call_id)).with_for_update())
+            ).scalar_one()
+            call.status = CallStatus.answered
+            call.ended_at = now_utc()
+            await db.flush()
+            holding.set()
+            await release.wait()
+            await db.commit()
+
+    async def webhook() -> None:
+        async with SessionLocal() as db:
+            await api_calls._handle_webhook_event(
+                db, _StubEvent("participant_joined", room_name, calls_service.identity_for(bob, "phone"))
+            )
+
+    task = asyncio.create_task(finalizer())
+    await asyncio.wait_for(holding.wait(), timeout=5)
+    handler = asyncio.create_task(webhook())
+    await asyncio.sleep(0.5)
+    blocked = not handler.done()
+    release.set()
+    await task
+    await handler
+
+    assert blocked, (
+        "the webhook handler ran to completion while a finalize held the call row, "
+        "so its status check saw a call that was already being ended"
+    )
+    async with SessionLocal() as db:
+        member = await db.get(CallParticipant, (uuid.UUID(call_id), bob))
+        assert member.joined_at is None, "a join racing the teardown must not mark the participant present"
+        assert member.left_at is None

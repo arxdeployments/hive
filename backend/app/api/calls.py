@@ -406,7 +406,14 @@ async def _handle_webhook_event(db: AsyncSession, event) -> None:
     call_id = parse_uuid(room.removeprefix("call_"))
     if call_id is None:
         return
-    call = (await db.execute(select(Call).where(Call.id == call_id))).scalar_one_or_none()
+    # FOR UPDATE for the same reason the token endpoint takes it: every branch below
+    # reads `call.status` and then writes. Under READ COMMITTED an unlocked read
+    # leaves the interleaving where this handler sees an active call, `_finalize`
+    # commits a terminal status, and this then commits `joined_at` / `left_at = None`
+    # — a participant marked present on a call that has ended, having sailed past
+    # the terminal branch that would have torn the room down. `_finalize` must
+    # UPDATE this row, so holding it here serializes the two.
+    call = (await db.execute(select(Call).where(Call.id == call_id).with_for_update())).scalar_one_or_none()
     if call is None:
         return
 
@@ -434,6 +441,11 @@ async def _handle_webhook_event(db: AsyncSession, event) -> None:
                 call.status.value,
                 event.participant.identity,
             )
+            # Release the row lock before the SFU round trip: the decision is made
+            # and nothing below writes, so there is no reason to hold the call row
+            # for the timeout's duration. `expire_on_commit=False` keeps `call`
+            # readable afterwards.
+            await db.commit()
             await calls_service._delete_room(call)
         return
 
