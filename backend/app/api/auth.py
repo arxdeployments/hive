@@ -238,9 +238,17 @@ async def _revoke_session_family(db: AsyncSession, token: RefreshToken) -> None:
 #     process outright, since the loop never yielded and no timeout could reach it.
 #     The locking read below does yield, so the same bug is now a hot loop against
 #     the database rather than a wedged worker — still worth not having.
-#   * the bound stops a pathologically LONG but acyclic chain from turning one
-#     logout into thousands of round trips.
-_MAX_ROTATION_CHAIN = 64
+#   * the runaway limit stops an acyclic chain of absurd length from turning one
+#     logout into unbounded round trips. It is NOT a functional bound on how long
+#     a lineage may be, and the earlier value of 64 was wrong to treat it as one:
+#     a web session refreshing on a 15-minute access token rotates four times an
+#     hour, so an ordinary long-lived session passes 64 links inside a day, and
+#     stopping there let logout answer "Logged out successfully" with live
+#     descendants still reachable. That is precisely the defect this function
+#     exists to fix, back again past an arbitrary line. Set high enough that no
+#     real lineage reaches it, and hitting it is handled below rather than
+#     silently reported as success.
+_ROTATION_CHAIN_RUNAWAY_LIMIT = 10_000
 
 
 async def _revoke_rotation_chain(db: AsyncSession, token: RefreshToken) -> int:
@@ -265,6 +273,14 @@ async def _revoke_rotation_chain(db: AsyncSession, token: RefreshToken) -> int:
     user's other sessions, so this revokes exactly the lineage of the token
     presented and leaves a second browser signed in.
 
+    The one thing it must never do is report success while a descendant is still
+    live, so the runaway limit is not allowed to end the walk quietly: reaching it
+    falls back to `_revoke_session_family`, which is wider than this lineage but a
+    guaranteed superset of it. That trades the scope property for the security one
+    in a case no real lineage reaches — the limit is 10,000 links, where a busy
+    session accumulates a few thousand in a year — and it is logged at ERROR
+    because reaching it means something is wrong with rotation, not with logout.
+
     ONE REQUIREMENT ON ANYONE WHO ADDS A RETENTION JOB. `replaced_by_id` is
     `ON DELETE SET NULL`, so deleting an ancestor row silently clears the link to
     its successor and a logout presenting that ancestor can no longer reach the
@@ -276,7 +292,21 @@ async def _revoke_rotation_chain(db: AsyncSession, token: RefreshToken) -> int:
     revoked = 0
     seen: set[uuid.UUID] = set()
     node: RefreshToken | None = token
-    while node is not None and node.id not in seen and len(seen) < _MAX_ROTATION_CHAIN:
+    while node is not None and node.id not in seen:
+        if len(seen) >= _ROTATION_CHAIN_RUNAWAY_LIMIT:
+            # Whatever is left of the lineage is unreachable in the budget we are
+            # willing to spend, and answering 200 with a live descendant is the one
+            # outcome this function exists to prevent. The family is wider than the
+            # lineage and revoking it is not what a logout should normally do, but
+            # it cannot leave a descendant behind.
+            logger.error(
+                "Rotation chain for user %s exceeded %s links; revoking the session "
+                "family so the logout cannot leave a live descendant",
+                token.user_id,
+                _ROTATION_CHAIN_RUNAWAY_LIMIT,
+            )
+            await _revoke_session_family(db, token)
+            return revoked
         seen.add(node.id)
         if node.revoked_at is None:
             node.revoked_at = now_utc()

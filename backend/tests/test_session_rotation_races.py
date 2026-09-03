@@ -18,6 +18,7 @@ import datetime as dt
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
+from app.api import auth as api_auth
 from app.core.security import ACCESS_COOKIE, REFRESH_COOKIE, hash_refresh_token
 from app.db.models import RefreshToken
 from app.db.session import SessionLocal
@@ -417,3 +418,111 @@ async def test_a_grace_replay_waits_for_a_rotation_of_its_successor(client):
     # a token that has already moved on: the theft branch, not the grace branch.
     assert resp.status_code == 401, resp.text
     assert await _live_tokens(user.id) == [], "the family should have been burned"
+
+
+async def _extend_chain(raw: str, links: int) -> list:
+    """Append `links` rotated successors after the row holding `raw`.
+
+    Built directly, because reaching this length through the endpoint would be a
+    few hundred HTTP round trips to prove something about one SQL walk. The shape
+    is what /refresh produces: each row revoked and pointing at the next, the last
+    one live.
+    """
+    ids = []
+    async with SessionLocal() as db:
+        node = (
+            await db.execute(select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw)))
+        ).scalar_one()
+        for i in range(links):
+            issued = RefreshToken(
+                user_id=node.user_id,
+                token_hash=hash_refresh_token(f"{raw}-link-{i}"),
+                client=node.client,
+                expires_at=node.expires_at,
+            )
+            db.add(issued)
+            await db.flush()
+            node.revoked_at = dt.datetime.now(dt.UTC)
+            node.replaced_by_id = issued.id
+            ids.append(issued.id)
+            node = issued
+        await db.commit()
+    return ids
+
+
+async def test_a_lineage_longer_than_the_old_cap_is_revoked_to_its_end(client):
+    """A cap on the walk was a cap on correctness, and 64 was reachable.
+
+    A web session refreshing on a 15-minute access token rotates four times an
+    hour, so an ordinary long-lived session passes 64 links inside a day. Stopping
+    there let logout answer "Logged out successfully" with live descendants still
+    reachable — the defect this whole function exists to fix, back again past an
+    arbitrary line.
+    """
+    user = await make_user("logout-long-chain@x.com")
+    await login(client, "logout-long-chain@x.com")
+    head = client.cookies.get(REFRESH_COOKIE)
+    access = client.cookies.get(ACCESS_COOKIE)
+
+    ids = await _extend_chain(head, 70)
+    assert len(await _live_tokens(user.id)) == 1, "only the tail of the chain is live"
+
+    assert (await _logout_with(head, access)).status_code == 200
+
+    async with SessionLocal() as db:
+        unrevoked = [str(i) for i in ids if (await db.get(RefreshToken, i)).revoked_at is None]
+    assert unrevoked == [], f"{len(unrevoked)} descendant(s) survived the logout"
+    assert await _live_tokens(user.id) == []
+
+
+async def test_hitting_the_runaway_limit_does_not_report_a_quiet_success(client, monkeypatch):
+    """The limit is a budget, not a correctness boundary.
+
+    If the walk ever cannot finish, the one outcome that must not happen is a 200
+    with a live descendant. Falling back to the family is wider than the lineage —
+    not what a logout should normally do — but it cannot leave one behind.
+    """
+    user = await make_user("logout-runaway@x.com")
+    await login(client, "logout-runaway@x.com")
+    head = client.cookies.get(REFRESH_COOKIE)
+    access = client.cookies.get(ACCESS_COOKIE)
+
+    ids = await _extend_chain(head, 8)
+    monkeypatch.setattr(api_auth, "_ROTATION_CHAIN_RUNAWAY_LIMIT", 3)
+
+    assert (await _logout_with(head, access)).status_code == 200
+
+    async with SessionLocal() as db:
+        unrevoked = [str(i) for i in ids if (await db.get(RefreshToken, i)).revoked_at is None]
+    assert unrevoked == [], f"{len(unrevoked)} descendant(s) survived past the limit"
+    assert await _live_tokens(user.id) == []
+
+
+async def test_the_runaway_fallback_still_spares_another_client(client, monkeypatch):
+    """The fallback is the family, which stops at the client boundary.
+
+    So even the pathological path cannot sign a person out of the browser they are
+    working in on the strength of a phone logout — the property
+    refresh_tokens.client exists for.
+    """
+    user = await make_user("logout-runaway-scope@x.com", mobile_access=True)
+    async with _fresh_client() as web, _fresh_client() as phone:
+        await login(web, "logout-runaway-scope@x.com")
+        keep = web.cookies.get(REFRESH_COOKIE)
+        await phone.post(
+            "/api/auth/login",
+            json={
+                "email": "logout-runaway-scope@x.com",
+                "password": "TestPass1234",
+                "client": "mobile",
+            },
+        )
+        mobile_raw = phone.cookies.get(REFRESH_COOKIE)
+        assert mobile_raw is not None, "the mobile session is the whole point of this test"
+
+        await _extend_chain(mobile_raw, 8)
+        monkeypatch.setattr(api_auth, "_ROTATION_CHAIN_RUNAWAY_LIMIT", 3)
+        assert (await _logout_with(mobile_raw, phone.cookies.get(ACCESS_COOKIE))).status_code == 200
+
+    assert (await _row_for(keep)).revoked_at is None, "the web session must survive"
+    assert [t.id for t in await _live_tokens(user.id)] == [(await _row_for(keep)).id]
