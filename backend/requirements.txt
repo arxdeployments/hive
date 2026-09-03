@@ -19,4 +19,34 @@ livekit-api==0.8.2
 email-validator==2.2.0
 httpx==0.28.1
 pywebpush==2.0.3
+# Pinned because app/services/push.py subclasses urllib3's HTTPConnection and
+# HTTPSConnection and overrides `_new_conn`, which is PRIVATE API. The subclass
+# stays valid Python across versions, so if a future urllib3 stops calling that
+# method the peer-address check silently stops running — the SSRF guard would be
+# gone with no error anywhere. Both arrive transitively via pywebpush, so without
+# these lines a resolver update could change them with no source change here.
+#
+# The pin is not the whole guarantee and cannot be: it stops an UNREVIEWED update
+# reaching production, while tests/test_push_ssrf_guard.py is what detects a
+# semantic change — it connects to a real loopback listener and asserts the guard
+# fires. Bump these two deliberately and let that test decide whether the hook
+# still holds.
+requests==2.34.2
+urllib3==2.7.0
+# Pinned for the same reason, found by asking which OTHER packages app/ imports
+# without constraining. Both arrive transitively and both are reached directly by
+# our own code, so a resolver update changes behaviour with no source change here.
+#
+# anyio is the sharp one. app/api/notifications.py and app/services/push.py call
+# anyio.to_thread.run_sync(..., abandon_on_cancel=True), and that keyword arrived
+# in anyio 4.1 — before it, the parameter was `cancellable`. starlette constrains
+# only `anyio>=3.6.2,<5`, so every version from 3.6.2 to 4.0.x satisfies the
+# declared requirements and none of them accepts the call. notifications.py
+# records that abandon_on_cancel is what makes its SSRF resolve deadline real
+# rather than decorative, so this is not a cosmetic argument name.
+#
+# starlette is reached for BaseHTTPMiddleware in app/core/observability.py, and
+# fastapi allows the whole 0.40-0.47 range.
+anyio==4.14.2
+starlette==0.46.2
 cryptography==44.0.0
