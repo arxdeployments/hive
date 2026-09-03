@@ -19,6 +19,7 @@ the previous build did.
 
 import datetime as dt
 import logging
+import uuid
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -225,6 +226,55 @@ async def _revoke_session_family(db: AsyncSession, token: RefreshToken) -> None:
     await db.commit()
 
 
+# A rotation chain is one session moving forward, so it is short in practice. The
+# walk below is guarded twice anyway, because it follows a link written by an
+# earlier request and the two failures are not the same:
+#
+#   * `seen` stops a CYCLE. The length bound cannot: a set does not grow when the
+#     walk revisits a row, so on A -> B -> A `len(seen)` sits at 2 forever. That
+#     matters more than it looks — `db.get` serves an already-identity-mapped row
+#     without awaiting anything, so the loop would never yield, no request or task
+#     timeout could interrupt it, and one bad row would peg a worker outright.
+#     Measured: removing `seen` hangs the test process rather than failing it.
+#   * the bound stops a pathologically LONG but acyclic chain from turning one
+#     logout into thousands of round trips.
+_MAX_ROTATION_CHAIN = 64
+
+
+async def _revoke_rotation_chain(db: AsyncSession, token: RefreshToken) -> int:
+    """Revoke this token and every session it was rotated into.
+
+    Logout used to revoke exactly the row it was handed, which cannot end a session
+    that has since moved on. The case is not hypothetical, and it is the one this
+    module already builds for elsewhere: a client whose rotation response never
+    arrived holds a spent token (see `_undelivered_successor`). Presenting it here
+    revoked a row that was already revoked, cleared the caller's cookies and
+    answered "Logged out successfully" — while the live successor kept working
+    until it expired, days later. Anyone else holding that successor, which is one
+    good reason the response went missing, kept a working session.
+
+    Same shape reached by a race: a refresh that commits its rotation while a
+    logout is deciding leaves the logout revoking the predecessor of a session that
+    now exists. The FOR UPDATE in the caller serializes the two, and this walks to
+    whatever the rotation produced.
+
+    The CHAIN, not the family. `_revoke_session_family` is deliberately wider
+    because theft implies other stolen cookies; a logout implies nothing about the
+    user's other sessions, so this revokes exactly the lineage of the token
+    presented and leaves a second browser signed in.
+    """
+    revoked = 0
+    seen: set[uuid.UUID] = set()
+    node: RefreshToken | None = token
+    while node is not None and node.id not in seen and len(seen) < _MAX_ROTATION_CHAIN:
+        seen.add(node.id)
+        if node.revoked_at is None:
+            node.revoked_at = now_utc()
+            revoked += 1
+        node = await db.get(RefreshToken, node.replaced_by_id) if node.replaced_by_id else None
+    return revoked
+
+
 async def _undelivered_successor(db: AsyncSession, token: RefreshToken) -> RefreshToken:
     """Resolve a replay of an already-rotated token, or raise 401 as theft.
 
@@ -277,8 +327,19 @@ async def refresh(
     raw = request.cookies.get(REFRESH_COOKIE)
     if not raw:
         raise HTTPException(status_code=401, detail="Refresh token required")
+    # FOR UPDATE. Rotation is a read-check-write on this row — `revoked_at` is
+    # read at the branch below and written at the end — and without the lock those
+    # are two transactions, so the single-use rule is not enforced under
+    # concurrency at all. Measured before this line existed: four simultaneous
+    # refreshes presenting the SAME token all returned 200 and left three live
+    # sessions. Worse than the extra sessions, every one of them read the token as
+    # unrevoked, so none of them entered the reuse branch — the theft detection
+    # below, and the family revocation it triggers, are exactly what a captured
+    # cookie racing the real client would have slipped past.
     token = (
-        await db.execute(select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw)))
+        await db.execute(
+            select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw)).with_for_update()
+        )
     ).scalar_one_or_none()
     if token is None:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
@@ -335,11 +396,24 @@ async def logout(
 ):
     raw = request.cookies.get(REFRESH_COOKIE)
     if raw:
+        # FOR UPDATE for the same reason /refresh takes it: this reads the row and
+        # then writes it, and a rotation committing in between would leave the
+        # successor untouched.
         token = (
-            await db.execute(select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw)))
+            await db.execute(
+                select(RefreshToken)
+                .where(RefreshToken.token_hash == hash_refresh_token(raw))
+                .with_for_update()
+            )
         ).scalar_one_or_none()
         if token and token.user_id == user.id:
-            token.revoked_at = now_utc()
+            _revoked = await _revoke_rotation_chain(db, token)
+            if _revoked > 1:
+                logger.info(
+                    "Logout for user %s revoked %s rotated sessions from the presented token",
+                    user.id,
+                    _revoked,
+                )
     user.last_seen_at = now_utc()
     await db.commit()
     clear_auth_cookies(response)
