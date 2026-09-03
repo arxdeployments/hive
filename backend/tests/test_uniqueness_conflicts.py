@@ -22,6 +22,7 @@ assertion. Said plainly rather than dressed up.
 
 import ast
 import pathlib
+import uuid
 
 import pytest
 from fastapi import HTTPException
@@ -76,6 +77,43 @@ async def test_the_helper_rolls_back_so_the_session_stays_usable():
         # The session works immediately afterwards.
         rows = (await db.execute(select(Department.name).where(Department.org_id == org.id))).scalars().all()
         assert rows == ["Twice"]
+
+
+async def test_a_foreign_key_violation_is_not_reported_as_a_duplicate():
+    """IntegrityError covers more than uniqueness, and the messages are not
+    interchangeable.
+
+    A department whose org_id does not exist fails with SQLSTATE 23503, not
+    23505. Answering that with "already exists" sends whoever is debugging it in
+    exactly the wrong direction, so it is re-raised as the unexpected condition it
+    is. Verified against this schema: duplicate is 23505, orphan FK is 23503.
+    """
+    async with SessionLocal() as db:
+        db.add(Department(org_id=uuid.uuid4(), name="Orphan"))
+        with pytest.raises(IntegrityError) as caught:
+            async with conflict_as_400(db, "Department already exists"):
+                await db.flush()
+
+    assert caught.value.orig.sqlstate == "23503"
+
+
+async def test_the_session_is_rolled_back_even_for_an_error_it_re_raises():
+    """The rollback is unconditional on purpose: the session is unusable after any
+    integrity failure, and the handler's audit write is the next statement."""
+    org = await make_org("Rollback Any Co")
+    async with SessionLocal() as db:
+        db.add(Department(org_id=uuid.uuid4(), name="Orphan"))
+        with pytest.raises(IntegrityError):
+            async with conflict_as_400(db, "Department already exists"):
+                await db.flush()
+
+        # Usable immediately afterwards.
+        db.add(Department(org_id=org.id, name="Fine"))
+        await db.commit()
+
+    async with SessionLocal() as db:
+        names = (await db.execute(select(Department.name).where(Department.org_id == org.id))).scalars().all()
+    assert names == ["Fine"]
 
 
 async def test_the_helper_passes_other_errors_through():

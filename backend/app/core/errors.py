@@ -22,6 +22,9 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# PostgreSQL unique_violation. The one integrity failure these call sites mean.
+UNIQUE_VIOLATION = "23505"
+
 
 class CodedHTTPException(HTTPException):
     """An `HTTPException` whose response also carries a stable `code`.
@@ -80,9 +83,24 @@ async def conflict_as_400(db: AsyncSession, detail: str) -> AsyncIterator[None]:
     The rollback matters: without it the session is left in a failed transaction
     and the next statement on it fails too, which turns one refused request into a
     confusing second error.
+
+    Only a UNIQUE violation becomes the 400. `IntegrityError` also covers foreign
+    key, not-null and check failures — verified against this schema, a duplicate
+    department carries SQLSTATE 23505 and one with a nonexistent org_id carries
+    23503 — and converting those too would answer a broken reference with
+    "already exists".
     """
     try:
         yield
     except IntegrityError as exc:
+        # Roll back for EVERY integrity failure — the session is unusable either
+        # way, and the handler's audit-log write is the next statement on it.
         await db.rollback()
+        sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+        if sqlstate != UNIQUE_VIOLATION:
+            # Not ours. Department creation can fail on its org_id foreign key
+            # (23503), and answering that with "already exists" sends whoever is
+            # debugging it in precisely the wrong direction. Re-raised, so it
+            # surfaces as the unexpected condition it is.
+            raise
         raise HTTPException(status_code=400, detail=detail) from exc
