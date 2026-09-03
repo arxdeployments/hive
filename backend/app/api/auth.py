@@ -19,6 +19,7 @@ the previous build did.
 
 import datetime as dt
 import logging
+import uuid
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -225,6 +226,107 @@ async def _revoke_session_family(db: AsyncSession, token: RefreshToken) -> None:
     await db.commit()
 
 
+# A rotation chain is one session moving forward, so it is short in practice. The
+# walk below is guarded twice anyway, because it follows a link written by an
+# earlier request and the two failures are not the same:
+#
+#   * `seen` stops a CYCLE. The length bound cannot: a set does not grow when the
+#     walk revisits a row, so on A -> B -> A `len(seen)` sits at 2 forever, and the
+#     walk goes round issuing the same two locking SELECTs until something kills
+#     the request. Measured against the earlier `db.get` version, which served the
+#     identity-mapped row without awaiting anything: removing `seen` hung the test
+#     process outright, since the loop never yielded and no timeout could reach it.
+#     The locking read below does yield, so the same bug is now a hot loop against
+#     the database rather than a wedged worker — still worth not having.
+#   * the runaway limit stops an acyclic chain of absurd length from turning one
+#     logout into unbounded round trips. It is NOT a functional bound on how long
+#     a lineage may be, and the earlier value of 64 was wrong to treat it as one:
+#     a web session refreshing on a 15-minute access token rotates four times an
+#     hour, so an ordinary long-lived session passes 64 links inside a day, and
+#     stopping there let logout answer "Logged out successfully" with live
+#     descendants still reachable. That is precisely the defect this function
+#     exists to fix, back again past an arbitrary line. Set high enough that no
+#     real lineage reaches it, and hitting it is handled below rather than
+#     silently reported as success.
+_ROTATION_CHAIN_RUNAWAY_LIMIT = 10_000
+
+
+async def _revoke_rotation_chain(db: AsyncSession, token: RefreshToken) -> int:
+    """Revoke this token and every session it was rotated into.
+
+    Logout used to revoke exactly the row it was handed, which cannot end a session
+    that has since moved on. The case is not hypothetical, and it is the one this
+    module already builds for elsewhere: a client whose rotation response never
+    arrived holds a spent token (see `_undelivered_successor`). Presenting it here
+    revoked a row that was already revoked, cleared the caller's cookies and
+    answered "Logged out successfully" — while the live successor kept working
+    until it expired, days later. Anyone else holding that successor, which is one
+    good reason the response went missing, kept a working session.
+
+    Same shape reached by a race: a refresh that commits its rotation while a
+    logout is deciding leaves the logout revoking the predecessor of a session that
+    now exists. The FOR UPDATE in the caller serializes the two, and this walks to
+    whatever the rotation produced.
+
+    The CHAIN, not the family. `_revoke_session_family` is deliberately wider
+    because theft implies other stolen cookies; a logout implies nothing about the
+    user's other sessions, so this revokes exactly the lineage of the token
+    presented and leaves a second browser signed in.
+
+    The one thing it must never do is report success while a descendant is still
+    live, so the runaway limit is not allowed to end the walk quietly: reaching it
+    falls back to `_revoke_session_family`, which is wider than this lineage but a
+    guaranteed superset of it. That trades the scope property for the security one
+    in a case no real lineage reaches — the limit is 10,000 links, where a busy
+    session accumulates a few thousand in a year — and it is logged at ERROR
+    because reaching it means something is wrong with rotation, not with logout.
+
+    ONE REQUIREMENT ON ANYONE WHO ADDS A RETENTION JOB. `replaced_by_id` is
+    `ON DELETE SET NULL`, so deleting an ancestor row silently clears the link to
+    its successor and a logout presenting that ancestor can no longer reach the
+    live descendant — the defect this function exists to fix, reintroduced by a
+    tidy-up. Nothing prunes refresh_tokens today. Anything that starts to must
+    either keep a chain whole for as long as any row in it can still be presented,
+    or revoke the reachable descendants before deleting an ancestor.
+    """
+    revoked = 0
+    seen: set[uuid.UUID] = set()
+    node: RefreshToken | None = token
+    while node is not None and node.id not in seen:
+        if len(seen) >= _ROTATION_CHAIN_RUNAWAY_LIMIT:
+            # Whatever is left of the lineage is unreachable in the budget we are
+            # willing to spend, and answering 200 with a live descendant is the one
+            # outcome this function exists to prevent. The family is wider than the
+            # lineage and revoking it is not what a logout should normally do, but
+            # it cannot leave a descendant behind.
+            logger.error(
+                "Rotation chain for user %s exceeded %s links; revoking the session "
+                "family so the logout cannot leave a live descendant",
+                token.user_id,
+                _ROTATION_CHAIN_RUNAWAY_LIMIT,
+            )
+            await _revoke_session_family(db, token)
+            return revoked
+        seen.add(node.id)
+        if node.revoked_at is None:
+            node.revoked_at = now_utc()
+            revoked += 1
+        if node.replaced_by_id is None:
+            break
+        # FOR UPDATE on every node, not just the one the caller presented. Locking
+        # only the presented token leaves the rest of the chain open: a refresh can
+        # rotate successor B into C after this walk has read B, and since the B it
+        # read still says `replaced_by_id IS NULL`, the walk stops there and C stays
+        # live. Locking each node as it is reached makes the walk see whatever the
+        # rotation produced, one link at a time.
+        node = (
+            await db.execute(
+                select(RefreshToken).where(RefreshToken.id == node.replaced_by_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+    return revoked
+
+
 async def _undelivered_successor(db: AsyncSession, token: RefreshToken) -> RefreshToken:
     """Resolve a replay of an already-rotated token, or raise 401 as theft.
 
@@ -243,7 +345,22 @@ async def _undelivered_successor(db: AsyncSession, token: RefreshToken) -> Refre
     just this row.
     """
     grace = dt.timedelta(seconds=get_settings().refresh_reuse_grace_seconds)
-    successor = await db.get(RefreshToken, token.replaced_by_id) if token.replaced_by_id else None
+    # FOR UPDATE, for the same reason the logout walk takes it on every node. This
+    # reads the successor's `revoked_at` to decide whether the rotation was
+    # undelivered, and then rotates from it — read it unlocked and a concurrent
+    # /refresh can lock and spend that successor in between, leaving this request
+    # to honour a grace window against state that no longer holds and fork a second
+    # live branch off it. Blocking here instead means the existing reuse policy is
+    # applied to the successor's committed state, whichever request got there first.
+    successor = (
+        (
+            await db.execute(
+                select(RefreshToken).where(RefreshToken.id == token.replaced_by_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if token.replaced_by_id
+        else None
+    )
     undelivered = (
         successor is not None
         and successor.revoked_at is None
@@ -277,8 +394,19 @@ async def refresh(
     raw = request.cookies.get(REFRESH_COOKIE)
     if not raw:
         raise HTTPException(status_code=401, detail="Refresh token required")
+    # FOR UPDATE. Rotation is a read-check-write on this row — `revoked_at` is
+    # read at the branch below and written at the end — and without the lock those
+    # are two transactions, so the single-use rule is not enforced under
+    # concurrency at all. Measured before this line existed: four simultaneous
+    # refreshes presenting the SAME token all returned 200 and left three live
+    # sessions. Worse than the extra sessions, every one of them read the token as
+    # unrevoked, so none of them entered the reuse branch — the theft detection
+    # below, and the family revocation it triggers, are exactly what a captured
+    # cookie racing the real client would have slipped past.
     token = (
-        await db.execute(select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw)))
+        await db.execute(
+            select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw)).with_for_update()
+        )
     ).scalar_one_or_none()
     if token is None:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
@@ -335,11 +463,24 @@ async def logout(
 ):
     raw = request.cookies.get(REFRESH_COOKIE)
     if raw:
+        # FOR UPDATE for the same reason /refresh takes it: this reads the row and
+        # then writes it, and a rotation committing in between would leave the
+        # successor untouched.
         token = (
-            await db.execute(select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw)))
+            await db.execute(
+                select(RefreshToken)
+                .where(RefreshToken.token_hash == hash_refresh_token(raw))
+                .with_for_update()
+            )
         ).scalar_one_or_none()
         if token and token.user_id == user.id:
-            token.revoked_at = now_utc()
+            _revoked = await _revoke_rotation_chain(db, token)
+            if _revoked > 1:
+                logger.info(
+                    "Logout for user %s revoked %s rotated sessions from the presented token",
+                    user.id,
+                    _revoked,
+                )
     user.last_seen_at = now_utc()
     await db.commit()
     clear_auth_cookies(response)
