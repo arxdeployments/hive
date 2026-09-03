@@ -50,3 +50,10 @@ urllib3==2.7.0
 anyio==4.14.2
 starlette==0.46.2
 cryptography==44.0.0
+# Same rule again, and this one arrived with a fix rather than a refactor.
+# services/calls.py constructs aiohttp.ClientTimeout directly, to hand the LiveKit
+# client a 5-second budget instead of its 60-second default — on the join and
+# teardown paths that default is a stall, not a timeout. aiohttp comes in
+# transitively via livekit-api, which constrains only `aiohttp`, so nothing pinned
+# the version whose ClientTimeout signature we now depend on.
+aiohttp==3.14.3

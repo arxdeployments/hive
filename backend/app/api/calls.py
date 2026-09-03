@@ -346,7 +346,14 @@ async def call_token(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    call = (await db.execute(select(Call).where(Call.id == call_id))).scalar_one_or_none()
+    # FOR UPDATE, because everything below decides on `call.status` and then
+    # writes. Without the lock the guard and the write are two transactions: a call
+    # ended in between still gets a six-hour token, and the participant this marks
+    # present keeps `left_at IS NULL` — the predicate the roster and the
+    # last-one-out check both read, so a call that has ended acquires a member who
+    # never leaves. The commit below releases it, so the SFU and Redis calls that
+    # follow are outside the lock.
+    call = (await db.execute(select(Call).where(Call.id == call_id).with_for_update())).scalar_one_or_none()
     member = await db.get(CallParticipant, (call_id, user.id)) if call else None
     if call is None or member is None:
         raise HTTPException(status_code=404, detail="Call not found")
@@ -399,11 +406,49 @@ async def _handle_webhook_event(db: AsyncSession, event) -> None:
     call_id = parse_uuid(room.removeprefix("call_"))
     if call_id is None:
         return
-    call = (await db.execute(select(Call).where(Call.id == call_id))).scalar_one_or_none()
+    # FOR UPDATE for the same reason the token endpoint takes it: every branch below
+    # reads `call.status` and then writes. Under READ COMMITTED an unlocked read
+    # leaves the interleaving where this handler sees an active call, `_finalize`
+    # commits a terminal status, and this then commits `joined_at` / `left_at = None`
+    # — a participant marked present on a call that has ended, having sailed past
+    # the terminal branch that would have torn the room down. `_finalize` must
+    # UPDATE this row, so holding it here serializes the two.
+    call = (await db.execute(select(Call).where(Call.id == call_id).with_for_update())).scalar_one_or_none()
     if call is None:
         return
 
     name = event.event
+    if name in ("participant_joined", "participant_left") and call.status not in _ACTIVE_STATUSES:
+        # Admission, enforced where it can actually be enforced.
+        #
+        # A join token is a JWT with a six-hour TTL and nothing can revoke it, so
+        # every participant of a finished call keeps a working credential. Deleting
+        # the room on teardown does not close that: LiveKit creates a room on join,
+        # so a holder can walk back into a room that was deleted and — with a second
+        # holder — hold a conversation with no call record, no history and nobody
+        # able to see them leave.
+        #
+        # The token cannot carry this check, but LiveKit tells us the moment someone
+        # uses one. Deleting the room again disconnects everyone in it, and does so
+        # for every rejoiner rather than one identity at a time. Without this the
+        # handler below would also clear `left_at`, putting a live participant back
+        # onto a call that had already ended.
+        if name == "participant_joined":
+            logger.warning(
+                "call.join_after_end call_id=%s status=%s identity=%s — "
+                "stale token used, tearing the room down again",
+                call.id,
+                call.status.value,
+                event.participant.identity,
+            )
+            # Release the row lock before the SFU round trip: the decision is made
+            # and nothing below writes, so there is no reason to hold the call row
+            # for the timeout's duration. `expire_on_commit=False` keeps `call`
+            # readable afterwards.
+            await db.commit()
+            await calls_service._delete_room(call)
+        return
+
     if name in ("participant_joined", "participant_left"):
         # Identities are `{user_id}#{device_id}` so one user may hold more than one
         # connection without the SFU evicting them as a duplicate

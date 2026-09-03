@@ -39,6 +39,7 @@ import datetime as dt
 import logging
 import uuid
 
+import aiohttp
 from livekit import api as lk_api
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -174,6 +175,15 @@ async def _call_participant_ids(db: AsyncSession, call_id: uuid.UUID) -> list[uu
 # than the difference between a working call and a dead one.
 IDENTITY_SEPARATOR = "#"
 
+# Control-plane calls to the SFU take single-digit milliseconds when it is healthy.
+# The LiveKit client's default is a 60-second total timeout, which on these two
+# paths is not a timeout so much as a stall: an SFU that accepts a connection and
+# then stops answering would hold POST /{id}/token for a minute before the caller
+# got a token, and delay every participant's `call:ended` by the same, leaving
+# clients sitting in a call the server had already finished ending. Both callers
+# are best-effort, so giving up quickly is strictly better than waiting.
+_SFU_TIMEOUT = aiohttp.ClientTimeout(total=5)
+
 
 def identity_for(user_id, device_id: str | None) -> str:
     """`{user_id}#{device_id}` — unique per client, resolvable back to the user."""
@@ -218,7 +228,9 @@ async def evict_other_devices(call: Call, user_id, keep_identity: str) -> int:
         return 0
     removed = 0
     try:
-        client = lk_api.LiveKitAPI(base, settings.livekit_api_key, settings.livekit_api_secret)
+        client = lk_api.LiveKitAPI(
+            base, settings.livekit_api_key, settings.livekit_api_secret, timeout=_SFU_TIMEOUT
+        )
         try:
             existing = await client.room.list_participants(
                 lk_api.ListParticipantsRequest(room=call.room_name)
@@ -234,17 +246,82 @@ async def evict_other_devices(call: Call, user_id, keep_identity: str) -> int:
                     user_id,
                     p.identity,
                 )
-                await client.room.remove_participant(
-                    lk_api.RoomParticipantIdentity(room=call.room_name, identity=p.identity)
-                )
-                removed += 1
+                # Per leg, and at WARNING. The outer catch below is written for the
+                # benign case — a room that does not exist yet — and once a stale
+                # leg has actually been identified that reading is gone: this user
+                # has two microphones in the call and the other side is hearing
+                # their own voice come back. Sharing one DEBUG line with the
+                # first-join case made a broken echo invariant invisible.
+                #
+                # Scoped per leg for the second reason too: a single leg that
+                # refuses to go used to abort the loop, so a user with three stale
+                # legs kept two of them.
+                try:
+                    await client.room.remove_participant(
+                        lk_api.RoomParticipantIdentity(room=call.room_name, identity=p.identity)
+                    )
+                    removed += 1
+                except Exception:
+                    logger.warning(
+                        "call.evict_failed call_id=%s user_id=%s identity=%s — "
+                        "duplicate audio leg remains, expect echo",
+                        call.id,
+                        user_id,
+                        p.identity,
+                        exc_info=True,
+                    )
         finally:
             await client.aclose()
     except Exception:
-        # A room that does not exist yet is the normal first-join case and raises
-        # here; nothing to evict either way.
+        # Reaching the SFU, or listing the room. A room that does not exist yet is
+        # the normal first-join case and raises here; nothing to evict either way,
+        # which is why this stays at DEBUG while a failed removal does not.
         logger.debug("evict_other_devices skipped", exc_info=True)
     return removed
+
+
+async def _delete_room(call: Call) -> bool:
+    """Tear down the media room. A call is over when the ROOM is gone, not the row.
+
+    Ending a call used to be a database-and-Redis operation only: status set,
+    `in_call` keys cleared, timers cancelled — and the SFU room left running. That
+    matters because a room is the only thing a client can actually observe. Tokens
+    are JWTs with a six-hour TTL and nothing can revoke them, so every participant
+    of a call that just ended holds a working credential for a room the server
+    still serves. Rejoining it recreates a live call that no longer exists in the
+    database: no ring, no roster, no history, and no participant the other side can
+    see leave.
+
+    LiveKit does eventually reap an empty room by itself, but `empty_timeout` only
+    starts once the room is empty — a client that rejoins keeps resetting it.
+
+    Best-effort, like eviction: a failure here must not stop a call from ending.
+    Logged at WARNING rather than DEBUG, because a room that outlived its call is a
+    condition someone should be able to see in production, and the failure is
+    invisible to every client until one of them rejoins.
+    """
+    settings = get_settings()
+    base = settings.livekit_probe_url
+    if not base or not call.room_name:
+        return False
+    try:
+        client = lk_api.LiveKitAPI(
+            base, settings.livekit_api_key, settings.livekit_api_secret, timeout=_SFU_TIMEOUT
+        )
+        try:
+            await client.room.delete_room(lk_api.DeleteRoomRequest(room=call.room_name))
+            logger.info("call.room_deleted call_id=%s room=%s", call.id, call.room_name)
+            return True
+        finally:
+            await client.aclose()
+    except Exception:
+        logger.warning(
+            "call.room_delete_failed call_id=%s room=%s — room may outlive the call",
+            call.id,
+            call.room_name,
+            exc_info=True,
+        )
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +339,9 @@ async def _finalize(
     call.status = status
     call.ended_at = now_utc()
     await db.commit()
+    # Before the Redis bookkeeping: the room is the part a client can still act on,
+    # and every other line here only affects what the server believes.
+    await _delete_room(call)
     ids = await _call_participant_ids(db, call.id)
     await _clear_in_call(ids, call.id)
     if call.conversation_id:
