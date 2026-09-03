@@ -11,6 +11,7 @@ import uuid
 
 from sqlalchemy import select
 
+from app.api import calls as api_calls
 from app.db.models import Call, CallParticipant, CallStatus
 from app.db.session import SessionLocal
 from app.services import calls as calls_service
@@ -316,3 +317,82 @@ async def test_both_sfu_calls_use_a_short_timeout(client, two_orgs_with_users, m
     for timeout in sfu.timeouts:
         assert timeout is not None, "the client's 60-second default must not be inherited"
         assert timeout.total is not None and timeout.total <= 10, timeout
+
+
+class _StubEvent:
+    """The three fields `_handle_webhook_event` reads off a verified LiveKit event."""
+
+    def __init__(self, event: str, room: str, identity: str) -> None:
+        self.event = event
+        self.room = type("_Room", (), {"name": room})()
+        self.participant = type("_P", (), {"identity": identity})()
+
+
+async def test_a_stale_token_rejoining_an_ended_call_is_thrown_out(
+    client, two_orgs_with_users, monkeypatch, caplog
+):
+    """Admission, enforced where it can be enforced.
+
+    A join token is a JWT with a six-hour TTL that nothing can revoke, and deleting
+    the room does not close that: LiveKit creates a room on join, so a holder can
+    walk back into a deleted room. Two holders could then hold a conversation with
+    no call record, no history, and nobody able to see them leave.
+
+    The token cannot carry the check, but LiveKit reports the join — so the room is
+    torn down again, and the participant must NOT be put back on the call.
+    """
+    users = two_orgs_with_users
+    call_id = await _seed_connected_call(users)
+    bob = users["bob"].id
+
+    sfu = _stub_sfu(monkeypatch)
+    await calls_service._end(users["alice"], uuid.UUID(call_id))
+    sfu.deleted.clear()
+
+    async with SessionLocal() as db:
+        call = await db.get(Call, uuid.UUID(call_id))
+        assert call.status == CallStatus.answered
+        room_name = call.room_name
+        # `_end` only stamps `left_at` on the person who ended it, so bob's row is
+        # exactly what the handler would corrupt: joined_at NULL, left_at NULL.
+        member = await db.get(CallParticipant, (uuid.UUID(call_id), bob))
+        before = (member.joined_at, member.left_at)
+
+    event = _StubEvent("participant_joined", room_name, calls_service.identity_for(bob, "phone"))
+    with caplog.at_level("WARNING", logger="app.api.calls"):
+        async with SessionLocal() as db:
+            await api_calls._handle_webhook_event(db, event)
+
+    assert sfu.deleted == [room_name], "the recreated room must be torn down again"
+    async with SessionLocal() as db:
+        member = await db.get(CallParticipant, (uuid.UUID(call_id), bob))
+        assert (member.joined_at, member.left_at) == before, (
+            "a join after the end must leave the participant row alone; the unguarded "
+            "handler stamps joined_at and clears left_at, putting a live participant "
+            "back onto a call that had already ended"
+        )
+        assert member.joined_at is None
+    assert any("call.join_after_end" in r.message for r in caplog.records), [
+        r.message for r in caplog.records
+    ]
+
+
+async def test_a_join_on_a_live_call_is_still_recorded(client, two_orgs_with_users, monkeypatch):
+    """The converse. Without it the guard above could refuse every join and pass."""
+    users = two_orgs_with_users
+    call_id = await _seed_connected_call(users)
+    bob = users["bob"].id
+    sfu = _stub_sfu(monkeypatch)
+
+    async with SessionLocal() as db:
+        room_name = (await db.get(Call, uuid.UUID(call_id))).room_name
+
+    event = _StubEvent("participant_joined", room_name, calls_service.identity_for(bob, "phone"))
+    async with SessionLocal() as db:
+        await api_calls._handle_webhook_event(db, event)
+
+    assert sfu.deleted == [], "a live call's room must not be torn down"
+    async with SessionLocal() as db:
+        member = await db.get(CallParticipant, (uuid.UUID(call_id), bob))
+        assert member.joined_at is not None
+        assert member.left_at is None

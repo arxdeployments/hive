@@ -411,6 +411,32 @@ async def _handle_webhook_event(db: AsyncSession, event) -> None:
         return
 
     name = event.event
+    if name in ("participant_joined", "participant_left") and call.status not in _ACTIVE_STATUSES:
+        # Admission, enforced where it can actually be enforced.
+        #
+        # A join token is a JWT with a six-hour TTL and nothing can revoke it, so
+        # every participant of a finished call keeps a working credential. Deleting
+        # the room on teardown does not close that: LiveKit creates a room on join,
+        # so a holder can walk back into a room that was deleted and — with a second
+        # holder — hold a conversation with no call record, no history and nobody
+        # able to see them leave.
+        #
+        # The token cannot carry this check, but LiveKit tells us the moment someone
+        # uses one. Deleting the room again disconnects everyone in it, and does so
+        # for every rejoiner rather than one identity at a time. Without this the
+        # handler below would also clear `left_at`, putting a live participant back
+        # onto a call that had already ended.
+        if name == "participant_joined":
+            logger.warning(
+                "call.join_after_end call_id=%s status=%s identity=%s — "
+                "stale token used, tearing the room down again",
+                call.id,
+                call.status.value,
+                event.participant.identity,
+            )
+            await calls_service._delete_room(call)
+        return
+
     if name in ("participant_joined", "participant_left"):
         # Identities are `{user_id}#{device_id}` so one user may hold more than one
         # connection without the SFU evicting them as a duplicate
