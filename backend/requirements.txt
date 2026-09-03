@@ -8,15 +8,15 @@ alembic==1.14.1
 redis[hiredis]==5.2.1
 bcrypt==4.2.1
 PyJWT==2.10.1
-python-multipart==0.0.20
-minio==7.2.15
+python-multipart==0.0.32
+minio==7.2.20
 Pillow==11.1.0
 # PDF page rasteriser for document previews. Chosen over PyMuPDF (AGPL) and
 # pdf2image (needs poppler-utils via apt). Apache-2.0 OR BSD-3, and ships a
 # py3-none manylinux wheel, so the Dockerfile needs no system packages.
-pypdfium2==5.12.1
+pypdfium2==5.13.0
 livekit-api==0.8.2
-email-validator==2.2.0
+email-validator==2.3.0
 httpx==0.28.1
 pywebpush==2.0.3
 # Pinned because app/services/push.py subclasses urllib3's HTTPConnection and
