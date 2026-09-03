@@ -74,7 +74,7 @@ jobs:
       run:
         working-directory: backend
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This workflow only ever reads the tree. Left at the default,
           # checkout leaves the job's token in .git/config for everything
@@ -113,7 +113,7 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This workflow only ever reads the tree. Left at the default,
           # checkout leaves the job's token in .git/config for everything
@@ -141,7 +141,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10  # a pip install and one text scan
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This workflow only ever reads the tree. Left at the default,
           # checkout leaves the job's token in .git/config for everything
@@ -190,7 +190,7 @@ jobs:
       run:
         working-directory: infra/terraform
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This workflow only ever reads the tree. Left at the default,
           # checkout leaves the job's token in .git/config for everything
@@ -227,7 +227,7 @@ jobs:
       run:
         working-directory: infra
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This workflow only ever reads the tree. Left at the default,
           # checkout leaves the job's token in .git/config for everything
@@ -370,7 +370,7 @@ jobs:
       E2E_API_URL: http://127.0.0.1:8000
       E2E_SUPERADMIN_PASSWORD: CiSuperadminPass123
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This workflow only ever reads the tree. Left at the default,
           # checkout leaves the job's token in .git/config for everything
@@ -520,7 +520,7 @@ jobs:
     timeout-minutes: 25  # two image builds from cold
     needs: [backend, frontend]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # This workflow only ever reads the tree. Left at the default,
           # checkout leaves the job's token in .git/config for everything
