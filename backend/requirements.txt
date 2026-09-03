@@ -48,5 +48,5 @@ urllib3==2.7.0
 # starlette is reached for BaseHTTPMiddleware in app/core/observability.py, and
 # fastapi allows the whole 0.40-0.47 range.
 anyio==4.14.2
-starlette==0.46.2
+starlette==1.6.0
 cryptography==44.0.0
