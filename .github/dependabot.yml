@@ -116,6 +116,27 @@ updates:
         patterns: ["*"]
         update-types: [minor, patch]
 
+  # The compose stack, which is a separate Dependabot ecosystem from `docker` and
+  # was missed entirely on the first pass. infra/docker-compose.yml and its prod
+  # sibling pin postgres, redis, caddy, minio and livekit-server — the images the
+  # production box actually runs, via user_data.sh.tftpl. Two of those sit on
+  # :latest, which Dependabot cannot bump meaningfully; the alpine-tagged three it
+  # can, and that is three more than before.
+  - package-ecosystem: docker-compose
+    directory: /infra
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: infra
+    groups:
+      compose-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
   # Providers, against the committed .terraform.lock.hcl. The terraform job runs
   # `init -backend=false` using that lock, so a provider bump is checked by the
   # same validate step that already guards hand edits.

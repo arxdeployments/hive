@@ -43,6 +43,7 @@ def test_the_real_repository_is_covered(checker):
         ("docker", "/backend"),
         ("docker", "/frontend"),
         ("terraform", "/infra/terraform"),
+        ("docker-compose", "/infra"),
         ("github-actions", "/"),
     ],
 )
@@ -73,9 +74,17 @@ def test_vendored_manifests_are_ignored(checker):
     them — which is also why this stays true for the next vendored tree nobody
     thought to list.
     """
-    for (_, directory), source in checker.present_ecosystems().items():
-        parts = set(source.parts)
-        assert not (parts & checker.IGNORED_PARTS), f"{directory} came from {source}"
+    # Asserted on the PATHS, not against IGNORED_PARTS. Exclusion is by git
+    # tracking now, so testing the blocklist tested a rule the code no longer
+    # uses: a regression that started detecting ios/build/.../Package.resolved
+    # would have passed, because that path's exclusion has nothing to do with
+    # the blocklist any more.
+    vendored_roots = ("ios/build", "ios/build-device", "node_modules", ".claude")
+    for (ecosystem, directory), source in checker.present_ecosystems().items():
+        text = source.as_posix()
+        assert not any(text.startswith(root) for root in vendored_roots), (
+            f"{ecosystem} at {directory} came from a vendored tree: {source}"
+        )
 
 
 def test_only_git_tracked_files_count(checker):
@@ -117,13 +126,24 @@ def test_every_configured_entry_groups_minor_and_patch(checker):
     Three entries were left ungrouped in the first version — the two Dockerfiles
     and terraform — which contradicted the rationale written directly above them.
     """
-    text = checker.CONFIG.read_text()
-    # [1:] drops the file's header comment, which is everything before the first
-    # entry. Keeping it made this assert 7 == 6 and fail on the preamble rather
-    # than on any real problem.
-    entries = text.split("  - package-ecosystem:")[1:]
-    assert len(entries) == 6, len(entries)
-    ungrouped = [e.splitlines()[0].strip() for e in entries if "update-types: [minor, patch]" not in e]
+    # Parsed, not string-matched. Matching the exact inline spelling
+    # `update-types: [minor, patch]` was wrong twice over: an equivalent
+    # block-style sequence would have failed it, and a COMMENT containing that
+    # text would have satisfied it. The first version also counted the file's
+    # header comment as a seventh entry and asserted 7 == 6.
+    import yaml
+
+    config = yaml.safe_load(checker.CONFIG.read_text())
+    assert config["version"] == 2
+    entries = config["updates"]
+    assert len(entries) == 7, [e["package-ecosystem"] for e in entries]
+
+    ungrouped = []
+    for entry in entries:
+        groups = entry.get("groups") or {}
+        grouped = any(set(group.get("update-types") or []) >= {"minor", "patch"} for group in groups.values())
+        if not grouped:
+            ungrouped.append(f"{entry['package-ecosystem']}@{entry['directory']}")
     assert not ungrouped, f"entries without a minor/patch group: {ungrouped}"
 
 
@@ -152,3 +172,27 @@ def test_mismatched_keys_are_rejected(checker, tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exit_info:
         checker.configured_ecosystems()
     assert exit_info.value.code == 1
+
+
+def test_compose_files_are_detected_as_their_own_ecosystem(checker):
+    """`docker-compose` is a distinct Dependabot ecosystem from `docker`.
+
+    Both infra compose files are tracked and pin the images the production box
+    actually runs — postgres, redis, caddy, minio, livekit-server — and none was
+    covered while this script reported full coverage, because MANIFESTS had no
+    entry for the filename.
+    """
+    present = checker.present_ecosystems()
+    assert ("docker-compose", "/infra") in present, sorted(present)
+    assert present[("docker-compose", "/infra")].name.startswith("docker-compose")
+
+
+def test_github_actions_is_derived_from_tracked_paths(checker, monkeypatch):
+    """It was an is_dir() check on the filesystem, so it would have counted an
+    untracked .github/workflows and missed a tracked root action.yml — the two
+    cases Dependabot itself treats as the same `/` entry."""
+    monkeypatch.setattr(checker, "repository_files", lambda: [pathlib.Path("action.yml")])
+    assert ("github-actions", "/") in checker.present_ecosystems()
+
+    monkeypatch.setattr(checker, "repository_files", lambda: [pathlib.Path("README.md")])
+    assert not any(eco == "github-actions" for eco, _ in checker.present_ecosystems())

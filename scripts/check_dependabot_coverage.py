@@ -37,6 +37,14 @@ MANIFESTS: dict[str, str] = {
     "package.json": "npm",
     "Dockerfile": "docker",
     "Package.resolved": "swift",
+    # Dependabot's own ecosystem key for these is `docker-compose`, distinct from
+    # `docker`. Both infra compose files are tracked and pin five images —
+    # postgres:16-alpine, redis:7-alpine, caddy:2-alpine, and minio and
+    # livekit-server on floating :latest — and none of them was covered, so the
+    # production stack's images were unmanaged while this script reported full
+    # coverage.
+    "docker-compose.yml": "docker-compose",
+    "docker-compose.yaml": "docker-compose",
 }
 
 # Terraform has no single well-known filename. Matching "main.tf" was the first
@@ -111,9 +119,18 @@ def present_ecosystems() -> dict[tuple[str, str], pathlib.Path]:
             continue
         directory = "/" + str(path.parent) if str(path.parent) != "." else "/"
         found.setdefault((ecosystem, directory), path)
-    # github-actions is keyed on the workflow directory, not a manifest name.
-    if (ROOT / ".github" / "workflows").is_dir():
-        found.setdefault(("github-actions", "/"), pathlib.Path(".github/workflows"))
+    # github-actions is keyed on the repository root rather than a manifest name,
+    # and Dependabot scans three places for it: .github/workflows/*, and a root
+    # action.yml or action.yaml. Derived from the TRACKED paths above, not from
+    # is_dir() — that checked the filesystem, so it would have counted an
+    # untracked .github/workflows and missed a tracked root action.yml.
+    for path in sorted(repository_files()):
+        parts = path.parts
+        is_workflow = len(parts) >= 3 and parts[0] == ".github" and parts[1] == "workflows"
+        is_root_action = len(parts) == 1 and path.name in ("action.yml", "action.yaml")
+        if is_workflow or is_root_action:
+            found.setdefault(("github-actions", "/"), path)
+            break
     return found
 
 
