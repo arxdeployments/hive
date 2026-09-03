@@ -19,6 +19,23 @@ Both were reached transitively. Neither was in requirements.txt. Nothing would h
 told us — which is the gap this closes: a direct import is a direct dependency,
 whatever installed it.
 
+SCOPE, STATED PLAINLY
+
+This reads STATIC imports only — ast.Import and ast.ImportFrom, at any nesting
+depth, including inside functions and try blocks. It does not see
+importlib.import_module, __import__, plugin discovery or entry points. app/ has
+none of those today (checked), but a dynamic import of an unpinned package would
+pass this check silently, so anyone adding one needs to pin it by hand.
+
+TWO MODES
+
+Default is the static check above and needs nothing installed. `--check-mappings`
+validates DISTRIBUTION_OF against importlib.metadata and therefore needs the
+environment; CI runs it after pip install. The split is deliberate: a
+hand-maintained map that nothing verifies is a way for this check to pass while a
+package is unpinned, and the map's own first run found `pil` pointing at nothing
+because Pillow's import name is `PIL`.
+
 Run by CI alongside scripts/check_contracts.py.
 """
 
@@ -90,7 +107,54 @@ def imported_top_level() -> dict[str, set[pathlib.Path]]:
     return where
 
 
+def validate_mappings() -> int:
+    """Check every DISTRIBUTION_OF entry against what is actually installed.
+
+    The map is hand-maintained, and a wrong entry does not fail loudly — it makes
+    the static check look for the wrong distribution name and pass. So the map is
+    verified separately, against importlib.metadata, where the answer is a fact
+    rather than an assumption.
+
+    Case matters and cost me one already: packages_distributions() keys are real
+    import names, so Pillow appears as `PIL`. Matching is case-insensitive on the
+    import name for that reason.
+    """
+    from importlib.metadata import packages_distributions
+
+    provided = packages_distributions()
+    by_lower: dict[str, list[str]] = {}
+    for import_name, distributions in provided.items():
+        by_lower.setdefault(import_name.lower(), []).extend(distributions)
+
+    problems: list[str] = []
+    for import_name, claimed in sorted(DISTRIBUTION_OF.items()):
+        actual = by_lower.get(import_name.lower())
+        if not actual:
+            problems.append(
+                f"  {import_name!r} -> {claimed!r}: nothing installed provides that import, "
+                "so the mapping cannot be verified (wrong key, or the package is absent)"
+            )
+            continue
+        normalised = {a.lower().replace("_", "-") for a in actual}
+        if claimed.lower().replace("_", "-") not in normalised:
+            problems.append(f"  {import_name!r} -> {claimed!r}: actually provided by {sorted(actual)}")
+
+    if problems:
+        print("DISTRIBUTION_OF entries that do not match the installed environment:\n")
+        print("\n".join(problems))
+        print(
+            "\nA wrong mapping makes the static check look for the wrong distribution"
+            "\nname and pass while the real package is unpinned. Fix the entry."
+        )
+        return 1
+
+    print(f"validated {len(DISTRIBUTION_OF)} import->distribution mappings against the environment")
+    return 0
+
+
 def main() -> int:
+    if "--check-mappings" in sys.argv[1:]:
+        return validate_mappings()
     stdlib = set(sys.stdlib_module_names)
     pinned = pinned_distributions()
     problems: list[str] = []

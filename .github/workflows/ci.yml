@@ -166,6 +166,12 @@ jobs:
       - run: python scripts/check_pinned_imports.py
       - run: pip install -r backend/requirements.txt
       - run: python scripts/check_contracts.py
+      # The other half, and it needs the environment. The static check above trusts
+      # a hand-maintained import->distribution map; this validates that map against
+      # importlib.metadata, because a wrong entry makes the static check look for
+      # the wrong name and PASS while the real package is unpinned. Its own first
+      # run found `pil` pointing at nothing, Pillow's import name being `PIL`.
+      - run: python scripts/check_pinned_imports.py --check-mappings
 
   terraform:
     # The infrastructure had no automated check of any kind: a syntax error, a
