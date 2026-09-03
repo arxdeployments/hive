@@ -68,13 +68,47 @@ def test_comments_and_blank_lines_are_not_pins(checker, tmp_path, monkeypatch):
     assert checker.pinned_distributions() == {"fastapi"}
 
 
-def test_a_mapping_is_honoured_exactly(checker):
+def test_a_mapping_is_honoured_exactly(checker, tmp_path, monkeypatch):
     """`import jwt` is provided by PyJWT, and `jwt` is a real, different package.
 
     The matcher used to accept a pin named after the MODULE as well, so a bare
     `jwt==` pin satisfied this import while PyJWT stayed unpinned.
+
+    Driven through main() rather than by reading DISTRIBUTION_OF. The first version
+    of this test asserted the map VALUE, which says nothing about the matching: it
+    would have passed unchanged if main() went back to accepting the fallback,
+    which is the bug it is named after. Flagged in review, and the fourth time in
+    this arc that an assertion could not fail for the thing it described.
     """
-    assert checker.DISTRIBUTION_OF["jwt"] == "pyjwt"
+    monkeypatch.setattr(
+        checker, "imported_top_level", lambda: {"jwt": {pathlib.Path("app/core/security.py")}}
+    )
+    runtime = tmp_path / "requirements.txt"
+    monkeypatch.setattr(checker, "RUNTIME_REQUIREMENTS", runtime)
+
+    # The module name alone must NOT satisfy it — `jwt` is a real, different package.
+    runtime.write_text("jwt==1.3.1\n")
+    assert checker.main() == 1
+
+    # The mapped distribution does.
+    runtime.write_text("PyJWT==2.10.1\n")
+    assert checker.main() == 0
+
+
+def test_an_unmapped_import_accepts_either_spelling(checker, tmp_path, monkeypatch):
+    """Without a mapping there is nothing asserted about the provider, so the
+    underscore and hyphen spellings of the module name both count — that is how
+    `pydantic_settings` and `pydantic-settings` reconcile."""
+    monkeypatch.setattr(checker, "imported_top_level", lambda: {"some_package": {pathlib.Path("app/x.py")}})
+    runtime = tmp_path / "requirements.txt"
+    monkeypatch.setattr(checker, "RUNTIME_REQUIREMENTS", runtime)
+
+    runtime.write_text("some-package==1.0.0\n")
+    assert checker.main() == 0
+    runtime.write_text("some_package==1.0.0\n")
+    assert checker.main() == 0
+    runtime.write_text("unrelated==1.0.0\n")
+    assert checker.main() == 1
 
 
 def test_the_mapping_validator_rejects_a_wrong_entry(checker, monkeypatch):
