@@ -164,6 +164,12 @@ jobs:
       # disabled an SSRF guard. Batch 47 found anyio, which app/ calls with a
       # keyword that did not exist before 4.1 while starlette allows 3.6.2 upward.
       - run: python scripts/check_pinned_imports.py
+      # Also stdlib-only, also before the install. Asserts dependabot.yml has an
+      # entry for every ecosystem the repository actually contains — ci.yml claimed
+      # Dependabot handled its pinned action SHAs for months while no config
+      # existed, and a config that silently stops covering a new ecosystem is the
+      # same failure with an extra step.
+      - run: python scripts/check_dependabot_coverage.py
       - run: pip install -r backend/requirements.txt
       - run: python scripts/check_contracts.py
       # The other half, and it needs the environment. The static check above trusts
