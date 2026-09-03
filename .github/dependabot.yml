@@ -1,0 +1,123 @@
+# Dependency updates, which ci.yml has been telling readers were handled since the
+# day the action SHAs were pinned.
+#
+# That comment says "(Dependabot handles pinned SHAs and rewrites the comment)".
+# Dependabot was never configured. So every `uses:` in the workflow has been frozen
+# at whatever was current when it was written, and the comment actively reassured
+# anyone who wondered. Measured on 2026-09-03:
+#
+#   actions/checkout           v4.4.0 -> v7.0.1
+#   actions/setup-node         v4.4.0 -> v7.0.0
+#   actions/setup-python       v5.6.0 -> v7.0.0
+#   actions/upload-artifact    v4.6.2 -> v7.0.1
+#   hashicorp/setup-terraform  v3.1.2 -> v4.0.1
+#
+# Three major versions behind, across the board.
+#
+# WHY THIS IS SAFE TO TURN ON NOW, AND WOULD NOT HAVE BEEN BEFORE
+#
+# Batches 46 and 47 pinned four transitive packages the application reaches into
+# directly, and the reason those pins were the right call is that nothing watched
+# for updates. Automation changes that trade — but only because those batches also
+# added the tests that detect a semantic break rather than a version change:
+#
+#   * urllib3 — services/push.py overrides its PRIVATE _new_conn to check the
+#     address a push actually connects to. A version that stopped calling that
+#     method would leave the subclass valid and the SSRF guard silently gone.
+#     tests/test_push_ssrf_guard.py connects to a real loopback listener and
+#     asserts the guard fires, so a Dependabot bump that breaks it fails CI.
+#   * anyio — api/notifications.py and services/push.py pass abandon_on_cancel,
+#     which did not exist before 4.1. scripts/check_pinned_imports.py keeps it
+#     pinned and the suite exercises the call.
+#
+# Every Dependabot PR runs the full pipeline, so those tests are the gate. Without
+# them this file would be a way to lose a security guard on a Tuesday.
+version: 2
+updates:
+  # Actions first: these are the ones the stale comment was about, and a compromised
+  # or abandoned action is the supply-chain risk the SHA pinning exists to bound.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    groups:
+      # Patch and minor together — reviewing five separate PRs for routine bumps is
+      # how a queue gets ignored. Majors stay separate; v4 to v7 on checkout is not
+      # a rubber stamp.
+      actions-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    groups:
+      python-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    groups:
+      npm-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # Both images, separately, because they are built from different bases and a bump
+  # to one says nothing about the other.
+  - package-ecosystem: docker
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: docker
+
+  - package-ecosystem: docker
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: docker
+
+  # Providers, against the committed .terraform.lock.hcl. The terraform job runs
+  # `init -backend=false` using that lock, so a provider bump is checked by the
+  # same validate step that already guards hand edits.
+  - package-ecosystem: terraform
+    directory: /infra/terraform
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Kolkata
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: infra
