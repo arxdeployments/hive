@@ -96,6 +96,10 @@ updates:
     open-pull-requests-limit: 3
     commit-message:
       prefix: docker
+    groups:
+      backend-image-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
 
   - package-ecosystem: docker
     directory: /frontend
@@ -107,6 +111,10 @@ updates:
     open-pull-requests-limit: 3
     commit-message:
       prefix: docker
+    groups:
+      frontend-image-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
 
   # Providers, against the committed .terraform.lock.hcl. The terraform job runs
   # `init -backend=false` using that lock, so a provider bump is checked by the
@@ -121,3 +129,7 @@ updates:
     open-pull-requests-limit: 3
     commit-message:
       prefix: infra
+    groups:
+      terraform-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]

@@ -67,10 +67,64 @@ def test_terraform_is_found_without_a_main_tf(checker):
 def test_vendored_manifests_are_ignored(checker):
     """ios/build holds SPM checkouts with their own package manifests and even
     their own dependabot.yml. Treating those as ours would demand entries for
-    somebody else's dependencies."""
+    somebody else's dependencies.
+
+    They are excluded because they are UNTRACKED, not because a blocklist names
+    them — which is also why this stays true for the next vendored tree nobody
+    thought to list.
+    """
     for (_, directory), source in checker.present_ecosystems().items():
         parts = set(source.parts)
         assert not (parts & checker.IGNORED_PARTS), f"{directory} came from {source}"
+
+
+def test_only_git_tracked_files_count(checker):
+    """Dependabot reads the repository, so an untracked manifest is invisible to it.
+
+    ios/RxHive.xcodeproj/.../Package.resolved is a real Swift manifest that
+    .gitignore line 46 excludes. A filesystem walk would demand a `swift` entry for
+    it, and that entry would be inert — Dependabot could never act on a file it
+    cannot see. Review asked for SPM detection; this is the half that makes the
+    detection correct rather than merely present.
+    """
+    tracked = set(checker.repository_files())
+    assert pathlib.Path("backend/requirements.txt") in tracked
+    assert (
+        pathlib.Path("ios/RxHive.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved")
+        not in tracked
+    )
+    # So no swift ecosystem is reported, and none is configured.
+    assert not any(eco == "swift" for eco, _ in checker.present_ecosystems())
+
+
+def test_a_tracked_swift_manifest_would_demand_an_entry(checker, monkeypatch):
+    """The regression test review asked for: SPM is recognised the moment it is
+    committed, rather than being a gap nobody notices."""
+    monkeypatch.setattr(
+        checker,
+        "repository_files",
+        lambda: [pathlib.Path("ios/Package.resolved")],
+    )
+    present = checker.present_ecosystems()
+    assert ("swift", "/ios") in present, sorted(present)
+    # And the real config has no swift entry, so coverage must fail.
+    assert checker.main() == 1
+
+
+def test_every_configured_entry_groups_minor_and_patch(checker):
+    """A routine week has to be one PR per ecosystem, not five.
+
+    Three entries were left ungrouped in the first version — the two Dockerfiles
+    and terraform — which contradicted the rationale written directly above them.
+    """
+    text = checker.CONFIG.read_text()
+    # [1:] drops the file's header comment, which is everything before the first
+    # entry. Keeping it made this assert 7 == 6 and fail on the preamble rather
+    # than on any real problem.
+    entries = text.split("  - package-ecosystem:")[1:]
+    assert len(entries) == 6, len(entries)
+    ungrouped = [e.splitlines()[0].strip() for e in entries if "update-types: [minor, patch]" not in e]
+    assert not ungrouped, f"entries without a minor/patch group: {ungrouped}"
 
 
 def test_a_missing_entry_fails(checker, tmp_path, monkeypatch):

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -35,6 +36,7 @@ MANIFESTS: dict[str, str] = {
     "requirements.txt": "pip",
     "package.json": "npm",
     "Dockerfile": "docker",
+    "Package.resolved": "swift",
 }
 
 # Terraform has no single well-known filename. Matching "main.tf" was the first
@@ -44,7 +46,19 @@ MANIFESTS: dict[str, str] = {
 # there to do. Any .tf file marks the directory instead.
 MANIFEST_SUFFIXES: dict[str, str] = {".tf": "terraform"}
 
-# Not ours: vendored checkouts, build output, installed packages.
+# TRACKED FILES ONLY, because that is precisely what Dependabot can see.
+#
+# The first version walked the filesystem and subtracted a hand-written blocklist
+# of directory names. That is the wrong question asked twice: it missed
+# ios/build/SourcePackages until the list grew, and it would have demanded a
+# `swift` entry for ios/RxHive.xcodeproj/.../Package.resolved — a real manifest
+# that .gitignore line 46 excludes, so Dependabot cannot read it and the entry
+# would be inert.
+#
+# `git ls-files` answers both at once: vendored checkouts, build output,
+# node_modules, .venv and .claude worktrees are all untracked, and anything
+# somebody deliberately commits shows up without this script needing to learn
+# about it. The blocklist survives only as a fallback for a tree with no git.
 IGNORED_PARTS = {
     "node_modules",
     ".venv",
@@ -59,6 +73,27 @@ IGNORED_PARTS = {
 }
 
 
+def repository_files() -> list[pathlib.Path]:
+    """Every tracked file, repository-relative. Falls back to a filesystem walk."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-z"],
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout
+        return [pathlib.Path(name) for name in out.split("\0") if name]
+    except (OSError, subprocess.CalledProcessError):
+        # No git available: walk instead, and fall back to the blocklist. Less
+        # accurate, and it says so rather than silently reporting a clean tree.
+        print("warning: git unavailable, falling back to a filesystem walk", file=sys.stderr)
+        return [
+            path.relative_to(ROOT)
+            for path in ROOT.rglob("*")
+            if path.is_file() and not (IGNORED_PARTS & set(path.relative_to(ROOT).parts))
+        ]
+
+
 def _display(path: pathlib.Path) -> str:
     """Repository-relative when it can be, absolute otherwise."""
     try:
@@ -70,16 +105,12 @@ def _display(path: pathlib.Path) -> str:
 def present_ecosystems() -> dict[tuple[str, str], pathlib.Path]:
     """{(ecosystem, directory): the manifest that put it there}."""
     found: dict[tuple[str, str], pathlib.Path] = {}
-    for path in sorted(ROOT.rglob("*")):
-        if not path.is_file():
-            continue
+    for path in sorted(repository_files()):
         ecosystem = MANIFESTS.get(path.name) or MANIFEST_SUFFIXES.get(path.suffix)
         if ecosystem is None:
             continue
-        if IGNORED_PARTS & set(path.relative_to(ROOT).parts):
-            continue
-        directory = "/" + str(path.parent.relative_to(ROOT)) if path.parent != ROOT else "/"
-        found.setdefault((ecosystem, directory), path.relative_to(ROOT))
+        directory = "/" + str(path.parent) if str(path.parent) != "." else "/"
+        found.setdefault((ecosystem, directory), path)
     # github-actions is keyed on the workflow directory, not a manifest name.
     if (ROOT / ".github" / "workflows").is_dir():
         found.setdefault(("github-actions", "/"), pathlib.Path(".github/workflows"))
