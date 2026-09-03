@@ -7,22 +7,68 @@ import ipaddress
 import json
 import logging
 import socket
+import threading
 import uuid
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
 import anyio
+import requests
+from requests.adapters import HTTPAdapter
 from sqlalchemy import delete, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.poolmanager import PoolManager, pool_classes_by_scheme
 
 from app.core.config import get_settings
 from app.db.models import PushSubscription
 from app.db.session import SessionLocal
 
 
+def is_public_address(value: str) -> bool:
+    """One definition of "safe to POST to", used by both checks below.
+
+    Written twice would be the usual outcome — the subscribe-time check and the
+    connect-time check are in different layers and ask the question at different
+    moments — and the two copies would drift.
+    """
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    # is_global AND not multicast. Both halves are load-bearing.
+    #
+    # The old test was a hand-written list — private, loopback, link-local,
+    # reserved, multicast, unspecified — and it let 100.64.0.0/10 through. RFC 6598
+    # shared address space is none of those by Python's predicates, and is
+    # emphatically not somewhere to POST: cloud providers use it for carrier-grade
+    # NAT and for internal services. is_global covers it, and tracks the IANA
+    # special-purpose registry as Python updates it, so the next range like that
+    # one is handled without anybody noticing it exists.
+    #
+    # But is_global is TRUE for multicast — 224.0.0.1, 239.255.255.250 (SSDP),
+    # ff02::1 are all "global" by that definition — which the hand-written list got
+    # right. Swapping one for the other would have closed the shared-address hole
+    # and opened a multicast one. Verified against both.
+    return ip.is_global and not ip.is_multicast
+
+
 def validate_push_endpoint(endpoint: str) -> bool:
     """Reject SSRF-prone push endpoints: must be https to a public host, never
-    an internal/loopback/link-local address. The server POSTs to this URL."""
+    an internal/loopback/link-local address. The server POSTs to this URL.
+
+    This is a PRE-check and cannot be the only one. It resolves the hostname now;
+    pywebpush resolves it again when the send happens, which may be days later and
+    is a different lookup. A caller who controls DNS for their own hostname can
+    answer with a public address here and a private one there — classic rebinding,
+    and no amount of care at this end closes it. _PublicOnlyHTTPSConnection does,
+    by checking the address actually connected to.
+
+    Kept anyway, because refusing a bad endpoint at subscribe time is a far better
+    experience than accepting it and silently failing every send, and because it
+    rejects non-https and unresolvable hosts outright.
+    """
     try:
         parts = urlsplit(endpoint)
     except ValueError:
@@ -34,18 +80,113 @@ def validate_push_endpoint(endpoint: str) -> bool:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
         return False
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_reserved
-            or ip.is_multicast
-            or ip.is_unspecified
-        ):
-            return False
-    return True
+    return all(is_public_address(info[4][0]) for info in infos)
+
+
+class BlockedPushAddress(OSError):
+    """Raised when a push endpoint resolves to an address we must not POST to.
+
+    OSError so urllib3 and requests treat it as a transport failure and wrap it
+    the way they wrap a refused connection, rather than it escaping as something
+    the retry machinery has no handling for.
+    """
+
+
+def _refuse_private_peer(sock: socket.socket) -> socket.socket:
+    """Shared by both connection classes below. See _PublicOnlyHTTPSConnection."""
+    try:
+        peer = sock.getpeername()[0]
+    except OSError:
+        sock.close()
+        raise
+    if not is_public_address(peer):
+        sock.close()
+        raise BlockedPushAddress(f"refused push delivery to non-public address {peer}")
+    return sock
+
+
+class _PublicOnlyHTTPSConnection(HTTPSConnection):
+    """Checks the address actually connected to, which is the only check that holds.
+
+    validate_push_endpoint resolves the hostname when the browser subscribes.
+    pywebpush resolves it again on every send, days later, in a separate lookup —
+    so a caller who controls DNS for their own hostname can answer publicly at
+    subscribe time and privately at send time. The endpoint is stored and reused,
+    so that is not a one-shot trick: it is a POST into the private network on every
+    message, indefinitely.
+
+    There is no way to close that from the subscribe side. What closes it is asking
+    the socket where it ACTUALLY went, after connect and before anything is sent.
+    """
+
+    def _new_conn(self) -> socket.socket:
+        return _refuse_private_peer(super()._new_conn())
+
+
+class _PublicOnlyHTTPConnection(HTTPConnection):
+    """The http half, which is not decoration.
+
+    Mounting the adapter for http:// was not enough on its own — the pool manager
+    decides the connection class per scheme, so http kept urllib3's default and
+    the guard was skipped for exactly the request worth guarding: a push service
+    answering with a redirect to an http:// address. Caught by the test that
+    covers the redirect case, having been missed here first.
+    """
+
+    def _new_conn(self) -> socket.socket:
+        return _refuse_private_peer(super()._new_conn())
+
+
+class _PublicOnlyHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _PublicOnlyHTTPSConnection
+
+
+class _PublicOnlyHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = _PublicOnlyHTTPConnection
+
+
+class _PublicOnlyPoolManager(PoolManager):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.pool_classes_by_scheme = {
+            **pool_classes_by_scheme,
+            "http": _PublicOnlyHTTPConnectionPool,
+            "https": _PublicOnlyHTTPSConnectionPool,
+        }
+
+
+class _PublicOnlyAdapter(HTTPAdapter):
+    def init_poolmanager(self, connections, maxsize, block=False, **kwargs):
+        self.poolmanager = _PublicOnlyPoolManager(
+            num_pools=connections, maxsize=maxsize, block=block, **kwargs
+        )
+
+
+# One session per worker thread rather than one shared session.
+#
+# requests.Session is not safe to share across threads, and _send_one runs in
+# anyio's worker pool with up to _MAX_CONCURRENT_SENDS of them at once. Per-thread
+# keeps connection reuse — the point of a Session — without the sharing.
+_sessions = threading.local()
+
+
+def _push_session() -> "requests.Session":
+    session = getattr(_sessions, "session", None)
+    if session is None:
+        session = requests.Session()
+        # No environment proxies. HTTPAdapter guards direct connections through
+        # the classes above, but proxy_manager_for builds its own pools that do
+        # not use them — so an HTTP_PROXY or HTTPS_PROXY in the environment would
+        # route delivery through the proxy and past the address check entirely.
+        # Push goes straight out or not at all.
+        session.trust_env = False
+        # BOTH schemes, deliberately. A push service that answers with a redirect
+        # to http:// would otherwise be served by the default adapter, and the
+        # guard would be skipped for exactly the request worth guarding.
+        session.mount("https://", _PublicOnlyAdapter())
+        session.mount("http://", _PublicOnlyAdapter())
+        _sessions.session = session
+    return session
 
 
 logger = logging.getLogger(__name__)
@@ -238,6 +379,9 @@ def _send_one(sub: _Target, data: str, settings) -> None:
         data=data,
         vapid_private_key=settings.vapid_private_key,
         vapid_claims={"sub": settings.vapid_subject},
+        # The connect-time address check lives here. Without this the send uses
+        # pywebpush's own session and re-resolves the hostname unguarded.
+        requests_session=_push_session(),
         # pywebpush uses requests, which has no default timeout: a blackholed
         # push endpoint would hang this worker thread forever.
         timeout=SEND_TIMEOUT_SECONDS,
