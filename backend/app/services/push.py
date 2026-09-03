@@ -37,14 +37,21 @@ def is_public_address(value: str) -> bool:
         ip = ipaddress.ip_address(value)
     except ValueError:
         return False
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    )
+    # is_global AND not multicast. Both halves are load-bearing.
+    #
+    # The old test was a hand-written list — private, loopback, link-local,
+    # reserved, multicast, unspecified — and it let 100.64.0.0/10 through. RFC 6598
+    # shared address space is none of those by Python's predicates, and is
+    # emphatically not somewhere to POST: cloud providers use it for carrier-grade
+    # NAT and for internal services. is_global covers it, and tracks the IANA
+    # special-purpose registry as Python updates it, so the next range like that
+    # one is handled without anybody noticing it exists.
+    #
+    # But is_global is TRUE for multicast — 224.0.0.1, 239.255.255.250 (SSDP),
+    # ff02::1 are all "global" by that definition — which the hand-written list got
+    # right. Swapping one for the other would have closed the shared-address hole
+    # and opened a multicast one. Verified against both.
+    return ip.is_global and not ip.is_multicast
 
 
 def validate_push_endpoint(endpoint: str) -> bool:
@@ -167,6 +174,12 @@ def _push_session() -> "requests.Session":
     session = getattr(_sessions, "session", None)
     if session is None:
         session = requests.Session()
+        # No environment proxies. HTTPAdapter guards direct connections through
+        # the classes above, but proxy_manager_for builds its own pools that do
+        # not use them — so an HTTP_PROXY or HTTPS_PROXY in the environment would
+        # route delivery through the proxy and past the address check entirely.
+        # Push goes straight out or not at all.
+        session.trust_env = False
         # BOTH schemes, deliberately. A push service that answers with a redirect
         # to http:// would otherwise be served by the default adapter, and the
         # guard would be skipped for exactly the request worth guarding.

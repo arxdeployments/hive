@@ -1,6 +1,7 @@
 """Regression tests for the closed security-review findings."""
 
 import datetime as dt
+import ipaddress
 import socket
 import uuid
 
@@ -94,6 +95,19 @@ def test_push_endpoint_ssrf_validation(endpoint, ok, monkeypatch):
     """
 
     def _resolve(host, *args, **kwargs):
+        # Literal IPs resolve to THEMSELVES, exactly as the real resolver does.
+        #
+        # Raising for them instead made every rejected literal — loopback,
+        # private, link-local — return False because the lookup failed, not
+        # because is_public_address refused the address. A regression that started
+        # permitting 127.0.0.1 would have passed this test unnoticed.
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            family = socket.AF_INET6 if ":" in host else socket.AF_INET
+            return [(family, socket.SOCK_STREAM, 6, "", (host, 443))]
         if host == "push.example.test":
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
         raise socket.gaierror(f"unexpected lookup of {host!r} in a test")

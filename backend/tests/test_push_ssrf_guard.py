@@ -127,7 +127,12 @@ def test_the_session_guards_both_schemes():
         ("::1", False),
         ("::ffff:127.0.0.1", False),  # IPv4-mapped loopback
         ("0.0.0.0", False),
-        ("224.0.0.1", False),
+        ("224.0.0.1", False),  # multicast: is_global is True for these
+        ("239.255.255.250", False),  # SSDP
+        ("ff02::1", False),
+        ("100.64.0.1", False),  # RFC 6598 shared address space (carrier-grade NAT)
+        ("198.18.0.1", False),  # benchmarking range
+        ("2001:db8::1", False),  # documentation range
         ("not-an-address", False),
     ],
 )
@@ -135,3 +140,25 @@ def test_is_public_address(address, public):
     """One predicate, shared by the subscribe-time check and the connect-time one,
     so the two cannot drift."""
     assert is_public_address(address) is public
+
+
+def test_environment_proxies_cannot_route_around_the_guard(monkeypatch):
+    """A proxy would bypass the address check entirely.
+
+    HTTPAdapter guards DIRECT connections through the connection classes above,
+    but proxy_manager_for builds its own pools that do not use them. With
+    HTTPS_PROXY set, delivery would go through the proxy and the peer we validate
+    would be the proxy — the endpoint's real address never checked, which is the
+    whole guarantee.
+
+    Asserted on what requests would actually do with the environment, not merely
+    on the flag: merge_environment_settings is the function that reads it.
+    """
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:3128")
+
+    session = _push_session()
+    assert session.trust_env is False
+
+    settings = session.merge_environment_settings("https://push.example.test/f/abc", {}, None, None, None)
+    assert settings["proxies"] == {}, f"delivery would go through a proxy: {settings['proxies']}"
