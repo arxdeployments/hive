@@ -8,7 +8,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.62"
     }
 
     # Used by secrets.tf to generate the app secrets that are then stored as
