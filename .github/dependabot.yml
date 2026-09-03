@@ -91,8 +91,12 @@ updates:
         patterns: [requests, urllib3, pywebpush, cryptography]
       python-database:
         patterns: [alembic, sqlalchemy, asyncpg]
+      # aiohttp is here because livekit-api requires it and Batch 51 pinned it:
+      # services/calls.py builds aiohttp.ClientTimeout directly to replace the
+      # LiveKit client's 60-second default. check_dependency_groups.py caught the
+      # split the moment the pin was added, which is what it is for.
       python-livekit:
-        patterns: ["livekit*", pyjwt]
+        patterns: ["livekit*", pyjwt, aiohttp]
       # pytest-asyncio 0.25.3 requires pytest<9 — an upper bound already in force.
       # #70 (pytest 9.1.1) and #68 (pytest-asyncio 1.4.0) are the same coupling hit
       # from opposite ends, and both failed at `pip install`. Grouped, this pair

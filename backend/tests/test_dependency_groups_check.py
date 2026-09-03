@@ -66,7 +66,7 @@ python-http-stack:
 python-database:
   patterns: [alembic, sqlalchemy, asyncpg]
 python-livekit:
-  patterns: ["livekit*", pyjwt]
+  patterns: ["livekit*", pyjwt, aiohttp]
 python-pytest:
   patterns: ["pytest*"]
 python-uvicorn-standard:
@@ -98,7 +98,7 @@ def test_the_couplings_are_actually_found(checker):
     assert ("starlette", "anyio") in pairs
     # Only reachable because the extras on a pin are honoured.
     assert ("uvicorn", "websockets") in pairs
-    assert sorted(len(c) for c in checker.components(pins, edges)) == [2, 2, 2, 3, 4, 5]
+    assert sorted(len(c) for c in checker.components(pins, edges)) == [2, 2, 3, 3, 4, 5]
 
 
 def test_update_types_on_a_cluster_lets_a_major_escape(checker, tmp_path, monkeypatch, capsys):

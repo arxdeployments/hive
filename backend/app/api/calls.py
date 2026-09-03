@@ -346,7 +346,14 @@ async def call_token(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    call = (await db.execute(select(Call).where(Call.id == call_id))).scalar_one_or_none()
+    # FOR UPDATE, because everything below decides on `call.status` and then
+    # writes. Without the lock the guard and the write are two transactions: a call
+    # ended in between still gets a six-hour token, and the participant this marks
+    # present keeps `left_at IS NULL` — the predicate the roster and the
+    # last-one-out check both read, so a call that has ended acquires a member who
+    # never leaves. The commit below releases it, so the SFU and Redis calls that
+    # follow are outside the lock.
+    call = (await db.execute(select(Call).where(Call.id == call_id).with_for_update())).scalar_one_or_none()
     member = await db.get(CallParticipant, (call_id, user.id)) if call else None
     if call is None or member is None:
         raise HTTPException(status_code=404, detail="Call not found")
