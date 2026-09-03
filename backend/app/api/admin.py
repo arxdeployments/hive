@@ -30,11 +30,11 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import func, or_, select, update
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import wire_role
 from app.core.deps import require_superadmin
+from app.core.errors import conflict_as_400
 from app.core.security import PasswordPolicyError, enforce_password_policy, hash_password
 from app.db.models import AuditLog, Department, Organization, RefreshToken, User, UserRole
 from app.db.session import get_db
@@ -406,11 +406,8 @@ async def create_organization(
         raise HTTPException(status_code=400, detail="Organization name already exists")
     org = Organization(name=name, slug=slug, logo_url=body.logo_url, is_active=True, created_at=now_utc())
     db.add(org)
-    try:
+    async with conflict_as_400(db, "Organization name already exists"):
         await db.flush()
-    except IntegrityError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=400, detail="Organization name already exists") from exc
     await log_audit(
         db,
         actor_id=actor.id,
@@ -505,7 +502,11 @@ async def update_organization(
         details=update_data,
         org_id=org.id,
     )
-    await db.commit()
+    # The rename races the same constraint the pre-check above tests for, and
+    # raises from commit() rather than a flush: nothing is flushed explicitly
+    # here, so the UPDATE is emitted when the transaction closes.
+    async with conflict_as_400(db, "Organization name already exists"):
+        await db.commit()
     return _serialize_org(org)
 
 
@@ -692,11 +693,8 @@ async def create_department(
         created_at=now_utc(),
     )
     db.add(dept)
-    try:
+    async with conflict_as_400(db, "Department already exists in this organization"):
         await db.flush()
-    except IntegrityError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=400, detail="Department already exists in this organization") from exc
     await log_audit(
         db,
         actor_id=actor.id,
@@ -761,7 +759,11 @@ async def update_department(
         details=update_data,
         org_id=dept.org_id,
     )
-    await db.commit()
+    # The rename races the same constraint the pre-check above tests for, and
+    # raises from commit() rather than a flush: nothing is flushed explicitly
+    # here, so the UPDATE is emitted when the transaction closes.
+    async with conflict_as_400(db, "Department already exists in this organization"):
+        await db.commit()
     return _serialize_dept(dept)
 
 
@@ -913,11 +915,8 @@ async def create_user(
         created_at=now_utc(),
     )
     db.add(user)
-    try:
+    async with conflict_as_400(db, "Email already in use"):
         await db.flush()
-    except IntegrityError as exc:
-        await db.rollback()
-        raise HTTPException(status_code=400, detail="Email already in use") from exc
     await log_audit(
         db,
         actor_id=actor.id,
