@@ -89,9 +89,13 @@ def test_push_endpoint_ssrf_validation(endpoint, ok, monkeypatch):
     as an SSRF-validation regression, pointing at the code rather than at the
     network. Observed twice in one sitting on 2026-09-03.
 
-    Only the hostname path is stubbed. Every negative case still exercises the real
-    logic: the literal IPs are parsed, not resolved, and the scheme and
-    unparseable-URL rejections happen before any lookup.
+    Every negative case still exercises the real logic. Literal IPs ARE resolved —
+    validate_push_endpoint calls getaddrinfo for them too — so the stub returns
+    each literal as its own answer, exactly as the real resolver does, and
+    is_public_address is what rejects them. Raising for literals instead would have
+    made them fail on the lookup rather than on the address, which is what the
+    first version of this stub did. The scheme and unparseable-URL rejections
+    happen before any lookup at all.
     """
 
     def _resolve(host, *args, **kwargs):

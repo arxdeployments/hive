@@ -11,12 +11,14 @@ socket where it actually went — after connect, before anything is sent — whi
 what these tests exercise against a real listening socket on loopback.
 """
 
+import http.server
 import socket
 import threading
 
 import pytest
 import requests
 
+import app.services.push as push_mod
 from app.services.push import BlockedPushAddress, _push_session, is_public_address
 
 
@@ -162,3 +164,72 @@ def test_environment_proxies_cannot_route_around_the_guard(monkeypatch):
 
     settings = session.merge_environment_settings("https://push.example.test/f/abc", {}, None, None, None)
     assert settings["proxies"] == {}, f"delivery would go through a proxy: {settings['proxies']}"
+
+
+def test_a_redirect_to_a_blocked_address_is_stopped(monkeypatch):
+    """The guard has to hold on the address a REDIRECT lands on, not just the first.
+
+    The other scheme test proves the http adapter carries the guard. It does not
+    prove requests re-selects an adapter, and re-runs the check, for the hop after
+    a redirect — a push service answering 302 to an internal address is the case
+    that matters, and "the adapter is mounted" is not the same claim.
+
+    Both hops are loopback, because a hermetic test cannot reach a public host, and
+    they are told apart by CALL ORDER rather than by address: the first connection
+    is allowed, the second refused. Distinguishing them by address was the obvious
+    way and is not portable — 127.0.0.2 is aliased on Linux but not on macOS, so
+    that version passed in CI and failed on the machine it was written on.
+
+    Both ends really listen. Pointing the redirect at a closed port would let the
+    OS refuse first, and the test would pass without the guard ever running.
+    """
+    target = socket.socket()
+    target.bind(("127.0.0.1", 0))
+    target.listen(4)
+    target_port = target.getsockname()[1]
+
+    def _accept_target():
+        while True:
+            try:
+                conn, _ = target.accept()
+                conn.close()
+            except OSError:
+                return
+
+    threading.Thread(target=_accept_target, daemon=True).start()
+
+    class _Redirector(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler's spelling
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{target_port}/next")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    redirector = http.server.HTTPServer(("127.0.0.1", 0), _Redirector)
+    threading.Thread(target=redirector.serve_forever, daemon=True).start()
+
+    seen: list[str] = []
+
+    def _first_hop_only(addr: str) -> bool:
+        seen.append(addr)
+        return len(seen) == 1
+
+    monkeypatch.setattr(push_mod, "is_public_address", _first_hop_only)
+
+    try:
+        session = _push_session()
+        with pytest.raises(requests.exceptions.RequestException) as caught:
+            session.post(f"http://127.0.0.1:{redirector.server_port}/start", timeout=5)
+    finally:
+        redirector.shutdown()
+        target.close()
+
+    assert len(seen) == 2, (
+        "the address guard did not run a second time, so the redirect hop was "
+        f"never checked (checked: {seen})"
+    )
+    assert _blocked_in_chain(caught.value), (
+        f"the redirect hop was not stopped by the address guard: {caught.value!r}"
+    )
