@@ -282,3 +282,71 @@ async def test_logout_sees_a_rotation_that_committed_while_it_was_deciding(clien
             "the session the token was rotated into outlived the logout"
         )
     assert await _live_tokens(user.id) == []
+
+
+async def test_logout_follows_a_rotation_that_happens_further_down_the_chain(client):
+    """Locking the presented token is not enough — every node needs the lock.
+
+    Lock only the row the caller presented and the rest of the chain stays open: a
+    refresh can rotate successor B into C after the walk has read B, and the B it
+    read still says `replaced_by_id IS NULL`, so the walk stops there and C stays
+    live. That is the same defect as logging out a rotated token, one link further
+    along, and it survives the fix for the first one.
+    """
+    user = await make_user("logout-deep-race@x.com")
+    await login(client, "logout-deep-race@x.com")
+    presented = client.cookies.get(REFRESH_COOKIE)
+
+    assert (await client.post("/api/auth/refresh")).status_code == 200
+    middle = client.cookies.get(REFRESH_COOKIE)
+    access = client.cookies.get(ACCESS_COOKIE)
+
+    holding = asyncio.Event()
+    release = asyncio.Event()
+    tail_id: list = []
+
+    async def rotate_the_middle() -> None:
+        """Rotate B -> C while holding B, so only a locking read of B can see C."""
+        async with SessionLocal() as db:
+            row = (
+                await db.execute(
+                    select(RefreshToken)
+                    .where(RefreshToken.token_hash == hash_refresh_token(middle))
+                    .with_for_update()
+                )
+            ).scalar_one()
+            issued = RefreshToken(
+                user_id=row.user_id,
+                token_hash=hash_refresh_token("tail-of-deep-race"),
+                client=row.client,
+                expires_at=row.expires_at,
+            )
+            db.add(issued)
+            await db.flush()
+            row.revoked_at = dt.datetime.now(dt.UTC)
+            row.replaced_by_id = issued.id
+            tail_id.append(issued.id)
+            holding.set()
+            await release.wait()
+            await db.commit()
+
+    task = asyncio.create_task(rotate_the_middle())
+    await asyncio.wait_for(holding.wait(), timeout=5)
+
+    request = asyncio.create_task(_logout_with(presented, access))
+    await asyncio.sleep(0.5)
+    blocked = not request.done()
+    release.set()
+    await task
+    resp = await request
+
+    assert blocked, (
+        "the walk read the middle of the chain without locking it, so it could not "
+        "see the rotation that was in flight there"
+    )
+    assert resp.status_code == 200, resp.text
+    async with SessionLocal() as db:
+        assert (await db.get(RefreshToken, tail_id[0])).revoked_at is not None, (
+            "the session at the end of the chain outlived the logout"
+        )
+    assert await _live_tokens(user.id) == []

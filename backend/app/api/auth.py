@@ -231,11 +231,13 @@ async def _revoke_session_family(db: AsyncSession, token: RefreshToken) -> None:
 # earlier request and the two failures are not the same:
 #
 #   * `seen` stops a CYCLE. The length bound cannot: a set does not grow when the
-#     walk revisits a row, so on A -> B -> A `len(seen)` sits at 2 forever. That
-#     matters more than it looks — `db.get` serves an already-identity-mapped row
-#     without awaiting anything, so the loop would never yield, no request or task
-#     timeout could interrupt it, and one bad row would peg a worker outright.
-#     Measured: removing `seen` hangs the test process rather than failing it.
+#     walk revisits a row, so on A -> B -> A `len(seen)` sits at 2 forever, and the
+#     walk goes round issuing the same two locking SELECTs until something kills
+#     the request. Measured against the earlier `db.get` version, which served the
+#     identity-mapped row without awaiting anything: removing `seen` hung the test
+#     process outright, since the loop never yielded and no timeout could reach it.
+#     The locking read below does yield, so the same bug is now a hot loop against
+#     the database rather than a wedged worker — still worth not having.
 #   * the bound stops a pathologically LONG but acyclic chain from turning one
 #     logout into thousands of round trips.
 _MAX_ROTATION_CHAIN = 64
@@ -271,7 +273,19 @@ async def _revoke_rotation_chain(db: AsyncSession, token: RefreshToken) -> int:
         if node.revoked_at is None:
             node.revoked_at = now_utc()
             revoked += 1
-        node = await db.get(RefreshToken, node.replaced_by_id) if node.replaced_by_id else None
+        if node.replaced_by_id is None:
+            break
+        # FOR UPDATE on every node, not just the one the caller presented. Locking
+        # only the presented token leaves the rest of the chain open: a refresh can
+        # rotate successor B into C after this walk has read B, and since the B it
+        # read still says `replaced_by_id IS NULL`, the walk stops there and C stays
+        # live. Locking each node as it is reached makes the walk see whatever the
+        # rotation produced, one link at a time.
+        node = (
+            await db.execute(
+                select(RefreshToken).where(RefreshToken.id == node.replaced_by_id).with_for_update()
+            )
+        ).scalar_one_or_none()
     return revoked
 
 
