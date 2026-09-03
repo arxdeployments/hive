@@ -153,14 +153,19 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: backend/requirements.txt
+      # BEFORE pip install, deliberately. This is stdlib-only and reads the
+      # repository, so running it first means a manifest that lets the resolver
+      # choose an unpinned package is rejected before that package's build backend
+      # gets to execute on the runner.
+      #
+      # A direct import of something nothing pins is a dependency the resolver
+      # picks for us. Batch 46 found urllib3 that way — app/ overrides its private
+      # _new_conn, and a version that stopped calling it would have silently
+      # disabled an SSRF guard. Batch 47 found anyio, which app/ calls with a
+      # keyword that did not exist before 4.1 while starlette allows 3.6.2 upward.
+      - run: python scripts/check_pinned_imports.py
       - run: pip install -r backend/requirements.txt
       - run: python scripts/check_contracts.py
-      # Static, and deliberately BEFORE the install would matter: a direct import
-      # of a package nothing pins is a dependency the resolver chooses for us.
-      # Batch 46 found urllib3 that way (app/ overrides its private _new_conn) and
-      # Batch 47 found anyio, which app/ calls with a keyword that did not exist
-      # before 4.1 while starlette allows 3.6.2 upward.
-      - run: python scripts/check_pinned_imports.py
 
   terraform:
     # The infrastructure had no automated check of any kind: a syntax error, a

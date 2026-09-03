@@ -223,7 +223,10 @@ def test_a_redirect_to_a_blocked_address_is_stopped(monkeypatch):
         with pytest.raises(requests.exceptions.RequestException) as caught:
             session.post(f"http://127.0.0.1:{redirector.server_port}/start", timeout=5)
     finally:
+        # shutdown() stops serve_forever; server_close() releases the socket.
+        # Without the second the listener leaks for the rest of the session.
         redirector.shutdown()
+        redirector.server_close()
         target.close()
 
     assert len(seen) == 2, (

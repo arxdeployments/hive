@@ -30,10 +30,12 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 APP = ROOT / "backend" / "app"
-REQUIREMENTS = [
-    ROOT / "backend" / "requirements.txt",
-    ROOT / "backend" / "requirements-dev.txt",
-]
+# RUNTIME pins only. backend/Dockerfile installs requirements.txt and nothing
+# else, so a package pinned only in requirements-dev.txt is unpinned in the image
+# that actually serves traffic — and merging the two files let a dev-only pin
+# satisfy a runtime import. Nothing hits that today; it is a hole that closes for
+# free.
+RUNTIME_REQUIREMENTS = ROOT / "backend" / "requirements.txt"
 
 # Import name -> distribution name, for the cases where they differ. Kept explicit
 # rather than resolved through importlib.metadata so this runs without the
@@ -55,15 +57,14 @@ FIRST_PARTY = {"app", "tests", "scripts", "alembic"}
 def pinned_distributions() -> set[str]:
     """Names pinned with `==`, extras stripped: `redis[hiredis]==5.2.1` -> redis."""
     found: set[str] = set()
-    for path in REQUIREMENTS:
-        if not path.exists():
+    if not RUNTIME_REQUIREMENTS.exists():
+        return found
+    for raw in RUNTIME_REQUIREMENTS.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "==" not in line:
             continue
-        for raw in path.read_text().splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "==" not in line:
-                continue
-            name = line.split("==", 1)[0].strip()
-            found.add(name.split("[", 1)[0].strip().lower())
+        name = line.split("==", 1)[0].strip()
+        found.add(name.split("[", 1)[0].strip().lower())
     return found
 
 
@@ -99,22 +100,28 @@ def main() -> int:
         if module in stdlib or module in FIRST_PARTY:
             continue
         checked += 1
-        distribution = DISTRIBUTION_OF.get(module.lower(), module.lower()).replace(
-            "_", "-"
-        )
-        if distribution not in pinned and module.lower() not in pinned:
+        mapped = DISTRIBUTION_OF.get(module.lower())
+        if mapped is not None:
+            # A mapping asserts which distribution provides this import, so
+            # only that name counts. Accepting the module name as a fallback —
+            # which this did — meant a bare `jwt==` pin satisfied an
+            # `import jwt` that PyJWT actually provides, leaving the real
+            # package unpinned.
+            candidates = {mapped.lower()}
+        else:
+            candidates = {module.lower(), module.lower().replace("_", "-")}
+        if not candidates & pinned:
             listed = ", ".join(str(f) for f in sorted(files)[:3])
-            problems.append(
-                f"  {module} (imported by {listed}) -> not pinned as {distribution!r}"
-            )
+            wanted = " or ".join(sorted(candidates))
+            problems.append(f"  {module} (imported by {listed}) -> not pinned as {wanted}")
 
     if problems:
         print("third-party packages imported by app/ but not pinned:\n")
         print("\n".join(problems))
         print(
             "\nA direct import is a direct dependency, whatever installed it. Pin it in"
-            "\nbackend/requirements.txt, or add the import->distribution mapping to"
-            "\nDISTRIBUTION_OF in this script if the names differ."
+            "\nbackend/requirements.txt (the RUNTIME file, the only one the image"
+            "\ninstalls), or add the import->distribution mapping to DISTRIBUTION_OF here."
         )
         return 1
 
