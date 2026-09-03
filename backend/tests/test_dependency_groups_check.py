@@ -262,6 +262,29 @@ def test_glob_patterns_survive_normalization(checker):
     ]
 
 
+def test_a_pin_gated_off_by_a_root_marker_is_skipped(checker, tmp_path, capsys):
+    """pip skips it on this platform, so demanding its metadata would misfire.
+
+    The guard insists every pin it governs has matching installed metadata. A root
+    requirement whose environment marker is false was never installed, so requiring
+    it would fail the check for a reason that has nothing to do with grouping.
+    """
+    manifest = tmp_path / "requirements.txt"
+    manifest.write_text(
+        'rxhive-not-a-real-package==1.0.0; sys_platform == "rxhive-no-such-platform"\nfastapi==0.115.12\n'
+    )
+    assert checker.read_pins([manifest]) == {"fastapi": ("0.115.12", frozenset())}
+    assert checker.main([str(manifest)]) == 0
+    assert "rxhive-not-a-real-package" not in capsys.readouterr().err
+
+
+def test_a_pin_whose_root_marker_is_true_is_kept(checker, tmp_path):
+    """The converse, or the test above would pass on a check that dropped every marker."""
+    manifest = tmp_path / "requirements.txt"
+    manifest.write_text('fastapi==0.115.12; python_version >= "3.8"\n')
+    assert checker.read_pins([manifest]) == {"fastapi": ("0.115.12", frozenset())}
+
+
 def test_unpinned_and_commented_lines_are_ignored(checker, tmp_path):
     manifest = tmp_path / "requirements.txt"
     manifest.write_text(

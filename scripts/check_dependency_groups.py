@@ -102,6 +102,12 @@ def read_pins(manifests: list[pathlib.Path]) -> dict[str, tuple[str, frozenset[s
             pinned = [s.version for s in req.specifier if s.operator in ("==", "===")]
             if not pinned:
                 continue
+            # A root marker that is false on this platform means pip skipped the
+            # install, and demanding installed metadata for it would fail the guard
+            # for a reason that has nothing to do with grouping. Root requirements
+            # cannot reference `extra`, so there is no extra context to supply.
+            if req.marker is not None and not req.marker.evaluate():
+                continue
             pins[canonical(req.name)] = (pinned[0], frozenset(req.extras))
     return pins
 
