@@ -1,6 +1,7 @@
 """Regression tests for the closed security-review findings."""
 
 import datetime as dt
+import socket
 import uuid
 
 import pytest
@@ -68,8 +69,8 @@ def test_explicit_cookie_secure_override_wins():
 @pytest.mark.parametrize(
     "endpoint,ok",
     [
-        ("https://fcm.googleapis.com/fcm/send/abc", True),
-        ("http://fcm.googleapis.com/fcm/send/abc", False),  # not https
+        ("https://push.example.test/fcm/send/abc", True),
+        ("http://push.example.test/fcm/send/abc", False),  # not https
         ("https://localhost/x", False),  # loopback
         ("https://127.0.0.1/x", False),  # loopback ip
         ("https://10.0.0.5/x", False),  # private
@@ -78,7 +79,26 @@ def test_explicit_cookie_secure_override_wins():
         ("not a url", False),
     ],
 )
-def test_push_endpoint_ssrf_validation(endpoint, ok):
+def test_push_endpoint_ssrf_validation(endpoint, ok, monkeypatch):
+    """The resolver is stubbed, and the positive case used to depend on live DNS.
+
+    This asserted validate_push_endpoint("https://fcm.googleapis.com/...") is True,
+    which needs a real lookup of a real Google hostname. When DNS is slow or
+    unavailable the function correctly returns False and the test fails — reported
+    as an SSRF-validation regression, pointing at the code rather than at the
+    network. Observed twice in one sitting on 2026-09-03.
+
+    Only the hostname path is stubbed. Every negative case still exercises the real
+    logic: the literal IPs are parsed, not resolved, and the scheme and
+    unparseable-URL rejections happen before any lookup.
+    """
+
+    def _resolve(host, *args, **kwargs):
+        if host == "push.example.test":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
+        raise socket.gaierror(f"unexpected lookup of {host!r} in a test")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _resolve)
     assert validate_push_endpoint(endpoint) is ok
 
 
@@ -139,7 +159,7 @@ async def test_change_password_revokes_other_sessions(client):
     assert (await client.post("/api/auth/refresh")).status_code == 200
 
 
-async def test_push_subscribe_unsubscribe_round_trip(client, two_orgs_with_users):
+async def test_push_subscribe_unsubscribe_round_trip(client, two_orgs_with_users, monkeypatch):
     """The frontend's subscribe/unsubscribe pair must match the routes the API
     actually exposes — a mismatch here silently 404s in the browser."""
     from sqlalchemy import select
@@ -148,7 +168,11 @@ async def test_push_subscribe_unsubscribe_round_trip(client, two_orgs_with_users
     from app.db.session import SessionLocal
 
     await login(client, "alice@a.com")
-    endpoint = "https://fcm.googleapis.com/fcm/send/round-trip-test"
+    # validate_push_endpoint stubbed rather than resolved, matching
+    # tests/test_rate_limit_identity.py. The subject here is the subscribe and
+    # unsubscribe round trip, not whether Google's DNS answers.
+    monkeypatch.setattr("app.services.push.validate_push_endpoint", lambda _endpoint: True)
+    endpoint = "https://push.example.test/fcm/send/round-trip-test"
 
     resp = await client.post(
         "/api/notifications/subscribe",
