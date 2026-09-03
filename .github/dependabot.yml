@@ -93,6 +93,19 @@ updates:
         patterns: [alembic, sqlalchemy, asyncpg]
       python-livekit:
         patterns: ["livekit*", pyjwt]
+      # pytest-asyncio 0.25.3 requires pytest<9 — an upper bound already in force.
+      # #70 (pytest 9.1.1) and #68 (pytest-asyncio 1.4.0) are the same coupling hit
+      # from opposite ends, and both failed at `pip install`. Grouped, this pair
+      # resolves on its own: pytest-asyncio 1.4.0 accepts pytest<10,>=8.4, so
+      # Dependabot can propose 9.1.1 with 1.4.0 and CI can judge the result.
+      python-pytest:
+        patterns: ["pytest*"]
+      # uvicorn[standard] pulls pyyaml>=5.1 and websockets>=10.4, both pinned in
+      # requirements-dev.txt. Only visible once the extras on a pin are honoured;
+      # the `extra == "standard"` markers evaluate False with no extra in context,
+      # silently, so dropping the extras dropped the whole cluster.
+      python-uvicorn-standard:
+        patterns: [uvicorn, pyyaml, websockets]
       # Everything else: routine bumps together, majors on their own so they get
       # individual review.
       #

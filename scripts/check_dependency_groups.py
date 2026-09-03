@@ -43,60 +43,132 @@ import argparse
 import fnmatch
 import pathlib
 import sys
-from importlib.metadata import PackageNotFoundError, requires
+from importlib.metadata import PackageNotFoundError, requires, version
 
 import yaml
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CONFIG = ROOT / ".github" / "dependabot.yml"
-DEFAULT_MANIFESTS = (ROOT / "backend" / "requirements.txt",)
+# Both, because Dependabot's pip entry is `directory: /backend` and it updates
+# every manifest it finds there. requirements-dev.txt starts with `-r
+# requirements.txt`, so the coupling graph genuinely spans the two files: uvicorn
+# [standard] needs pyyaml and websockets, which are pinned in the dev file, and the
+# pytest <-> pytest-asyncio pair lives entirely inside it.
+DEFAULT_MANIFESTS = (
+    ROOT / "backend" / "requirements.txt",
+    ROOT / "backend" / "requirements-dev.txt",
+)
 ECOSYSTEM = "pip"
 UPDATE_TYPES = ("major", "minor", "patch")
 
 
 def canonical(name: str) -> str:
-    """PyPI treats runs of -, _ and . as equivalent and is case-insensitive."""
-    return name.lower().replace("_", "-").replace(".", "-")
+    """PEP 503 normalization: lowercase, and runs of -, _ and . collapse to one -.
+
+    Hand-rolling this as two str.replace calls turned Foo__bar into foo--bar rather
+    than foo-bar, and because couplings() tests dependency names against the pins by
+    exact membership, an equivalent spelling would simply not match and the edge
+    would vanish. Deferring to packaging removes the chance of getting it wrong.
+
+    Also applied to the dependabot.yml patterns, which are globs. Collapsing runs of
+    separators leaves *, pydantic* and *alchemy* untouched.
+    """
+    return str(canonicalize_name(name))
 
 
-def read_pins(manifests: list[pathlib.Path]) -> dict[str, str]:
-    pins: dict[str, str] = {}
+def read_pins(manifests: list[pathlib.Path]) -> dict[str, tuple[str, frozenset[str]]]:
+    """Pinned name -> (version, requested extras).
+
+    The extras are not decoration. requirements.txt pins uvicorn[standard],
+    SQLAlchemy[asyncio] and redis[hiredis], and an extra's requirements are gated
+    behind `; extra == "..."` markers that evaluate False when no extra is in the
+    environment — silently, without raising. Dropping the extras therefore dropped
+    every coupling those three contribute, which is the check quietly narrowing
+    itself rather than failing.
+    """
+    pins: dict[str, tuple[str, frozenset[str]]] = {}
     for manifest in manifests:
         for raw in manifest.read_text().splitlines():
             line = raw.split("#", 1)[0].strip()
             if not line or "==" not in line:
                 continue
-            name, _, spec = line.partition("==")
-            pins[canonical(name.split("[", 1)[0])] = spec.strip()
+            try:
+                req = Requirement(line)
+            except InvalidRequirement:
+                continue
+            pinned = [s.version for s in req.specifier if s.operator in ("==", "===")]
+            if not pinned:
+                continue
+            pins[canonical(req.name)] = (pinned[0], frozenset(req.extras))
     return pins
 
 
-def couplings(pins: dict[str, str]) -> tuple[list[tuple[str, str, str]], list[str]]:
-    """Edges (dependent, dependency, specifier) where both ends are pinned."""
+def _in_force(req: Requirement, extras: frozenset[str]) -> bool:
+    """Is this requirement active for the base install plus the requested extras?
+
+    A marker with no extra context evaluates `extra == "standard"` to False rather
+    than raising, so an extra's requirements have to be evaluated once per extra
+    that the pin actually asks for. Both the manifest spelling and the canonical
+    one are tried, because metadata normalizes extra names and older wheels do not.
+    """
+    if req.marker is None:
+        return True
+    if req.marker.evaluate():
+        return True
+    for extra in extras:
+        for spelling in {extra, canonical(extra)}:
+            if req.marker.evaluate({"extra": spelling}):
+                return True
+    return False
+
+
+def couplings(
+    pins: dict[str, tuple[str, frozenset[str]]],
+) -> tuple[list[tuple[str, str, str]], list[str], list[str]]:
+    """Edges (dependent, dependency, specifier) where both ends are pinned.
+
+    Also reports pins with no installed metadata, and pins whose installed version
+    is not the pinned one. Both make the graph untrustworthy: requires() answers for
+    whatever version is actually installed, so a stale environment would have this
+    validate the wrong graph and bless a configuration that cannot install.
+    """
     edges: list[tuple[str, str, str]] = []
     missing: list[str] = []
+    mismatched: list[str] = []
     for name in sorted(pins):
+        pinned_version, extras = pins[name]
         try:
+            installed = version(name)
             declared = requires(name) or []
         except PackageNotFoundError:
             missing.append(name)
+            continue
+        try:
+            same = Version(installed) == Version(pinned_version)
+        except InvalidVersion:
+            same = installed == pinned_version
+        if not same:
+            mismatched.append(f"{name}: pinned {pinned_version}, installed {installed}")
             continue
         for raw in declared:
             try:
                 req = Requirement(raw)
             except InvalidRequirement:
                 continue
-            # An extras-only or platform-gated requirement is not in force here.
-            if req.marker is not None and not req.marker.evaluate():
+            if not _in_force(req, extras):
                 continue
             dep = canonical(req.name)
             if dep in pins and str(req.specifier):
                 edges.append((name, dep, str(req.specifier)))
-    return edges, missing
+    return edges, missing, mismatched
 
 
-def components(pins: dict[str, str], edges: list[tuple[str, str, str]]) -> list[list[str]]:
+def components(
+    pins: dict[str, tuple[str, frozenset[str]]], edges: list[tuple[str, str, str]]
+) -> list[list[str]]:
     parent = {name: name for name in pins}
 
     def find(node: str) -> str:
@@ -152,14 +224,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no pins found in {', '.join(str(m) for m in manifests)}", file=sys.stderr)
         return 1
 
-    edges, missing = couplings(pins)
-    if missing:
+    edges, missing, mismatched = couplings(pins)
+    if missing or mismatched:
         print(
-            "cannot check dependency groups: no installed metadata for "
-            f"{', '.join(missing)}.\n"
-            "The couplings are read from installed distributions, so a missing one "
-            "removes edges and silently stops checking the cluster it belonged to.\n"
-            f"Install {', '.join(str(m) for m in manifests)} before running this.",
+            "cannot check dependency groups: the installed environment does not match the manifest.\n",
+            file=sys.stderr,
+        )
+        if missing:
+            print(f"  no installed metadata for: {', '.join(missing)}", file=sys.stderr)
+        if mismatched:
+            for line in mismatched:
+                print(f"  wrong version installed for {line}", file=sys.stderr)
+        print(
+            "\nThe couplings are read from installed distributions, so a package that "
+            "is absent contributes no edges and one at the wrong version contributes "
+            "another version's edges. Either way a cluster stops being checked, or is "
+            "checked against a graph that is not the one being shipped.\n"
+            f"Run `pip install -r {manifests[-1]}` and try again.",
             file=sys.stderr,
         )
         return 1
@@ -193,8 +274,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\nThe couplings, from installed metadata:", file=sys.stderr)
         for (dependent, dependency), spec in sorted(constrains.items()):
             print(
-                f"  {dependent}=={pins[dependent]} requires {dependency}{spec} "
-                f"(pinned at {pins[dependency]})",
+                f"  {dependent}=={pins[dependent][0]} requires {dependency}{spec} "
+                f"(pinned at {pins[dependency][0]})",
                 file=sys.stderr,
             )
         print(
