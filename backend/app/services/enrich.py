@@ -489,6 +489,39 @@ async def tenant_participants(db: AsyncSession, conversation_id: uuid.UUID) -> l
     )
 
 
+def visible_reactions(
+    reactions: list[MessageReaction],
+    conv: Conversation | None,
+    users: dict[uuid.UUID, User] | None = None,
+) -> list[MessageReaction]:
+    """Reaction rows whose author belongs in this conversation's tenant.
+
+    `conv_participants` stopped `read_by` and `delivered_to` disclosing a
+    foreign-org row, but reactions are stored rows rather than derived ones: a
+    reaction created before the mutation gate landed outlives it, and serializing it
+    hands every legitimate member that user's id and display name. Gating new
+    reactions does not remove the old ones.
+
+    Filters on the AUTHOR's org against the conversation's, not on current
+    membership — a member who has since left legitimately reacted while they were
+    there, and dropping their reaction would rewrite history to fix a leak. A
+    cross_org conversation spans tenants by design and keeps every author.
+
+    An author that cannot be resolved is dropped for an ordinary conversation.
+    message_reactions.user_id is ON DELETE CASCADE, so a row cannot outlive its
+    user; an unresolvable author means the relationship was not loaded, and
+    disclosing an id we cannot place is the thing being prevented.
+    """
+    if conv is None or conv.type == ConversationType.cross_org:
+        return list(reactions)
+    kept = []
+    for r in reactions:
+        author = users.get(r.user_id) if users is not None else r.user
+        if author is not None and author.org_id == conv.org_id:
+            kept.append(r)
+    return kept
+
+
 async def serialize_message(
     db: AsyncSession,
     msg: Message,
@@ -513,6 +546,7 @@ async def serialize_message(
     """
     if sender is None and msg.sender_id:
         sender = await db.get(User, msg.sender_id)
+    conv = await db.get(Conversation, msg.conversation_id)
     if conv_participants is None:
         conv_participants = await tenant_participants(db, msg.conversation_id)
 
@@ -530,7 +564,7 @@ async def serialize_message(
         is_pinned = await db.get(MessagePin, msg.id) is not None
 
     reactions = []
-    for r in msg.reactions:
+    for r in visible_reactions(list(msg.reactions), conv):
         reactions.append(
             {
                 "user_id": str(r.user_id),
@@ -633,10 +667,19 @@ async def load_message(db: AsyncSession, message_id: uuid.UUID) -> Message | Non
     return (await db.execute(stmt)).scalar_one_or_none()
 
 
-def enriched_reactions(msg_reactions: list[MessageReaction], users: dict[uuid.UUID, User]) -> list[dict]:
-    """The react endpoint's shape: [{user_id, user_name, emoji}]."""
+def enriched_reactions(
+    msg_reactions: list[MessageReaction],
+    users: dict[uuid.UUID, User],
+    conv: Conversation | None = None,
+) -> list[dict]:
+    """The react endpoint's shape: [{user_id, user_name, emoji}].
+
+    Takes the conversation so the same tenant filter applies here as in
+    serialize_message: this list is broadcast on every reaction_update, so an
+    unfiltered one re-discloses a stale foreign author each time anyone reacts.
+    """
     out = []
-    for r in msg_reactions:
+    for r in visible_reactions(msg_reactions, conv, users):
         user = users.get(r.user_id)
         out.append(
             {

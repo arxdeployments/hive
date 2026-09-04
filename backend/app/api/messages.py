@@ -82,15 +82,12 @@ def _require_org_access(conv: Conversation, tenant: TenantContext) -> None:
 
 
 async def _participants_of(db, conv_uuid: uuid.UUID) -> list[ConversationParticipant]:
-    return (
-        (
-            await db.execute(
-                select(ConversationParticipant).where(ConversationParticipant.conversation_id == conv_uuid)
-            )
-        )
-        .scalars()
-        .all()
-    )
+    """Tenant-filtered, because _serialize_page hands this straight to
+    serialize_message as conv_participants — which bypasses that function's own
+    filtered fallback. Unfiltered, a foreign-org participant row with a qualifying
+    last_read_at appeared in read_by and delivered_to on the message page, the
+    starred page and the pinned page."""
+    return await enrich.tenant_participants(db, conv_uuid)
 
 
 async def _serialize_page(

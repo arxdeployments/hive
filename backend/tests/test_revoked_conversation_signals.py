@@ -21,7 +21,13 @@ import uuid
 
 from httpx import ASGITransport, AsyncClient
 
-from app.db.models import Conversation, ConversationParticipant, ConversationType, User
+from app.db.models import (
+    Conversation,
+    ConversationParticipant,
+    ConversationType,
+    MessageReaction,
+    User,
+)
 from app.db.session import SessionLocal
 from app.main import app
 from app.realtime import hub
@@ -35,6 +41,13 @@ async def _deactivate_conversation(conv_id: uuid.UUID) -> None:
         conv = await db.get(Conversation, conv_id)
         conv.is_active = False
         await db.commit()
+
+
+def _fresh_client() -> AsyncClient:
+    """A client of its own, so a test can hold a logged-in session across calls."""
+    c = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+    c.headers.update(CSRF)
+    return c
 
 
 async def _direct_conversation(email_a: str, other: User) -> uuid.UUID:
@@ -600,3 +613,116 @@ async def test_receipts_in_a_serialized_message_exclude_a_foreign_org_row(client
     seen = {r["user_id"] for r in doc["read_by"]} | {r["user_id"] for r in doc["delivered_to"]}
     assert str(b.id) in seen, "control: the legitimate member's receipt is still reported"
     assert str(outsider.id) not in seen, "a foreign-org participant was disclosed in the receipts"
+
+
+# ---------------------------------------------------------------------------
+# The HTTP read paths, and stored rows that outlive the gate
+# ---------------------------------------------------------------------------
+
+
+async def _mark_participant_read(conv_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    async with SessionLocal() as db:
+        row = await db.get(ConversationParticipant, (conv_id, user_id))
+        row.last_read_at = dt.datetime.now(dt.UTC) + dt.timedelta(minutes=1)
+        await db.commit()
+
+
+async def test_the_message_page_does_not_disclose_a_foreign_org_row(client, two_orgs_with_users):
+    """`_participants_of` fed the serializer directly, bypassing its safe fallback.
+
+    This is the busiest path of all — every message load — and it is the one place
+    the filtered fallback could not save, because the caller supplies the list.
+    """
+    users = two_orgs_with_users
+    async with _fresh_client() as c:
+        await login(c, "alice@a.com")
+        conv_id = uuid.UUID(
+            (await c.post("/api/conversations/direct", json={"participant_id": str(users["bob"].id)})).json()[
+                "_id"
+            ]
+        )
+        await c.post(f"/api/conversations/{conv_id}/messages", json={"content": "tenant only"})
+
+        outsider = users["carol"]
+        await _intrude(conv_id, outsider.id)
+        await _mark_participant_read(conv_id, users["bob"].id)
+        await _mark_participant_read(conv_id, outsider.id)
+
+        body = (await c.get(f"/api/conversations/{conv_id}/messages")).json()
+
+    seen = {
+        r["user_id"]
+        for m in body["messages"]
+        for r in (m.get("read_by") or []) + (m.get("delivered_to") or [])
+    }
+    assert str(users["bob"].id) in seen, "control: the legitimate member's receipt is reported"
+    assert str(outsider.id) not in seen, "the message page disclosed a foreign-org participant"
+
+
+async def test_a_stale_foreign_reaction_is_not_serialized(client, two_orgs_with_users):
+    """Gating new reactions does not remove the old ones.
+
+    A reaction row created before the mutation gate landed outlives it, and
+    serializing it hands every legitimate member that user's id and display name.
+    """
+    users = two_orgs_with_users
+    async with _fresh_client() as c:
+        await login(c, "alice@a.com")
+        conv_id = uuid.UUID(
+            (await c.post("/api/conversations/direct", json={"participant_id": str(users["bob"].id)})).json()[
+                "_id"
+            ]
+        )
+        msg_id = uuid.UUID(
+            (await c.post(f"/api/conversations/{conv_id}/messages", json={"content": "hi"})).json()["_id"]
+        )
+
+        outsider = users["carol"]
+        await _intrude(conv_id, outsider.id)
+        # Written directly: the endpoint now refuses it, which is the point — this
+        # is the row that predates the gate.
+        async with SessionLocal() as db:
+            db.add(MessageReaction(message_id=msg_id, user_id=outsider.id, emoji="👀"))
+            db.add(MessageReaction(message_id=msg_id, user_id=users["bob"].id, emoji="👍"))
+            await db.commit()
+
+        body = (await c.get(f"/api/conversations/{conv_id}/messages")).json()
+
+    reactors = {r["user_id"] for m in body["messages"] for r in (m.get("reactions") or [])}
+    assert str(users["bob"].id) in reactors, "control: the legitimate reaction still renders"
+    assert str(outsider.id) not in reactors, "a stale foreign reaction was disclosed"
+
+
+async def test_a_cross_org_group_keeps_every_reaction_author(client, two_orgs_with_users):
+    """The converse: filtering on the author's org must not strip a cross-org group.
+
+    Without this, a filter that dropped every out-of-org author would satisfy the
+    test above and quietly break reactions in exactly the conversations that are
+    supposed to span tenants.
+    """
+    users = two_orgs_with_users
+    async with SessionLocal() as db:
+        conv = Conversation(type=ConversationType.cross_org, org_id=users["org_a"].id, is_active=True)
+        db.add(conv)
+        await db.flush()
+        db.add_all(
+            [
+                ConversationParticipant(conversation_id=conv.id, user_id=users["alice"].id),
+                ConversationParticipant(conversation_id=conv.id, user_id=users["carol"].id),
+            ]
+        )
+        await db.commit()
+        conv_id = conv.id
+
+    msg_id = await _send_one(conv_id, users["alice"].id)
+    async with SessionLocal() as db:
+        db.add(MessageReaction(message_id=msg_id, user_id=users["carol"].id, emoji="🎉"))
+        await db.commit()
+
+    async with SessionLocal() as db:
+        loaded = await enrich.load_message(db, msg_id)
+        doc = await enrich.serialize_message(db, loaded)
+
+    assert [r["user_id"] for r in doc["reactions"]] == [str(users["carol"].id)], (
+        "a cross-org group must keep reaction authors from the other tenant"
+    )

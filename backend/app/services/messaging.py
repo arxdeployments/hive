@@ -643,7 +643,7 @@ async def mark_read(
     )
 
 
-async def _require_message_access(db: AsyncSession, conversation_id: uuid.UUID, actor: User) -> None:
+async def _require_message_access(db: AsyncSession, conversation_id: uuid.UUID, actor: User) -> Conversation:
     """The actor gate for mutating a message, as opposed to receiving one.
 
     Membership alone was the whole check on reactions, edits, stars, pins,
@@ -668,6 +668,7 @@ async def _require_message_access(db: AsyncSession, conversation_id: uuid.UUID, 
         raise
     except SendError as exc:
         raise SendError(status_code=404, detail="Message not found") from exc
+    return conv
 
 
 async def toggle_reaction(db: AsyncSession, *, message_id: uuid.UUID, actor: User, emoji: str) -> list[dict]:
@@ -675,7 +676,7 @@ async def toggle_reaction(db: AsyncSession, *, message_id: uuid.UUID, actor: Use
     msg = await enrich.load_message(db, message_id)
     if msg is None:
         raise SendError(status_code=404, detail="Message not found")
-    await _require_message_access(db, msg.conversation_id, actor)
+    conv = await _require_message_access(db, msg.conversation_id, actor)
 
     emoji = (emoji or "").strip()[:32]
     if not emoji:
@@ -694,7 +695,7 @@ async def toggle_reaction(db: AsyncSession, *, message_id: uuid.UUID, actor: Use
     if user_ids:
         rows = (await db.execute(select(User).where(User.id.in_(user_ids)))).scalars().all()
         users = {u.id: u for u in rows}
-    reactions = enrich.enriched_reactions(list(msg.reactions), users)
+    reactions = enrich.enriched_reactions(list(msg.reactions), users, conv)
 
     participants = await conversation_recipients(db, msg.conversation_id)
     await publish_to_users(
