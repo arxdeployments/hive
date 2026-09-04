@@ -63,6 +63,72 @@ class SendError(HTTPException):
     pass
 
 
+class AccountInactive(SendError):
+    """The actor's own account is gone, as distinct from the conversation.
+
+    Its own type so a caller can remap the conversation-scoped refusals to 404 —
+    the mutation paths deliberately keep a foreign message indistinguishable from a
+    nonexistent one — without restating the account condition to tell them apart.
+    Restating it is how this batch's defects happened.
+    """
+
+
+def assert_conversation_access(conv: Conversation, user: User, *, is_member: bool) -> None:
+    """May this user interact with this conversation AT ALL. Raises SendError.
+
+    Public and shared on purpose. These three conditions were previously written
+    out at each call site, and the copies drifted — which is the whole reason this
+    exists. `_member_attachment` in api/media.py records the same lesson from the
+    other direction: "media was missed when that gate was added", so the bytes kept
+    serving out of a group whose is_active flag had been cleared while /messages
+    404'd. Batch 53 found three more paths still on membership alone — typing
+    indicators, presence fan-out and read receipts — so a tenant cut off from a
+    cross-org group kept signalling into it. A fourth copy would have been a fourth
+    thing to miss.
+
+    `is_active = False` IS the revocation: archiving or deleting a group sets that
+    flag and leaves every ConversationParticipant row in place (cross_org.py
+    delete_group writes deleted_at and is_active and nothing else), so membership
+    alone can never express whether access still stands.
+    """
+    # The user's own account, checked per call. HTTP refuses a deactivated user at
+    # the auth dependency, but the websocket path arrives with a User row loaded
+    # when the socket was opened — so without this a session that was live at
+    # deactivation could keep acting until the socket's periodic revalidation
+    # caught up. That revalidation is the backstop; this is the actual gate.
+    if not user.is_active:
+        raise AccountInactive(status_code=403, detail="Your account is no longer active")
+    if not is_member or not conv.is_active:
+        raise SendError(status_code=404, detail="Conversation not found")
+    # Org isolation: non-cross-org conversations must match the user's org.
+    if conv.type.value != "cross_org" and conv.org_id != user.org_id:
+        raise SendError(status_code=403, detail="Access denied")
+
+
+async def conversation_recipients(
+    db: AsyncSession, conversation_id: uuid.UUID, *, exclude: uuid.UUID | None = None
+) -> list[uuid.UUID]:
+    """Who may be TOLD anything about this conversation.
+
+    The mirror of `assert_conversation_access`, which decides who may ACT. Both
+    exist for the same reason: a ConversationParticipant row carries no org, so
+    nothing in the schema stops one pointing at a conversation in another tenant,
+    and the predicate that excludes such a row on the way IN has to exclude it on
+    the way OUT too. Gating the actor and not the audience would have left the
+    tenant boundary open in the direction that actually discloses data.
+
+    There were eight copies of the unfiltered version of this query —
+    `select(ConversationParticipant.user_id).where(conversation_id == ...)`, five of
+    them byte-identical — feeding new_message, message_edited, reaction_update,
+    message_pin_update, the system-message batch, messages_read and typing. A
+    foreign-org row in an ordinary conversation received all of it, message bodies
+    included. Adding the org predicate to eight call sites would have been eight
+    more places for it to go stale, which is the defect this batch is about.
+    """
+    rows = await enrich.tenant_participants(db, conversation_id)
+    return [p.user_id for p in rows if exclude is None or p.user_id != exclude]
+
+
 async def _require_send_access(
     db: AsyncSession, conv: Conversation, sender: User
 ) -> list[ConversationParticipant]:
@@ -75,21 +141,8 @@ async def _require_send_access(
         .scalars()
         .all()
     )
-    # The sender's own account, checked per send. HTTP refuses a deactivated
-    # user at the auth dependency, but the websocket path reaches here with a
-    # User row loaded when the socket was opened — so without this a session
-    # that was live at deactivation could keep sending until the socket's
-    # periodic revalidation caught up. That revalidation is the backstop; this
-    # is the actual gate.
-    if not sender.is_active:
-        raise SendError(status_code=403, detail="Your account is no longer active")
-
     me = next((p for p in participants if p.user_id == sender.id), None)
-    if me is None or not conv.is_active:
-        raise SendError(status_code=404, detail="Conversation not found")
-    # Org isolation: non-cross-org conversations must match the sender's org.
-    if conv.type.value != "cross_org" and conv.org_id != sender.org_id:
-        raise SendError(status_code=403, detail="Access denied")
+    assert_conversation_access(conv, sender, is_member=me is not None)
 
     # No per-pair reachability check any more: membership of the conversation
     # IS the permission, and the org check above is what keeps tenants apart.
@@ -176,15 +229,17 @@ async def _replay_after_conflict(
     )
     if winner is None:
         return None
-    participants = await _require_send_access(db, conv, sender)
-    return await _replay_doc(db, winner, participants=participants, sender=sender, temp_id=temp_id)
+    # Called for the refusal, not the return value: a replay must still be gated
+    # the same way the original send was. Do not fold this away because nothing
+    # reads the list any more.
+    await _require_send_access(db, conv, sender)
+    return await _replay_doc(db, winner, sender=sender, temp_id=temp_id)
 
 
 async def _replay_doc(
     db: AsyncSession,
     msg: Message,
     *,
-    participants: list[ConversationParticipant],
     sender: User,
     temp_id: str | None,
 ) -> dict:
@@ -196,12 +251,17 @@ async def _replay_doc(
     Unlike the fresh path this cannot assume the message is unstarred and
     unpinned, because an arbitrary amount of time may have passed since it was
     stored, so it pays the two lookups instead of passing empty sets.
+
+    Took a `participants` list until the serializer's participant set had to be
+    tenant-filtered; it now reads the filtered rows itself, so passing the caller's
+    unfiltered list in would have been a way to reintroduce the leak.
     """
     loaded = await enrich.load_message(db, msg.id)
+    visible = await enrich.tenant_participants(db, msg.conversation_id)
     doc = await enrich.serialize_message(
         db,
         loaded,
-        conv_participants=participants,
+        conv_participants=visible,
         sender=sender,
         include_reply=True,
         for_user=sender.id,
@@ -243,7 +303,7 @@ async def send_message(
             client_msg_id=client_msg_id,
         )
         if already is not None:
-            return await _replay_doc(db, already, participants=participants, sender=sender, temp_id=temp_id)
+            return await _replay_doc(db, already, sender=sender, temp_id=temp_id)
 
     if msg_type not in _MEDIA_TYPES and msg_type != "text":
         msg_type = "text"  # clients may not mint system/other types
@@ -365,10 +425,15 @@ async def send_message(
         return replay
 
     loaded = await enrich.load_message(db, msg.id)
+    # Filtered rows, not the full membership list: conv_participants becomes
+    # read_by/delivered_to in the fanned-out document, so an unfiltered list would
+    # disclose a foreign-org participant's user id to everyone legitimately here even
+    # though nothing is delivered to them.
+    visible = await enrich.tenant_participants(db, msg.conversation_id)
     doc = await enrich.serialize_message(
         db,
         loaded,
-        conv_participants=participants,
+        conv_participants=visible,
         sender=sender,
         include_reply=True,
         # Brand-new message: it cannot be starred or pinned yet, so hand the
@@ -377,7 +442,11 @@ async def send_message(
         pinned_ids=set(),
     )
 
-    others = [p.user_id for p in participants if p.user_id != sender.id]
+    # Not `[p.user_id for p in participants]`: that list is every membership row,
+    # and a foreign-org one would have been handed the message body. `participants`
+    # stays as loaded for the mute set and the serializer, both of which only ever
+    # subtract from this.
+    others = await conversation_recipients(db, msg.conversation_id, exclude=sender.id)
     statuses = await presence.get_statuses(others)
     online = [uid for uid in others if statuses.get(str(uid)) == "online"]
 
@@ -462,17 +531,7 @@ async def send_system_message(
     loaded = await enrich.load_message(db, msg.id)
     doc = await enrich.serialize_message(db, loaded, include_reply=False, starred_ids=set(), pinned_ids=set())
     if broadcast and conv is not None:
-        participants = (
-            (
-                await db.execute(
-                    select(ConversationParticipant.user_id).where(
-                        ConversationParticipant.conversation_id == conversation_id
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        participants = await conversation_recipients(db, conversation_id)
         await publish_to_users(
             participants, {"type": "new_message", "message": {**doc, "status": "delivered"}}
         )
@@ -526,17 +585,7 @@ async def send_system_messages(
     # Read once, not once per message. The frames themselves are still sent
     # individually: collapsing them would change what a client receives, and this
     # is meant to cost less, not to do less.
-    participants = (
-        (
-            await db.execute(
-                select(ConversationParticipant.user_id).where(
-                    ConversationParticipant.conversation_id == conversation_id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    participants = await conversation_recipients(db, conversation_id)
     for msg in msgs:
         loaded = await enrich.load_message(db, msg.id)
         doc = await enrich.serialize_message(
@@ -556,8 +605,14 @@ async def mark_read(
 ) -> None:
     """Set last_read_at and broadcast messages_read to other participants."""
     me = await db.get(ConversationParticipant, (conversation_id, reader.id))
-    if me is None:
+    # Membership alone was the whole gate here, so a reader cut off from a
+    # conversation could still stamp last_read_at on it and fan `messages_read` out
+    # to the members of a group they had been revoked from — while their own
+    # message list 404'd. Same rule as sending, deliberately the same function.
+    conv = await db.get(Conversation, conversation_id)
+    if conv is None:
         raise SendError(status_code=404, detail="Conversation not found")
+    assert_conversation_access(conv, reader, is_member=me is not None)
 
     read_time = now_utc()
     anchor_id = None
@@ -576,18 +631,7 @@ async def mark_read(
         me.last_read_at = read_time
     await db.commit()
 
-    others = (
-        (
-            await db.execute(
-                select(ConversationParticipant.user_id).where(
-                    ConversationParticipant.conversation_id == conversation_id,
-                    ConversationParticipant.user_id != reader.id,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    others = await conversation_recipients(db, conversation_id, exclude=reader.id)
     await publish_to_users(
         others,
         {
@@ -599,14 +643,40 @@ async def mark_read(
     )
 
 
+async def _require_message_access(db: AsyncSession, conversation_id: uuid.UUID, actor: User) -> Conversation:
+    """The actor gate for mutating a message, as opposed to receiving one.
+
+    Membership alone was the whole check on reactions, edits, stars, pins,
+    deletions and forwards, so a participant row on a conversation that had been
+    revoked — or one filed under another org, which the schema permits — could
+    still MUTATE message state. Filtering the recipients of the resulting broadcast
+    stops it disclosing anything; it does not stop the write.
+
+    Refusals about the CONVERSATION collapse to 404 "Message not found", keeping the
+    posture toggle_reaction and _member_message already documented: a non-member
+    must not be able to tell a foreign message from a nonexistent one. A dead
+    account is not information about the conversation, so AccountInactive passes
+    through as the 403 the send path gives.
+    """
+    conv = await db.get(Conversation, conversation_id)
+    me = await db.get(ConversationParticipant, (conversation_id, actor.id))
+    if conv is None:
+        raise SendError(status_code=404, detail="Message not found")
+    try:
+        assert_conversation_access(conv, actor, is_member=me is not None)
+    except AccountInactive:
+        raise
+    except SendError as exc:
+        raise SendError(status_code=404, detail="Message not found") from exc
+    return conv
+
+
 async def toggle_reaction(db: AsyncSession, *, message_id: uuid.UUID, actor: User, emoji: str) -> list[dict]:
     """Toggle a reaction. Requires conversation membership (closes the IDOR)."""
     msg = await enrich.load_message(db, message_id)
     if msg is None:
         raise SendError(status_code=404, detail="Message not found")
-    me = await db.get(ConversationParticipant, (msg.conversation_id, actor.id))
-    if me is None:
-        raise SendError(status_code=404, detail="Message not found")
+    conv = await _require_message_access(db, msg.conversation_id, actor)
 
     emoji = (emoji or "").strip()[:32]
     if not emoji:
@@ -625,19 +695,9 @@ async def toggle_reaction(db: AsyncSession, *, message_id: uuid.UUID, actor: Use
     if user_ids:
         rows = (await db.execute(select(User).where(User.id.in_(user_ids)))).scalars().all()
         users = {u.id: u for u in rows}
-    reactions = enrich.enriched_reactions(list(msg.reactions), users)
+    reactions = enrich.enriched_reactions(list(msg.reactions), users, conv)
 
-    participants = (
-        (
-            await db.execute(
-                select(ConversationParticipant.user_id).where(
-                    ConversationParticipant.conversation_id == msg.conversation_id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    participants = await conversation_recipients(db, msg.conversation_id)
     await publish_to_users(
         participants,
         {
@@ -659,9 +719,7 @@ async def _member_message(db: AsyncSession, message_id: uuid.UUID, actor: User) 
     msg = await db.get(Message, message_id)
     if msg is None:
         raise SendError(status_code=404, detail="Message not found")
-    me = await db.get(ConversationParticipant, (msg.conversation_id, actor.id))
-    if me is None:
-        raise SendError(status_code=404, detail="Message not found")
+    await _require_message_access(db, msg.conversation_id, actor)
     return msg
 
 
@@ -713,17 +771,7 @@ async def toggle_pin(db: AsyncSession, *, message_id: uuid.UUID, actor: User) ->
         pinned = True
     await db.commit()
 
-    participants = (
-        (
-            await db.execute(
-                select(ConversationParticipant.user_id).where(
-                    ConversationParticipant.conversation_id == msg.conversation_id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    participants = await conversation_recipients(db, msg.conversation_id)
     await publish_to_users(
         participants,
         {
@@ -768,9 +816,7 @@ async def edit_message(db: AsyncSession, *, message_id: uuid.UUID, actor: User, 
     msg = await enrich.load_message(db, message_id)
     if msg is None:
         raise SendError(status_code=404, detail="Message not found")
-    me = await db.get(ConversationParticipant, (msg.conversation_id, actor.id))
-    if me is None:
-        raise SendError(status_code=404, detail="Message not found")
+    await _require_message_access(db, msg.conversation_id, actor)
     if msg.sender_id != actor.id:
         raise SendError(status_code=403, detail="Can only edit your own messages")
     if msg.deleted_at is not None:
@@ -787,17 +833,7 @@ async def edit_message(db: AsyncSession, *, message_id: uuid.UUID, actor: User, 
 
     msg = await enrich.load_message(db, message_id)
     doc = await enrich.serialize_message(db, msg, for_user=actor.id)
-    participants = (
-        (
-            await db.execute(
-                select(ConversationParticipant.user_id).where(
-                    ConversationParticipant.conversation_id == msg.conversation_id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    participants = await conversation_recipients(db, msg.conversation_id)
     await publish_to_users(
         participants,
         {
@@ -824,9 +860,11 @@ async def forward_message(
     original = await enrich.load_message(db, message_id)
     if original is None:
         raise SendError(status_code=404, detail="Message not found")
-    src_membership = await db.get(ConversationParticipant, (original.conversation_id, actor.id))
-    if src_membership is None:
-        raise SendError(status_code=404, detail="Message not found")
+    # The SOURCE conversation, on the same terms as any other message mutation. A
+    # revoked source keeps its participant rows, so membership alone let a former
+    # member copy a message out of a group they had been cut off from into a live
+    # one — laundering the content past the revocation.
+    await _require_message_access(db, original.conversation_id, actor)
     if original.deleted_at is not None:
         raise SendError(status_code=400, detail="Cannot forward a deleted message")
 
@@ -864,16 +902,17 @@ async def forward_message(
         conv.last_message_at = now
         await db.commit()
         loaded = await enrich.load_message(db, copy.id)
+        visible = await enrich.tenant_participants(db, conv.id)
         doc = await enrich.serialize_message(
             db,
             loaded,
-            conv_participants=participants,
+            conv_participants=visible,
             sender=actor,
             include_reply=False,
             starred_ids=set(),  # the forwarded copy is new — no stars, no pin
             pinned_ids=set(),
         )
-        others = [p.user_id for p in participants if p.user_id != actor.id]
+        others = [p.user_id for p in visible if p.user_id != actor.id]
         await publish_to_users(others, {"type": "new_message", "message": {**doc, "status": "delivered"}})
         forwarded_to.append(str(conv.id))
 

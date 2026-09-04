@@ -18,11 +18,11 @@ import logging
 import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.core.deps import get_current_user_ws
 from app.core.security import MOBILE_CLIENT
-from app.db.models import ConversationParticipant, User, UserRole
+from app.db.models import Conversation, ConversationParticipant, ConversationType, User, UserRole
 from app.db.session import SessionLocal
 from app.realtime.redis_bus import get_redis, publish_to_users, user_channel
 from app.services import presence
@@ -266,13 +266,46 @@ registry = LocalRegistry()
 
 
 async def _conversation_partner_ids(db, user_id: uuid.UUID) -> list[uuid.UUID]:
-    """Distinct users sharing at least one conversation with user_id."""
-    mine = select(ConversationParticipant.conversation_id).where(ConversationParticipant.user_id == user_id)
+    """Distinct users sharing at least one LIVE conversation with user_id.
+
+    The is_active join is the point. Deactivating a conversation leaves every
+    participant row in place, so without it a tenant cut off from a cross-org group
+    went on receiving the online status and last_seen of everyone in it, and
+    broadcasting their own back, for as long as both accounts existed — while their
+    messages, media and search results all 404'd. api/contacts.py already filters
+    the contact list this way; presence was the path that did not.
+
+    The org predicate is here for the same reason it is on the content paths, and
+    an earlier version of this docstring argued for leaving it out — that
+    membership already is the org rule, because a non-cross-org conversation's
+    participants are all inside its org. That contradicted this module's own test
+    that a participant row can name a conversation in another tenant: the row
+    carries no org and nothing in the schema ties it to the conversation's. So a
+    malformed row would have had presence crossing the boundary while every content
+    path correctly refused it.
+    """
+    mine = (
+        select(ConversationParticipant.conversation_id)
+        .join(Conversation, Conversation.id == ConversationParticipant.conversation_id)
+        .where(
+            ConversationParticipant.user_id == user_id,
+            Conversation.is_active.is_(True),
+        )
+    )
     stmt = (
         select(ConversationParticipant.user_id)
+        .join(Conversation, Conversation.id == ConversationParticipant.conversation_id)
+        .join(User, User.id == ConversationParticipant.user_id)
         .where(
             ConversationParticipant.conversation_id.in_(mine),
             ConversationParticipant.user_id != user_id,
+            # The recipient's tenant, not just their membership. A participant row
+            # carries no org, so an ordinary conversation can hold a foreign-org row
+            # and this is the only thing that stops presence being disclosed to it.
+            or_(
+                Conversation.type == ConversationType.cross_org,
+                Conversation.org_id == User.org_id,
+            ),
         )
         .distinct()
     )
@@ -293,8 +326,31 @@ async def _broadcast_presence(user: User, status: str) -> None:
     )
 
 
-async def _is_participant(db, conversation_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    return (await db.get(ConversationParticipant, (conversation_id, user_id))) is not None
+async def _may_act_in(db, conversation_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+    """Whether this user may still interact with this conversation at all.
+
+    Was a bare participant-row lookup, which is how typing indicators kept flowing
+    into a group whose `is_active` flag had been cleared: archiving or deleting a
+    group leaves the participant rows, so the row proves nothing about access.
+
+    Delegates to `messaging.assert_conversation_access` rather than restating the
+    rule in SQL. That costs two extra row reads on a typing frame, and buys the one
+    thing worth having here — the rule cannot drift, which is exactly how this path
+    came to be weaker than every other one. Reloads the user row for the same
+    reason the send path does: the User handed in was loaded when the socket opened.
+    """
+    from app.services.messaging import SendError, assert_conversation_access
+
+    fresh = await db.get(User, user_id)
+    conv = await db.get(Conversation, conversation_id)
+    if fresh is None or conv is None:
+        return False
+    is_member = (await db.get(ConversationParticipant, (conversation_id, user_id))) is not None
+    try:
+        assert_conversation_access(conv, fresh, is_member=is_member)
+    except SendError:
+        return False
+    return True
 
 
 async def _handle_inbound(user: User, data: dict) -> None:
@@ -345,23 +401,12 @@ async def _handle_inbound(user: User, data: dict) -> None:
         if conv_id is None:
             return
         async with SessionLocal() as db:
-            if not await _is_participant(db, conv_id, user.id):
+            if not await _may_act_in(db, conv_id, user.id):
                 return
-            others = [
-                uid
-                for uid in (
-                    (
-                        await db.execute(
-                            select(ConversationParticipant.user_id).where(
-                                ConversationParticipant.conversation_id == conv_id
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                if uid != user.id
-            ]
+            # Same recipient rule as message delivery, and for the same reason:
+            # membership is not tenant authorisation, so a foreign-org participant
+            # row in an ordinary conversation must not be told who is typing in it.
+            others = await messaging.conversation_recipients(db, conv_id, exclude=user.id)
         await publish_to_users(
             others,
             {
