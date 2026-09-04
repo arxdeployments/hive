@@ -726,3 +726,43 @@ async def test_a_cross_org_group_keeps_every_reaction_author(client, two_orgs_wi
     assert [r["user_id"] for r in doc["reactions"]] == [str(users["carol"].id)], (
         "a cross-org group must keep reaction authors from the other tenant"
     )
+
+
+async def test_message_info_does_not_disclose_a_foreign_org_participant(client, two_orgs_with_users):
+    """The "who has read this" route serializes each participant by name.
+
+    The caller's own org is checked; the participant rows were not. So the sender
+    asking who had read their message was shown the foreign-org row's display name
+    and read state.
+    """
+    users = two_orgs_with_users
+    async with _fresh_client() as c:
+        await login(c, "alice@a.com")
+        conv_id = uuid.UUID(
+            (await c.post("/api/conversations/direct", json={"participant_id": str(users["bob"].id)})).json()[
+                "_id"
+            ]
+        )
+        msg_id = (
+            await c.post(f"/api/conversations/{conv_id}/messages", json={"content": "who read this"})
+        ).json()["_id"]
+
+        outsider = users["carol"]
+        await _intrude(conv_id, outsider.id)
+        await _mark_participant_read(conv_id, users["bob"].id)
+        await _mark_participant_read(conv_id, outsider.id)
+
+        # Router prefix is /api/conversations, so the route is nested under it.
+        info = await c.get(f"/api/conversations/messages/{msg_id}/info")
+        assert info.status_code == 200, info.text
+        body = info.json()
+
+    listed = {
+        # This route reports participants by display NAME, which is the disclosure:
+        # the sender is told who read their message.
+        entry["user_name"]
+        for key in ("read_by", "delivered_to", "pending")
+        for entry in (body.get(key) or [])
+    }
+    assert users["bob"].display_name in listed, "control: the legitimate member is still listed"
+    assert outsider.display_name not in listed, "message info disclosed a foreign-org participant by name"

@@ -521,17 +521,12 @@ async def message_info(msg_id: str, tenant: TenantContext = Depends(get_tenant))
     if msg.sender_id != tenant.user.id:
         raise HTTPException(status_code=403, detail="Can only view info for your own messages")
 
-    participants = (
-        (
-            await db.execute(
-                select(ConversationParticipant).where(
-                    ConversationParticipant.conversation_id == msg.conversation_id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    # Tenant-filtered, like _participants_of. The caller's own org is checked
+    # above; this is the other half — an ordinary conversation can hold a
+    # foreign-org participant row, and this route serializes each participant's
+    # display name and read state, so an unfiltered list discloses that user to the
+    # sender asking who has read their message.
+    participants = await enrich.tenant_participants(db, msg.conversation_id)
     other_ids = [p.user_id for p in participants if p.user_id != msg.sender_id]
     names: dict[uuid.UUID, str] = {}
     if other_ids:
