@@ -63,6 +63,38 @@ class SendError(HTTPException):
     pass
 
 
+def assert_conversation_access(conv: Conversation, user: User, *, is_member: bool) -> None:
+    """May this user interact with this conversation AT ALL. Raises SendError.
+
+    Public and shared on purpose. These three conditions were previously written
+    out at each call site, and the copies drifted — which is the whole reason this
+    exists. `_member_attachment` in api/media.py records the same lesson from the
+    other direction: "media was missed when that gate was added", so the bytes kept
+    serving out of a group whose is_active flag had been cleared while /messages
+    404'd. Batch 53 found three more paths still on membership alone — typing
+    indicators, presence fan-out and read receipts — so a tenant cut off from a
+    cross-org group kept signalling into it. A fourth copy would have been a fourth
+    thing to miss.
+
+    `is_active = False` IS the revocation: archiving or deleting a group sets that
+    flag and leaves every ConversationParticipant row in place (cross_org.py
+    delete_group writes deleted_at and is_active and nothing else), so membership
+    alone can never express whether access still stands.
+    """
+    # The user's own account, checked per call. HTTP refuses a deactivated user at
+    # the auth dependency, but the websocket path arrives with a User row loaded
+    # when the socket was opened — so without this a session that was live at
+    # deactivation could keep acting until the socket's periodic revalidation
+    # caught up. That revalidation is the backstop; this is the actual gate.
+    if not user.is_active:
+        raise SendError(status_code=403, detail="Your account is no longer active")
+    if not is_member or not conv.is_active:
+        raise SendError(status_code=404, detail="Conversation not found")
+    # Org isolation: non-cross-org conversations must match the user's org.
+    if conv.type.value != "cross_org" and conv.org_id != user.org_id:
+        raise SendError(status_code=403, detail="Access denied")
+
+
 async def _require_send_access(
     db: AsyncSession, conv: Conversation, sender: User
 ) -> list[ConversationParticipant]:
@@ -75,21 +107,8 @@ async def _require_send_access(
         .scalars()
         .all()
     )
-    # The sender's own account, checked per send. HTTP refuses a deactivated
-    # user at the auth dependency, but the websocket path reaches here with a
-    # User row loaded when the socket was opened — so without this a session
-    # that was live at deactivation could keep sending until the socket's
-    # periodic revalidation caught up. That revalidation is the backstop; this
-    # is the actual gate.
-    if not sender.is_active:
-        raise SendError(status_code=403, detail="Your account is no longer active")
-
     me = next((p for p in participants if p.user_id == sender.id), None)
-    if me is None or not conv.is_active:
-        raise SendError(status_code=404, detail="Conversation not found")
-    # Org isolation: non-cross-org conversations must match the sender's org.
-    if conv.type.value != "cross_org" and conv.org_id != sender.org_id:
-        raise SendError(status_code=403, detail="Access denied")
+    assert_conversation_access(conv, sender, is_member=me is not None)
 
     # No per-pair reachability check any more: membership of the conversation
     # IS the permission, and the org check above is what keeps tenants apart.
@@ -556,8 +575,14 @@ async def mark_read(
 ) -> None:
     """Set last_read_at and broadcast messages_read to other participants."""
     me = await db.get(ConversationParticipant, (conversation_id, reader.id))
-    if me is None:
+    # Membership alone was the whole gate here, so a reader cut off from a
+    # conversation could still stamp last_read_at on it and fan `messages_read` out
+    # to the members of a group they had been revoked from — while their own
+    # message list 404'd. Same rule as sending, deliberately the same function.
+    conv = await db.get(Conversation, conversation_id)
+    if conv is None:
         raise SendError(status_code=404, detail="Conversation not found")
+    assert_conversation_access(conv, reader, is_member=me is not None)
 
     read_time = now_utc()
     anchor_id = None

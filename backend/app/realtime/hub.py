@@ -22,7 +22,7 @@ from sqlalchemy import select
 
 from app.core.deps import get_current_user_ws
 from app.core.security import MOBILE_CLIENT
-from app.db.models import ConversationParticipant, User, UserRole
+from app.db.models import Conversation, ConversationParticipant, User, UserRole
 from app.db.session import SessionLocal
 from app.realtime.redis_bus import get_redis, publish_to_users, user_channel
 from app.services import presence
@@ -266,8 +266,28 @@ registry = LocalRegistry()
 
 
 async def _conversation_partner_ids(db, user_id: uuid.UUID) -> list[uuid.UUID]:
-    """Distinct users sharing at least one conversation with user_id."""
-    mine = select(ConversationParticipant.conversation_id).where(ConversationParticipant.user_id == user_id)
+    """Distinct users sharing at least one LIVE conversation with user_id.
+
+    The is_active join is the point. Deactivating a conversation leaves every
+    participant row in place, so without it a tenant cut off from a cross-org group
+    went on receiving the online status and last_seen of everyone in it, and
+    broadcasting their own back, for as long as both accounts existed — while their
+    messages, media and search results all 404'd. api/contacts.py already filters
+    the contact list this way; presence was the path that did not.
+
+    No org predicate here, unlike the content paths: for "who shares a live
+    conversation with me", membership already is the org rule. A non-cross-org
+    conversation's participants are all inside its org, and a cross_org one spans
+    orgs by design.
+    """
+    mine = (
+        select(ConversationParticipant.conversation_id)
+        .join(Conversation, Conversation.id == ConversationParticipant.conversation_id)
+        .where(
+            ConversationParticipant.user_id == user_id,
+            Conversation.is_active.is_(True),
+        )
+    )
     stmt = (
         select(ConversationParticipant.user_id)
         .where(
@@ -293,8 +313,31 @@ async def _broadcast_presence(user: User, status: str) -> None:
     )
 
 
-async def _is_participant(db, conversation_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    return (await db.get(ConversationParticipant, (conversation_id, user_id))) is not None
+async def _may_act_in(db, conversation_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+    """Whether this user may still interact with this conversation at all.
+
+    Was a bare participant-row lookup, which is how typing indicators kept flowing
+    into a group whose `is_active` flag had been cleared: archiving or deleting a
+    group leaves the participant rows, so the row proves nothing about access.
+
+    Delegates to `messaging.assert_conversation_access` rather than restating the
+    rule in SQL. That costs two extra row reads on a typing frame, and buys the one
+    thing worth having here — the rule cannot drift, which is exactly how this path
+    came to be weaker than every other one. Reloads the user row for the same
+    reason the send path does: the User handed in was loaded when the socket opened.
+    """
+    from app.services.messaging import SendError, assert_conversation_access
+
+    fresh = await db.get(User, user_id)
+    conv = await db.get(Conversation, conversation_id)
+    if fresh is None or conv is None:
+        return False
+    is_member = (await db.get(ConversationParticipant, (conversation_id, user_id))) is not None
+    try:
+        assert_conversation_access(conv, fresh, is_member=is_member)
+    except SendError:
+        return False
+    return True
 
 
 async def _handle_inbound(user: User, data: dict) -> None:
@@ -345,7 +388,7 @@ async def _handle_inbound(user: User, data: dict) -> None:
         if conv_id is None:
             return
         async with SessionLocal() as db:
-            if not await _is_participant(db, conv_id, user.id):
+            if not await _may_act_in(db, conv_id, user.id):
                 return
             others = [
                 uid
