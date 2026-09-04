@@ -252,3 +252,129 @@ async def test_read_receipts_still_work_on_a_live_conversation(client):
         await messaging.mark_read(db, conversation_id=conv_id, reader=reader)
         me = await db.get(ConversationParticipant, (conv_id, a.id))
         assert me.last_read_at is not None
+
+
+# ---------------------------------------------------------------------------
+# The audience, not just the actor: a participant row carries no org
+# ---------------------------------------------------------------------------
+
+
+async def _intrude(conv_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    """Persist a foreign-org membership row in an ordinary conversation.
+
+    Nothing in the schema forbids it: conversation_participants has no org column
+    and no constraint tying it to the conversation's tenant. This is the row the
+    recipient predicate exists for, and it is the same shape of representable
+    inconsistency CodeRabbit identified for users.dept_id in Batch 46.
+    """
+    async with SessionLocal() as db:
+        db.add(ConversationParticipant(conversation_id=conv_id, user_id=user_id))
+        await db.commit()
+
+
+async def test_no_signal_reaches_a_foreign_org_participant_row(client, monkeypatch):
+    """Typing, presence and read receipts must all exclude it.
+
+    Gating who may ACT and not who may be TOLD would leave the tenant boundary
+    open in the direction that actually discloses data.
+    """
+    org_a = await make_org("Tenant A Signals")
+    org_b = await make_org("Tenant B Signals")
+    a = await make_user("a@tenanta.com", org_id=org_a.id)
+    b = await make_user("b@tenanta.com", org_id=org_a.id)
+    outsider = await make_user("x@tenantb.com", org_id=org_b.id)
+
+    conv_id = await _direct_conversation("a@tenanta.com", b)
+    await _intrude(conv_id, outsider.id)
+
+    sent = _capture(monkeypatch)
+    await hub._handle_inbound(a, {"type": "typing_start", "conversation_id": str(conv_id)})
+    typing_recipients = [uid for uids, _ in sent for uid in uids]
+    assert str(b.id) in typing_recipients, "control: the legitimate member is still told"
+    assert str(outsider.id) not in typing_recipients, "typing leaked across tenants"
+
+    sent.clear()
+    await hub._broadcast_presence(a, "online")
+    presence_recipients = [uid for uids, _ in sent for uid in uids]
+    assert str(b.id) in presence_recipients, "control: the legitimate member still hears presence"
+    assert str(outsider.id) not in presence_recipients, "presence leaked across tenants"
+
+    read_sent: list = []
+
+    async def _capture_read(user_ids, event):
+        read_sent.append(([str(u) for u in user_ids], event))
+
+    monkeypatch.setattr(messaging, "publish_to_users", _capture_read)
+    async with SessionLocal() as db:
+        reader = await db.get(User, a.id)
+        await messaging.mark_read(db, conversation_id=conv_id, reader=reader)
+    read_recipients = [uid for uids, _ in read_sent for uid in uids]
+    assert str(b.id) in read_recipients, "control: the legitimate member gets the receipt"
+    assert str(outsider.id) not in read_recipients, "read receipts leaked across tenants"
+
+
+async def test_a_foreign_org_participant_row_is_not_sent_the_message_body(client, monkeypatch):
+    """The severe case, and the one that was reached by the same unfiltered query.
+
+    `send_message` fanned out to every membership row, so the foreign-org row
+    received `new_message` with the serialized body — not merely the fact that
+    someone was typing.
+    """
+    org_a = await make_org("Tenant A Body")
+    org_b = await make_org("Tenant B Body")
+    a = await make_user("a@bodya.com", org_id=org_a.id)
+    b = await make_user("b@bodya.com", org_id=org_a.id)
+    outsider = await make_user("x@bodyb.com", org_id=org_b.id)
+
+    conv_id = await _direct_conversation("a@bodya.com", b)
+    await _intrude(conv_id, outsider.id)
+
+    sent: list = []
+
+    async def _capture_send(user_ids, event):
+        sent.append(([str(u) for u in user_ids], event))
+
+    monkeypatch.setattr(messaging, "publish_to_users", _capture_send)
+    async with SessionLocal() as db:
+        sender = await db.get(User, a.id)
+        await messaging.send_message(db, conversation_id=conv_id, sender=sender, content="tenant A internal")
+
+    delivered = [uid for uids, event in sent if event.get("type") == "new_message" for uid in uids]
+    assert str(b.id) in delivered, "control: the legitimate member receives the message"
+    assert str(outsider.id) not in delivered, "the message body was delivered across tenants"
+
+
+async def test_a_cross_org_group_still_reaches_every_tenant(client, monkeypatch):
+    """The converse, and the reason the predicate is not a plain org equality.
+
+    A cross_org conversation is supposed to span tenants, so the same rule that
+    excludes the row above must let these through — otherwise the fix would
+    silently break the feature it is protecting.
+    """
+    org_a = await make_org("Cross A")
+    org_b = await make_org("Cross B")
+    a = await make_user("a@crossa.com", org_id=org_a.id)
+    partner = await make_user("p@crossb.com", org_id=org_b.id)
+
+    async with SessionLocal() as db:
+        conv = Conversation(type=ConversationType.cross_org, org_id=org_a.id, is_active=True)
+        db.add(conv)
+        await db.flush()
+        db.add_all(
+            [
+                ConversationParticipant(conversation_id=conv.id, user_id=a.id),
+                ConversationParticipant(conversation_id=conv.id, user_id=partner.id),
+            ]
+        )
+        await db.commit()
+        conv_id = conv.id
+
+    async with SessionLocal() as db:
+        recipients = await messaging.conversation_recipients(db, conv_id, exclude=a.id)
+    assert [str(u) for u in recipients] == [str(partner.id)], (
+        "a cross-org group must still deliver to the other tenant"
+    )
+
+    sent = _capture(monkeypatch)
+    await hub._handle_inbound(a, {"type": "typing_start", "conversation_id": str(conv_id)})
+    assert str(partner.id) in [uid for uids, _ in sent for uid in uids]

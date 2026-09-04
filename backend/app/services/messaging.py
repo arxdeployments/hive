@@ -10,13 +10,14 @@ import re
 import uuid
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
     Conversation,
     ConversationParticipant,
+    ConversationType,
     Message,
     MessageAttachment,
     MessagePin,
@@ -93,6 +94,44 @@ def assert_conversation_access(conv: Conversation, user: User, *, is_member: boo
     # Org isolation: non-cross-org conversations must match the user's org.
     if conv.type.value != "cross_org" and conv.org_id != user.org_id:
         raise SendError(status_code=403, detail="Access denied")
+
+
+async def conversation_recipients(
+    db: AsyncSession, conversation_id: uuid.UUID, *, exclude: uuid.UUID | None = None
+) -> list[uuid.UUID]:
+    """Who may be TOLD anything about this conversation.
+
+    The mirror of `assert_conversation_access`, which decides who may ACT. Both
+    exist for the same reason: a ConversationParticipant row carries no org, so
+    nothing in the schema stops one pointing at a conversation in another tenant,
+    and the predicate that excludes such a row on the way IN has to exclude it on
+    the way OUT too. Gating the actor and not the audience would have left the
+    tenant boundary open in the direction that actually discloses data.
+
+    There were eight copies of the unfiltered version of this query —
+    `select(ConversationParticipant.user_id).where(conversation_id == ...)`, five of
+    them byte-identical — feeding new_message, message_edited, reaction_update,
+    message_pin_update, the system-message batch, messages_read and typing. A
+    foreign-org row in an ordinary conversation received all of it, message bodies
+    included. Adding the org predicate to eight call sites would have been eight
+    more places for it to go stale, which is the defect this batch is about.
+    """
+    stmt = (
+        select(ConversationParticipant.user_id)
+        .join(Conversation, Conversation.id == ConversationParticipant.conversation_id)
+        .join(User, User.id == ConversationParticipant.user_id)
+        .where(
+            ConversationParticipant.conversation_id == conversation_id,
+            # A cross_org group spans tenants by design; an ordinary one does not.
+            or_(
+                Conversation.type == ConversationType.cross_org,
+                Conversation.org_id == User.org_id,
+            ),
+        )
+    )
+    if exclude is not None:
+        stmt = stmt.where(ConversationParticipant.user_id != exclude)
+    return list((await db.execute(stmt)).scalars().all())
 
 
 async def _require_send_access(
@@ -396,7 +435,11 @@ async def send_message(
         pinned_ids=set(),
     )
 
-    others = [p.user_id for p in participants if p.user_id != sender.id]
+    # Not `[p.user_id for p in participants]`: that list is every membership row,
+    # and a foreign-org one would have been handed the message body. `participants`
+    # stays as loaded for the mute set and the serializer, both of which only ever
+    # subtract from this.
+    others = await conversation_recipients(db, msg.conversation_id, exclude=sender.id)
     statuses = await presence.get_statuses(others)
     online = [uid for uid in others if statuses.get(str(uid)) == "online"]
 
@@ -481,17 +524,7 @@ async def send_system_message(
     loaded = await enrich.load_message(db, msg.id)
     doc = await enrich.serialize_message(db, loaded, include_reply=False, starred_ids=set(), pinned_ids=set())
     if broadcast and conv is not None:
-        participants = (
-            (
-                await db.execute(
-                    select(ConversationParticipant.user_id).where(
-                        ConversationParticipant.conversation_id == conversation_id
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        participants = await conversation_recipients(db, conversation_id)
         await publish_to_users(
             participants, {"type": "new_message", "message": {**doc, "status": "delivered"}}
         )
@@ -545,17 +578,7 @@ async def send_system_messages(
     # Read once, not once per message. The frames themselves are still sent
     # individually: collapsing them would change what a client receives, and this
     # is meant to cost less, not to do less.
-    participants = (
-        (
-            await db.execute(
-                select(ConversationParticipant.user_id).where(
-                    ConversationParticipant.conversation_id == conversation_id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    participants = await conversation_recipients(db, conversation_id)
     for msg in msgs:
         loaded = await enrich.load_message(db, msg.id)
         doc = await enrich.serialize_message(
@@ -601,18 +624,7 @@ async def mark_read(
         me.last_read_at = read_time
     await db.commit()
 
-    others = (
-        (
-            await db.execute(
-                select(ConversationParticipant.user_id).where(
-                    ConversationParticipant.conversation_id == conversation_id,
-                    ConversationParticipant.user_id != reader.id,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    others = await conversation_recipients(db, conversation_id, exclude=reader.id)
     await publish_to_users(
         others,
         {
@@ -652,17 +664,7 @@ async def toggle_reaction(db: AsyncSession, *, message_id: uuid.UUID, actor: Use
         users = {u.id: u for u in rows}
     reactions = enrich.enriched_reactions(list(msg.reactions), users)
 
-    participants = (
-        (
-            await db.execute(
-                select(ConversationParticipant.user_id).where(
-                    ConversationParticipant.conversation_id == msg.conversation_id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    participants = await conversation_recipients(db, msg.conversation_id)
     await publish_to_users(
         participants,
         {
@@ -738,17 +740,7 @@ async def toggle_pin(db: AsyncSession, *, message_id: uuid.UUID, actor: User) ->
         pinned = True
     await db.commit()
 
-    participants = (
-        (
-            await db.execute(
-                select(ConversationParticipant.user_id).where(
-                    ConversationParticipant.conversation_id == msg.conversation_id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    participants = await conversation_recipients(db, msg.conversation_id)
     await publish_to_users(
         participants,
         {
@@ -812,17 +804,7 @@ async def edit_message(db: AsyncSession, *, message_id: uuid.UUID, actor: User, 
 
     msg = await enrich.load_message(db, message_id)
     doc = await enrich.serialize_message(db, msg, for_user=actor.id)
-    participants = (
-        (
-            await db.execute(
-                select(ConversationParticipant.user_id).where(
-                    ConversationParticipant.conversation_id == msg.conversation_id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
+    participants = await conversation_recipients(db, msg.conversation_id)
     await publish_to_users(
         participants,
         {

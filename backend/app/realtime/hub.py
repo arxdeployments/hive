@@ -18,11 +18,11 @@ import logging
 import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.core.deps import get_current_user_ws
 from app.core.security import MOBILE_CLIENT
-from app.db.models import Conversation, ConversationParticipant, User, UserRole
+from app.db.models import Conversation, ConversationParticipant, ConversationType, User, UserRole
 from app.db.session import SessionLocal
 from app.realtime.redis_bus import get_redis, publish_to_users, user_channel
 from app.services import presence
@@ -290,9 +290,18 @@ async def _conversation_partner_ids(db, user_id: uuid.UUID) -> list[uuid.UUID]:
     )
     stmt = (
         select(ConversationParticipant.user_id)
+        .join(Conversation, Conversation.id == ConversationParticipant.conversation_id)
+        .join(User, User.id == ConversationParticipant.user_id)
         .where(
             ConversationParticipant.conversation_id.in_(mine),
             ConversationParticipant.user_id != user_id,
+            # The recipient's tenant, not just their membership. A participant row
+            # carries no org, so an ordinary conversation can hold a foreign-org row
+            # and this is the only thing that stops presence being disclosed to it.
+            or_(
+                Conversation.type == ConversationType.cross_org,
+                Conversation.org_id == User.org_id,
+            ),
         )
         .distinct()
     )
@@ -390,21 +399,10 @@ async def _handle_inbound(user: User, data: dict) -> None:
         async with SessionLocal() as db:
             if not await _may_act_in(db, conv_id, user.id):
                 return
-            others = [
-                uid
-                for uid in (
-                    (
-                        await db.execute(
-                            select(ConversationParticipant.user_id).where(
-                                ConversationParticipant.conversation_id == conv_id
-                            )
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-                if uid != user.id
-            ]
+            # Same recipient rule as message delivery, and for the same reason:
+            # membership is not tenant authorisation, so a foreign-org participant
+            # row in an ordinary conversation must not be told who is typing in it.
+            others = await messaging.conversation_recipients(db, conv_id, exclude=user.id)
         await publish_to_users(
             others,
             {
