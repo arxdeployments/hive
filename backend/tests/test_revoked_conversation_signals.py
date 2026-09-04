@@ -378,3 +378,120 @@ async def test_a_cross_org_group_still_reaches_every_tenant(client, monkeypatch)
     sent = _capture(monkeypatch)
     await hub._handle_inbound(a, {"type": "typing_start", "conversation_id": str(conv_id)})
     assert str(partner.id) in [uid for uids, _ in sent for uid in uids]
+
+
+# ---------------------------------------------------------------------------
+# Mutating a message, not just receiving one
+# ---------------------------------------------------------------------------
+
+
+async def _send_one(conv_id: uuid.UUID, sender_id: uuid.UUID) -> uuid.UUID:
+    async with SessionLocal() as db:
+        sender = await db.get(User, sender_id)
+        doc = await messaging.send_message(db, conversation_id=conv_id, sender=sender, content="hi")
+        return uuid.UUID(doc["_id"])
+
+
+async def _expect_refused(coro, *, status: int) -> None:
+    try:
+        await coro
+    except messaging.SendError as exc:
+        assert exc.status_code == status, f"expected {status}, got {exc.status_code}: {exc.detail}"
+    else:
+        raise AssertionError("the mutation was allowed")
+
+
+async def test_a_revoked_member_cannot_mutate_a_message(client):
+    """Filtering the audience stops the disclosure; it does not stop the write.
+
+    Reactions, edits, stars and pins all checked the participant row and nothing
+    else, so a tenant cut off from a group could still change message state in it —
+    and the resulting broadcast, now correctly filtered, would simply hide that it
+    had happened.
+    """
+    org = await make_org("Mutate Revoked Co")
+    a = await make_user("a@mutrev.com", org_id=org.id)
+    b = await make_user("b@mutrev.com", org_id=org.id)
+    conv_id = await _direct_conversation("a@mutrev.com", b)
+    msg_id = await _send_one(conv_id, a.id)
+    await _deactivate_conversation(conv_id)
+
+    async with SessionLocal() as db:
+        actor = await db.get(User, a.id)
+        # 404 throughout: a revoked conversation must be indistinguishable from a
+        # message that is not there.
+        await _expect_refused(
+            messaging.toggle_reaction(db, message_id=msg_id, actor=actor, emoji="👍"), status=404
+        )
+        await _expect_refused(
+            messaging.edit_message(db, message_id=msg_id, actor=actor, content="edited"), status=404
+        )
+        await _expect_refused(messaging.toggle_star(db, message_id=msg_id, actor=actor), status=404)
+        await _expect_refused(messaging.toggle_pin(db, message_id=msg_id, actor=actor), status=404)
+
+
+async def test_a_foreign_org_participant_row_cannot_mutate_a_message(client):
+    """The other representable state, on the write side."""
+    org_a = await make_org("Mutate Tenant A")
+    org_b = await make_org("Mutate Tenant B")
+    a = await make_user("a@muta.com", org_id=org_a.id)
+    b = await make_user("b@muta.com", org_id=org_a.id)
+    outsider = await make_user("x@mutb.com", org_id=org_b.id)
+
+    conv_id = await _direct_conversation("a@muta.com", b)
+    msg_id = await _send_one(conv_id, a.id)
+    await _intrude(conv_id, outsider.id)
+
+    async with SessionLocal() as db:
+        actor = await db.get(User, outsider.id)
+        await _expect_refused(
+            messaging.toggle_reaction(db, message_id=msg_id, actor=actor, emoji="👍"), status=404
+        )
+        await _expect_refused(messaging.toggle_star(db, message_id=msg_id, actor=actor), status=404)
+
+
+async def test_a_deactivated_account_gets_403_not_404_on_a_mutation(client):
+    """A dead account is not information about the conversation.
+
+    The conversation-scoped refusals collapse to 404 to keep a foreign message
+    indistinguishable from a missing one; the account case keeps the 403 the send
+    path gives, which is why it has its own exception type rather than being told
+    apart by restating the condition.
+    """
+    org = await make_org("Mutate Deact Co")
+    a = await make_user("a@mutdeact.com", org_id=org.id)
+    b = await make_user("b@mutdeact.com", org_id=org.id)
+    conv_id = await _direct_conversation("a@mutdeact.com", b)
+    msg_id = await _send_one(conv_id, a.id)
+
+    async with SessionLocal() as db:
+        actor = await db.get(User, a.id)
+        actor.is_active = False
+        await db.commit()
+
+    async with SessionLocal() as db:
+        actor = await db.get(User, a.id)
+        try:
+            await messaging.toggle_reaction(db, message_id=msg_id, actor=actor, emoji="👍")
+        except messaging.AccountInactive as exc:
+            assert exc.status_code == 403
+            assert "no longer active" in exc.detail
+        else:
+            raise AssertionError("a deactivated account mutated a message")
+
+
+async def test_an_ordinary_member_can_still_mutate(client):
+    """Negative control. Without it, a gate that refused everything would pass."""
+    org = await make_org("Mutate OK Co")
+    a = await make_user("a@mutok.com", org_id=org.id)
+    b = await make_user("b@mutok.com", org_id=org.id)
+    conv_id = await _direct_conversation("a@mutok.com", b)
+    msg_id = await _send_one(conv_id, a.id)
+
+    async with SessionLocal() as db:
+        actor = await db.get(User, a.id)
+        assert await messaging.toggle_star(db, message_id=msg_id, actor=actor) is True
+        reactions = await messaging.toggle_reaction(db, message_id=msg_id, actor=actor, emoji="👍")
+        assert reactions, "the reaction should have been recorded"
+        edited = await messaging.edit_message(db, message_id=msg_id, actor=actor, content="edited fine")
+        assert edited["content"] == "edited fine"

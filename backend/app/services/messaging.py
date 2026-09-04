@@ -64,6 +64,16 @@ class SendError(HTTPException):
     pass
 
 
+class AccountInactive(SendError):
+    """The actor's own account is gone, as distinct from the conversation.
+
+    Its own type so a caller can remap the conversation-scoped refusals to 404 —
+    the mutation paths deliberately keep a foreign message indistinguishable from a
+    nonexistent one — without restating the account condition to tell them apart.
+    Restating it is how this batch's defects happened.
+    """
+
+
 def assert_conversation_access(conv: Conversation, user: User, *, is_member: bool) -> None:
     """May this user interact with this conversation AT ALL. Raises SendError.
 
@@ -88,7 +98,7 @@ def assert_conversation_access(conv: Conversation, user: User, *, is_member: boo
     # deactivation could keep acting until the socket's periodic revalidation
     # caught up. That revalidation is the backstop; this is the actual gate.
     if not user.is_active:
-        raise SendError(status_code=403, detail="Your account is no longer active")
+        raise AccountInactive(status_code=403, detail="Your account is no longer active")
     if not is_member or not conv.is_active:
         raise SendError(status_code=404, detail="Conversation not found")
     # Org isolation: non-cross-org conversations must match the user's org.
@@ -636,14 +646,39 @@ async def mark_read(
     )
 
 
+async def _require_message_access(db: AsyncSession, conversation_id: uuid.UUID, actor: User) -> None:
+    """The actor gate for mutating a message, as opposed to receiving one.
+
+    Membership alone was the whole check on reactions, edits, stars, pins,
+    deletions and forwards, so a participant row on a conversation that had been
+    revoked — or one filed under another org, which the schema permits — could
+    still MUTATE message state. Filtering the recipients of the resulting broadcast
+    stops it disclosing anything; it does not stop the write.
+
+    Refusals about the CONVERSATION collapse to 404 "Message not found", keeping the
+    posture toggle_reaction and _member_message already documented: a non-member
+    must not be able to tell a foreign message from a nonexistent one. A dead
+    account is not information about the conversation, so AccountInactive passes
+    through as the 403 the send path gives.
+    """
+    conv = await db.get(Conversation, conversation_id)
+    me = await db.get(ConversationParticipant, (conversation_id, actor.id))
+    if conv is None:
+        raise SendError(status_code=404, detail="Message not found")
+    try:
+        assert_conversation_access(conv, actor, is_member=me is not None)
+    except AccountInactive:
+        raise
+    except SendError as exc:
+        raise SendError(status_code=404, detail="Message not found") from exc
+
+
 async def toggle_reaction(db: AsyncSession, *, message_id: uuid.UUID, actor: User, emoji: str) -> list[dict]:
     """Toggle a reaction. Requires conversation membership (closes the IDOR)."""
     msg = await enrich.load_message(db, message_id)
     if msg is None:
         raise SendError(status_code=404, detail="Message not found")
-    me = await db.get(ConversationParticipant, (msg.conversation_id, actor.id))
-    if me is None:
-        raise SendError(status_code=404, detail="Message not found")
+    await _require_message_access(db, msg.conversation_id, actor)
 
     emoji = (emoji or "").strip()[:32]
     if not emoji:
@@ -686,9 +721,7 @@ async def _member_message(db: AsyncSession, message_id: uuid.UUID, actor: User) 
     msg = await db.get(Message, message_id)
     if msg is None:
         raise SendError(status_code=404, detail="Message not found")
-    me = await db.get(ConversationParticipant, (msg.conversation_id, actor.id))
-    if me is None:
-        raise SendError(status_code=404, detail="Message not found")
+    await _require_message_access(db, msg.conversation_id, actor)
     return msg
 
 
@@ -785,9 +818,7 @@ async def edit_message(db: AsyncSession, *, message_id: uuid.UUID, actor: User, 
     msg = await enrich.load_message(db, message_id)
     if msg is None:
         raise SendError(status_code=404, detail="Message not found")
-    me = await db.get(ConversationParticipant, (msg.conversation_id, actor.id))
-    if me is None:
-        raise SendError(status_code=404, detail="Message not found")
+    await _require_message_access(db, msg.conversation_id, actor)
     if msg.sender_id != actor.id:
         raise SendError(status_code=403, detail="Can only edit your own messages")
     if msg.deleted_at is not None:

@@ -275,10 +275,14 @@ async def _conversation_partner_ids(db, user_id: uuid.UUID) -> list[uuid.UUID]:
     messages, media and search results all 404'd. api/contacts.py already filters
     the contact list this way; presence was the path that did not.
 
-    No org predicate here, unlike the content paths: for "who shares a live
-    conversation with me", membership already is the org rule. A non-cross-org
-    conversation's participants are all inside its org, and a cross_org one spans
-    orgs by design.
+    The org predicate is here for the same reason it is on the content paths, and
+    an earlier version of this docstring argued for leaving it out — that
+    membership already is the org rule, because a non-cross-org conversation's
+    participants are all inside its org. That contradicted this module's own test
+    that a participant row can name a conversation in another tenant: the row
+    carries no org and nothing in the schema ties it to the conversation's. So a
+    malformed row would have had presence crossing the boundary while every content
+    path correctly refused it.
     """
     mine = (
         select(ConversationParticipant.conversation_id)
