@@ -12,13 +12,14 @@ last_read_at instead of stored counters — one source of truth, no drift.
 import datetime as dt
 import uuid
 
-from sqlalchemy import func, literal_column, select, true
+from sqlalchemy import func, literal_column, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.db.models import (
     Conversation,
     ConversationParticipant,
+    ConversationType,
     Message,
     MessageAttachment,
     MessageDeletion,
@@ -451,6 +452,43 @@ async def reply_targets(db: AsyncSession, messages: list[Message]) -> dict[uuid.
     return found
 
 
+async def tenant_participants(db: AsyncSession, conversation_id: uuid.UUID) -> list[ConversationParticipant]:
+    """Participant rows that pass the conversation's tenant rule.
+
+    Lives here rather than in messaging because this is the lower layer and it
+    already owned the unfiltered version of this query — so the serializer's own
+    fallback is correct by construction instead of being a second copy.
+
+    The rows matter as well as the ids: `receipts_for_message` turns them into
+    `read_by` and `delivered_to`, which go into the document fanned out to every
+    recipient. So an unfiltered list does not merely widen delivery, it discloses a
+    foreign-org participant's user id to everyone legitimately in the conversation,
+    even once delivery itself is filtered.
+
+    A participant row carries no org and nothing in the schema ties it to the
+    conversation's, so this predicate is the only thing that excludes such a row. A
+    cross_org conversation spans tenants by design and is the explicit exception.
+    """
+    return list(
+        (
+            await db.execute(
+                select(ConversationParticipant)
+                .join(Conversation, Conversation.id == ConversationParticipant.conversation_id)
+                .join(User, User.id == ConversationParticipant.user_id)
+                .where(
+                    ConversationParticipant.conversation_id == conversation_id,
+                    or_(
+                        Conversation.type == ConversationType.cross_org,
+                        Conversation.org_id == User.org_id,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
 async def serialize_message(
     db: AsyncSession,
     msg: Message,
@@ -476,17 +514,7 @@ async def serialize_message(
     if sender is None and msg.sender_id:
         sender = await db.get(User, msg.sender_id)
     if conv_participants is None:
-        conv_participants = (
-            (
-                await db.execute(
-                    select(ConversationParticipant).where(
-                        ConversationParticipant.conversation_id == msg.conversation_id
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        conv_participants = await tenant_participants(db, msg.conversation_id)
 
     read_by, delivered_to = receipts_for_message(msg.created_at, msg.sender_id, conv_participants)
 

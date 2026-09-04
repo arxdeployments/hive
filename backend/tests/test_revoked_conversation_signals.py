@@ -16,6 +16,7 @@ So a tenant cut off from a group kept broadcasting into it and kept receiving it
 members' online status, indefinitely, while their messages and media 404'd.
 """
 
+import datetime as dt
 import uuid
 
 from httpx import ASGITransport, AsyncClient
@@ -24,7 +25,7 @@ from app.db.models import Conversation, ConversationParticipant, ConversationTyp
 from app.db.session import SessionLocal
 from app.main import app
 from app.realtime import hub
-from app.services import messaging
+from app.services import enrich, messaging
 from tests.conftest import CSRF, login, make_org, make_user
 
 
@@ -495,3 +496,107 @@ async def test_an_ordinary_member_can_still_mutate(client):
         assert reactions, "the reaction should have been recorded"
         edited = await messaging.edit_message(db, message_id=msg_id, actor=actor, content="edited fine")
         assert edited["content"] == "edited fine"
+
+
+# ---------------------------------------------------------------------------
+# Forwarding: the source, the target, and the receipts
+# ---------------------------------------------------------------------------
+
+
+async def test_forwarding_out_of_a_revoked_conversation_is_refused(client):
+    """Otherwise revocation is a formality: copy the message into a live group.
+
+    The source conversation keeps its participant rows, so membership alone let a
+    former member launder content past the revocation into somewhere they still
+    belong.
+    """
+    org = await make_org("Forward Source Co")
+    a = await make_user("a@fwdsrc.com", org_id=org.id)
+    b = await make_user("b@fwdsrc.com", org_id=org.id)
+    c = await make_user("c@fwdsrc.com", org_id=org.id)
+
+    source = await _direct_conversation("a@fwdsrc.com", b)
+    target = await _direct_conversation("a@fwdsrc.com", c)
+    msg_id = await _send_one(source, a.id)
+    await _deactivate_conversation(source)
+
+    async with SessionLocal() as db:
+        actor = await db.get(User, a.id)
+        await _expect_refused(
+            messaging.forward_message(
+                db,
+                actor=actor,
+                message_id=msg_id,
+                conversation_ids=[str(target)],
+                contact_ids=[],
+            ),
+            status=404,
+        )
+
+
+async def test_a_forwarded_message_is_not_delivered_to_a_foreign_org_row(client, monkeypatch):
+    """The forward path built its own fan-out and missed the tenant filter."""
+    org_a = await make_org("Forward Tenant A")
+    org_b = await make_org("Forward Tenant B")
+    a = await make_user("a@fwda.com", org_id=org_a.id)
+    b = await make_user("b@fwda.com", org_id=org_a.id)
+    c = await make_user("c@fwda.com", org_id=org_a.id)
+    outsider = await make_user("x@fwdb.com", org_id=org_b.id)
+
+    source = await _direct_conversation("a@fwda.com", b)
+    target = await _direct_conversation("a@fwda.com", c)
+    msg_id = await _send_one(source, a.id)
+    await _intrude(target, outsider.id)
+
+    sent: list = []
+
+    async def _capture_fwd(user_ids, event):
+        sent.append(([str(u) for u in user_ids], event))
+
+    monkeypatch.setattr(messaging, "publish_to_users", _capture_fwd)
+    async with SessionLocal() as db:
+        actor = await db.get(User, a.id)
+        await messaging.forward_message(
+            db, actor=actor, message_id=msg_id, conversation_ids=[str(target)], contact_ids=[]
+        )
+
+    delivered = [uid for uids, e in sent if e.get("type") == "new_message" for uid in uids]
+    assert str(c.id) in delivered, "control: the legitimate target member receives it"
+    assert str(outsider.id) not in delivered, "a forwarded message crossed tenants"
+
+
+async def test_receipts_in_a_serialized_message_exclude_a_foreign_org_row(client):
+    """The subtler half: conv_participants becomes read_by/delivered_to.
+
+    Filtering delivery is not enough — the document every legitimate recipient
+    receives is derived from the participant list, so an unfiltered list discloses
+    the foreign row's user id to all of them even though nothing is delivered to it.
+    """
+    org_a = await make_org("Receipts Tenant A")
+    org_b = await make_org("Receipts Tenant B")
+    a = await make_user("a@rcpta.com", org_id=org_a.id)
+    b = await make_user("b@rcpta.com", org_id=org_a.id)
+    outsider = await make_user("x@rcptb.com", org_id=org_b.id)
+
+    conv_id = await _direct_conversation("a@rcpta.com", b)
+    msg_id = await _send_one(conv_id, a.id)
+    await _intrude(conv_id, outsider.id)
+
+    # Give both the legitimate member and the intruder a read timestamp after the
+    # message, which is what puts a participant into read_by at all.
+    async with SessionLocal() as db:
+        later = dt.datetime.now(dt.UTC) + dt.timedelta(minutes=1)
+        for uid in (b.id, outsider.id):
+            row = await db.get(ConversationParticipant, (conv_id, uid))
+            row.last_read_at = later
+        await db.commit()
+
+    async with SessionLocal() as db:
+        loaded = await enrich.load_message(db, msg_id)
+        # conv_participants omitted on purpose: this exercises the serializer's own
+        # fallback query, which was unfiltered too.
+        doc = await enrich.serialize_message(db, loaded)
+
+    seen = {r["user_id"] for r in doc["read_by"]} | {r["user_id"] for r in doc["delivered_to"]}
+    assert str(b.id) in seen, "control: the legitimate member's receipt is still reported"
+    assert str(outsider.id) not in seen, "a foreign-org participant was disclosed in the receipts"

@@ -10,14 +10,13 @@ import re
 import uuid
 
 from fastapi import HTTPException
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
     Conversation,
     ConversationParticipant,
-    ConversationType,
     Message,
     MessageAttachment,
     MessagePin,
@@ -126,22 +125,8 @@ async def conversation_recipients(
     included. Adding the org predicate to eight call sites would have been eight
     more places for it to go stale, which is the defect this batch is about.
     """
-    stmt = (
-        select(ConversationParticipant.user_id)
-        .join(Conversation, Conversation.id == ConversationParticipant.conversation_id)
-        .join(User, User.id == ConversationParticipant.user_id)
-        .where(
-            ConversationParticipant.conversation_id == conversation_id,
-            # A cross_org group spans tenants by design; an ordinary one does not.
-            or_(
-                Conversation.type == ConversationType.cross_org,
-                Conversation.org_id == User.org_id,
-            ),
-        )
-    )
-    if exclude is not None:
-        stmt = stmt.where(ConversationParticipant.user_id != exclude)
-    return list((await db.execute(stmt)).scalars().all())
+    rows = await enrich.tenant_participants(db, conversation_id)
+    return [p.user_id for p in rows if exclude is None or p.user_id != exclude]
 
 
 async def _require_send_access(
@@ -244,15 +229,17 @@ async def _replay_after_conflict(
     )
     if winner is None:
         return None
-    participants = await _require_send_access(db, conv, sender)
-    return await _replay_doc(db, winner, participants=participants, sender=sender, temp_id=temp_id)
+    # Called for the refusal, not the return value: a replay must still be gated
+    # the same way the original send was. Do not fold this away because nothing
+    # reads the list any more.
+    await _require_send_access(db, conv, sender)
+    return await _replay_doc(db, winner, sender=sender, temp_id=temp_id)
 
 
 async def _replay_doc(
     db: AsyncSession,
     msg: Message,
     *,
-    participants: list[ConversationParticipant],
     sender: User,
     temp_id: str | None,
 ) -> dict:
@@ -264,12 +251,17 @@ async def _replay_doc(
     Unlike the fresh path this cannot assume the message is unstarred and
     unpinned, because an arbitrary amount of time may have passed since it was
     stored, so it pays the two lookups instead of passing empty sets.
+
+    Took a `participants` list until the serializer's participant set had to be
+    tenant-filtered; it now reads the filtered rows itself, so passing the caller's
+    unfiltered list in would have been a way to reintroduce the leak.
     """
     loaded = await enrich.load_message(db, msg.id)
+    visible = await enrich.tenant_participants(db, msg.conversation_id)
     doc = await enrich.serialize_message(
         db,
         loaded,
-        conv_participants=participants,
+        conv_participants=visible,
         sender=sender,
         include_reply=True,
         for_user=sender.id,
@@ -311,7 +303,7 @@ async def send_message(
             client_msg_id=client_msg_id,
         )
         if already is not None:
-            return await _replay_doc(db, already, participants=participants, sender=sender, temp_id=temp_id)
+            return await _replay_doc(db, already, sender=sender, temp_id=temp_id)
 
     if msg_type not in _MEDIA_TYPES and msg_type != "text":
         msg_type = "text"  # clients may not mint system/other types
@@ -433,10 +425,15 @@ async def send_message(
         return replay
 
     loaded = await enrich.load_message(db, msg.id)
+    # Filtered rows, not the full membership list: conv_participants becomes
+    # read_by/delivered_to in the fanned-out document, so an unfiltered list would
+    # disclose a foreign-org participant's user id to everyone legitimately here even
+    # though nothing is delivered to them.
+    visible = await enrich.tenant_participants(db, msg.conversation_id)
     doc = await enrich.serialize_message(
         db,
         loaded,
-        conv_participants=participants,
+        conv_participants=visible,
         sender=sender,
         include_reply=True,
         # Brand-new message: it cannot be starred or pinned yet, so hand the
@@ -862,9 +859,11 @@ async def forward_message(
     original = await enrich.load_message(db, message_id)
     if original is None:
         raise SendError(status_code=404, detail="Message not found")
-    src_membership = await db.get(ConversationParticipant, (original.conversation_id, actor.id))
-    if src_membership is None:
-        raise SendError(status_code=404, detail="Message not found")
+    # The SOURCE conversation, on the same terms as any other message mutation. A
+    # revoked source keeps its participant rows, so membership alone let a former
+    # member copy a message out of a group they had been cut off from into a live
+    # one — laundering the content past the revocation.
+    await _require_message_access(db, original.conversation_id, actor)
     if original.deleted_at is not None:
         raise SendError(status_code=400, detail="Cannot forward a deleted message")
 
@@ -902,16 +901,17 @@ async def forward_message(
         conv.last_message_at = now
         await db.commit()
         loaded = await enrich.load_message(db, copy.id)
+        visible = await enrich.tenant_participants(db, conv.id)
         doc = await enrich.serialize_message(
             db,
             loaded,
-            conv_participants=participants,
+            conv_participants=visible,
             sender=actor,
             include_reply=False,
             starred_ids=set(),  # the forwarded copy is new — no stars, no pin
             pinned_ids=set(),
         )
-        others = [p.user_id for p in participants if p.user_id != actor.id]
+        others = [p.user_id for p in visible if p.user_id != actor.id]
         await publish_to_users(others, {"type": "new_message", "message": {**doc, "status": "delivered"}})
         forwarded_to.append(str(conv.id))
 
