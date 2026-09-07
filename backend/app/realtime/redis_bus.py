@@ -116,6 +116,13 @@ async def publish_to_users(user_ids, event: dict) -> None:
     # Serialized outside the guard: an unserializable payload is a bug in the
     # caller, not an outage, and must not be silently swallowed.
     payload = json.dumps(event, default=str)
+    # An empty user_ids is free and needs no guard at the call sites. redis-py's
+    # Pipeline.execute opens with `if not stack and not self.watching: return []`
+    # (verified against the pinned 5.2.1), so no command is sent and no connection
+    # is taken from the pool. That matters because callers legitimately pass an
+    # empty list — conversation_recipients returns nothing for a revoked
+    # conversation — and adding `if not user_ids: return` to each of them would be
+    # a branch per caller for no saving.
     async with degrade_on_outage("publish_to_users"):
         redis = get_redis()
         pipe = redis.pipeline()
