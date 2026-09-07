@@ -43,6 +43,11 @@ def test_a_real_extension_is_kept(label, ext):
         ("too long", "." + "z" * 500),
         ("just over the cap", "." + "z" * 17),
         ("nul byte", ".pn\x00g"),
+        # "$" matches before a trailing newline, so `match` accepted this one and
+        # `fullmatch` is what rejects it.
+        ("trailing newline", ".png\n"),
+        ("trailing carriage return", ".png\r"),
+        ("newline inside", ".p\nng"),
         ("fragment", ".png#x"),
         ("query", ".png?a=b"),
         ("space", ". png"),

@@ -522,7 +522,11 @@ def safe_ext(ext: str) -> str:
     extension, so dropping it here cannot change how a file is served.
     """
     candidate = (ext or "").lower().lstrip(".")
-    return f".{candidate}" if _SAFE_EXT.match(candidate) else ""
+    # fullmatch, not match: "$" also matches just BEFORE a trailing newline, so
+    # `match` accepted ".png\n" and put a control character in the object key. The
+    # anchors in the pattern are kept anyway rather than relying on fullmatch alone,
+    # so the intent survives someone changing one or the other.
+    return f".{candidate}" if _SAFE_EXT.fullmatch(candidate) else ""
 
 
 def new_storage_key(org_id, ext: str) -> str:
