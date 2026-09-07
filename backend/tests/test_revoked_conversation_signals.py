@@ -37,6 +37,7 @@ from app.db.session import SessionLocal
 from app.main import app
 from app.realtime import hub
 from app.services import calls as calls_service
+from app.services import conversations as conv_service
 from app.services import enrich, messaging
 from tests.conftest import CSRF, login, make_org, make_user
 
@@ -983,3 +984,96 @@ async def test_a_cross_org_group_call_still_rings_the_other_tenant(client, two_o
         uid for uids, e in sent if e.get("type") in ("call:incoming", "call:group_active") for uid in uids
     }
     assert str(users["carol"].id) in told, "a cross-org group call must ring the other tenant"
+
+
+# ---------------------------------------------------------------------------
+# Conversation-level fan-out
+# ---------------------------------------------------------------------------
+
+
+async def _ordinary_group(users, *, members: list) -> uuid.UUID:
+    async with SessionLocal() as db:
+        conv = Conversation(
+            type=ConversationType.group,
+            org_id=users["org_a"].id,
+            is_active=True,
+            name="Tenant A Group",
+        )
+        db.add(conv)
+        await db.flush()
+        db.add_all([ConversationParticipant(conversation_id=conv.id, user_id=m.id) for m in members])
+        await db.commit()
+        return conv.id
+
+
+async def test_conversation_events_skip_a_foreign_org_participant(client, two_orgs_with_users):
+    """Icon changes, renames, removals and leaves all went through one helper.
+
+    Every caller of broadcast_conversation_event is in api/groups.py — ordinary
+    group conversations — and it read the raw membership rows.
+    """
+    users = two_orgs_with_users
+    conv_id = await _ordinary_group(users, members=[users["alice"], users["bob"]])
+    outsider = users["carol"]
+    await _intrude(conv_id, outsider.id)
+
+    sent: list = []
+
+    async def _capture(user_ids, event):
+        sent.append(([str(u) for u in user_ids], event))
+
+    with _patched(conv_service, "publish_to_users", _capture):
+        async with SessionLocal() as db:
+            await conv_service.broadcast_conversation_event(
+                db, conv_id, {"type": "group_updated", "name": "Tenant A Group"}
+            )
+
+    told = [uid for uids, _ in sent for uid in uids]
+    assert str(users["bob"].id) in told, "control: the legitimate member is told"
+    assert str(outsider.id) not in told, "a group event reached a foreign-org row"
+
+
+async def test_conversation_created_is_not_sent_to_a_foreign_org_participant(client, two_orgs_with_users):
+    """The largest single disclosure of the set: a whole serialized conversation.
+
+    notify_conversation_created targets `loaded.participants` — the raw
+    relationship — and sends each recipient the conversation's name, participant
+    list and last message.
+    """
+    users = two_orgs_with_users
+    conv_id = await _ordinary_group(users, members=[users["alice"], users["bob"]])
+    outsider = users["carol"]
+    await _intrude(conv_id, outsider.id)
+
+    sent: list = []
+
+    async def _capture(user_ids, event):
+        sent.append(([str(u) for u in user_ids], event))
+
+    with _patched(conv_service, "publish_to_users", _capture):
+        async with SessionLocal() as db:
+            await conv_service.notify_conversation_created(db, conv_id)
+
+    told = [uid for uids, _ in sent for uid in uids]
+    assert str(users["bob"].id) in told, "control: the legitimate member is notified"
+    assert str(outsider.id) not in told, "a conversation document reached a foreign-org row"
+
+
+async def test_participant_ids_stays_unfiltered_on_purpose(client, two_orgs_with_users):
+    """It answers "who is a member", which is not the same question.
+
+    cross_org.py uses it to build dedup and emptiness sets, where a foreign-org row
+    must still count as present or an add would collide with the primary key.
+    Filtering it would look tidier and would break that.
+    """
+    users = two_orgs_with_users
+    conv_id = await _ordinary_group(users, members=[users["alice"], users["bob"]])
+    outsider = users["carol"]
+    await _intrude(conv_id, outsider.id)
+
+    async with SessionLocal() as db:
+        raw = set(await conv_service.participant_ids(db, conv_id))
+        filtered = {p.user_id for p in await enrich.tenant_participants(db, conv_id)}
+
+    assert outsider.id in raw, "membership is membership, however the row got there"
+    assert outsider.id not in filtered
