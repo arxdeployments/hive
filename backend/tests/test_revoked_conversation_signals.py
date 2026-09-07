@@ -25,6 +25,7 @@ from app.db.models import (
     Conversation,
     ConversationParticipant,
     ConversationType,
+    Message,
     MessageReaction,
     User,
 )
@@ -766,3 +767,113 @@ async def test_message_info_does_not_disclose_a_foreign_org_participant(client, 
     }
     assert users["bob"].display_name in listed, "control: the legitimate member is still listed"
     assert outsider.display_name not in listed, "message info disclosed a foreign-org participant by name"
+
+
+# ---------------------------------------------------------------------------
+# System messages: the callers with no actor in front of them
+# ---------------------------------------------------------------------------
+
+
+async def test_a_system_message_is_not_broadcast_into_a_revoked_conversation(client, monkeypatch):
+    """`send_system_message` takes a conversation id and broadcasts. No actor.
+
+    Group events and call records go through it, so a call ending on a group that
+    was archived mid-call — or an admin action on an archived one — pushed
+    `new_message` to every former participant of a conversation they had been cut
+    off from. Every other path into `conversation_recipients` has an actor gate in
+    front of it; these two do not.
+    """
+    org = await make_org("System Msg Co")
+    await make_user("a@sysmsg.com", org_id=org.id)
+    b = await make_user("b@sysmsg.com", org_id=org.id)
+    conv_id = await _direct_conversation("a@sysmsg.com", b)
+
+    sent: list = []
+
+    async def _capture(user_ids, event):
+        sent.append(([str(u) for u in user_ids], event))
+
+    monkeypatch.setattr(messaging, "publish_to_users", _capture)
+
+    async with SessionLocal() as db:
+        await messaging.send_system_message(db, conv_id, "Alice added Bob")
+    assert [uid for uids, _ in sent for uid in uids], "control: it broadcasts while active"
+
+    await _deactivate_conversation(conv_id)
+    sent.clear()
+    async with SessionLocal() as db:
+        await messaging.send_system_message(db, conv_id, "📞 Voice call · 0:42")
+    # The publish is still called, with nobody in it — that is a no-op delivery,
+    # and the recipient list is the property that matters.
+    assert [uid for uids, _ in sent for uid in uids] == [], (
+        "a system message was pushed into a revoked conversation"
+    )
+
+
+async def test_a_batched_system_message_is_not_broadcast_into_a_revoked_conversation(client, monkeypatch):
+    """The batch variant shares the helper, so it must share the refusal."""
+    org = await make_org("System Batch Co")
+    await make_user("a@sysbatch.com", org_id=org.id)
+    b = await make_user("b@sysbatch.com", org_id=org.id)
+    conv_id = await _direct_conversation("a@sysbatch.com", b)
+    await _deactivate_conversation(conv_id)
+
+    sent: list = []
+
+    async def _capture(user_ids, event):
+        sent.append(([str(u) for u in user_ids], event))
+
+    monkeypatch.setattr(messaging, "publish_to_users", _capture)
+    async with SessionLocal() as db:
+        await messaging.send_system_messages(db, conv_id, ["one left", "two left"])
+    assert [uid for uids, _ in sent for uid in uids] == []
+
+
+async def test_the_system_message_row_is_still_written_when_revoked(client):
+    """Not delivered is not the same as not recorded.
+
+    The row is history and no read path will serve it, so refusing the broadcast
+    must not also refuse the write — a call record that vanished because the group
+    was archived mid-call would be a different bug.
+    """
+    org = await make_org("System Row Co")
+    await make_user("a@sysrow.com", org_id=org.id)
+    b = await make_user("b@sysrow.com", org_id=org.id)
+    conv_id = await _direct_conversation("a@sysrow.com", b)
+    await _deactivate_conversation(conv_id)
+
+    async with SessionLocal() as db:
+        doc = await messaging.send_system_message(db, conv_id, "📞 Voice call · 1:03")
+    assert doc["content"] == "📞 Voice call · 1:03"
+
+    async with SessionLocal() as db:
+        stored = await db.get(Message, uuid.UUID(doc["_id"]))
+        assert stored is not None, "the system message row must still be recorded"
+        assert stored.conversation_id == conv_id
+
+
+async def test_receipts_still_render_for_a_revoked_conversation(client):
+    """Why `is_active` is on conversation_recipients and not on tenant_participants.
+
+    They answer different questions: one is "who should be told", the other is
+    "whose rows may be shown". Putting the revocation check on the second would
+    blank out the receipts of already-stored history, which is a display change
+    nobody asked for rather than a leak being closed.
+    """
+    org = await make_org("System Receipts Co")
+    a = await make_user("a@sysrcpt.com", org_id=org.id)
+    b = await make_user("b@sysrcpt.com", org_id=org.id)
+    conv_id = await _direct_conversation("a@sysrcpt.com", b)
+    msg_id = await _send_one(conv_id, a.id)
+    await _mark_participant_read(conv_id, b.id)
+    await _deactivate_conversation(conv_id)
+
+    async with SessionLocal() as db:
+        rows = await enrich.tenant_participants(db, conv_id)
+        assert {p.user_id for p in rows} == {a.id, b.id}
+        loaded = await enrich.load_message(db, msg_id)
+        doc = await enrich.serialize_message(db, loaded)
+        recipients = await messaging.conversation_recipients(db, conv_id)
+
+    assert [r["user_id"] for r in doc["read_by"]] == [str(b.id)], "history keeps its receipts"
+    assert recipients == [], "but nothing is delivered"

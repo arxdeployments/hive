@@ -125,6 +125,21 @@ async def conversation_recipients(
     included. Adding the org predicate to eight call sites would have been eight
     more places for it to go stale, which is the defect this batch is about.
     """
+    # A revoked conversation has no recipients. `is_active` belongs on THIS
+    # question rather than on enrich.tenant_participants, which answers a different
+    # one — tenant_participants supplies the rows serialize_message turns into
+    # read_by/delivered_to, and history should still render its receipts.
+    #
+    # It matters because two callers reach here with no actor gate in front of
+    # them: send_system_message and send_system_messages take a conversation id and
+    # broadcast. Group events and call records go through them, so a call ending on
+    # a group that was archived mid-call, or an admin action on an archived one,
+    # pushed `new_message` to every former participant of a conversation they had
+    # been cut off from. The row is still written — that is history, and no read
+    # path will serve it — but nothing is delivered.
+    conv = await db.get(Conversation, conversation_id)
+    if conv is None or not conv.is_active:
+        return []
     rows = await enrich.tenant_participants(db, conversation_id)
     return [p.user_id for p in rows if exclude is None or p.user_id != exclude]
 
