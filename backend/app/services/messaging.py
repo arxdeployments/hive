@@ -459,8 +459,11 @@ async def send_message(
 
     # Not `[p.user_id for p in participants]`: that list is every membership row,
     # and a foreign-org one would have been handed the message body. `participants`
-    # stays as loaded for the mute set and the serializer, both of which only ever
-    # subtract from this.
+    # stays as loaded only for the mute set below, which subtracts from this list
+    # and so cannot widen it. The serializer takes `visible` above — an earlier
+    # version of this comment still credited `participants` for that, and describing
+    # the behaviour a fix removed is the kind of stale comment this batch keeps
+    # finding.
     others = await conversation_recipients(db, msg.conversation_id, exclude=sender.id)
     statuses = await presence.get_statuses(others)
     online = [uid for uid in others if statuses.get(str(uid)) == "online"]
