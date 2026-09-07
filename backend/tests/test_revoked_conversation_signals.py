@@ -16,12 +16,16 @@ So a tenant cut off from a group kept broadcasting into it and kept receiving it
 members' online status, indefinitely, while their messages and media 404'd.
 """
 
+import contextlib
 import datetime as dt
 import uuid
 
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 from app.db.models import (
+    Call,
+    CallParticipant,
     Conversation,
     ConversationParticipant,
     ConversationType,
@@ -32,6 +36,7 @@ from app.db.models import (
 from app.db.session import SessionLocal
 from app.main import app
 from app.realtime import hub
+from app.services import calls as calls_service
 from app.services import enrich, messaging
 from tests.conftest import CSRF, login, make_org, make_user
 
@@ -42,6 +47,17 @@ async def _deactivate_conversation(conv_id: uuid.UUID) -> None:
         conv = await db.get(Conversation, conv_id)
         conv.is_active = False
         await db.commit()
+
+
+@contextlib.contextmanager
+def _patched(module, name, value):
+    """Swap an attribute back on exit — these tests patch around an await."""
+    original = getattr(module, name)
+    setattr(module, name, value)
+    try:
+        yield
+    finally:
+        setattr(module, name, original)
 
 
 def _fresh_client() -> AsyncClient:
@@ -877,3 +893,93 @@ async def test_receipts_still_render_for_a_revoked_conversation(client):
 
     assert [r["user_id"] for r in doc["read_by"]] == [str(b.id)], "history keeps its receipts"
     assert recipients == [], "but nothing is delivered"
+
+
+# ---------------------------------------------------------------------------
+# Group calls: the roster is a seat, not just an audience
+# ---------------------------------------------------------------------------
+
+
+async def test_a_group_call_roster_excludes_a_foreign_org_participant(client, two_orgs_with_users):
+    """Worse than a signal leak: the roster grants a seat.
+
+    initiate_group_call created a CallParticipant row for every membership row, so
+    a foreign-org row in an ordinary conversation was handed the caller's identity,
+    the conversation id and the group name — and a seat it could use to join the
+    audio, because POST /{id}/token only requires a CallParticipant row.
+    """
+    users = two_orgs_with_users
+    async with SessionLocal() as db:
+        conv = Conversation(type=ConversationType.group, org_id=users["org_a"].id, is_active=True)
+        db.add(conv)
+        await db.flush()
+        db.add_all(
+            [
+                ConversationParticipant(conversation_id=conv.id, user_id=users["alice"].id),
+                ConversationParticipant(conversation_id=conv.id, user_id=users["bob"].id),
+            ]
+        )
+        await db.commit()
+        conv_id = conv.id
+
+    outsider = users["carol"]
+    await _intrude(conv_id, outsider.id)
+
+    sent: list = []
+
+    async def _capture(user_ids, event):
+        sent.append(([str(u) for u in user_ids], event))
+
+    with _patched(calls_service, "publish_to_users", _capture):
+        async with SessionLocal() as db:
+            caller = await db.get(User, users["alice"].id)
+        await calls_service.initiate_group_call(caller, conv_id, "voice")
+
+    told = {
+        uid for uids, e in sent if e.get("type") in ("call:incoming", "call:group_active") for uid in uids
+    }
+    assert str(users["bob"].id) in told, "control: the legitimate member is rung"
+    assert str(outsider.id) not in told, "a foreign-org row was rung into a group call"
+
+    async with SessionLocal() as db:
+        call = (await db.execute(select(Call).where(Call.conversation_id == conv_id))).scalar_one()
+        seats = {
+            p.user_id
+            for p in (
+                await db.execute(select(CallParticipant).where(CallParticipant.call_id == call.id))
+            ).scalars()
+        }
+    assert users["bob"].id in seats, "control: the legitimate member has a seat"
+    assert outsider.id not in seats, "a foreign-org row was given a seat in the call"
+
+
+async def test_a_cross_org_group_call_still_rings_the_other_tenant(client, two_orgs_with_users):
+    """The converse. A cross_org group call is meant to span tenants."""
+    users = two_orgs_with_users
+    async with SessionLocal() as db:
+        conv = Conversation(type=ConversationType.cross_org, org_id=users["org_a"].id, is_active=True)
+        db.add(conv)
+        await db.flush()
+        db.add_all(
+            [
+                ConversationParticipant(conversation_id=conv.id, user_id=users["alice"].id),
+                ConversationParticipant(conversation_id=conv.id, user_id=users["carol"].id),
+            ]
+        )
+        await db.commit()
+        conv_id = conv.id
+
+    sent: list = []
+
+    async def _capture(user_ids, event):
+        sent.append(([str(u) for u in user_ids], event))
+
+    with _patched(calls_service, "publish_to_users", _capture):
+        async with SessionLocal() as db:
+            caller = await db.get(User, users["alice"].id)
+        await calls_service.initiate_group_call(caller, conv_id, "voice")
+
+    told = {
+        uid for uids, e in sent if e.get("type") in ("call:incoming", "call:group_active") for uid in uids
+    }
+    assert str(users["carol"].id) in told, "a cross-org group call must ring the other tenant"
