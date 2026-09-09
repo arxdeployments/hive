@@ -51,20 +51,59 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute("CREATE INDEX ix_message_attachments_created_keyset ON message_attachments (created_at, id)")
-    op.execute(
-        """CREATE INDEX ix_message_attachments_pdf_unpreviewed
-           ON message_attachments (created_at, id)
-           WHERE mime_type = 'application/pdf' AND page_count IS NULL"""
-    )
-    op.execute(
-        """CREATE INDEX ix_uploads_pdf_unpreviewed
-           ON uploads (created_at, id)
-           WHERE mime_type = 'application/pdf' AND page_count IS NULL AND claimed = false"""
-    )
+    # CONCURRENTLY, which cannot run inside a transaction, hence the autocommit
+    # block. A plain CREATE INDEX takes ACCESS EXCLUSIVE for the length of a full
+    # heap scan, and these are not quiet tables: message_attachments takes a row
+    # for every file anyone sends, and uploads one for every upload. Three
+    # non-concurrent builds in one transaction would hold that lock across all
+    # three, so every send carrying a file blocks until the last one finishes.
+    #
+    # Worse in this deployment than a stalled send. Production boots with
+    # `alembic upgrade head && python -m app.seed && uvicorn ...`
+    # (infra/docker-compose.prod.yml), so blocking here does not merely queue
+    # writes — the API never finishes starting.
+    #
+    # DROP first rather than CREATE ... IF NOT EXISTS. A cancelled or timed-out
+    # concurrent build leaves an INVALID index of the same name behind, and
+    # IF NOT EXISTS would take it for the finished article. The autocommit block
+    # commits each statement while alembic_version is stamped only once upgrade()
+    # returns, so a failure part-way leaves indexes built, this revision unstamped,
+    # and the retry re-entering here. These are not unique indexes, so an INVALID
+    # one enforces nothing and breaks nothing — it is simply never used by the
+    # planner, which would leave the tools walking unindexed while the migration
+    # reported success. Dropping first costs nothing when the index is absent.
+    #
+    # The drops are CONCURRENTLY for the same reason the creates are: a plain DROP
+    # INDEX takes ACCESS EXCLUSIVE on the table, which is the one lock this block
+    # exists to avoid. Easy to read as the harmless half because it is usually a
+    # no-op, but the case it is written for is the retry after a failed build —
+    # exactly when the index IS there and the table is live.
+    with op.get_context().autocommit_block():
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_message_attachments_created_keyset")
+        op.execute(
+            """CREATE INDEX CONCURRENTLY ix_message_attachments_created_keyset
+               ON message_attachments (created_at, id)"""
+        )
+
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_message_attachments_pdf_unpreviewed")
+        op.execute(
+            """CREATE INDEX CONCURRENTLY ix_message_attachments_pdf_unpreviewed
+               ON message_attachments (created_at, id)
+               WHERE mime_type = 'application/pdf' AND page_count IS NULL"""
+        )
+
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_uploads_pdf_unpreviewed")
+        op.execute(
+            """CREATE INDEX CONCURRENTLY ix_uploads_pdf_unpreviewed
+               ON uploads (created_at, id)
+               WHERE mime_type = 'application/pdf' AND page_count IS NULL AND claimed = false"""
+        )
 
 
 def downgrade() -> None:
-    op.execute("DROP INDEX IF EXISTS ix_uploads_pdf_unpreviewed")
-    op.execute("DROP INDEX IF EXISTS ix_message_attachments_pdf_unpreviewed")
-    op.execute("DROP INDEX IF EXISTS ix_message_attachments_created_keyset")
+    # Concurrently here too. A downgrade runs against the same live tables, and
+    # there is no reason to take on the way out the lock the way in avoided.
+    with op.get_context().autocommit_block():
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_uploads_pdf_unpreviewed")
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_message_attachments_pdf_unpreviewed")
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_message_attachments_created_keyset")
