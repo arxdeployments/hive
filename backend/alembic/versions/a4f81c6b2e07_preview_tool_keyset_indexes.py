@@ -52,8 +52,13 @@ depends_on = None
 
 def upgrade() -> None:
     # CONCURRENTLY, which cannot run inside a transaction, hence the autocommit
-    # block. A plain CREATE INDEX takes ACCESS EXCLUSIVE for the length of a full
-    # heap scan, and these are not quiet tables: message_attachments takes a row
+    # block. A plain CREATE INDEX takes SHARE for the length of a full heap scan,
+    # which conflicts with the ROW EXCLUSIVE that INSERT/UPDATE/DELETE take: it
+    # blocks writes and leaves reads alone. Measured, because an earlier version of
+    # this comment said ACCESS EXCLUSIVE — that is the DROP's lock below, not this
+    # one, and c5d81e37a204 states it correctly while this was written claiming to
+    # follow it. The overstatement did not change the conclusion: these are not
+    # quiet tables. message_attachments takes a row
     # for every file anyone sends, and uploads one for every upload. Three
     # non-concurrent builds in one transaction would hold that lock across all
     # three, so every send carrying a file blocks until the last one finishes.
