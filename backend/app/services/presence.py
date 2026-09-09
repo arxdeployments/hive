@@ -127,7 +127,7 @@ async def mark_online(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> bool:
     #
     # added/count stay 0 on an outage, so no edge is claimed: the caller treats
     # True as "just came online" and publishes a presence event from it.
-    added, count = 0, 0
+    added, count, wrote = 0, 0, False
     async with degrade_on_outage("presence.mark_online"):
         pipe = get_redis().pipeline(transaction=True)
         key = _key(user_id)
@@ -135,9 +135,18 @@ async def mark_online(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> bool:
         pipe.expire(key, _TTL)
         pipe.scard(key)
         added, _, count = await pipe.execute()
+        wrote = True
     # After the authoritative write, and best-effort: the index must never be
     # able to fail a connection that Redis has already accepted as online.
-    await _index_add(user_id, org_id)
+    #
+    # Only if that write LANDED, though. Guarding the pipeline above opened a new
+    # way for the two to disagree: a blip that fails the authoritative write and
+    # then recovers would leave the index claiming this user is online while their
+    # presence key holds no connection at all. Same drift refresh() was just fixed
+    # for, arriving by the opposite route — and unlike a count ageing out of its
+    # window, nothing reconciles this one.
+    if wrote:
+        await _index_add(user_id, org_id)
     return bool(added) and count == 1
 
 
@@ -170,16 +179,23 @@ async def refresh(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> None:
     a state change anyone can be told about reliably — publish_to_users was
     degraded through the same outage — and peers refetch on reconnect.
     """
+    wrote = False
     async with degrade_on_outage("presence.refresh"):
         key = _key(user_id)
         pipe = get_redis().pipeline(transaction=True)
         pipe.sadd(key, conn_id)
         pipe.expire(key, _TTL)
         await pipe.execute()
+        wrote = True
     # Re-scores rather than merely extending: the index counts by recency, so a
     # connection that never re-scored would age out of the count while its
     # presence key was still being kept alive right beside it.
-    await _index_add(user_id, org_id)
+    #
+    # Conditional for the same reason as in mark_online: re-scoring off the back of
+    # a failed authoritative write is how the index and the authority come to
+    # disagree with nothing to reconcile them.
+    if wrote:
+        await _index_add(user_id, org_id)
 
 
 async def mark_offline(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> bool:

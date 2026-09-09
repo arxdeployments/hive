@@ -167,3 +167,76 @@ async def test_a_heartbeat_is_idempotent_for_a_live_connection(client):
 
     members = await get_redis().smembers(presence._key(user.id))
     assert {m.decode() if isinstance(m, bytes) else m for m in members} == {"conn-1"}
+
+
+# ---------------------------------------------------------------------------
+# A blip that recovers between the two writes
+# ---------------------------------------------------------------------------
+
+
+class _RecoveringRedis:
+    """Fails the first pipeline, then behaves like the real client.
+
+    Models the interleaving that guarding the authoritative write opened up: the
+    pipeline fails, degrade_on_outage swallows it, and by the time _index_add runs
+    Redis is answering again. Every other attribute delegates, so the index write
+    lands for real and the assertion is about the index's actual contents.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self._failed = False
+
+    def pipeline(self, *args, **kwargs):
+        if not self._failed:
+            self._failed = True
+            return _DeadPipeline()
+        return self._real.pipeline(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@pytest.fixture
+def redis_that_recovers(monkeypatch):
+    """ONE instance, deliberately.
+
+    `lambda: _RecoveringRedis(get_redis())` builds a fresh double per call, so its
+    "first pipeline" counter resets and EVERY pipeline dies — which made the two
+    tests below pass for the wrong reason: they were exercising a total outage, not
+    a blip that recovers between the authoritative write and the index write.
+    Caught by mutation: removing the `if wrote:` guards did not fail them.
+    """
+    double = _RecoveringRedis(get_redis())
+    monkeypatch.setattr(presence, "get_redis", lambda: double)
+
+
+async def test_a_failed_authoritative_write_does_not_still_index_the_user(client, redis_that_recovers):
+    """The index must not claim someone is online whose presence key is empty.
+
+    presence.py's own comment allows the advisory index to put a wrong number on an
+    admin tile, on the grounds that a drifted entry ages out of the window. This
+    drift would not: mark_online would keep being called on each new socket and
+    keep re-adding an entry for a user with no connection recorded.
+    """
+    org = await make_org("Presence Blip Co")
+    user = await make_user("pres-blip@x.com", org_id=org.id)
+
+    came_online = await presence.mark_online(user.id, "conn-1", org_id=org.id)
+
+    assert came_online is False
+    assert await presence.is_online(user.id) is False, "the authoritative write failed"
+    assert await presence.count_online_in_org(org.id) == 0, (
+        "the index recorded a user the authority has no connection for"
+    )
+
+
+async def test_a_failed_heartbeat_does_not_still_rescore_the_index(client, redis_that_recovers):
+    """Same rule on the refresh path, which re-scores rather than adds."""
+    org = await make_org("Presence Blip Refresh Co")
+    user = await make_user("pres-blip-refresh@x.com", org_id=org.id)
+
+    await presence.refresh(user.id, "conn-1", org_id=org.id)
+
+    assert await presence.is_online(user.id) is False
+    assert await presence.count_online_in_org(org.id) == 0
