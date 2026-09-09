@@ -120,6 +120,15 @@ async def get_or_create_direct(
 
 
 async def participant_ids(db: AsyncSession, conversation_id: uuid.UUID) -> list[uuid.UUID]:
+    """Raw membership, unfiltered — the honest answer to "who is a member".
+
+    Deliberately NOT tenant-filtered, because its callers ask two different
+    questions and only one of them is about disclosure. cross_org.py uses it to
+    build dedup and emptiness sets, where a foreign-org row must still count as
+    present or an add would collide with the primary key. Anything that FANS OUT
+    must use enrich.tenant_participants instead — see broadcast_conversation_event
+    directly below, which used this and should not have.
+    """
     return (
         (
             await db.execute(
@@ -136,8 +145,12 @@ async def participant_ids(db: AsyncSession, conversation_id: uuid.UUID) -> list[
 async def broadcast_conversation_event(
     db: AsyncSession, conversation_id: uuid.UUID, event: dict, *, exclude: uuid.UUID | None = None
 ) -> None:
-    ids = await participant_ids(db, conversation_id)
-    targets = [u for u in ids if u != exclude]
+    # Tenant-filtered, unlike participant_ids above. Every caller of this is in
+    # api/groups.py — ordinary group conversations, not cross_org ones — and the
+    # events are icon changes, renames, member removals and leaves. A foreign-org
+    # participant row in one of those groups was receiving all of it.
+    rows = await enrich.tenant_participants(db, conversation_id)
+    targets = [p.user_id for p in rows if p.user_id != exclude]
     await publish_to_users(targets, event)
 
 
@@ -148,7 +161,15 @@ async def notify_conversation_created(
     loaded = await enrich.load_conversation_with_participants(db, conversation_id)
     if loaded is None:
         return
-    targets = only if only is not None else [p.user_id for p in loaded.participants]
+    # `loaded.participants` is the raw relationship, so the default audience needs
+    # the same filter as everything else — this one hands over a fully serialized
+    # conversation (name, participant list, last message), which is the largest
+    # single disclosure of the set. An explicit `only` is the caller naming its own
+    # recipients and is left alone.
+    if only is not None:
+        targets = only
+    else:
+        targets = [p.user_id for p in await enrich.tenant_participants(db, conversation_id)]
     for uid in targets:
         doc = await enrich.serialize_conversation(db, loaded, uid)
         await publish_to_users([uid], {"type": "conversation_created", "conversation": doc})

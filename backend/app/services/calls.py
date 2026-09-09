@@ -56,7 +56,7 @@ from app.db.models import (
 )
 from app.db.session import SessionLocal
 from app.realtime.redis_bus import get_redis, publish_to_users
-from app.services import call_deadlines, presence
+from app.services import call_deadlines, enrich, presence
 from app.utils import iso_z, now_utc
 
 logger = logging.getLogger(__name__)
@@ -576,17 +576,17 @@ async def initiate_group_call(user: User, conversation_id: uuid.UUID, call_type:
             await publish_to_users([caller.id], {"type": "call:error", "message": "Already in a call"})
             return
 
-        member_ids = (
-            (
-                await db.execute(
-                    select(ConversationParticipant.user_id).where(
-                        ConversationParticipant.conversation_id == conversation_id
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        # The ROSTER, not just the caller. The caller's org is checked above; these
+        # rows were not, and the same asymmetry that ran through api/messages.py ran
+        # here — except this is worse than a fan-out audience. A CallParticipant row
+        # is created for every id below, so a foreign-org participant row in an
+        # ordinary conversation was handed the caller's identity, the conversation id
+        # and the group name, AND a seat it could use to join the audio.
+        #
+        # enrich.tenant_participants is the canonical filter: it admits a foreign org
+        # only for a cross_org conversation, which is exactly where a group call is
+        # meant to span tenants.
+        member_ids = [p.user_id for p in await enrich.tenant_participants(db, conversation_id)]
 
         ctype = CallType.video if call_type == "video" else CallType.voice
         now = now_utc()
