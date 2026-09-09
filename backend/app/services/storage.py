@@ -8,6 +8,7 @@ short-lived presigned URL.
 import datetime as dt
 import io
 import logging
+import re
 import uuid
 from functools import lru_cache
 from urllib.parse import urlsplit
@@ -496,6 +497,38 @@ def rewrite_to_public(url: str, public_endpoint: str) -> str:
     return f"{public}{parts.path}{query}"
 
 
+# An extension is whatever followed the last dot in a name the client chose, so it
+# is arbitrary text of arbitrary length. os.path.splitext is path-aware and never
+# yields a "/", so it cannot escape the org scope — that much was already safe.
+# What it could do was make the key unusable: a filename with a 500-character
+# extension produced a 546-character object name, which minio refuses with
+# XMinioInvalidObjectName, and the S3Error came straight back out of the upload
+# endpoint as a 500. Measured before this: a 100-character extension uploaded
+# fine, a 500-character one raised.
+#
+# 16 is well past every real extension (".jpeg", ".webm", ".xlsx") and leaves the
+# key comfortably inside both the store's limit and uploads.storage_key's
+# String(500).
+_MAX_EXT = 16
+_SAFE_EXT = re.compile(rf"^[a-z0-9]{{1,{_MAX_EXT}}}$")
+
+
+def safe_ext(ext: str) -> str:
+    """A client extension reduced to something that can be part of an object name.
+
+    Anything else is dropped rather than mangled: the extension in the key is a
+    readability convenience, and the authoritative record of what the user sent is
+    uploads.filename. MIME_BY_EXT already decides the content type from the ORIGINAL
+    extension, so dropping it here cannot change how a file is served.
+    """
+    candidate = (ext or "").lower().lstrip(".")
+    # fullmatch, not match: "$" also matches just BEFORE a trailing newline, so
+    # `match` accepted ".png\n" and put a control character in the object key. The
+    # anchors in the pattern are kept anyway rather than relying on fullmatch alone,
+    # so the intent survives someone changing one or the other.
+    return f".{candidate}" if _SAFE_EXT.fullmatch(candidate) else ""
+
+
 def new_storage_key(org_id, ext: str) -> str:
     scope = str(org_id) if org_id else "platform"
-    return f"{scope}/{uuid.uuid4()}{ext.lower()}"
+    return f"{scope}/{uuid.uuid4()}{safe_ext(ext)}"

@@ -304,6 +304,27 @@ async def serve_attachment(
     return RedirectResponse(url, status_code=307)
 
 
+def _too_large_to_render(attachment: MessageAttachment) -> bool:
+    """Would rendering this hold more in memory than the UPLOAD path would accept?
+
+    The upload path declines to buffer a preview source above
+    THUMBNAIL_SOURCE_LIMIT — "Previews need the bytes in memory, so they are the
+    one thing still bounded by size". The paths that read the same object back
+    applied no bound at all, and the self-healing preview below is aimed exactly at
+    the files upload declined: its guard runs when a PDF has no thumbnail_key AND
+    no page_count, which is precisely the state a >64 MB upload leaves. So the file
+    upload refused to buffer was the file a member's first chat open pulled into the
+    worker whole, up to max_upload_bytes — 2 GB by default.
+
+    storage._PDF_LIMITER is CapacityLimiter(1), which makes that worse rather than
+    better: it serialises the render, so concurrent requests queue and each one is
+    already sitting on its own full copy of the file.
+
+    Decided from file_size on the row, so nothing is fetched to find out.
+    """
+    return (attachment.file_size or 0) > storage.THUMBNAIL_SOURCE_LIMIT
+
+
 async def _ensure_pdf_preview(db: AsyncSession, attachment: MessageAttachment) -> None:
     """Render and persist page 1 of a PDF that has never been processed.
 
@@ -326,6 +347,14 @@ async def _ensure_pdf_preview(db: AsyncSession, attachment: MessageAttachment) -
         or attachment.mime_type != "application/pdf"
         or attachment.page_count is not None
     ):
+        return
+    if _too_large_to_render(attachment):
+        # Marked as tried rather than fetched. page_count = 0 is this module's
+        # "could not render" marker, so the file keeps its icon and no later view
+        # re-enters this path — without it the refusal would be re-made, and the
+        # object re-considered, on every single request forever.
+        attachment.page_count = 0
+        await db.commit()
         return
     data = await storage.get_object(attachment.storage_key)
     thumb, pages = await storage.make_pdf_preview(data)
@@ -415,6 +444,14 @@ async def serve_pdf_page(
 
     key = f"{attachment.storage_key}_p{page_no}.jpg"
     if not await storage.object_exists(key):
+        # Checked here as well as in _ensure_pdf_preview, and not redundantly: a
+        # page_count already set does not prove the file is small. The backfill and
+        # regenerate tools in app/tools set it with no size bound of their own, and
+        # rows predate this limit — either way a window miss would fetch the whole
+        # object. The cached-page branch above stays reachable, so a file rendered
+        # before this still serves the pages it already has.
+        if _too_large_to_render(attachment):
+            raise _not_found()
         data = await storage.get_object(attachment.storage_key)
         pages = await storage.render_pdf_window(data, page_no)
         if page_no not in pages:
