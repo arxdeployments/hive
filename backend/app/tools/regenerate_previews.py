@@ -31,6 +31,7 @@ from sqlalchemy import or_, select
 from app.db.models import MessageAttachment
 from app.db.session import SessionLocal, engine
 from app.services import storage
+from app.tools.paging import iter_keyset
 
 PDF_MIME = "application/pdf"
 
@@ -46,16 +47,25 @@ async def _regenerate(kind: str, dry_run: bool, limit: int | None, only_missing:
         if kind in ("pdf", "all"):
             conds.append(MessageAttachment.mime_type == PDF_MIME)
 
-        stmt = select(MessageAttachment).where(or_(*conds)).order_by(MessageAttachment.created_at)
+        stmt = select(MessageAttachment).where(or_(*conds))
         if only_missing:
             stmt = stmt.where(MessageAttachment.thumbnail_key.is_(None))
-        if limit:
-            stmt = stmt.limit(limit)
 
-        rows = (await db.execute(stmt)).scalars().all()
-        print(f"{len(rows)} attachment(s) to consider (kind={kind})\n")
+        # Paged, not `.all()`. Without --limit this selection is every image and
+        # every PDF attachment in the database, and reading it whole put the entire
+        # table in the operator's process before the first file was touched. The
+        # docstring's promise — "committed as it goes" — was true of the writes and
+        # not of the read. No count printed up front any more: knowing it would mean
+        # the COUNT(*) this exists to avoid.
+        print(f"walking attachments (kind={kind})\n")
 
-        for a in rows:
+        async for a in iter_keyset(
+            db,
+            stmt,
+            MessageAttachment.created_at,
+            MessageAttachment.id,
+            limit=limit,
+        ):
             label = f"  {a.filename[:44]:44}"
             is_pdf = a.mime_type == PDF_MIME
 
@@ -68,6 +78,21 @@ async def _regenerate(kind: str, dry_run: bool, limit: int | None, only_missing:
 
             if dry_run:
                 print(f"{label} would re-render ({'pdf' if is_pdf else 'image'})")
+                skipped += 1
+                continue
+
+            # The same ceiling the request paths apply, from the same function.
+            # This tool exists to RE-render, so it reaches files that already have a
+            # preview — including ones rendered before that ceiling existed. Without
+            # this it reads them whole, and a successful re-render would write a
+            # positive page_count that api/media.py then has to defend against.
+            #
+            # page_count is left exactly as it was. Unlike the backfill, which is
+            # visiting never-tried rows, an existing count here is a fact about a
+            # preview that already exists, and a skip is not new information about
+            # the document.
+            if storage.too_large_to_render(a.file_size):
+                print(f"{label} SKIP — too large to re-render ({a.file_size} bytes)")
                 skipped += 1
                 continue
 

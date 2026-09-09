@@ -583,12 +583,24 @@ MIGRATION_OWNED_COLUMNS = frozenset({("messages", "search_tsv")})
 #   ix_messages_links               the Links tab's own ILIKE predicate (4471a6d661d3)
 #   ix_users_org_display_name       the capped roster's ORDER BY (b7e21c4a9d33)
 #   ix_message_attachments_message_id  the attachment foreign key (b7e21c4a9d33)
+#   ix_message_attachments_created_keyset   \
+#   ix_message_attachments_pdf_unpreviewed   > the preview tools' keyset walks
+#   ix_uploads_pdf_unpreviewed              /  (a4f81c6b2e07)
+#
+# The last three exist because app/tools walks those tables keyset-paged, and two
+# of them carry the tools' own scan predicates. Declaring them on the models would
+# describe a maintenance script's query shape as a property of the schema, which
+# it is not — and the partial predicates could not be expressed there anyway
+# without repeating them a third time.
 MIGRATION_OWNED_INDEXES = frozenset(
     {
         "ix_messages_search_tsv",
         "ix_messages_links",
         "ix_users_org_display_name",
         "ix_message_attachments_message_id",
+        "ix_message_attachments_created_keyset",
+        "ix_message_attachments_pdf_unpreviewed",
+        "ix_uploads_pdf_unpreviewed",
     }
 )
 

@@ -84,6 +84,23 @@ MAX_UPLOAD_BYTES = get_settings().max_upload_bytes
 # sends; it just arrives without a preview image.
 THUMBNAIL_SOURCE_LIMIT = 64 * 1024 * 1024
 
+
+def too_large_to_render(file_size: int | None) -> bool:
+    """Would rendering a preview for this hold more than an UPLOAD may buffer?
+
+    The upload path declines to keep a preview source in memory above
+    THUMBNAIL_SOURCE_LIMIT. Batch 54 applied the same ceiling to the two request
+    paths that render on demand. This lives here, in the module that owns the
+    limit, because the maintenance tools in app/tools need the identical answer and
+    importing api/media.py into a CLI script would be the wrong direction — and a
+    second copy of the comparison is how the tools came to disagree with the
+    request paths in the first place.
+
+    Answered from a stored size so no caller has to fetch an object to find out.
+    """
+    return (file_size or 0) > THUMBNAIL_SOURCE_LIMIT
+
+
 MIME_BY_EXT = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
