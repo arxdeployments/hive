@@ -42,6 +42,19 @@ async def iter_keyset(
 
     `stmt` must NOT carry its own ORDER BY or LIMIT — both belong to the paging and
     are applied here.
+
+    THE WALK IS BEST-EFFORT, NOT A SNAPSHOT
+
+    A short page proves only that the selection was exhausted when THAT query ran.
+    A matching row committed afterwards — by ordinary traffic, while the sweep is
+    running — is not processed in this run. Nor is one whose created_at sorts before
+    the cursor, since the keyset has already moved past it.
+
+    That is the right trade for these tools and worth stating rather than leaving to
+    be discovered: both are re-runnable sweeps whose next run picks up whatever this
+    one missed, and neither promises to process an exact start-of-run set. A tool
+    that did need that guarantee would want a high-water mark taken before the walk
+    begins and carried as an upper bound, not this.
     """
     ordered = stmt.order_by(created_col, id_col)
     seen = 0
