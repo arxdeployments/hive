@@ -21,7 +21,7 @@ import datetime as dt
 import uuid
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.db.models import (
     Conversation,
@@ -263,3 +263,75 @@ async def test_a_selection_that_never_shrinks_terminates(client):
             async for row in iter_keyset(db, _selection(), Upload.created_at, Upload.id, page=1)
         ]
     assert seen == ids
+
+
+# ---------------------------------------------------------------------------
+# The indexes the paged walks depend on
+# ---------------------------------------------------------------------------
+
+# Each entry is (label, index name, the query the tool actually issues). The
+# predicates must stay identical to the tools' selections and to the migration's
+# WHERE clauses: Postgres silently stops using a partial index when they drift,
+# and the symptom is a slow tool rather than a failure. Migration a4f81c6b2e07
+# records the same trade the links-tab index does.
+_KEYSET_PLANS = [
+    (
+        "regenerate --kind all",
+        "ix_message_attachments_created_keyset",
+        """SELECT * FROM message_attachments
+           WHERE (mime_type LIKE 'image/%' OR mime_type = 'application/pdf')
+             AND (created_at, id) > (now(), '00000000-0000-0000-0000-000000000000'::uuid)
+           ORDER BY created_at, id LIMIT 200""",
+    ),
+    (
+        "backfill attachments",
+        "ix_message_attachments_pdf_unpreviewed",
+        """SELECT * FROM message_attachments
+           WHERE mime_type = 'application/pdf' AND page_count IS NULL
+             AND (created_at, id) > (now(), '00000000-0000-0000-0000-000000000000'::uuid)
+           ORDER BY created_at, id LIMIT 200""",
+    ),
+    (
+        "backfill uploads",
+        "ix_uploads_pdf_unpreviewed",
+        """SELECT * FROM uploads
+           WHERE mime_type = 'application/pdf' AND page_count IS NULL AND claimed = false
+             AND (created_at, id) > (now(), '00000000-0000-0000-0000-000000000000'::uuid)
+           ORDER BY created_at, id LIMIT 200""",
+    ),
+]
+
+
+@pytest.mark.parametrize(("label", "index", "query"), _KEYSET_PLANS, ids=[p[0] for p in _KEYSET_PLANS])
+async def test_the_keyset_walk_is_index_backed(client, label, index, query):
+    """Paging without a supporting index is the worse half of the trade.
+
+    Before migration a4f81c6b2e07 neither table had ANY index on created_at, so
+    every continuation query filtered and sorted the remaining matching rows —
+    bounding Python memory by growing database work instead.
+
+    WHAT THIS ASSERTS, AND WHAT IT DELIBERATELY DOES NOT
+
+    That the index is USABLE for the query. That is the property which can break
+    silently: a partial index stops being considered the moment its predicate
+    drifts from the tool's selection, and the symptom is a slow tool rather than
+    a failure.
+
+    It does NOT assert the absence of a Sort node, even though an ordered index
+    scan is the point. Whether the planner takes an ordered Index Scan or a
+    Bitmap Index Scan plus a Sort depends on row-count statistics rather than on
+    whether the index matches: on these near-empty test tables it picks the
+    bitmap, and against a populated database it picks the ordered scan. Verified
+    by hand there, on all three queries, with no Sort node. Asserting it here
+    would be asserting the planner's cost model on an empty table.
+
+    enable_seqscan is forced off for the same reason: on a tiny table a
+    sequential scan wins on cost and says nothing about the index.
+    """
+    async with SessionLocal() as db:
+        await db.execute(text("SET LOCAL enable_seqscan = off"))
+        plan = "\n".join(row[0] for row in (await db.execute(text("EXPLAIN " + query))).all())
+
+    assert index in plan, (
+        f"{label} did not use {index} — its predicate has probably drifted from the index's:\n{plan}"
+    )
