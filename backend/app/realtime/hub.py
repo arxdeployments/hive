@@ -586,7 +586,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     break
 
             if data["type"] == "ping":
-                await presence.refresh(user.id, org_id=user.org_id)
+                await presence.refresh(user.id, conn_id, org_id=user.org_id)
                 await registry.send_to(
                     user.id, conn_id, json.dumps({"type": "pong", "timestamp": iso_z(now_utc())})
                 )

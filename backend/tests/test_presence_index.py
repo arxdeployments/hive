@@ -105,7 +105,7 @@ async def test_a_heartbeat_rescores_so_a_long_call_is_not_aged_out():
     await get_redis().zadd(presence._INDEX, {str(user): stale})
     await get_redis().zadd(presence._org_index(org), {str(user): stale})
 
-    await presence.refresh(user, org_id=org)
+    await presence.refresh(user, "conn-1", org_id=org)
 
     assert await presence.count_online() == 1
     assert await presence.count_online_in_org(org) == 1

@@ -141,8 +141,8 @@ async def mark_online(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> bool:
     return bool(added) and count == 1
 
 
-async def refresh(user_id: uuid.UUID, *, org_id=None) -> None:
-    """Extend this user's presence TTL. Best-effort, and that matters here.
+async def refresh(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> None:
+    """Re-assert that this connection is alive. Best-effort, and that matters here.
 
     This is the websocket loop's `ping` branch (realtime/hub.py). That branch sits
     OUTSIDE the try/except wrapping _handle_inbound, and the enclosing try catches
@@ -151,13 +151,31 @@ async def refresh(user_id: uuid.UUID, *, org_id=None) -> None:
     ping, within the 60-second heartbeat, all at the same moment: the outage
     turned into a reconnect storm on top of itself.
 
-    Degrading instead costs the TTL one interval. The key expires 90 seconds after
-    the last successful refresh, so a brief outage shows the user offline for a
-    moment and the next ping repairs it — which is the trade the rest of this
-    module already makes.
+    SADD, not a bare EXPIRE, and it takes conn_id for that reason.
+
+    EXPIRE on a missing key returns 0 and does nothing — measured, after asserting
+    the opposite in an earlier version of this docstring. So once the key had aged
+    out, which is exactly what an outage longer than _TTL causes, no number of
+    pings could bring the user back: they stayed offline until their socket
+    reconnected and mark_online ran. Worse, _index_add below ZADDs unconditionally,
+    so every ping re-added them to the advisory index while the authority still
+    said offline — count_online reported them online with no green dot anywhere to
+    match, and the drift persisted instead of ageing out.
+
+    Re-adding the member makes the heartbeat mean what it says: this connection is
+    alive, so this user is online. It is idempotent for the ordinary case, since
+    the member is already in the set.
+
+    No `online` edge is published from here. A resurrection after an outage is not
+    a state change anyone can be told about reliably — publish_to_users was
+    degraded through the same outage — and peers refetch on reconnect.
     """
     async with degrade_on_outage("presence.refresh"):
-        await get_redis().expire(_key(user_id), _TTL)
+        key = _key(user_id)
+        pipe = get_redis().pipeline(transaction=True)
+        pipe.sadd(key, conn_id)
+        pipe.expire(key, _TTL)
+        await pipe.execute()
     # Re-scores rather than merely extending: the index counts by recency, so a
     # connection that never re-scored would age out of the count while its
     # presence key was still being kept alive right beside it.

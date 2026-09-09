@@ -25,8 +25,9 @@ import uuid
 
 import pytest
 
+from app.realtime.redis_bus import get_redis
 from app.services import presence
-from tests.conftest import make_user
+from tests.conftest import make_org, make_user
 
 _REFUSED = "Error 61 connecting to localhost:6379. Connection refused."
 
@@ -69,7 +70,7 @@ async def test_refresh_degrades_instead_of_dropping_the_socket(client, dead_pres
     WebSocketDisconnect.
     """
     user = await make_user("pres-refresh@x.com")
-    await presence.refresh(user.id, org_id=user.org_id)
+    await presence.refresh(user.id, "conn-1", org_id=user.org_id)
 
 
 async def test_mark_offline_degrades_instead_of_raising_from_finally(client, dead_presence_redis):
@@ -106,3 +107,54 @@ async def test_the_read_paths_already_degraded(client, dead_presence_redis):
     assert await presence.get_statuses([user.id]) == {str(user.id): "offline"}
     assert await presence.count_online() == 0
     assert await presence.count_online_in_org(uuid.uuid4()) == 0
+
+
+# ---------------------------------------------------------------------------
+# Recovery after an outage longer than the TTL
+# ---------------------------------------------------------------------------
+
+
+async def test_a_heartbeat_brings_a_user_back_after_the_key_aged_out(client):
+    """EXPIRE on a missing key does nothing, so a bare TTL bump could not recover.
+
+    An outage longer than _TTL is exactly what ages the key out. Measured before
+    the fix: EXPIRE returned 0, the key stayed gone, and no number of pings brought
+    the user back — they were offline until their socket reconnected and
+    mark_online ran. Meanwhile _index_add ZADDs unconditionally, so every ping
+    re-added them to the advisory index while the authority still said offline:
+    count_online reported them online with no green dot anywhere to match.
+    """
+    # An org, because the org index is only written when org_id is not None and
+    # the point of this test is that the two views agree again afterwards.
+    org = await make_org("Presence Revive Co")
+    user = await make_user("pres-revive@x.com", org_id=org.id)
+    redis = get_redis()
+
+    await presence.mark_online(user.id, "conn-1", org_id=user.org_id)
+    assert await presence.is_online(user.id) is True
+
+    # What an outage longer than the TTL leaves behind.
+    await redis.delete(presence._key(user.id))
+    assert await presence.is_online(user.id) is False
+
+    await presence.refresh(user.id, "conn-1", org_id=user.org_id)
+
+    assert await presence.is_online(user.id) is True, (
+        "the heartbeat did not re-register the connection, so the user stays "
+        "offline until their socket reconnects"
+    )
+    assert await presence.get_statuses([user.id]) == {str(user.id): "online"}
+    # And the two agree again, which is the drift this closes.
+    assert await presence.count_online_in_org(user.org_id) == 1
+
+
+async def test_a_heartbeat_is_idempotent_for_a_live_connection(client):
+    """The ordinary case: the member is already in the set, so nothing changes."""
+    user = await make_user("pres-idem@x.com")
+    await presence.mark_online(user.id, "conn-1", org_id=user.org_id)
+
+    for _ in range(3):
+        await presence.refresh(user.id, "conn-1", org_id=user.org_id)
+
+    members = await get_redis().smembers(presence._key(user.id))
+    assert {m.decode() if isinstance(m, bytes) else m for m in members} == {"conn-1"}
