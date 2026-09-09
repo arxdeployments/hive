@@ -322,7 +322,7 @@ def _too_large_to_render(attachment: MessageAttachment) -> bool:
 
     Decided from file_size on the row, so nothing is fetched to find out.
     """
-    return (attachment.file_size or 0) > storage.THUMBNAIL_SOURCE_LIMIT
+    return storage.too_large_to_render(attachment.file_size)
 
 
 async def _ensure_pdf_preview(db: AsyncSession, attachment: MessageAttachment) -> None:
