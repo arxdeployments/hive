@@ -25,6 +25,15 @@ import uuid
 
 import pytest
 
+# redis-py's ConnectionError, not the builtin. They are different exceptions:
+# redis.exceptions.ConnectionError subclasses RedisError and NOT OSError, while
+# the builtin subclasses OSError. degrade_on_outage catches (RedisError, OSError),
+# so a double raising the builtin is handled through the OSError arm and never
+# exercises the arm a real redis-py failure takes — a test that passes for a
+# reason other than the one it names. Narrowing that guard to OSError alone would
+# break every outage path in production while leaving these green.
+from redis.exceptions import ConnectionError as RedisConnectionError
+
 from app.realtime.redis_bus import get_redis
 from app.services import presence
 from tests.conftest import make_org, make_user
@@ -42,7 +51,7 @@ class _DeadPipeline:
         return _queue
 
     async def execute(self, *_args, **_kwargs):
-        raise ConnectionError(_REFUSED)
+        raise RedisConnectionError(_REFUSED)
 
 
 class _DeadRedis:
@@ -51,7 +60,7 @@ class _DeadRedis:
 
     def __getattr__(self, _name):
         async def _raise(*_args, **_kwargs):
-            raise ConnectionError(_REFUSED)
+            raise RedisConnectionError(_REFUSED)
 
         return _raise
 
