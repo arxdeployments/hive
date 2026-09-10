@@ -198,8 +198,19 @@ async def refresh(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> None:
         await _index_add(user_id, org_id)
 
 
-async def mark_offline(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> bool:
-    """Deregister a connection. Returns True if the user just went offline.
+async def mark_offline(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> bool | None:
+    """Deregister a connection.
+
+    True  — this was the last socket, so the user just went offline.
+    False — other sockets remain.
+    None  — Redis could not be asked, so the answer is UNKNOWN.
+
+    None rather than False for the unknown case, because the two are not the same
+    question and one caller cannot treat them alike. A client error does not prove
+    the transaction had no effect: Redis can apply the MULTI/EXEC and lose the
+    reply on the way back, in which case the SREM really did remove the last
+    connection and this user really is offline. Returning False there told the
+    caller "other sockets remain", which is a claim, not an absence of one.
 
     MULTI for the same reason as mark_online: the `offline` broadcast is an edge.
     """
@@ -221,6 +232,8 @@ async def mark_offline(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> bool
         pipe.srem(key, conn_id)
         pipe.scard(key)
         _, count = await pipe.execute()
+    if count < 0:
+        return None
     if count == 0:
         # Only when the last socket goes. A user with a phone and a browser open
         # is still online after one of them closes, and dropping them from the

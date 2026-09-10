@@ -34,6 +34,7 @@ import pytest
 # break every outage path in production while leaving these green.
 from redis.exceptions import ConnectionError as RedisConnectionError
 
+from app.realtime import hub
 from app.realtime.redis_bus import get_redis
 from app.services import presence
 from tests.conftest import make_org, make_user
@@ -90,9 +91,11 @@ async def test_mark_offline_degrades_instead_of_raising_from_finally(client, dea
     """
     user = await make_user("pres-offline@x.com")
     went_offline = await presence.mark_offline(user.id, "conn-1", org_id=user.org_id)
-    assert went_offline is False, (
-        "with presence unknown, the offline edge must not fire: broadcasting it "
-        "would grey out a user who may still hold a socket on another worker"
+    assert went_offline is None, (
+        "an unreachable Redis is UNKNOWN, not False. A client error does not prove "
+        "the transaction had no effect — Redis can apply the EXEC and lose the "
+        "reply — so False would be a claim rather than the absence of one, and the "
+        "call path reads it as 'other sockets remain'"
     )
 
 
@@ -240,3 +243,70 @@ async def test_a_failed_heartbeat_does_not_still_rescore_the_index(client, redis
 
     assert await presence.is_online(user.id) is False
     assert await presence.count_online_in_org(org.id) == 0
+
+
+# ---------------------------------------------------------------------------
+# The call grace window's own decision (issue #89)
+# ---------------------------------------------------------------------------
+
+
+async def test_mark_offline_reports_the_three_outcomes_distinctly(client):
+    """True, False and None are three different answers and the caller needs all."""
+    org = await make_org("Presence Tri Co")
+    user = await make_user("pres-tri@x.com", org_id=org.id)
+
+    await presence.mark_online(user.id, "c1", org_id=org.id)
+    await presence.mark_online(user.id, "c2", org_id=org.id)
+
+    assert await presence.mark_offline(user.id, "c1", org_id=org.id) is False, (
+        "one of two sockets closed — the user is still online"
+    )
+    assert await presence.mark_offline(user.id, "c2", org_id=org.id) is True, "the last socket closed"
+
+
+async def test_mark_offline_is_unknown_not_false_when_redis_cannot_be_asked(client, dead_presence_redis):
+    user = await make_user("pres-unknown@x.com")
+    assert await presence.mark_offline(user.id, "c1", org_id=user.org_id) is None
+
+
+async def test_an_unknown_result_asks_the_authority_before_skipping_the_grace_window(client):
+    """Issue #89. Redis can apply the EXEC and lose the reply on the way back.
+
+    The SREM really removed the last connection, so the user really has no live
+    transport — but mark_offline could not read the SCARD and returns None.
+    Treating that as "other sockets remain" skipped handle_user_link_down and lost
+    a call that would have survived a reconnect.
+    """
+    org = await make_org("Grace Unknown Co")
+    user = await make_user("grace-unknown@x.com", org_id=org.id)
+
+    # No presence key: exactly the state an applied-but-unacknowledged SREM leaves.
+    assert await presence.is_online(user.id) is False
+    assert await hub._lost_last_transport(user.id, None) is True, (
+        "an unknown result plus an authority that says the user is gone must open the grace window"
+    )
+
+
+async def test_an_unknown_result_does_not_open_a_window_for_a_user_still_connected(client):
+    """The converse, and the reason this is not just an unconditional call.
+
+    Someone closing one of two tabs must not arm a grace deadline or show their
+    peers "Connecting…" for a call that never lost its transport.
+    """
+    org = await make_org("Grace Still Here Co")
+    user = await make_user("grace-still@x.com", org_id=org.id)
+    await presence.mark_online(user.id, "other-tab", org_id=org.id)
+
+    assert await presence.is_online(user.id) is True
+    assert await hub._lost_last_transport(user.id, None) is False
+
+
+async def test_a_known_result_is_taken_at_its_word(client):
+    """A definite answer is not second-guessed with an extra round trip."""
+    org = await make_org("Grace Known Co")
+    user = await make_user("grace-known@x.com", org_id=org.id)
+    # Online, but mark_offline already said True: the known answer wins.
+    await presence.mark_online(user.id, "c1", org_id=org.id)
+
+    assert await hub._lost_last_transport(user.id, True) is True
+    assert await hub._lost_last_transport(user.id, False) is False
