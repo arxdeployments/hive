@@ -353,6 +353,39 @@ async def _may_act_in(db, conversation_id: uuid.UUID, user_id: uuid.UUID) -> boo
     return True
 
 
+async def _lost_last_transport(user_id: uuid.UUID, went_offline: bool | None) -> bool:
+    """Does this user still have a live socket anywhere? Asked for the CALL path.
+
+    The presence edge above and the call's grace window ask different questions,
+    and the grace window must not inherit the edge's uncertainty.
+
+    presence.mark_offline returns None when Redis could not be asked, and that is
+    not the same as False. Redis can apply the MULTI/EXEC and lose the reply on the
+    way back — the SREM really did remove the last connection, the user really is
+    offline, and the next Redis call works fine. Treating None as "other sockets
+    remain" skipped handle_user_link_down for a call that could have been kept
+    alive: the user lost the call instead of reconnecting into it.
+
+    So an unknown is resolved by asking the authority directly rather than assumed
+    either way. presence:{user_id} is a set, and Redis drops the key when its last
+    member is removed, so EXISTS answers exactly this question — and it is the same
+    key is_online already treats as the single authority.
+
+    NOT resolved by calling handle_user_link_down unconditionally. A non-final
+    disconnect — someone closing one of two tabs — would then arm a grace deadline
+    and show their peers "Connecting…" for a call that never lost its transport.
+
+    When Redis is unreachable outright, is_online degrades to False and the window
+    opens. That is the safe direction: handle_user_link_down's own work is
+    guarded (_mark_link suppresses, call_deadlines.schedule and publish_to_users
+    degrade), so it writes nothing and announces nothing — while the opposite
+    error loses a live call.
+    """
+    if went_offline is not None:
+        return went_offline
+    return not await presence.is_online(user_id)
+
+
 async def _handle_inbound(user: User, data: dict) -> None:
     """Dispatch one client frame. Every subscription/broadcast is
     membership-checked — no client-supplied identity is trusted."""
@@ -586,7 +619,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     break
 
             if data["type"] == "ping":
-                await presence.refresh(user.id, org_id=user.org_id)
+                await presence.refresh(user.id, conn_id, org_id=user.org_id)
                 await registry.send_to(
                     user.id, conn_id, json.dumps({"type": "pong", "timestamp": iso_z(now_utc())})
                 )
@@ -606,12 +639,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         await registry.remove(user.id, conn_id)
         went_offline = await presence.mark_offline(user.id, conn_id, org_id=user.org_id)
         if went_offline:
+            # The presence EDGE, and only on a known transition. An indeterminate
+            # result must not stamp last_seen_at or grey this user out for their
+            # peers off a read that may simply have lost its reply.
             async with SessionLocal() as db:
                 db_user = await db.get(User, user.id)
                 if db_user:
                     db_user.last_seen_at = now_utc()
                     await db.commit()
             await _broadcast_presence(user, "offline")
+
+        # The CALL path asks a different question, so it is decided separately —
+        # see _lost_last_transport. An unknown is resolved against the authority
+        # rather than assumed, because assuming "still connected" drops a call that
+        # would have survived a reconnect.
+        if await _lost_last_transport(user.id, went_offline):
             # NOT a hang-up. This opens a grace window and tells the peers to show
             # "Connecting…"; the call is only resolved if the user is still missing
             # when the window closes. See services/calls.handle_user_link_down for

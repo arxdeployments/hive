@@ -105,10 +105,18 @@ async def test_a_heartbeat_rescores_so_a_long_call_is_not_aged_out():
     await get_redis().zadd(presence._INDEX, {str(user): stale})
     await get_redis().zadd(presence._org_index(org), {str(user): stale})
 
-    await presence.refresh(user, org_id=org)
+    # The connection this test registered above. refresh() now SADDs, so passing a
+    # different id would add a SECOND connection rather than heart-beating the
+    # live one — the test would stay green while measuring something else.
+    await presence.refresh(user, "c1", org_id=org)
 
     assert await presence.count_online() == 1
     assert await presence.count_online_in_org(org) == 1
+    # The member set, not just the count: refresh() SADDs, so heart-beating the
+    # wrong id would add a SECOND connection and leave both counts at 1 anyway.
+    # Without this the test cannot tell a heartbeat from a new connection.
+    members = await get_redis().smembers(presence._key(user))
+    assert {m.decode() if isinstance(m, bytes) else m for m in members} == {"c1"}
 
 
 async def test_a_stale_disconnect_cannot_evict_a_user_who_reconnected():

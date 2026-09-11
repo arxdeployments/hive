@@ -22,6 +22,7 @@ import datetime as dt
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import select
 
 from app.api.auth import MOBILE_NOT_APPROVED_CODE
@@ -252,9 +253,12 @@ class _DeadPipeline:
         return self
 
     async def execute(self):
-        raise ConnectionError(_REFUSED)
+        raise RedisConnectionError(_REFUSED)
 
 
+# redis-py's ConnectionError rather than the builtin, for the reason recorded in
+# test_presence_outage.py: the builtin is an OSError and would exercise the wrong
+# arm of degrade_on_outage, which is what rate_limit.py runs its Redis work in.
 class _DeadRedis:
     """Every call raises, the way a client with no reachable server does."""
 
@@ -262,13 +266,13 @@ class _DeadRedis:
         return _DeadPipeline()
 
     async def incr(self, *_args, **_kwargs):
-        raise ConnectionError(_REFUSED)
+        raise RedisConnectionError(_REFUSED)
 
     async def expire(self, *_args, **_kwargs):
-        raise ConnectionError(_REFUSED)
+        raise RedisConnectionError(_REFUSED)
 
     async def ttl(self, *_args, **_kwargs):
-        raise ConnectionError(_REFUSED)
+        raise RedisConnectionError(_REFUSED)
 
 
 @pytest.fixture

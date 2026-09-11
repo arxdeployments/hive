@@ -120,36 +120,120 @@ async def mark_online(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> bool:
     presence event — the user stays grey to every conversation partner until
     something unrelated forces a refetch.
     """
-    pipe = get_redis().pipeline(transaction=True)
-    key = _key(user_id)
-    pipe.sadd(key, conn_id)
-    pipe.expire(key, _TTL)
-    pipe.scard(key)
-    added, _, count = await pipe.execute()
+    # Guarded like every read in this module. hub.py opens its try before this
+    # call so a raise here is torn down cleanly, which makes this the least urgent
+    # of the three — but raising still refuses a websocket Redis merely could not
+    # be asked about, and the module's rule is that an outage costs a green dot.
+    #
+    # added/count stay 0 on an outage, so no edge is claimed: the caller treats
+    # True as "just came online" and publishes a presence event from it.
+    added, count, wrote = 0, 0, False
+    async with degrade_on_outage("presence.mark_online"):
+        pipe = get_redis().pipeline(transaction=True)
+        key = _key(user_id)
+        pipe.sadd(key, conn_id)
+        pipe.expire(key, _TTL)
+        pipe.scard(key)
+        added, _, count = await pipe.execute()
+        wrote = True
     # After the authoritative write, and best-effort: the index must never be
     # able to fail a connection that Redis has already accepted as online.
-    await _index_add(user_id, org_id)
+    #
+    # Only if that write LANDED, though. Guarding the pipeline above opened a new
+    # way for the two to disagree: a blip that fails the authoritative write and
+    # then recovers would leave the index claiming this user is online while their
+    # presence key holds no connection at all. Same drift refresh() was just fixed
+    # for, arriving by the opposite route — and unlike a count ageing out of its
+    # window, nothing reconciles this one.
+    if wrote:
+        await _index_add(user_id, org_id)
     return bool(added) and count == 1
 
 
-async def refresh(user_id: uuid.UUID, *, org_id=None) -> None:
-    await get_redis().expire(_key(user_id), _TTL)
+async def refresh(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> None:
+    """Re-assert that this connection is alive. Best-effort, and that matters here.
+
+    This is the websocket loop's `ping` branch (realtime/hub.py). That branch sits
+    OUTSIDE the try/except wrapping _handle_inbound, and the enclosing try catches
+    only WebSocketDisconnect — so a RedisError raised here left the endpoint
+    altogether. One blip therefore dropped every connected socket on its next
+    ping, within the 60-second heartbeat, all at the same moment: the outage
+    turned into a reconnect storm on top of itself.
+
+    SADD, not a bare EXPIRE, and it takes conn_id for that reason.
+
+    EXPIRE on a missing key returns 0 and does nothing — measured, after asserting
+    the opposite in an earlier version of this docstring. So once the key had aged
+    out, which is exactly what an outage longer than _TTL causes, no number of
+    pings could bring the user back: they stayed offline until their socket
+    reconnected and mark_online ran. Worse, _index_add below ZADDs unconditionally,
+    so every ping re-added them to the advisory index while the authority still
+    said offline — count_online reported them online with no green dot anywhere to
+    match, and the drift persisted instead of ageing out.
+
+    Re-adding the member makes the heartbeat mean what it says: this connection is
+    alive, so this user is online. It is idempotent for the ordinary case, since
+    the member is already in the set.
+
+    No `online` edge is published from here. A resurrection after an outage is not
+    a state change anyone can be told about reliably — publish_to_users was
+    degraded through the same outage — and peers refetch on reconnect.
+    """
+    wrote = False
+    async with degrade_on_outage("presence.refresh"):
+        key = _key(user_id)
+        pipe = get_redis().pipeline(transaction=True)
+        pipe.sadd(key, conn_id)
+        pipe.expire(key, _TTL)
+        await pipe.execute()
+        wrote = True
     # Re-scores rather than merely extending: the index counts by recency, so a
     # connection that never re-scored would age out of the count while its
     # presence key was still being kept alive right beside it.
-    await _index_add(user_id, org_id)
+    #
+    # Conditional for the same reason as in mark_online: re-scoring off the back of
+    # a failed authoritative write is how the index and the authority come to
+    # disagree with nothing to reconcile them.
+    if wrote:
+        await _index_add(user_id, org_id)
 
 
-async def mark_offline(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> bool:
-    """Deregister a connection. Returns True if the user just went offline.
+async def mark_offline(user_id: uuid.UUID, conn_id: str, *, org_id=None) -> bool | None:
+    """Deregister a connection.
+
+    True  — this was the last socket, so the user just went offline.
+    False — other sockets remain.
+    None  — Redis could not be asked, so the answer is UNKNOWN.
+
+    None rather than False for the unknown case, because the two are not the same
+    question and one caller cannot treat them alike. A client error does not prove
+    the transaction had no effect: Redis can apply the MULTI/EXEC and lose the
+    reply on the way back, in which case the SREM really did remove the last
+    connection and this user really is offline. Returning False there told the
+    caller "other sockets remain", which is a claim, not an absence of one.
 
     MULTI for the same reason as mark_online: the `offline` broadcast is an edge.
     """
-    pipe = get_redis().pipeline(transaction=True)
-    key = _key(user_id)
-    pipe.srem(key, conn_id)
-    pipe.scard(key)
-    _, count = await pipe.execute()
+    # Guarded because this runs in the websocket loop's `finally`. Raising from a
+    # finally masks whatever actually ended the connection and skips every line
+    # after it — including handle_user_link_down, the grace window that keeps a
+    # call alive across a reconnect. hub.py's comment above its try lists that
+    # skip as one of the consequences it moved the try earlier to prevent.
+    #
+    # The sentinel is -1, NOT 0, and that is the whole point of it: 0 is the value
+    # that means "the last socket just closed". Initialising to 0 would make an
+    # outage indistinguishable from a real disconnect and fire the offline edge —
+    # greying out a user who may still hold a socket on another worker, which is
+    # the one thing this module says it will never do.
+    count = -1
+    async with degrade_on_outage("presence.mark_offline"):
+        pipe = get_redis().pipeline(transaction=True)
+        key = _key(user_id)
+        pipe.srem(key, conn_id)
+        pipe.scard(key)
+        _, count = await pipe.execute()
+    if count < 0:
+        return None
     if count == 0:
         # Only when the last socket goes. A user with a phone and a browser open
         # is still online after one of them closes, and dropping them from the
