@@ -98,8 +98,11 @@ def test_no_output_contains_a_tag():
     """Fuzz over the alphabet that can build one. Fixed seed so a failure is a
     reproducible case rather than a flake."""
     rng = random.Random(13)
-    alphabet = "<>/!?ab1= \"'"
-    for _ in range(20000):
+    # Quotes, `-` and `=` are in here deliberately: they are what builds a
+    # quoted attribute and a comment, the shapes where a `>` appears inside
+    # what a browser would still be reading as one tag.
+    alphabet = "<>/!?-=ab1 \"'"
+    for _ in range(40000):
         raw = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 20)))
         cleaned = sanitize_text(raw)
         assert not _TAGLIKE.search(cleaned), f"{raw!r} -> {cleaned!r}"
@@ -120,6 +123,39 @@ def test_unclosed_angle_brackets_do_not_stall_the_event_loop(payload: str):
     sanitize_text(text)
     elapsed = time.perf_counter() - started
     assert elapsed < 5.0, f"{payload!r} * n took {elapsed:.1f}s — the scan is quadratic again"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('<a title=">">x</a>', '">x'),
+        ("<a title='>'>x</a>", "'>x"),
+        ('<a title="><script>">x', '">x'),
+        ("<!-- a > b -->", " b -->"),
+    ],
+)
+def test_a_quoted_or_comment_contained_gt_ends_the_tag_early(raw: str, expected: str):
+    """A known limitation, asserted so it stays known.
+
+    The scan takes the first `>` after a tag opens. A browser would not: inside
+    a quoted attribute value, or between `<!--` and `-->`, a `>` is content and
+    the tag runs on. So markup of that shape is cut in the wrong place and part
+    of it survives as text.
+
+    Deliberately not fixed. It is exactly what `<[^>]+>` did before this change
+    — the outputs above are byte-identical to the old pattern's, on every case
+    in this table — so the behaviour is unchanged rather than introduced, and
+    closing it means hand-rolling quote and comment states, i.e. an HTML
+    tokenizer, for text that nothing in the product renders as HTML.
+
+    What has to hold is the property below, and it does: the leftover is inert
+    text, never a tag. The fuzz above covers this shape, and the oracle is not
+    blind to it — `_TAGLIKE` uses `[^>]*`, so it matches a surviving
+    `<a title=">">` readily. The oracle erring toward calling something a tag is
+    the safe direction for an oracle.
+    """
+    assert sanitize_text(raw) == expected
+    assert not _TAGLIKE.search(sanitize_text(raw))
 
 
 @pytest.mark.parametrize("falsy", [None, ""])
