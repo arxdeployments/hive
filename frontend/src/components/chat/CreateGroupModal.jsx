@@ -44,6 +44,13 @@ export const CreateGroupModal = ({
   const ticketRef = useRef(null);
   ticketRef.current ??= createRequestTicket();
 
+  // The ticket is taken when the debounce fires, not when `search` changes, so
+  // between a keystroke and the next timer the previous request is still the
+  // current one and its response writes. That is deliberate: the last search
+  // value always gets a timer that fires and takes the highest ticket, so the
+  // settled list is correct, and the write it makes in the meantime is the
+  // freshest result that exists. Invalidating on keystroke instead would hold
+  // an older list on screen until the new request answered.
   const fetchContacts = useCallback(async () => {
     const ticket = ticketRef.current.take();
     setLoading(true);

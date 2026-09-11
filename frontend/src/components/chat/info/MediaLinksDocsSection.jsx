@@ -167,6 +167,14 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
     }
   }, [conversationId, tab]);
 
+  // A tab change commits and paints before React flushes this effect, so for
+  // that gap the outgoing load still holds the current ticket and can write.
+  // Nothing clears `items` on a switch and the list below is gated on
+  // `loading`, so a response landing there writes behind a skeleton that is
+  // already up, and the replacement load overwrites it before `loading` next
+  // goes false. Invalidating from another useEffect would not help — it would
+  // be queued in this same flush. Closing the gap properly needs
+  // useLayoutEffect, which is not worth blocking paint for.
   useEffect(() => {
     load();
   }, [load]);
