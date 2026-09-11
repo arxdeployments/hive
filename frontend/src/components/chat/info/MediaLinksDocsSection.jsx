@@ -12,7 +12,7 @@
  * browser should be able to do by accident.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CheckCircle2,
   Circle,
@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import client from '../../../api/client';
+import { createRequestTicket } from '../../../utils/latestRequest';
 import { ForwardModal } from '../ForwardModal';
 import { FullscreenImageViewer } from '../FullscreenImageViewer';
 import { FullscreenVideoViewer } from '../FullscreenVideoViewer';
@@ -117,8 +118,23 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
   // { kind: 'image', index } | { kind: 'video' | 'pdf', item }
   const [viewer, setViewer] = useState(null);
 
+  // One counter for every load this panel makes. `load` is keyed on
+  // [conversationId, tab], so switching Media -> Docs quickly puts two loads in
+  // flight with nothing ordering them — and Media issues TWO requests (images
+  // and videos, interleaved), which widens the window. The loser writing last
+  // leaves images under a Docs header, with Forward and Star acting on them.
+  //
+  // A ticket rather than an effect-cleanup flag, which would also work here
+  // since nothing reloads imperatively: this is the mechanism the repo already
+  // extracted for exactly this race, it is unit-tested in
+  // utils/latestRequest.test.js, and there is no component harness in which a
+  // bare flag could be tested at all.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
   const load = useCallback(async () => {
     if (!conversationId) return;
+    const ticket = ticketRef.current.take();
     setLoading(true);
     setError(false);
     try {
@@ -138,12 +154,16 @@ export const MediaLinksDocsSection = ({ conversationId, onJumpToMessage, testIdP
       } else {
         next = await fetchType(conversationId, 'file');
       }
+      if (!ticketRef.current.isCurrent(ticket)) return;
       setItems(next);
     } catch {
+      if (!ticketRef.current.isCurrent(ticket)) return;
       setItems([]);
       setError(true);
     } finally {
-      setLoading(false);
+      // Only the newest load owns the spinner: a stale response clearing it
+      // would show an empty-looking panel while the current tab is still loading.
+      if (ticketRef.current.isCurrent(ticket)) setLoading(false);
     }
   }, [conversationId, tab]);
 
