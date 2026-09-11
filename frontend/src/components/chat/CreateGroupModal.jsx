@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Search, X, ArrowLeft, Camera, Users, Loader2 } from 'lucide-react';
 import client from '../../api/client';
+import { createRequestTicket } from '../../utils/latestRequest';
 import { toast } from 'sonner';
 import { useModalDialog } from '../../hooks/useModalDialog';
 import { apiError } from '../../utils/helpers';
@@ -33,13 +34,36 @@ export const CreateGroupModal = ({
   const [groupDesc, setGroupDesc] = useState('');
   const [creating, setCreating] = useState(false);
 
+  // One counter for every contact search this modal makes. The 300ms debounce
+  // below only cancels a load that has not STARTED; once a request is open,
+  // clearing the timer does nothing and the response still writes. A
+  // two-character prefix matches more rows and answers slower, so it can land
+  // after the five-character query typed after it and leave the picker showing
+  // people the search box no longer asks for — and you choose who to add to a
+  // group from that list.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
+  // The ticket is taken when the debounce fires, not when `search` changes, so
+  // between a keystroke and the next timer the previous request is still the
+  // current one and its response writes. That is deliberate: the last search
+  // value always gets a timer that fires and takes the highest ticket, so the
+  // settled list is correct, and the write it makes in the meantime is the
+  // freshest result that exists. Invalidating on keystroke instead would hold
+  // an older list on screen until the new request answered.
   const fetchContacts = useCallback(async () => {
+    const ticket = ticketRef.current.take();
     setLoading(true);
     try {
       const { data } = await client.get('/api/users/contacts', { params: { search } });
+      if (!ticketRef.current.isCurrent(ticket)) return;
       setContacts(data);
     } catch { /* ignore */ }
-    finally { setLoading(false); }
+    finally {
+      // Only the newest load owns the spinner. A stale response clearing it
+      // would show an idle picker while the current search is still running.
+      if (ticketRef.current.isCurrent(ticket)) setLoading(false);
+    }
   }, [search]);
 
   useEffect(() => {
@@ -51,6 +75,9 @@ export const CreateGroupModal = ({
   // Reset on close
   useEffect(() => {
     if (!isOpen) {
+      // Disown anything still in flight: a response arriving after close would
+      // write contacts into a modal that has just been reset.
+      ticketRef.current.invalidate();
       setStep(1);
       setSelectedIds([]);
       setSelectedContacts([]);
