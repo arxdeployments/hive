@@ -39,10 +39,17 @@ const read = (rel) => readFileSync(join(import.meta.dirname, rel), 'utf8');
 
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-// `isCurrent(<anything>))` followed by the statement it protects, tolerating the
+// `isCurrent(ticket))` followed by the statements it protects, tolerating the
 // comments and reflow that sit between them.
-const guarding = (statement) =>
-  new RegExp(`isCurrent\\([^)]*\\)\\)(?:\\s*return;)?\\s*(?://[^\\n]*\\n\\s*)*${escape(statement)}`);
+//
+// The ticket is named exactly, not `[^)]*`: a guard reading some other variable
+// would prove nothing about the ticket `take()` handed this load, and would
+// satisfy a loose matcher.
+const guarding = (...statements) =>
+  new RegExp(
+    'isCurrent\\(ticket\\)\\)(?:\\s*return;)?' +
+      statements.map((s) => `\\s*(?://[^\\n]*\\n\\s*)*${escape(s)}`).join(''),
+  );
 
 const CASES = [
   {
@@ -82,7 +89,10 @@ const CASES = [
       },
       {
         what: 'writes the error state only while its ticket is current',
-        pattern: guarding('setItems([])'),
+        // Both writes, in order: hoisting `setError(true)` above the guard would
+        // mark the live tab failed on a stale rejection while still matching a
+        // matcher that only looked for `setItems([])`.
+        pattern: guarding('setItems([]);', 'setError(true);'),
         why: "a stale failure would empty the current tab's list and show its error",
       },
       {
