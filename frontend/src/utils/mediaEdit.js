@@ -134,7 +134,15 @@ export const GREY_STOP = 0.16;
  */
 export function inkForSliderPosition(position) {
   const t = clamp(position, 0, 1);
-  if (t <= GREY_STOP) {
+  // `<`, not `<=`: GREY_STOP is the one position both bands want, and it belongs
+  // to the ramp. `sliderPositionForInk` maps EVERY red to exactly GREY_STOP —
+  // hue 0 is the start of the ramp — so while the grey band owned that point,
+  // picking the red swatch parked the thumb on the gradient's black stop and one
+  // ArrowUp from there turned the pen #202020, with ArrowDown returning #000000
+  // rather than red. The ramp is the only band with a colour that lands here;
+  // the grey band gives up nothing a swatch needs, since its own black is
+  // #0A0A0A, which sits inside the band at 0.1537.
+  if (t < GREY_STOP) {
     // White at the very top down to black at the end of the band.
     const level = Math.round(255 * (1 - t / GREY_STOP));
     return rgbToHex(level, level, level);
