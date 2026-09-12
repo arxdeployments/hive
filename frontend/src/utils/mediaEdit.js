@@ -127,6 +127,21 @@ export const DEFAULT_INK = '#22D3EE';
 export const GREY_STOP = 0.16;
 
 /**
+ * Where the grey band reaches black, strictly inside it.
+ *
+ * GREY_STOP is a single position that both bands want: every red maps to it,
+ * and so did pure black while the greys ran all the way to the boundary. One of
+ * them had to give it up, and it had to be black — a hue has nowhere else to
+ * go, whereas black only needs *a* position, and the last sliver of the grey
+ * band is one. Positions between here and GREY_STOP are black too, which makes
+ * it easier to hit by dragging than a single exact point ever was.
+ *
+ * The gap is 0.5% of the track, wide enough to survive the gradient's own
+ * rounding — the stops either side of it must not collapse onto one offset.
+ */
+export const BLACK_STOP = GREY_STOP - 0.005;
+
+/**
  * Slider position (0 at the top, 1 at the bottom) → CSS colour.
  *
  * Returns `#RRGGBB` rather than `hsl()` so the value can go straight into a
@@ -134,9 +149,18 @@ export const GREY_STOP = 0.16;
  */
 export function inkForSliderPosition(position) {
   const t = clamp(position, 0, 1);
-  if (t <= GREY_STOP) {
-    // White at the very top down to black at the end of the band.
-    const level = Math.round(255 * (1 - t / GREY_STOP));
+  // `<`, not `<=`: GREY_STOP is the one position both bands want, and it belongs
+  // to the ramp. `sliderPositionForInk` maps EVERY red to exactly GREY_STOP —
+  // hue 0 is the start of the ramp — so while the grey band owned that point,
+  // picking the red swatch parked the thumb on the gradient's black stop and one
+  // ArrowUp from there turned the pen #202020, with ArrowDown returning #000000
+  // rather than red. The ramp is the only band with a colour that lands here;
+  // the grey band gives up nothing a swatch needs, since its own black is
+  // #0A0A0A, which sits inside the band at 0.1537.
+  if (t < GREY_STOP) {
+    // White at the very top down to black at BLACK_STOP, and black from there
+    // to the boundary.
+    const level = Math.round(255 * (1 - Math.min(t, BLACK_STOP) / BLACK_STOP));
     return rgbToHex(level, level, level);
   }
   // 0 → 330 rather than 0 → 360: ending on magenta instead of wrapping back to
@@ -152,7 +176,7 @@ export function sliderPositionForInk(hex) {
   if (!rgb) return GREY_STOP + 0.35;
   const [r, g, b] = rgb;
   if (r === g && g === b) {
-    return clamp((1 - r / 255) * GREY_STOP, 0, GREY_STOP);
+    return clamp((1 - r / 255) * BLACK_STOP, 0, BLACK_STOP);
   }
   const hue = rgbToHue(r, g, b);
   // A hue past the 330 end of the ramp is nearer red than magenta, so it parks
@@ -163,10 +187,18 @@ export function sliderPositionForInk(hex) {
 
 /** CSS for the strip itself. Kept here so web and iOS read from one place. */
 export function sliderGradientStops() {
-  const stops = ['#FFFFFF 0%', `#000000 ${(GREY_STOP * 100).toFixed(1)}%`];
+  // Two black stops, not one: the band is black from BLACK_STOP all the way to
+  // the boundary, and painting a single stop there would blend black into red
+  // across a sliver that is actually solid black. Two decimals because one
+  // rounds BLACK_STOP and GREY_STOP onto the same offset and the edge vanishes.
+  const stops = [
+    '#FFFFFF 0%',
+    `#000000 ${(BLACK_STOP * 100).toFixed(2)}%`,
+    `#000000 ${(GREY_STOP * 100 - 0.01).toFixed(2)}%`,
+  ];
   for (let i = 0; i <= 6; i += 1) {
     const t = GREY_STOP + (i / 6) * (1 - GREY_STOP);
-    stops.push(`${inkForSliderPosition(t)} ${(t * 100).toFixed(1)}%`);
+    stops.push(`${inkForSliderPosition(t)} ${(t * 100).toFixed(2)}%`);
   }
   return stops;
 }
