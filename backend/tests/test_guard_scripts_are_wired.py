@@ -21,7 +21,6 @@ This asserts the wiring itself, so the next guard cannot be born dead.
 
 import pathlib
 import re
-import shlex
 
 import pytest
 import yaml
@@ -67,18 +66,108 @@ def test_there_are_guard_scripts_to_check():
 
 # `&&`, `;` and friends separate commands; `(` and `)` group them. shlex hands
 # these back as their own tokens only with punctuation_chars set.
-_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "(", ")"})
+# Characters that end one command and begin the next. `&&` and `||` are runs of
+# these, consumed as one.
+_SEPARATOR_CHARS = frozenset({";", "|", "&", "(", ")"})
 
 # `python`, `python3`, `python3.12`, `/usr/bin/python` — an interpreter whose
 # first argument is the script it runs.
 _PYTHON = re.compile(r"^(?:\S*/)?python[\d.]*$")
 
+# Inside double quotes a backslash is literal except before one of these.
+_DOUBLE_QUOTE_ESCAPES = frozenset({"\\", '"', "$", "`"})
 
-def _unquote(token: str) -> str:
-    """Drop one layer of surrounding quotes, which non-posix shlex keeps."""
-    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
-        return token[1:-1]
-    return token
+
+def _commands(line: str) -> list[list[str]]:
+    """Split one shell line into commands, each a list of unquoted words.
+
+    Hand-written rather than shlex, after three review findings in a row on this
+    helper, each one shlex disagreeing with the shell in a different place:
+
+      * `re.split` on `&&` and `;` read a separator inside a quoted string as a
+        real one, so `echo 'note; python scripts/check_x.py'` looked wired.
+      * shlex's commenters cut at a `#` anywhere, so
+        `python scripts/check_x.py#note` looked wired, where a shell reads one
+        word naming a path that does not exist.
+      * shlex in non-posix mode does not honour a backslash escape, so
+        `echo "note\\"#still quoted" && python scripts/check_x.py` ended its
+        token early and the `#still` that followed read as a comment, hiding the
+        real invocation after the `&&`.
+
+    Patching a lexer three times without converging says the lexer is the wrong
+    tool. This tracks the three states that actually matter — single quote,
+    double quote, backslash — and nothing else, because nothing else changes
+    where a word begins or whether a `#` opens a comment.
+
+    No expansion is attempted: `$VAR`, globs and substitutions stay literal.
+    They cannot turn something that is not an invocation into one, since the
+    path has to be written out to be matched.
+    """
+    commands: list[list[str]] = []
+    words: list[str] = []
+    word: list[str] = []
+    started = False  # a word is open, possibly empty — `""` is a word
+    quote: str | None = None
+    index, length = 0, len(line)
+
+    def end_word() -> None:
+        nonlocal word, started
+        if started:
+            words.append("".join(word))
+        word, started = [], False
+
+    def end_command() -> None:
+        nonlocal words
+        end_word()
+        if words:
+            commands.append(words)
+        words = []
+
+    while index < length:
+        char = line[index]
+        if quote == "'":
+            # Single quotes protect everything, backslash included.
+            if char == "'":
+                quote = None
+            else:
+                word.append(char)
+            index += 1
+        elif quote == '"':
+            following = line[index + 1 : index + 2]
+            if char == "\\" and following in _DOUBLE_QUOTE_ESCAPES:
+                word.append(following)
+                index += 2
+                continue
+            if char == '"':
+                quote = None
+            else:
+                word.append(char)
+            index += 1
+        elif char == "\\" and index + 1 < length:
+            word.append(line[index + 1])
+            started = True
+            index += 2
+        elif char in ("'", '"'):
+            quote = char
+            started = True
+            index += 1
+        elif char == "#" and not started:
+            # A shell opens a comment at `#` only where a word begins.
+            break
+        elif char.isspace():
+            end_word()
+            index += 1
+        elif char in _SEPARATOR_CHARS:
+            end_command()
+            while index < length and line[index] in _SEPARATOR_CHARS:
+                index += 1
+        else:
+            word.append(char)
+            started = True
+            index += 1
+
+    end_command()
+    return commands
 
 
 def _is_invocation(words: list[str], script: str) -> bool:
@@ -94,47 +183,12 @@ def _is_invocation(words: list[str], script: str) -> bool:
 def _invokes(command: str, script: str) -> bool:
     """Whether a shell command actually runs `scripts/<script>`.
 
-    Naming the path is not running it, and the ways to name it are not obvious.
-    Splitting the raw text on `&&` and `;` reads a separator inside a quoted
-    string as a real one, so `echo 'note; python scripts/check_x.py'` looks like
-    an invocation; dropping only lines that *start* with `#` misses an inline
-    comment, so `true # && python scripts/check_x.py` does too.
-
-    Lexing with shlex fixes both, but its own comment handling is not the
-    shell's: it cuts at a `#` anywhere, so `scripts/check_x.py#note` lexes to
-    `scripts/check_x.py` and reads as an invocation, where a POSIX shell treats
-    the whole thing as one word naming a path that does not exist. So commenters
-    are switched off and `#` is honoured only where a word begins, which is the
-    rule the shell applies.
-
-    Non-posix, which keeps quotes on the token: that is what distinguishes a
-    word genuinely starting `#` from a quoted `'#'`, and quotes are stripped for
-    comparison afterwards.
-
-    A line that cannot be lexed is treated as not an invocation — the
-    conservative direction, since it reports a wired guard as unwired rather
-    than the reverse.
+    Naming the path is not running it, and the ways to name it are not obvious —
+    see _commands for the three that got through review. The path has to be the
+    program of one of the commands on a line, or the first argument to a python
+    interpreter.
     """
-    for line in command.splitlines():
-        lexer = shlex.shlex(line, punctuation_chars=True, posix=False)
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        try:
-            tokens = list(lexer)
-        except ValueError:
-            continue
-        words: list[str] = []
-        for token in [*tokens, ";"]:
-            comment = token.startswith("#")
-            if comment or token in _SEPARATORS:
-                if _is_invocation(words, script):
-                    return True
-                words = []
-                if comment:
-                    break
-            else:
-                words.append(_unquote(token))
-    return False
+    return any(_is_invocation(words, script) for line in command.splitlines() for words in _commands(line))
 
 
 @pytest.mark.parametrize(
@@ -175,6 +229,21 @@ def _invokes(command: str, script: str) -> bool:
         # ...and a quoted `#` opens nothing.
         ("echo '#' && python scripts/check_contracts.py", True),
         ('python "scripts/check_contracts.py"', True),
+        # A backslash escape inside double quotes does not end the string, so
+        # the `#` after it is still quoted and the command after `&&` still runs.
+        ('echo "note\\"#still quoted" && python scripts/check_contracts.py', True),
+        # An escaped `#` outside quotes is a literal, not a comment.
+        ("echo \\# && python scripts/check_contracts.py", True),
+        ("echo \\#not-a-comment && python scripts/check_contracts.py", True),
+        # ...but the escape only covers the character after it.
+        ("echo \\x # && python scripts/check_contracts.py", False),
+        # Single quotes protect a backslash, so this one stays open to the `&&`.
+        ("echo 'a\\' && python scripts/check_contracts.py", True),
+        # An escaped `&&` does not separate, so the invocation never starts —
+        # without escape handling this parses as two commands and looks wired.
+        ("echo x\\&\\& python scripts/check_contracts.py", False),
+        # ...and an escape inside the path resolves, so this one does run.
+        ("python scripts\\/check_contracts.py", True),
     ],
 )
 def test_only_a_real_invocation_counts(command: str, runs: bool):
