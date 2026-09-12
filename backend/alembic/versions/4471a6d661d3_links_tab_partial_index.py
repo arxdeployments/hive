@@ -30,11 +30,34 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute(
-        """CREATE INDEX ix_messages_links ON messages (conversation_id, created_at DESC)
-           WHERE content ILIKE '%http%'"""
-    )
+    # CONCURRENTLY, like b7e21c4a9d33, c5d81e37a204 and a4f81c6b2e07. This one was
+    # not, and messages is the table it least should have been: a row per message
+    # sent. A plain CREATE INDEX holds SHARE for a full heap scan, which conflicts
+    # with the ROW EXCLUSIVE every INSERT takes, so the build blocks sends for as
+    # long as it runs — and production boots with
+    # `alembic upgrade head && python -m app.seed && uvicorn ...`
+    # (infra/docker-compose.prod.yml), so on a large table the API does not merely
+    # queue writes behind this, it never finishes starting.
+    #
+    # Nothing to trade away here: this migration creates the index and does
+    # nothing else, so leaving the transaction costs it no atomicity. The DROP
+    # first is what makes the retry safe instead — a cancelled concurrent build
+    # leaves an INVALID index of the same name, and this revision is not stamped
+    # until upgrade() returns, so the retry re-enters here and must clear it. The
+    # index is not unique, so an INVALID one enforces nothing; it is simply never
+    # used by the planner, which would leave the Links tab scanning whole
+    # conversations while the migration reported success.
+    with op.get_context().autocommit_block():
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_messages_links")
+        op.execute(
+            """CREATE INDEX CONCURRENTLY ix_messages_links
+               ON messages (conversation_id, created_at DESC)
+               WHERE content ILIKE '%http%'"""
+        )
 
 
 def downgrade() -> None:
-    op.execute("DROP INDEX IF EXISTS ix_messages_links")
+    # Concurrently here too: a plain DROP INDEX takes ACCESS EXCLUSIVE on
+    # messages, which is the stronger of the two locks this migration avoids.
+    with op.get_context().autocommit_block():
+        op.execute("DROP INDEX CONCURRENTLY IF EXISTS ix_messages_links")
