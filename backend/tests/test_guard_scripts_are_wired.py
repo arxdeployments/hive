@@ -21,6 +21,7 @@ This asserts the wiring itself, so the next guard cannot be born dead.
 
 import pathlib
 import re
+import shlex
 
 import pytest
 import yaml
@@ -64,26 +65,61 @@ def test_there_are_guard_scripts_to_check():
     assert len(_guard_scripts()) >= 4, [p.name for p in _guard_scripts()]
 
 
+# `&&`, `;` and friends separate commands; `(` and `)` group them. shlex hands
+# these back as their own tokens only with punctuation_chars set.
+_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "(", ")"})
+
+# `python`, `python3`, `python3.12`, `/usr/bin/python` — an interpreter whose
+# first argument is the script it runs.
+_PYTHON = re.compile(r"^(?:\S*/)?python[\d.]*$")
+
+
+def _is_invocation(words: list[str], script: str) -> bool:
+    """Whether one command — already split from its neighbours — runs the script."""
+    if not words:
+        return False
+    target = f"scripts/{script}"
+    if words[0] in (target, f"./{target}"):
+        return True
+    return len(words) > 1 and bool(_PYTHON.match(words[0])) and words[1] == target
+
+
 def _invokes(command: str, script: str) -> bool:
     """Whether a shell command actually runs `scripts/<script>`.
 
-    Naming the path is not running it. `echo scripts/check_x.py` mentions it, and
-    so does a `#` comment inside a run block — YAML parsing does not strip those,
-    only the comments around the step. Accepting either would repeat the very
-    mistake this file exists for, one level down.
+    Naming the path is not running it, and the ways to name it are not obvious.
+    Splitting the raw text on `&&` and `;` reads a separator inside a quoted
+    string as a real one, so `echo 'note; python scripts/check_x.py'` looks like
+    an invocation; and dropping only lines that *start* with `#` misses an inline
+    comment, so `true # && python scripts/check_x.py` does too. Both were live
+    here until CodeRabbit found them on this PR.
 
-    So the path has to sit where a command goes: at the start of a line, or of a
-    segment after `&&`, `||`, `;` or a pipe, either as the program itself or as
-    the argument to a python interpreter.
+    So the line is tokenized the way a shell would: shlex with punctuation_chars
+    keeps quoted separators inside their token and hands real ones back on their
+    own, and its commenters setting drops an inline `#` and everything after it.
+    The path then has to be the program of one of those commands, or the first
+    argument to a python interpreter.
+
+    A line with an unbalanced quote cannot be tokenized, and is treated as not an
+    invocation — the conservative direction, since the failure that causes is a
+    guard reported as unwired rather than an unwired guard reported as fine.
     """
-    invocation = re.compile(rf"^(?:\S*python\S*\s+|\./)?scripts/{re.escape(script)}(?:\s|$)")
-    for line in command.splitlines():
-        line = line.strip()
-        if line.startswith("#"):
+    target_lines = command.splitlines()
+    for line in target_lines:
+        lexer = shlex.shlex(line, punctuation_chars=True, posix=True)
+        lexer.whitespace_split = True
+        try:
+            tokens = list(lexer)
+        except ValueError:
             continue
-        for segment in re.split(r"&&|\|\||;|\|", line):
-            if invocation.match(segment.strip()):
-                return True
+        words: list[str] = []
+        for token in [*tokens, ";"]:
+            if token in _SEPARATORS:
+                if _is_invocation(words, script):
+                    return True
+                words = []
+            else:
+                words.append(token)
     return False
 
 
@@ -105,6 +141,19 @@ def _invokes(command: str, script: str) -> bool:
         # Running a different guard is not running this one.
         ("python scripts/check_dependency_groups.py", False),
         ("python scripts/check_pinned_imports.py --check-mappings", False),
+        # A separator inside a quoted string is not a separator.
+        ("echo 'note; python scripts/check_contracts.py --check-mappings'", False),
+        ('echo "a && python scripts/check_contracts.py"', False),
+        # An inline comment ends the line, wherever it starts.
+        ("true # && python scripts/check_contracts.py", False),
+        ("true  #; python scripts/check_contracts.py", False),
+        # ...but the same separators, unquoted, do separate.
+        ("true && python scripts/check_contracts.py", True),
+        ("python scripts/check_contracts.py; true", True),
+        ("false || python scripts/check_contracts.py", True),
+        ("python scripts/check_contracts.py | tee log", True),
+        ("bare scripts/check_contracts.py", False),
+        ("scripts/check_contracts.py", True),
     ],
 )
 def test_only_a_real_invocation_counts(command: str, runs: bool):
