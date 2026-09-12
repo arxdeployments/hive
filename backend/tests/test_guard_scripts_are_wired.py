@@ -21,6 +21,7 @@ This asserts the wiring itself, so the next guard cannot be born dead.
 
 import pathlib
 import re
+import shlex
 
 import pytest
 import yaml
@@ -64,26 +65,75 @@ def test_there_are_guard_scripts_to_check():
     assert len(_guard_scripts()) >= 4, [p.name for p in _guard_scripts()]
 
 
+# `&&`, `;` and friends separate commands; `(` and `)` group them. shlex hands
+# these back as their own tokens only with punctuation_chars set.
+_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "(", ")"})
+
+# `python`, `python3`, `python3.12`, `/usr/bin/python` — an interpreter whose
+# first argument is the script it runs.
+_PYTHON = re.compile(r"^(?:\S*/)?python[\d.]*$")
+
+
+def _unquote(token: str) -> str:
+    """Drop one layer of surrounding quotes, which non-posix shlex keeps."""
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+        return token[1:-1]
+    return token
+
+
+def _is_invocation(words: list[str], script: str) -> bool:
+    """Whether one command — already split from its neighbours — runs the script."""
+    if not words:
+        return False
+    target = f"scripts/{script}"
+    if words[0] in (target, f"./{target}"):
+        return True
+    return len(words) > 1 and bool(_PYTHON.match(words[0])) and words[1] == target
+
+
 def _invokes(command: str, script: str) -> bool:
     """Whether a shell command actually runs `scripts/<script>`.
 
-    Naming the path is not running it. `echo scripts/check_x.py` mentions it, and
-    so does a `#` comment inside a run block — YAML parsing does not strip those,
-    only the comments around the step. Accepting either would repeat the very
-    mistake this file exists for, one level down.
+    Naming the path is not running it, and the ways to name it are not obvious.
+    Splitting the raw text on `&&` and `;` reads a separator inside a quoted
+    string as a real one, so `echo 'note; python scripts/check_x.py'` looks like
+    an invocation; dropping only lines that *start* with `#` misses an inline
+    comment, so `true # && python scripts/check_x.py` does too.
 
-    So the path has to sit where a command goes: at the start of a line, or of a
-    segment after `&&`, `||`, `;` or a pipe, either as the program itself or as
-    the argument to a python interpreter.
+    Lexing with shlex fixes both, but its own comment handling is not the
+    shell's: it cuts at a `#` anywhere, so `scripts/check_x.py#note` lexes to
+    `scripts/check_x.py` and reads as an invocation, where a POSIX shell treats
+    the whole thing as one word naming a path that does not exist. So commenters
+    are switched off and `#` is honoured only where a word begins, which is the
+    rule the shell applies.
+
+    Non-posix, which keeps quotes on the token: that is what distinguishes a
+    word genuinely starting `#` from a quoted `'#'`, and quotes are stripped for
+    comparison afterwards.
+
+    A line that cannot be lexed is treated as not an invocation — the
+    conservative direction, since it reports a wired guard as unwired rather
+    than the reverse.
     """
-    invocation = re.compile(rf"^(?:\S*python\S*\s+|\./)?scripts/{re.escape(script)}(?:\s|$)")
     for line in command.splitlines():
-        line = line.strip()
-        if line.startswith("#"):
+        lexer = shlex.shlex(line, punctuation_chars=True, posix=False)
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        try:
+            tokens = list(lexer)
+        except ValueError:
             continue
-        for segment in re.split(r"&&|\|\||;|\|", line):
-            if invocation.match(segment.strip()):
-                return True
+        words: list[str] = []
+        for token in [*tokens, ";"]:
+            comment = token.startswith("#")
+            if comment or token in _SEPARATORS:
+                if _is_invocation(words, script):
+                    return True
+                words = []
+                if comment:
+                    break
+            else:
+                words.append(_unquote(token))
     return False
 
 
@@ -105,6 +155,26 @@ def _invokes(command: str, script: str) -> bool:
         # Running a different guard is not running this one.
         ("python scripts/check_dependency_groups.py", False),
         ("python scripts/check_pinned_imports.py --check-mappings", False),
+        # A separator inside a quoted string is not a separator.
+        ("echo 'note; python scripts/check_contracts.py --check-mappings'", False),
+        ('echo "a && python scripts/check_contracts.py"', False),
+        # An inline comment ends the line, wherever it starts.
+        ("true # && python scripts/check_contracts.py", False),
+        ("true  #; python scripts/check_contracts.py", False),
+        # ...but the same separators, unquoted, do separate.
+        ("true && python scripts/check_contracts.py", True),
+        ("python scripts/check_contracts.py; true", True),
+        ("false || python scripts/check_contracts.py", True),
+        ("python scripts/check_contracts.py | tee log", True),
+        ("bare scripts/check_contracts.py", False),
+        ("scripts/check_contracts.py", True),
+        # shlex cuts at `#` anywhere; a shell only does so where a word begins.
+        ("python scripts/check_contracts.py#note", False),
+        ("python scripts/check_contracts.py #note", True),
+        ("python scripts/check_contracts.py --flag#x", True),
+        # ...and a quoted `#` opens nothing.
+        ("echo '#' && python scripts/check_contracts.py", True),
+        ('python "scripts/check_contracts.py"', True),
     ],
 )
 def test_only_a_real_invocation_counts(command: str, runs: bool):
