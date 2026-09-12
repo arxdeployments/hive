@@ -51,25 +51,6 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping" --health-interval 5s
           --health-timeout 3s --health-retries 10
-      # The suite has always contained tests that upload for real —
-      # test_media_upload_and_authenticated_serving predates all of this — but
-      # this job had no object store, so they could only ever fail. It went
-      # unnoticed because the ruff-format step above failed first and the job
-      # never reached Tests. Same image and credentials as the e2e job.
-      minio:
-        # minio/minio:edge-cicd, not bitnami/minio — Bitnami withdrew their public
-        # Docker Hub catalogue and that tag now 404s, which failed this job at
-        # container start before a single step ran. The edge-cicd tag is MinIO's
-        # own build for exactly this: its default command is `minio server /data`,
-        # and a GitHub Actions service container has no way to supply one.
-        image: minio/minio:edge-cicd
-        env:
-          MINIO_ROOT_USER: rxhive
-          MINIO_ROOT_PASSWORD: rxhive-dev
-        ports: ["9000:9000"]
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/live"
-          --health-interval 5s --health-timeout 3s --health-retries 20
     defaults:
       run:
         working-directory: backend
@@ -91,6 +72,44 @@ jobs:
         run: |
           ruff check app tests
           ruff format --check app tests
+      # MinIO cannot be a `services:` container any more, so it is started here.
+      #
+      # The service form gives the image no command. That only ever worked
+      # because minio/minio:edge-cicd defaulted to `minio server /data` — and
+      # Docker Hub's minio/minio repository is now withdrawn entirely: an
+      # authenticated pull token gets 401 there where library/redis gets 200.
+      # The job failed at container start, before a single step ran. Second time
+      # an upstream withdrawal has done this to this file; Bitnami was the first.
+      #
+      # quay.io is MinIO's own other registry, but nothing there is a drop-in for
+      # edge-cicd: `latest`, `latest-cicd` and every RELEASE tag default to
+      # Cmd ["minio"], which prints its help and exits 0 — a service container
+      # that is never healthy. MINIO_VOLUMES does not stand in for the missing
+      # subcommand either. Starting the container in a step is the only form that
+      # can pass `server /data`, and it is immune to the next default-command
+      # change as well.
+      #
+      # Pinned to a dated RELEASE rather than latest/latest-cicd: a floating tag
+      # is exactly what disappeared, and MinIO never reuses a RELEASE.
+      #
+      # The suite has always contained tests that upload for real —
+      # test_media_upload_and_authenticated_serving predates all of this — and
+      # they need a real object store. Same image and credentials as the e2e job.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=rxhive -e MINIO_ROOT_PASSWORD=rxhive-dev \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for _ in $(seq 1 40); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null; then
+              echo "MinIO is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO never became healthy" >&2
+          docker logs minio >&2
+          exit 1
       - name: Migrations apply cleanly
         run: alembic upgrade head
         env:
@@ -340,20 +359,6 @@ jobs:
         options: >-
           --health-cmd "redis-cli ping" --health-interval 5s
           --health-timeout 3s --health-retries 10
-      minio:
-        # minio/minio:edge-cicd, not bitnami/minio — Bitnami withdrew their public
-        # Docker Hub catalogue and that tag now 404s, which failed this job at
-        # container start before a single step ran. The edge-cicd tag is MinIO's
-        # own build for exactly this: its default command is `minio server /data`,
-        # and a GitHub Actions service container has no way to supply one.
-        image: minio/minio:edge-cicd
-        env:
-          MINIO_ROOT_USER: rxhive
-          MINIO_ROOT_PASSWORD: rxhive-dev
-        ports: ["9000:9000"]
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/live"
-          --health-interval 5s --health-timeout 3s --health-retries 20
     env:
       RXHIVE_DATABASE_URL: postgresql+asyncpg://rxhive:rxhive@localhost:5432/rxhive
       RXHIVE_REDIS_URL: redis://localhost:6379/0
@@ -388,6 +393,40 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      # MinIO cannot be a `services:` container any more, so it is started here.
+      #
+      # The service form gives the image no command. That only ever worked
+      # because minio/minio:edge-cicd defaulted to `minio server /data` — and
+      # Docker Hub's minio/minio repository is now withdrawn entirely: an
+      # authenticated pull token gets 401 there where library/redis gets 200.
+      # The job failed at container start, before a single step ran. Second time
+      # an upstream withdrawal has done this to this file; Bitnami was the first.
+      #
+      # quay.io is MinIO's own other registry, but nothing there is a drop-in for
+      # edge-cicd: `latest`, `latest-cicd` and every RELEASE tag default to
+      # Cmd ["minio"], which prints its help and exits 0 — a service container
+      # that is never healthy. MINIO_VOLUMES does not stand in for the missing
+      # subcommand either. Starting the container in a step is the only form that
+      # can pass `server /data`, and it is immune to the next default-command
+      # change as well.
+      #
+      # Pinned to a dated RELEASE rather than latest/latest-cicd: a floating tag
+      # is exactly what disappeared, and MinIO never reuses a RELEASE.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=rxhive -e MINIO_ROOT_PASSWORD=rxhive-dev \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+          for _ in $(seq 1 40); do
+            if curl -fsS http://localhost:9000/minio/health/live >/dev/null; then
+              echo "MinIO is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO never became healthy" >&2
+          docker logs minio >&2
+          exit 1
       - name: Install backend
         working-directory: backend
         run: pip install -r requirements.txt

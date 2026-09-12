@@ -32,7 +32,12 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:latest
+    # quay.io, not Docker Hub: MinIO's minio/minio repository there is withdrawn,
+    # and an authenticated pull token now gets 401 where library/redis gets 200.
+    # Pinned to a dated RELEASE rather than :latest — a floating tag is precisely
+    # what went away, and MinIO never reuses a RELEASE. Compose can pass the
+    # command below, so unlike CI this needs no other change.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
