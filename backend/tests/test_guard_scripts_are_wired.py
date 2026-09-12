@@ -64,11 +64,58 @@ def test_there_are_guard_scripts_to_check():
     assert len(_guard_scripts()) >= 4, [p.name for p in _guard_scripts()]
 
 
+def _invokes(command: str, script: str) -> bool:
+    """Whether a shell command actually runs `scripts/<script>`.
+
+    Naming the path is not running it. `echo scripts/check_x.py` mentions it, and
+    so does a `#` comment inside a run block — YAML parsing does not strip those,
+    only the comments around the step. Accepting either would repeat the very
+    mistake this file exists for, one level down.
+
+    So the path has to sit where a command goes: at the start of a line, or of a
+    segment after `&&`, `||`, `;` or a pipe, either as the program itself or as
+    the argument to a python interpreter.
+    """
+    invocation = re.compile(rf"^(?:\S*python\S*\s+|\./)?scripts/{re.escape(script)}(?:\s|$)")
+    for line in command.splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            continue
+        for segment in re.split(r"&&|\|\||;|\|", line):
+            if invocation.match(segment.strip()):
+                return True
+    return False
+
+
+@pytest.mark.parametrize(
+    ("command", "runs"),
+    [
+        ("python scripts/check_contracts.py --check-mappings", True),
+        ("python3 scripts/check_contracts.py", True),
+        ("./scripts/check_contracts.py", True),
+        ("cd backend && python scripts/check_contracts.py", True),
+        ("  python scripts/check_contracts.py  ", True),
+        # Mentions, not invocations — each of these would have satisfied a plain
+        # substring match, which is what this guard was first written with.
+        ("echo scripts/check_contracts.py", False),
+        ("# python scripts/check_contracts.py", False),
+        ("echo 'see scripts/check_contracts.py for why'", False),
+        ("python scripts/check_contracts.py.bak", False),
+        ("python other/scripts/check_contracts.py", False),
+        # Running a different guard is not running this one.
+        ("python scripts/check_dependency_groups.py", False),
+        ("python scripts/check_pinned_imports.py --check-mappings", False),
+    ],
+)
+def test_only_a_real_invocation_counts(command: str, runs: bool):
+    """The matcher itself, since the guard is only as good as it."""
+    assert _invokes(command, "check_contracts.py") is runs
+
+
 @pytest.mark.parametrize("script", _guard_scripts(), ids=lambda p: p.name)
 def test_every_guard_script_is_run_by_ci(script: pathlib.Path):
     """A guard that CI never invokes cannot fail, so it protects nothing."""
-    pattern = re.compile(rf"(?<![\w./-])scripts/{re.escape(script.name)}(?![\w.-])")
-    assert any(pattern.search(cmd) for cmd in _ci_commands()), (
+    assert any(_invokes(cmd, script.name) for cmd in _ci_commands()), (
         f"scripts/{script.name} is never run by any workflow. It can only pass, whatever "
         "the repository does. Add a step for it, or drop the check_ prefix if it is a tool "
         "rather than a guard."
