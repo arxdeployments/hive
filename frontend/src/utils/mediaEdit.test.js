@@ -32,8 +32,9 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
-  FULL_CROP,
+  ASPECT_PRESETS,
   BLACK_STOP,
+  FULL_CROP,
   GREY_STOP,
   SWATCHES,
   emptyEdit,
@@ -41,7 +42,10 @@ import {
   frameBoxFraction,
   frameFontFraction,
   boxWidthForFrame,
+  clampFrameRect,
+  foldDragRect,
   fontSizeForFrame,
+  MIN_CROP_SPAN,
   inkForSliderPosition,
   rectFrameToSource,
   rectSourceToFrame,
@@ -258,4 +262,172 @@ describe('the frame/source conversions are inverses under every transform', () =
       }
     });
   }
+});
+
+
+/**
+ * clampFrameRect is 117 lines and carries three fixed bugs in its comments, each
+ * with the exact drag that produced it. None of them had a test, so each was one
+ * refactor from coming back — and they come back silently, in an exported image,
+ * not in anything that throws.
+ */
+describe('a crop drag stays where the finger put it', () => {
+  const FRAME = [1600, 900];
+
+  for (const [anchor, held, describeHeld] of [
+    ['e', (r) => r.x, 'the left edge'],
+    ['w', (r) => r.x + r.w, 'the right edge'],
+    ['s', (r) => r.y, 'the top edge'],
+    ['n', (r) => r.y + r.h, 'the bottom edge'],
+  ]) {
+    it(`dragging '${anchor}' past the frame holds ${describeHeld}`, () => {
+      // The comment's own reproduction: "Pulling the east handle right from
+      // x=0.5,w=0.3 returned x=0.3,w=0.7" — the edge the finger was NOT holding
+      // jumped inward, and a big enough overshoot selected the whole image.
+      const start = { x: 0.5, y: 0.5, w: 0.3, h: 0.3 };
+      const overshoot = { ...start, w: anchor === 'e' ? 1.2 : start.w, h: anchor === 's' ? 1.2 : start.h };
+      if (anchor === 'w') Object.assign(overshoot, { x: -0.7, w: 1.5 });
+      if (anchor === 'n') Object.assign(overshoot, { y: -0.7, h: 1.5 });
+
+      const out = clampFrameRect(overshoot, ...FRAME, null, anchor);
+      assert.ok(
+        Math.abs(held(out) - held(start)) < 1e-9,
+        `${describeHeld} moved from ${held(start)} to ${held(out)}: ${JSON.stringify(out)}`,
+      );
+    });
+  }
+
+  it('holds the right edge when a locked ratio shrinks the span', () => {
+    // The re-seat at the end of the function, which the ratio block alone does
+    // not cover: it anchors x for the ratio correction, and then the frame fit
+    // scales the span again underneath it. Dragging the south-west handle below
+    // the picture must not pull the right edge left with it.
+    const rect = { x: 0.0279, y: 0.1047, w: 0.5488, h: 1.2659 };
+    const out = clampFrameRect(rect, ...FRAME, 0.5625, 'sw');
+    assert.ok(
+      Math.abs(out.x + out.w - (rect.x + rect.w)) < 1e-3,
+      `right edge moved from ${rect.x + rect.w} to ${out.x + out.w}: ${JSON.stringify(out)}`,
+    );
+  });
+
+  it('grows up from the held bottom edge when a drag is squeezed under the minimum', () => {
+    // The same re-seat on the other axis, reached a different way: the span is
+    // below MIN_CROP_SPAN and gets grown. It has to grow away from the edge the
+    // finger is holding, not push that edge further down.
+    const rect = { x: 0.2, y: 0.5838, w: 0.5, h: 0.0134 };
+    const out = clampFrameRect(rect, ...FRAME, null, 'n');
+    assert.ok(out.h > rect.h, 'the span should have been grown to the minimum');
+    assert.ok(
+      Math.abs(out.y + out.h - (rect.y + rect.h)) < 1e-3,
+      `bottom edge moved from ${rect.y + rect.h} to ${out.y + out.h}: ${JSON.stringify(out)}`,
+    );
+  });
+
+  it('keeps a locked ratio when the frame squeezes one axis under the minimum', () => {
+    // The second comment: dragging the north handle to the top with the bottom
+    // edge already near the frame returned "a rect whose displayed ratio was
+    // 1.07 instead of the 0.5625 the user had chosen" — because the minimum was
+    // applied per axis after the fit, and a ratio does not survive that.
+    const ratio = 0.5625;
+    const out = clampFrameRect({ x: 0.3, y: -0.4, w: 0.4, h: 1.35 }, ...FRAME, ratio, 'n');
+    const shown = (out.w * FRAME[0]) / (out.h * FRAME[1]);
+    assert.ok(Math.abs(shown - ratio) < 1e-9, `displayed ratio ${shown}, wanted ${ratio}`);
+  });
+
+  it('folds a drag that crosses its own opposite edge, and moves the anchor with it', () => {
+    // clampFrameRect reads the anchor as given, so the fold has to hand over the
+    // swapped one — by the time a rect reaches it the span is positive again and
+    // nothing else knows a fold happened.
+    const { rect, anchor } = foldDragRect({ x: 0.7, y: 0.6, w: -0.4, h: -0.3 }, 'se');
+    assert.deepEqual(
+      { x: +rect.x.toFixed(10), y: +rect.y.toFixed(10), w: +rect.w.toFixed(10), h: +rect.h.toFixed(10) },
+      { x: 0.3, y: 0.3, w: 0.4, h: 0.3 },
+    );
+    assert.equal(anchor, 'nw');
+  });
+
+  it('keeps the unheld axis centred on the drag', () => {
+    // Dragging 'n' or 's' constrains the vertical only, so a ratio lock is free
+    // to choose the width — and it has to stay centred on the drag rather than
+    // sliding sideways. The order matters: the span has to be final before the
+    // re-centring, or the rect is centred at one width and then grown to
+    // another. Both cases below drift by ~3% of the frame when it is not.
+    for (const [anchor, rect, ratio, frame, axis] of [
+      ['s', { x: 0.4792, y: 0.4484, w: 0.0101, h: 0.1825 }, 4 / 3, [900, 1600], 'x'],
+      ['w', { x: 0.6115, y: 0.7908, w: 0.0755, h: 0.3049 }, 16 / 9, [900, 1600], 'y'],
+    ]) {
+      const out = clampFrameRect(rect, ...frame, ratio, anchor);
+      const span = axis === 'x' ? 'w' : 'h';
+      const wanted = rect[axis] + rect[span] / 2;
+      const got = out[axis] + out[span] / 2;
+      assert.ok(
+        Math.abs(got - wanted) < 1e-3,
+        `anchor '${anchor}': ${axis} centre moved from ${wanted} to ${got}: ${JSON.stringify(out)}`,
+      );
+    }
+  });
+
+  it('locks a ratio by shrinking, never by growing', () => {
+    // Both axes can reach a given ratio — shrink the long one or grow the short
+    // one — and both leave the ratio exactly right, so asserting the ratio alone
+    // cannot tell them apart. Growing is wrong: the crop would cover more of the
+    // picture than the drag asked for. Measured on the inverted branch, a
+    // 0.61 x 0.65 drag at 3:4 came back 0.42 x 0.99 — nearly the full height.
+    const ratios = ASPECT_PRESETS.map((preset) => preset.ratio).filter(Boolean);
+    const rects = [
+      { x: 0.21, y: 0.33, w: 0.61, h: 0.65 },
+      { x: 0.31, y: 0.2, w: 0.52, h: 0.27 },
+      { x: 0.1, y: 0.1, w: 0.8, h: 0.3 },
+      { x: 0.25, y: 0.25, w: 0.3, h: 0.7 },
+    ];
+    for (const [width, height] of [FRAME, [900, 1600], [1000, 1000]]) {
+      for (const ratio of ratios) {
+        for (const anchor of [null, 'n', 'e', 'sw', 'ne']) {
+          for (const rect of rects) {
+            const out = clampFrameRect(rect, width, height, ratio, anchor);
+            const where = `${width}x${height} ratio=${ratio} anchor=${anchor} ${JSON.stringify(rect)} -> ${JSON.stringify(out)}`;
+            // These rects all sit inside the frame and well above the minimum,
+            // so neither the fit nor the grow-to-minimum has anything to do.
+            assert.ok(out.w <= rect.w + 1e-9, `width grew: ${where}`);
+            assert.ok(out.h <= rect.h + 1e-9, `height grew: ${where}`);
+          }
+        }
+      }
+    }
+  });
+
+  it('never returns a rect outside the frame, under the minimum, or off-ratio', () => {
+    // A deterministic sweep rather than a sample: every anchor against every
+    // preset ratio, with rects that overshoot each way on purpose, since
+    // overshooting is the case the function exists for.
+    const anchors = [null, 'n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'];
+    const ratios = [null, ...ASPECT_PRESETS.map((preset) => preset.ratio).filter(Boolean)];
+    const rects = [
+      { x: 0.5, y: 0.5, w: 1.2, h: 1.2 },
+      { x: -0.3, y: -0.3, w: 1.4, h: 1.4 },
+      { x: 0.9, y: 0.9, w: 0.5, h: 0.5 },
+      { x: 0.5, y: 0.5, w: 0.0001, h: 0.0001 },
+      { x: 0.02, y: 0.02, w: 0.01, h: 0.99 },
+    ];
+    for (const [width, height] of [FRAME, [900, 1600], [1000, 1000]]) {
+      for (const anchor of anchors) {
+        for (const ratio of ratios) {
+          for (const rect of rects) {
+            const out = clampFrameRect(rect, width, height, ratio, anchor);
+            const where = `${width}x${height} ratio=${ratio} anchor=${anchor} ${JSON.stringify(rect)} -> ${JSON.stringify(out)}`;
+            assert.ok(out.x >= -1e-9 && out.y >= -1e-9, `outside the frame: ${where}`);
+            assert.ok(out.x + out.w <= 1 + 1e-9 && out.y + out.h <= 1 + 1e-9, `outside the frame: ${where}`);
+            assert.ok(
+              out.w >= MIN_CROP_SPAN - 1e-9 && out.h >= MIN_CROP_SPAN - 1e-9,
+              `under the minimum span: ${where}`,
+            );
+            if (ratio) {
+              const shown = (out.w * width) / (out.h * height);
+              assert.ok(Math.abs(shown - ratio) < 1e-6 * ratio, `ratio ${shown} != ${ratio}: ${where}`);
+            }
+          }
+        }
+      }
+    }
+  });
 });
