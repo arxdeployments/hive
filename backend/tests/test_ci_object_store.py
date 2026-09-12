@@ -53,10 +53,21 @@ _IMAGE_TOKEN = re.compile(r"(?<![\w./-])((?:[\w.-]+(?::\d+)?/)*minio[\w.-]*:[\w.
 
 
 def _workflow() -> dict:
+    """ci.yml, parsed.
+
+    Structure is asserted against this rather than against the raw text, so
+    reindenting or reordering the file cannot fail a test for the wrong reason.
+    """
     return yaml.safe_load(WORKFLOW.read_text())
 
 
 def _uncommented(text: str) -> str:
+    """Drop whole-line comments before scanning for image references.
+
+    The comments in ci.yml name minio/minio:edge-cicd deliberately, to record
+    what was withdrawn and why. Scanning the raw text would read that prose as a
+    reference and fail the quay rule on the explanation for the quay rule.
+    """
     return "\n".join(line for line in text.splitlines() if not line.strip().startswith("#"))
 
 
@@ -100,6 +111,13 @@ def test_minio_is_never_a_service_container():
 
 
 def test_every_job_expecting_an_object_store_starts_one():
+    """Credentials are not an object store.
+
+    The backend job carried RXHIVE_S3_ENDPOINT and real upload tests long before
+    anything served them, so those tests could only ever fail — and it went
+    unnoticed because lint failed earlier and the job never reached them. Tying
+    the two sets together is what makes that state unrepresentable.
+    """
     expecting = {
         name for name, job in _workflow()["jobs"].items() if "RXHIVE_S3_ENDPOINT" in yaml.safe_dump(job)
     }
@@ -113,6 +131,13 @@ def test_every_job_expecting_an_object_store_starts_one():
 
 @pytest.mark.parametrize("job", sorted(_start_steps()))
 def test_the_start_step_passes_the_server_subcommand(job: str):
+    """The subcommand is the entire reason this is a step and not a service.
+
+    Every published MinIO image defaults to Cmd ["minio"], which prints its help
+    and exits 0. Dropping `server /data` leaves a step that succeeds, a container
+    that is already gone, and a failure that surfaces much later as a refused
+    connection in something unrelated.
+    """
     assert re.search(r"\bserver\s+/data\b", _start_steps()[job]), (
         f"{job} starts MinIO without `server /data`. The image's default command is "
         "`minio`, which prints its help and exits 0, so the job fails later and "
@@ -131,6 +156,12 @@ def test_the_start_step_waits_for_health(job: str):
 
 @pytest.mark.parametrize(("source", "image"), _minio_image_references())
 def test_minio_images_come_from_quay(source: str, image: str):
+    """Docker Hub's minio/minio cannot be pulled by anyone any more.
+
+    An authenticated pull token gets 401 there where library/redis gets 200, so a
+    reference that goes back is not slow or rate-limited — it is dead, and it
+    fails at container start before any step of the job runs.
+    """
     assert image.startswith("quay.io/"), (
         f"{source} pulls {image}. Docker Hub's minio/minio is withdrawn — that reference "
         "cannot be pulled by anyone."
@@ -139,6 +170,13 @@ def test_minio_images_come_from_quay(source: str, image: str):
 
 @pytest.mark.parametrize(("source", "image"), _minio_image_references())
 def test_minio_images_are_pinned_to_a_dated_release(source: str, image: str):
+    """A floating tag is what disappeared.
+
+    `latest`, `latest-cicd` and `edge-cicd` all move or vanish underneath you.
+    MinIO stamps a RELEASE with a UTC timestamp and never reuses it, so a dated
+    tag is a fixed artefact that cannot change meaning between two runs of the
+    same commit.
+    """
     tag = image.rpartition(":")[2]
     assert _DATED_RELEASE.match(tag), (
         f"{source} pins MinIO at {tag!r}. A floating tag is what disappeared; use a dated "
