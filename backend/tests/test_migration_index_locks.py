@@ -73,6 +73,7 @@ class Op:
     table: str | None
     concurrent: bool
     in_block: bool
+    conditional: bool  # sits inside an if/for/while/try, so it may not run
 
 
 def _migrations() -> list[pathlib.Path]:
@@ -102,7 +103,7 @@ def _is_autocommit_block(node: ast.With) -> bool:
     )
 
 
-def _ops_from_call(call: ast.Call, in_block: bool) -> list[Op]:
+def _ops_from_call(call: ast.Call, in_block: bool, conditional: bool = False) -> list[Op]:
     """Index statements expressed by one call — raw SQL or the alembic helper."""
     if not isinstance(call.func, ast.Attribute):
         return []
@@ -112,11 +113,12 @@ def _ops_from_call(call: ast.Call, in_block: bool) -> list[Op]:
         if not isinstance(sql, str):
             return []
         found = [
-            Op("create", _bare(m.group(2)), _bare(m.group(3)), bool(m.group(1)), in_block)
+            Op("create", _bare(m.group(2)), _bare(m.group(3)), bool(m.group(1)), in_block, conditional)
             for m in _CREATE_INDEX.finditer(sql)
         ]
         found += [
-            Op("drop", _bare(m.group(2)), None, bool(m.group(1)), in_block) for m in _DROP_INDEX.finditer(sql)
+            Op("drop", _bare(m.group(2)), None, bool(m.group(1)), in_block, conditional)
+            for m in _DROP_INDEX.finditer(sql)
         ]
         return found
     if (
@@ -128,13 +130,15 @@ def _ops_from_call(call: ast.Call, in_block: bool) -> list[Op]:
             kw.arg == "postgresql_concurrently" and getattr(kw.value, "value", False) is True
             for kw in call.keywords
         )
-        return [Op("create", str(call.args[0].value), str(call.args[1].value), concurrent, in_block)]
+        return [
+            Op("create", str(call.args[0].value), str(call.args[1].value), concurrent, in_block, conditional)
+        ]
     if name == "drop_index" and call.args and isinstance(call.args[0], ast.Constant):
         concurrent = any(
             kw.arg == "postgresql_concurrently" and getattr(kw.value, "value", False) is True
             for kw in call.keywords
         )
-        return [Op("drop", str(call.args[0].value), None, concurrent, in_block)]
+        return [Op("drop", str(call.args[0].value), None, concurrent, in_block, conditional)]
     return []
 
 
@@ -146,26 +150,27 @@ def _ops_in(function: ast.FunctionDef) -> list[Op]:
     """
     ops: list[Op] = []
 
-    def walk(body: list[ast.stmt], in_block: bool) -> None:
+    def walk(body: list[ast.stmt], in_block: bool, conditional: bool) -> None:
         for node in body:
             if isinstance(node, ast.With):
-                walk(node.body, in_block or _is_autocommit_block(node))
+                walk(node.body, in_block or _is_autocommit_block(node), conditional)
                 continue
             if isinstance(node, ast.If | ast.For | ast.While):
-                walk(node.body, in_block)
-                walk(node.orelse, in_block)
+                walk(node.body, in_block, True)
+                walk(node.orelse, in_block, True)
                 continue
             if isinstance(node, ast.Try):
-                for part in (node.body, node.orelse, node.finalbody):
-                    walk(part, in_block)
+                walk(node.body, in_block, conditional)
+                for part in (node.orelse, node.finalbody):
+                    walk(part, in_block, True)
                 for handler in node.handlers:
-                    walk(handler.body, in_block)
+                    walk(handler.body, in_block, True)
                 continue
             for sub in ast.walk(node):
                 if isinstance(sub, ast.Call):
-                    ops.extend(_ops_from_call(sub, in_block))
+                    ops.extend(_ops_from_call(sub, in_block, conditional))
 
-    walk(function.body, False)
+    walk(function.body, False, False)
     return ops
 
 
@@ -252,6 +257,11 @@ def test_a_concurrent_build_clears_an_invalid_index_first(path: pathlib.Path):
     the finished article; a DROP CONCURRENTLY IF EXISTS *earlier in the same
     function* does not. A drop in downgrade() never runs on that retry.
 
+    Both statements have to be unconditional, too. A drop inside a branch may
+    not run on the path the build takes, and the pairing is the whole point —
+    while `IF EXISTS` already makes the drop a no-op when there is nothing to
+    clear, so the branch buys nothing.
+
     The drop has to be concurrent as well. A plain DROP INDEX takes ACCESS
     EXCLUSIVE — stronger than the SHARE the CREATE was made concurrent to avoid
     — and it is easy to read as the harmless half because it is usually a no-op.
@@ -269,10 +279,21 @@ def test_a_concurrent_build_clears_an_invalid_index_first(path: pathlib.Path):
         plain_dropped: set[str] = set()
         for op in ops:
             if op.kind == "drop":
+                if op.conditional:
+                    # A drop that may not run cannot be the one the retry needs.
+                    continue
                 (dropped if op.concurrent else plain_dropped).add(op.index)
                 continue
             if not op.concurrent:
                 continue
+            if op.conditional:
+                raise AssertionError(
+                    f"{path.name}: {name}() builds {op.index} concurrently inside a "
+                    "branch. Whether its pre-drop runs on the same path cannot be read "
+                    "from here, and the pairing is the whole point. DROP INDEX "
+                    "CONCURRENTLY IF EXISTS is already conditional in SQL, so the "
+                    "branch buys nothing — take both statements out of it."
+                )
             if op.index in dropped:
                 continue
             if op.index in plain_dropped:
@@ -299,3 +320,195 @@ def test_the_guard_sees_the_migrations():
     assert len(paths) >= 10, [p.name for p in paths]
     builds = sum(1 for p in paths for f in _functions(p).values() for op in _ops_in(f) if op.kind == "create")
     assert builds >= 15, f"only found {builds} index builds across {len(paths)} migrations"
+
+
+# ── The guard's own rules ────────────────────────────────────────────────────
+#
+# Everything above reads the real migrations, which all pass — so nothing there
+# exercises a rule's failure path, and a rule that stopped firing would look
+# exactly the same. These run each rule against synthetic migrations instead,
+# in both directions. Four of them were live blind spots found in review.
+
+_HEAD = 'from alembic import op\n\nrevision = "zz1"\n\n\n'
+_BLOCK = "    with op.get_context().autocommit_block():\n"
+
+
+def _synthetic(tmp_path: pathlib.Path, body: str, revision: str = "zz1") -> pathlib.Path:
+    """A migration file on disk, which is what every rule above reads."""
+    path = tmp_path / "x.py"
+    path.write_text(f'from alembic import op\n\nrevision = "{revision}"\n\n\n{body}')
+    return path
+
+
+def _fires(rule, path: pathlib.Path) -> bool:
+    """Whether a rule rejects this migration. A skip is not a rejection."""
+    try:
+        rule(path)
+    except AssertionError:
+        return True
+    except BaseException as exc:  # pytest's Skipped is not an Exception
+        if type(exc).__name__ != "Skipped":
+            raise
+    return False
+
+
+_EXEMPT_REVISION = next(iter(EXEMPT))
+_EXEMPT_INDEX, _EXEMPT_TABLE = next(iter(EXEMPT[_EXEMPT_REVISION]))
+
+
+@pytest.mark.parametrize(
+    ("case", "body", "revision", "rejected"),
+    [
+        (
+            "plain index on an existing table",
+            'def upgrade():\n    op.create_index("i", "messages", ["a"])\n',
+            "zz1",
+            True,
+        ),
+        (
+            "raw plain CREATE INDEX",
+            'def upgrade():\n    op.execute("CREATE INDEX i ON messages (a)")\n',
+            "zz1",
+            True,
+        ),
+        (
+            "index on a table this migration creates",
+            'def upgrade():\n    op.create_table("t")\n    op.create_index("i", "t", ["a"])\n',
+            "zz1",
+            False,
+        ),
+        (
+            "postgresql_concurrently=True",
+            'def upgrade():\n    op.create_index("i", "messages", ["a"], postgresql_concurrently=True)\n',
+            "zz1",
+            False,
+        ),
+        (
+            "the exempt pair itself",
+            f'def upgrade():\n    op.create_index("{_EXEMPT_INDEX}", "{_EXEMPT_TABLE}", ["a"])\n',
+            _EXEMPT_REVISION,
+            False,
+        ),
+        (
+            "a different index in the exempt revision",
+            f'def upgrade():\n    op.create_index("{_EXEMPT_INDEX}", "{_EXEMPT_TABLE}", ["a"])\n'
+            '    op.create_index("i2", "messages", ["b"])\n',
+            _EXEMPT_REVISION,
+            True,
+        ),
+        (
+            "an exemption that is no longer used",
+            f'def upgrade():\n    op.create_index("{_EXEMPT_INDEX}", "{_EXEMPT_TABLE}", ["a"], '
+            "postgresql_concurrently=True)\n",
+            _EXEMPT_REVISION,
+            True,
+        ),
+    ],
+)
+def test_the_existing_table_rule_fires_exactly_when_it_should(
+    tmp_path: pathlib.Path, case: str, body: str, revision: str, rejected: bool
+):
+    """Both directions, including the exemption and the tables it does not cover."""
+    path = _synthetic(tmp_path, body, revision)
+    assert _fires(test_an_index_on_an_existing_table_is_built_concurrently, path) is rejected, case
+
+
+@pytest.mark.parametrize(
+    ("case", "body", "rejected"),
+    [
+        ("inside the block", _BLOCK + '        op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n', False),
+        ("outside the block", '    op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n', True),
+        (
+            "concurrent DROP outside the block",
+            '    op.execute("DROP INDEX CONCURRENTLY IF EXISTS i")\n',
+            True,
+        ),
+        ("no concurrent DDL at all", '    op.create_index("i", "t", ["a"])\n', False),
+    ],
+)
+def test_the_transaction_rule_fires_exactly_when_it_should(
+    tmp_path: pathlib.Path, case: str, body: str, rejected: bool
+):
+    """A block in the other function is covered separately, below."""
+    path = _synthetic(tmp_path, f"def upgrade():\n{body}")
+    assert _fires(test_concurrent_statements_leave_the_transaction, path) is rejected, case
+
+
+def test_a_block_in_one_function_does_not_vouch_for_another(tmp_path: pathlib.Path):
+    """The reason statements are read per function rather than per file."""
+    path = _synthetic(
+        tmp_path,
+        'def upgrade():\n    op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n\n\n'
+        "def downgrade():\n" + _BLOCK + "        pass\n",
+    )
+    assert _fires(test_concurrent_statements_leave_the_transaction, path)
+
+
+@pytest.mark.parametrize(
+    ("case", "body", "rejected"),
+    [
+        (
+            "drop then create",
+            _BLOCK
+            + '        op.execute("DROP INDEX CONCURRENTLY IF EXISTS i")\n'
+            + '        op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n',
+            False,
+        ),
+        (
+            "create with no drop",
+            _BLOCK + '        op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n',
+            True,
+        ),
+        (
+            "drop after the create",
+            _BLOCK
+            + '        op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n'
+            + '        op.execute("DROP INDEX CONCURRENTLY IF EXISTS i")\n',
+            True,
+        ),
+        (
+            "drops a different index",
+            _BLOCK
+            + '        op.execute("DROP INDEX CONCURRENTLY IF EXISTS other")\n'
+            + '        op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n',
+            True,
+        ),
+        (
+            "a plain DROP as the pre-drop",
+            _BLOCK
+            + '        op.execute("DROP INDEX IF EXISTS i")\n'
+            + '        op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n',
+            True,
+        ),
+        (
+            "op.drop_index() as the pre-drop",
+            _BLOCK
+            + '        op.drop_index("i")\n        op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n',
+            True,
+        ),
+        (
+            "a conditional pre-drop",
+            _BLOCK
+            + '        if op.get_bind().dialect.name == "postgresql":\n'
+            + '            op.execute("DROP INDEX CONCURRENTLY IF EXISTS i")\n'
+            + '        op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n',
+            True,
+        ),
+    ],
+)
+def test_the_retry_rule_fires_exactly_when_it_should(
+    tmp_path: pathlib.Path, case: str, body: str, rejected: bool
+):
+    """The pre-drop has to run, be concurrent, and come first."""
+    path = _synthetic(tmp_path, f"def upgrade():\n{body}")
+    assert _fires(test_a_concurrent_build_clears_an_invalid_index_first, path) is rejected, case
+
+
+def test_a_drop_in_downgrade_does_not_vouch_for_a_build_in_upgrade(tmp_path: pathlib.Path):
+    """A drop that runs on the way down is not the drop a retry needs on the way up."""
+    path = _synthetic(
+        tmp_path,
+        "def upgrade():\n" + _BLOCK + '        op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n\n\n'
+        "def downgrade():\n" + _BLOCK + '        op.execute("DROP INDEX CONCURRENTLY IF EXISTS i")\n',
+    )
+    assert _fires(test_a_concurrent_build_clears_an_invalid_index_first, path)
