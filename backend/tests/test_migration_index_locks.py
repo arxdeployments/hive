@@ -251,6 +251,12 @@ def test_a_concurrent_build_clears_an_invalid_index_first(path: pathlib.Path):
     and has to clear it. CREATE ... IF NOT EXISTS would take the invalid one for
     the finished article; a DROP CONCURRENTLY IF EXISTS *earlier in the same
     function* does not. A drop in downgrade() never runs on that retry.
+
+    The drop has to be concurrent as well. A plain DROP INDEX takes ACCESS
+    EXCLUSIVE — stronger than the SHARE the CREATE was made concurrent to avoid
+    — and it is easy to read as the harmless half because it is usually a no-op.
+    The run it is not a no-op on is the retry, which is the run where the table
+    is live and the index is there.
     """
     functions = _functions(path)
     checked = False
@@ -260,16 +266,29 @@ def test_a_concurrent_build_clears_an_invalid_index_first(path: pathlib.Path):
             continue
         checked = True
         dropped: set[str] = set()
+        plain_dropped: set[str] = set()
         for op in ops:
             if op.kind == "drop":
-                dropped.add(op.index)
+                (dropped if op.concurrent else plain_dropped).add(op.index)
                 continue
-            if op.concurrent and op.index not in dropped:
+            if not op.concurrent:
+                continue
+            if op.index in dropped:
+                continue
+            if op.index in plain_dropped:
                 raise AssertionError(
-                    f"{path.name}: {name}() builds {op.index} concurrently without "
-                    "dropping it first, in this function and before the build. A retry "
-                    "after a cancelled build would find an INVALID index and keep it."
+                    f"{path.name}: {name}() clears {op.index} with a plain DROP INDEX "
+                    "before building it concurrently. That drop takes ACCESS EXCLUSIVE "
+                    "on the table — a stronger lock than the CREATE was made concurrent "
+                    "to avoid, and taken on exactly the run that needs it: the retry "
+                    "after a cancelled build, when the index is there and the table is "
+                    "live. Drop it CONCURRENTLY too, as a4f81c6b2e07 does."
                 )
+            raise AssertionError(
+                f"{path.name}: {name}() builds {op.index} concurrently without "
+                "dropping it first, in this function and before the build. A retry "
+                "after a cancelled build would find an INVALID index and keep it."
+            )
     if not checked:
         pytest.skip("no concurrent index build")
 
