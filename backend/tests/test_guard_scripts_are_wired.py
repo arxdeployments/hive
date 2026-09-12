@@ -78,26 +78,27 @@ _PYTHON = re.compile(r"^(?:\S*/)?python[\d.]*$")
 _DOUBLE_QUOTE_ESCAPES = frozenset({"\\", '"', "$", "`"})
 
 
-def _commands(line: str) -> list[list[str]]:
-    """Split one shell line into commands, each a list of unquoted words.
+def _commands(text: str) -> list[list[str]]:
+    """Split a whole `run:` value into commands, each a list of unquoted words.
 
     Hand-written rather than shlex, after three review findings in a row on this
-    helper, each one shlex disagreeing with the shell in a different place:
+    helper, each one shlex disagreeing with the shell in a different place: a
+    regex split that read a quoted `;` as a separator, commenters that cut at a
+    `#` anywhere, and non-posix mode ignoring a backslash escape.
 
-      * `re.split` on `&&` and `;` read a separator inside a quoted string as a
-        real one, so `echo 'note; python scripts/check_x.py'` looked wired.
-      * shlex's commenters cut at a `#` anywhere, so
-        `python scripts/check_x.py#note` looked wired, where a shell reads one
-        word naming a path that does not exist.
-      * shlex in non-posix mode does not honour a backslash escape, so
-        `echo "note\\"#still quoted" && python scripts/check_x.py` ended its
-        token early and the `#still` that followed read as a comment, hiding the
-        real invocation after the `&&`.
+    It takes the whole value, not a line at a time. Splitting first loses the
+    two things that cross a line boundary: a trailing backslash continues the
+    command onto the next line, so
 
-    Patching a lexer three times without converging says the lexer is the wrong
-    tool. This tracks the three states that actually matter — single quote,
-    double quote, backslash — and nothing else, because nothing else changes
-    where a word begins or whether a `#` opens a comment.
+        echo continued \\
+        python scripts/check_x.py
+
+    is one `echo` and not an invocation; and a quote opened on one line runs on,
+    newline included, until it closes.
+
+    A value whose quote never closes is not a command the shell would run, so it
+    yields nothing rather than its words. Reporting a wired guard as unwired is
+    the safe direction; reporting an unwired one as fine is not.
 
     No expansion is attempted: `$VAR`, globs and substitutions stay literal.
     They cannot turn something that is not an invocation into one, since the
@@ -108,7 +109,7 @@ def _commands(line: str) -> list[list[str]]:
     word: list[str] = []
     started = False  # a word is open, possibly empty — `""` is a word
     quote: str | None = None
-    index, length = 0, len(line)
+    index, length = 0, len(text)
 
     def end_word() -> None:
         nonlocal word, started
@@ -124,16 +125,19 @@ def _commands(line: str) -> list[list[str]]:
         words = []
 
     while index < length:
-        char = line[index]
+        char = text[index]
+        following = text[index + 1 : index + 2]
         if quote == "'":
-            # Single quotes protect everything, backslash included.
+            # Single quotes protect everything, backslash and newline included.
             if char == "'":
                 quote = None
             else:
                 word.append(char)
             index += 1
         elif quote == '"':
-            following = line[index + 1 : index + 2]
+            if char == "\\" and following == "\n":
+                index += 2  # line continuation, removed
+                continue
             if char == "\\" and following in _DOUBLE_QUOTE_ESCAPES:
                 word.append(following)
                 index += 2
@@ -143,8 +147,10 @@ def _commands(line: str) -> list[list[str]]:
             else:
                 word.append(char)
             index += 1
+        elif char == "\\" and following == "\n":
+            index += 2  # line continuation: both characters vanish
         elif char == "\\" and index + 1 < length:
-            word.append(line[index + 1])
+            word.append(following)
             started = True
             index += 2
         elif char in ("'", '"'):
@@ -152,20 +158,29 @@ def _commands(line: str) -> list[list[str]]:
             started = True
             index += 1
         elif char == "#" and not started:
-            # A shell opens a comment at `#` only where a word begins.
-            break
+            # A shell opens a comment at `#` only where a word begins, and it
+            # runs to the end of THIS line rather than of the whole value.
+            newline = text.find("\n", index)
+            if newline < 0:
+                break
+            index = newline
+        elif char == "\n":
+            end_command()
+            index += 1
         elif char.isspace():
             end_word()
             index += 1
         elif char in _SEPARATOR_CHARS:
             end_command()
-            while index < length and line[index] in _SEPARATOR_CHARS:
+            while index < length and text[index] in _SEPARATOR_CHARS:
                 index += 1
         else:
             word.append(char)
             started = True
             index += 1
 
+    if quote is not None:
+        return []
     end_command()
     return commands
 
@@ -184,11 +199,11 @@ def _invokes(command: str, script: str) -> bool:
     """Whether a shell command actually runs `scripts/<script>`.
 
     Naming the path is not running it, and the ways to name it are not obvious —
-    see _commands for the three that got through review. The path has to be the
-    program of one of the commands on a line, or the first argument to a python
-    interpreter.
+    see _commands for the four that got through review. The path has to be the
+    program of one of the commands in the value, or the first argument to a
+    python interpreter.
     """
-    return any(_is_invocation(words, script) for line in command.splitlines() for words in _commands(line))
+    return any(_is_invocation(words, script) for words in _commands(command))
 
 
 @pytest.mark.parametrize(
@@ -248,6 +263,39 @@ def _invokes(command: str, script: str) -> bool:
 )
 def test_only_a_real_invocation_counts(command: str, runs: bool):
     """The matcher itself, since the guard is only as good as it."""
+    assert _invokes(command, "check_contracts.py") is runs
+
+
+@pytest.mark.parametrize(
+    ("name", "command", "runs"),
+    [
+        # A quote that never closes is not a command the shell runs at all.
+        ("unterminated single quote", "python scripts/check_contracts.py '", False),
+        ("unterminated double quote", 'python scripts/check_contracts.py "', False),
+        # A trailing backslash joins the next line onto this command, so the
+        # path below is an argument to echo and nothing is invoked.
+        ("continuation joins the lines", "echo continued \\\npython scripts/check_contracts.py", False),
+        ("continuation inside quotes", 'echo "a \\\npython scripts/check_contracts.py"', False),
+        # A quote opened on one line swallows the newline and everything after.
+        ("quote spanning lines", "echo 'a\npython scripts/check_contracts.py'", False),
+        # ...but a plain newline separates, and a comment ends at its own line.
+        ("two separate lines", "echo hi\npython scripts/check_contracts.py", True),
+        ("comment ends at the line", "true # x\npython scripts/check_contracts.py", True),
+        # A continuation that joins an invocation back together still runs it —
+        # the branch has to remove the pair, not merely stop the newline ending
+        # the word. Splitting a long command this way is ordinary in CI YAML.
+        ("continued invocation", "python \\\nscripts/check_contracts.py", True),
+        ("continuation inside a quote", 'python "scripts/check_\\\ncontracts.py"', True),
+    ],
+)
+def test_state_carries_across_lines(name: str, command: str, runs: bool):
+    """A `run:` block is one script, not a list of independent lines.
+
+    Scanning it line by line loses the two things that cross a boundary — a
+    trailing backslash continuing the command, and a quote that stays open — and
+    both turn into false positives: a path that is an argument to echo, read as
+    an invocation.
+    """
     assert _invokes(command, "check_contracts.py") is runs
 
 

@@ -33,6 +33,7 @@ import { describe, it } from 'node:test';
 
 import {
   FULL_CROP,
+  BLACK_STOP,
   GREY_STOP,
   SWATCHES,
   emptyEdit,
@@ -73,6 +74,43 @@ describe('the colour slider is its own inverse', () => {
     const back = inkForSliderPosition(position);
     assert.equal(position, GREY_STOP, 'every red maps to the boundary; that is why it is the case that broke');
     assert.ok(isRed(back), `the red swatch round-tripped to ${back}`);
+  });
+
+  it('still reaches pure black, below the boundary', () => {
+    // Giving GREY_STOP to the ramp took black's only position with it — the
+    // greys ran to exactly GREY_STOP, so #000000 started round-tripping to red.
+    // Black now ends the band at BLACK_STOP instead, which is why that constant
+    // exists.
+    assert.ok(BLACK_STOP < GREY_STOP, 'black must sit inside the grey band');
+    assert.equal(sliderPositionForInk('#000000'), BLACK_STOP);
+    assert.equal(inkForSliderPosition(BLACK_STOP), '#000000');
+    assert.equal(inkForSliderPosition(sliderPositionForInk('#000000')), '#000000');
+  });
+
+  it('is black across the whole sliver, not just at one point', () => {
+    // The reason for a band rather than an exact position: dragging can land
+    // anywhere, and a single representable point is not reachable by hand.
+    const midway = (BLACK_STOP + GREY_STOP) / 2;
+    assert.equal(inkForSliderPosition(midway), '#000000');
+  });
+
+  it('paints that sliver solid rather than fading it into red', () => {
+    const stops = sliderGradientStops();
+    const blacks = stops.filter((stop) => stop.startsWith('#000000'));
+    assert.equal(blacks.length, 2, `expected black at both ends of the sliver: ${stops.join(', ')}`);
+    // Compared as numbers, not as the strings CSS happens to be given: '16.0%'
+    // and '16.00%' are different text and the same position, and rounding the
+    // two sides of the sliver onto one offset is exactly how it disappears.
+    const offsets = stops.map((stop) => Number.parseFloat(stop.split(' ')[1]));
+    assert.equal(
+      new Set(offsets).size,
+      stops.length,
+      `two stops land on the same offset: ${stops.join(', ')}`,
+    );
+    assert.ok(
+      offsets.every((offset, i) => i === 0 || offset > offsets[i - 1]),
+      `stops are not in ascending order: ${stops.join(', ')}`,
+    );
   });
 
   it('gives the shared boundary to the hue ramp, not the greys', () => {
