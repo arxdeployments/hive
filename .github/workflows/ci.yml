@@ -171,7 +171,7 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
+          cache-dependency-path: backend/requirements-dev.txt
       # BEFORE pip install, deliberately. This is stdlib-only and reads the
       # repository, so running it first means a manifest that lets the resolver
       # choose an unpinned package is rejected before that package's build backend
@@ -189,7 +189,11 @@ jobs:
       # existed, and a config that silently stops covering a new ecosystem is the
       # same failure with an extra step.
       - run: python scripts/check_dependabot_coverage.py
-      - run: pip install -r backend/requirements.txt
+      # requirements-dev, not requirements: it is `-r requirements.txt` plus the
+      # dev pins, and check_dependency_groups.py below needs PyYAML, which lives
+      # there. The two checks that follow read installed distribution metadata,
+      # and the extra dev packages do not change what they resolve for app/.
+      - run: pip install -r backend/requirements-dev.txt
       - run: python scripts/check_contracts.py
       # The other half, and it needs the environment. The static check above trusts
       # a hand-maintained import->distribution map; this validates that map against
@@ -197,6 +201,16 @@ jobs:
       # the wrong name and PASS while the real package is unpinned. Its own first
       # run found `pil` pointing at nothing, Pillow's import name being `PIL`.
       - run: python scripts/check_pinned_imports.py --check-mappings
+      # Batch 48 wrote this guard and nothing ever ran it. Its own test exercises
+      # the script's logic, so the suite stayed green while the invariant it
+      # exists for — that pins constraining each other move as one Dependabot
+      # group — went unchecked against the real dependabot.yml and
+      # requirements.txt. Four of the twenty-one PRs open on 2026-09-03 were
+      # stuck for exactly that reason, which is what the script was written from.
+      #
+      # After the install, unlike the two stdlib-only checks above: the couplings
+      # come from importlib.metadata, so the pins have to be installed to be read.
+      - run: python scripts/check_dependency_groups.py
 
   terraform:
     # The infrastructure had no automated check of any kind: a syntax error, a
