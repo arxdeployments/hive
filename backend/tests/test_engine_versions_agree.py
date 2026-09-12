@@ -36,9 +36,30 @@ COMPOSE_DEV = ROOT / "infra" / "docker-compose.yml"
 COMPOSE_PROD = ROOT / "infra" / "docker-compose.prod.yml"
 TERRAFORM_DATA = ROOT / "infra" / "terraform" / "data.tf"
 
-# The RDS instance's engine version, tied to the postgres engine declaration so a
-# second aws_db_instance cannot be read by accident.
-_RDS_POSTGRES_VERSION = re.compile(r'engine\s*=\s*"postgres".*?engine_version\s*=\s*"([^"]+)"', re.DOTALL)
+# The application's RDS instance, by name. A DOTALL search for engine_version
+# across the whole file can pair the `engine` of one resource with the
+# `engine_version` of another — there is one instance today, and a read replica
+# or a second database would silently become the thing this check reads.
+_RDS_MAIN_BLOCK = re.compile(r'^resource\s+"aws_db_instance"\s+"main"\s*\{(.*?)^\}', re.DOTALL | re.MULTILINE)
+_ENGINE = re.compile(r'^\s*engine\s*=\s*"([^"]+)"', re.MULTILINE)
+_ENGINE_VERSION = re.compile(r'^\s*engine_version\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+def _rds_engine_version(terraform: str) -> str | None:
+    """The engine version of `aws_db_instance.main`, if it is a Postgres instance.
+
+    Takes the text rather than reading the file, so the block scoping can be
+    tested against a decoy resource without writing one into infra/.
+    """
+    block = _RDS_MAIN_BLOCK.search(terraform)
+    if block is None:
+        return None
+    body = block.group(1)
+    engine = _ENGINE.search(body)
+    version = _ENGINE_VERSION.search(body)
+    if engine is None or engine.group(1) != "postgres" or version is None:
+        return None
+    return version.group(1)
 
 
 def _major(reference: str) -> str:
@@ -83,9 +104,9 @@ def _declared(service: str) -> dict[str, str]:
     found.update(_compose_image(COMPOSE_DEV, service))
     found.update(_compose_image(COMPOSE_PROD, service))
     if service == "postgres":
-        match = _RDS_POSTGRES_VERSION.search(TERRAFORM_DATA.read_text())
-        if match:
-            found["infra/terraform/data.tf (RDS engine_version)"] = match.group(1)
+        version = _rds_engine_version(TERRAFORM_DATA.read_text())
+        if version:
+            found["infra/terraform/data.tf (RDS engine_version)"] = version
     return found
 
 
@@ -135,3 +156,46 @@ def test_the_same_major_version_everywhere(service: str):
         "Move them together — and note that the RDS engine_version is a real major "
         "upgrade of the production database, not a tag change."
     )
+
+
+_DECOY_TERRAFORM = """
+resource "aws_db_instance" "analytics" {
+  engine         = "postgres"
+  engine_version = "14"
+}
+
+resource "aws_db_instance" "main" {
+  identifier     = "rxhive-prod"
+  engine         = "postgres"
+  engine_version = "16"
+}
+
+resource "aws_db_instance" "replica" {
+  engine         = "postgres"
+  engine_version = "18"
+}
+"""
+
+
+def test_the_rds_version_comes_from_the_main_instance_only():
+    """A second Postgres resource must not be read in place of `main`.
+
+    There is one instance today, so an unscoped search happens to be right. A
+    read replica or an analytics database would make it wrong without anyone
+    touching this file — and it would still pass, reading someone else's version.
+    """
+    assert _rds_engine_version(_DECOY_TERRAFORM) == "16"
+
+
+def test_a_non_postgres_main_instance_is_not_read_as_postgres():
+    """The version is only meaningful next to the engine it belongs to."""
+    mysql = _DECOY_TERRAFORM.replace(
+        '  engine         = "postgres"\n  engine_version = "16"',
+        '  engine         = "mysql"\n  engine_version = "8"',
+    )
+    assert _rds_engine_version(mysql) is None
+
+
+def test_the_real_terraform_still_parses():
+    """The decoys prove the scoping; this proves it still finds the real instance."""
+    assert _rds_engine_version(TERRAFORM_DATA.read_text()) == "16"

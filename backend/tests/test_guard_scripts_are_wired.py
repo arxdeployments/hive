@@ -74,6 +74,13 @@ _SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "(", ")"})
 _PYTHON = re.compile(r"^(?:\S*/)?python[\d.]*$")
 
 
+def _unquote(token: str) -> str:
+    """Drop one layer of surrounding quotes, which non-posix shlex keeps."""
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+        return token[1:-1]
+    return token
+
+
 def _is_invocation(words: list[str], script: str) -> bool:
     """Whether one command — already split from its neighbours — runs the script."""
     if not words:
@@ -90,36 +97,43 @@ def _invokes(command: str, script: str) -> bool:
     Naming the path is not running it, and the ways to name it are not obvious.
     Splitting the raw text on `&&` and `;` reads a separator inside a quoted
     string as a real one, so `echo 'note; python scripts/check_x.py'` looks like
-    an invocation; and dropping only lines that *start* with `#` misses an inline
-    comment, so `true # && python scripts/check_x.py` does too. Both were live
-    here until CodeRabbit found them on this PR.
+    an invocation; dropping only lines that *start* with `#` misses an inline
+    comment, so `true # && python scripts/check_x.py` does too.
 
-    So the line is tokenized the way a shell would: shlex with punctuation_chars
-    keeps quoted separators inside their token and hands real ones back on their
-    own, and its commenters setting drops an inline `#` and everything after it.
-    The path then has to be the program of one of those commands, or the first
-    argument to a python interpreter.
+    Lexing with shlex fixes both, but its own comment handling is not the
+    shell's: it cuts at a `#` anywhere, so `scripts/check_x.py#note` lexes to
+    `scripts/check_x.py` and reads as an invocation, where a POSIX shell treats
+    the whole thing as one word naming a path that does not exist. So commenters
+    are switched off and `#` is honoured only where a word begins, which is the
+    rule the shell applies.
 
-    A line with an unbalanced quote cannot be tokenized, and is treated as not an
-    invocation — the conservative direction, since the failure that causes is a
-    guard reported as unwired rather than an unwired guard reported as fine.
+    Non-posix, which keeps quotes on the token: that is what distinguishes a
+    word genuinely starting `#` from a quoted `'#'`, and quotes are stripped for
+    comparison afterwards.
+
+    A line that cannot be lexed is treated as not an invocation — the
+    conservative direction, since it reports a wired guard as unwired rather
+    than the reverse.
     """
-    target_lines = command.splitlines()
-    for line in target_lines:
-        lexer = shlex.shlex(line, punctuation_chars=True, posix=True)
+    for line in command.splitlines():
+        lexer = shlex.shlex(line, punctuation_chars=True, posix=False)
         lexer.whitespace_split = True
+        lexer.commenters = ""
         try:
             tokens = list(lexer)
         except ValueError:
             continue
         words: list[str] = []
         for token in [*tokens, ";"]:
-            if token in _SEPARATORS:
+            comment = token.startswith("#")
+            if comment or token in _SEPARATORS:
                 if _is_invocation(words, script):
                     return True
                 words = []
+                if comment:
+                    break
             else:
-                words.append(token)
+                words.append(_unquote(token))
     return False
 
 
@@ -154,6 +168,13 @@ def _invokes(command: str, script: str) -> bool:
         ("python scripts/check_contracts.py | tee log", True),
         ("bare scripts/check_contracts.py", False),
         ("scripts/check_contracts.py", True),
+        # shlex cuts at `#` anywhere; a shell only does so where a word begins.
+        ("python scripts/check_contracts.py#note", False),
+        ("python scripts/check_contracts.py #note", True),
+        ("python scripts/check_contracts.py --flag#x", True),
+        # ...and a quoted `#` opens nothing.
+        ("echo '#' && python scripts/check_contracts.py", True),
+        ('python "scripts/check_contracts.py"', True),
     ],
 )
 def test_only_a_real_invocation_counts(command: str, runs: bool):
