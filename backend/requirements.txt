@@ -18,7 +18,7 @@ pypdfium2==5.12.1
 livekit-api==0.8.2
 email-validator==2.2.0
 httpx==0.28.1
-pywebpush==2.0.3
+pywebpush==2.5.0
 # Pinned because app/services/push.py subclasses urllib3's HTTPConnection and
 # HTTPSConnection and overrides `_new_conn`, which is PRIVATE API. The subclass
 # stays valid Python across versions, so if a future urllib3 stops calling that
@@ -49,7 +49,7 @@ urllib3==2.7.0
 # fastapi allows the whole 0.40-0.47 range.
 anyio==4.14.2
 starlette==0.46.2
-cryptography==44.0.0
+cryptography==50.0.1
 # Same rule again, and this one arrived with a fix rather than a refactor.
 # services/calls.py constructs aiohttp.ClientTimeout directly, to hand the LiveKit
 # client a 5-second budget instead of its 60-second default — on the join and
