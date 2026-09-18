@@ -160,8 +160,10 @@ def _ops_in(function: ast.FunctionDef) -> list[Op]:
                 walk(node.orelse, in_block, True)
                 continue
             if isinstance(node, ast.Try):
-                walk(node.body, in_block, conditional)
-                for part in (node.orelse, node.finalbody):
+                # The body too, not just the handlers: a drop that raises and is
+                # caught leaves execution running on past it, so the statement
+                # completed is exactly what cannot be assumed.
+                for part in (node.body, node.orelse, node.finalbody):
                     walk(part, in_block, True)
                 for handler in node.handlers:
                     walk(handler.body, in_block, True)
@@ -257,8 +259,9 @@ def test_a_concurrent_build_clears_an_invalid_index_first(path: pathlib.Path):
     the finished article; a DROP CONCURRENTLY IF EXISTS *earlier in the same
     function* does not. A drop in downgrade() never runs on that retry.
 
-    Both statements have to be unconditional, too. A drop inside a branch may
-    not run on the path the build takes, and the pairing is the whole point —
+    Both statements have to be unconditional, too. A drop inside a branch — or
+    inside a `try` whose handler swallows the failure — may not run, or may not
+    finish, on the path the build takes, and the pairing is the whole point —
     while `IF EXISTS` already makes the drop a no-op when there is nothing to
     clear, so the branch buys nothing.
 
@@ -484,6 +487,16 @@ def test_a_block_in_one_function_does_not_vouch_for_another(tmp_path: pathlib.Pa
             "op.drop_index() as the pre-drop",
             _BLOCK
             + '        op.drop_index("i")\n        op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n',
+            True,
+        ),
+        (
+            "a pre-drop whose failure is caught",
+            _BLOCK
+            + "        try:\n"
+            + '            op.execute("DROP INDEX CONCURRENTLY IF EXISTS i")\n'
+            + "        except Exception:\n"
+            + "            pass\n"
+            + '        op.execute("CREATE INDEX CONCURRENTLY i ON t (a)")\n',
             True,
         ),
         (
