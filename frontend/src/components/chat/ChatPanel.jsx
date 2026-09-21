@@ -31,6 +31,7 @@ import wsClient from '../../services/websocket';
 import { withDerivedStatuses } from '../../utils/messageStatus';
 import { toast } from 'sonner';
 import { apiError } from '../../utils/helpers';
+import { carryOverLocalOnly } from '../../utils/carryOverLocalOnly';
 
 const EMPTY_PINNED = [];
 
@@ -265,38 +266,28 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       if (seq !== fetchSeqRef.current) return;
       const fetched = withDerivedStatuses(data.messages, myUserId);
 
-      // Carry over 'failed' bubbles, which the server has never seen.
+      // Carry over the bubbles the server has never seen — see
+      // utils/carryOverLocalOnly.js for why 'sending' belongs here as well as
+      // 'failed', and for the dedupe that keeps a send which DID land from
+      // coming back twice.
       //
-      // A text send can now fail on BOTH transports — socket not open AND the
-      // HTTP fallback rejected, i.e. the whole network is down — and when it
-      // does, the optimistic bubble is the only record of it: nothing queues the
-      // frame for replay any more. This refetch is force-run the moment the
-      // socket reconnects, and setMessages replaces the array wholesale, so
-      // without this the user's message was deleted on reconnect with no bubble,
-      // no error and no way to retry.
+      // A text send can fail on BOTH transports — socket not open AND the HTTP
+      // fallback rejected, i.e. the whole network is down — and when it does,
+      // the optimistic bubble is the only record of it: nothing queues the
+      // frame for replay. This refetch is force-run the moment the socket
+      // reconnects, and setMessages replaces the array wholesale, so without
+      // this the user's message was deleted on reconnect with no bubble, no
+      // error and no way to retry.
       //
-      // These cannot be auto-reconciled: the GET carries no temp_id (the API
-      // only echoes it on the send response), so they stay until the user
-      // retries or reloads. Scoped to 'failed' only, and that is now sufficient:
-      // the ack deadline in websocket.js resolves every unacked send to 'failed'
-      // — immediately when the socket is lost, which is strictly before the
-      // reconnect that triggers this refetch — so a message the server never
-      // received arrives here already carried, rather than sitting on 'sending'
-      // and being dropped.
-      //
-      // A failure is NOT proof the message was not stored, though — the server
-      // commits before the sender is told anything, so a lost response or a 502
-      // marks a bubble failed for a message that is already in the conversation.
-      // Every fetched message OF OUR OWN carries `client_msg_id`, so those are
-      // identified here and dropped instead of sitting under the real message as
-      // a second copy the user is invited to send again. The API withholds other
-      // senders' keys — they describe someone else's device and could only ever
-      // match one of ours by collision — so filter(Boolean) is also what keeps
-      // this set to our own sends.
-      const landed = new Set(fetched.map(m => m.client_msg_id).filter(Boolean));
-      const failedLocal = (useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES)
-        .filter(m => m.status === 'failed' && !landed.has(m.temp_id));
-      setMessages(conversationId, failedLocal.length ? [...fetched, ...failedLocal] : fetched);
+      // A failure is NOT proof the message was not stored: the server commits
+      // before the sender is told anything, so a lost response or a 502 marks a
+      // bubble failed for a message that is already in the conversation. That
+      // is what the dedupe is for.
+      const localOnly = carryOverLocalOnly(
+        useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES,
+        fetched,
+      );
+      setMessages(conversationId, localOnly.length ? [...fetched, ...localOnly] : fetched);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
       // The default window is anchored to the newest message, so by definition
       // nothing newer is missing. This also clears the flag after a "jump to
@@ -1158,20 +1149,18 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         return false;
       }
       const fetched = withDerivedStatuses(data.messages, myUserId);
-      // Keep local-only bubbles for the same reason fetchMessages does: the
-      // server has never seen them, so a wholesale replace would delete the
-      // user's unsent message.
+      // Same rule as fetchMessages, and the same helper: a wholesale replace
+      // would delete a bubble the server has never seen.
       //
-      // Unlike fetchMessages this also keeps 'sending'. There is no socket loss
-      // on this path and no deadline has necessarily elapsed, so a send from a
-      // few seconds ago is still in flight — and jumping is something the user
-      // does WHILE waiting (tapping a pinned message, a reply quote, a search
-      // hit). Dropping it here deleted a message the server may never receive
-      // and left the ack deadline with no row to mark failed. An `around` window
-      // is centred on an older message and by construction cannot contain the
-      // send, so carrying it costs nothing.
-      const localOnly = (useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES)
-        .filter(m => m.status === 'failed' || m.status === 'sending');
+      // 'sending' matters especially here — jumping is something the user does
+      // WHILE waiting (tapping a pinned message, a reply quote, a search hit),
+      // and dropping it left the ack deadline with no row to mark failed. The
+      // dedupe is a no-op on this path by construction: an `around` window is
+      // centred on an older message and cannot contain the send.
+      const localOnly = carryOverLocalOnly(
+        useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES,
+        fetched,
+      );
       setMessages(conversationId, localOnly.length ? [...fetched, ...localOnly] : fetched);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
       setHasNewerByConv(prev => ({ ...prev, [conversationId]: !!data.has_newer }));
