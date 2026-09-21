@@ -89,3 +89,17 @@ export async function uiLogin(page, email, password) {
   await page.getByTestId('login-password-input').fill(password);
   await page.getByTestId('login-submit-button').click();
 }
+
+/**
+ * The message thread, as opposed to the whole page.
+ *
+ * The sidebar renders a `You: <text>` preview of the newest message, so a bare
+ * `page.getByText(body)` matches the SIDEBAR first — it comes earlier in the
+ * DOM — and is satisfied before the thread has rendered anything. Measured:
+ * when that unscoped wait passed, the only match was inside chat-sidebar and
+ * zero message rows were mounted.
+ *
+ * Any wait for message CONTENT goes through here. Waits for UI chrome —
+ * "Forward Message", "Notifications muted" — are page-wide and fine as they are.
+ */
+export const thread = (page) => page.getByTestId('virtuoso-item-list');

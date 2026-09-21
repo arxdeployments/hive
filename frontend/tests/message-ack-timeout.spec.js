@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { seedOrgWithUsers, uiLogin } from './helpers.js';
+import { seedOrgWithUsers, thread, uiLogin } from './helpers.js';
 
 /**
  * A text message the server never acknowledged must end up retryable, not
@@ -96,7 +96,7 @@ test('a send the server never received survives the reconnect as retryable', asy
     page.getByTestId('message-retry'),
     'the unacked message was deleted by the reconnect refetch instead of being made retryable'
   ).toBeVisible({ timeout: 20000 });
-  await expect(page.getByText(body).first()).toBeVisible();
+  await expect(thread(page).getByText(body)).toBeVisible();
 
   // ...and the control actually works: retrying puts the message on the server.
   await page.getByTestId('message-retry').click();
