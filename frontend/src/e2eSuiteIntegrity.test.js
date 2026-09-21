@@ -111,11 +111,24 @@ describe('the e2e suite cannot be silently emptied', () => {
   // page-wide; a variable is a message body somebody built for the test.
   const CONTENT_WAIT = /expect\(\s*page\.getByText\(\s*([^)]*)\)/g;
 
+  /**
+   * Whether this argument names UI chrome rather than a message body.
+   *
+   * A quoted string or a regex is chrome. A template literal is only chrome if
+   * nothing is interpolated into it — `\`x ${id}\`` is runtime content built for
+   * the test and has to be scoped like any other body, which a rule keyed on
+   * the opening backtick alone would wave through.
+   */
+  const isChrome = (argument) =>
+    /^['"]/.test(argument) ||
+    argument.startsWith('/') ||
+    (argument.startsWith('`') && !argument.includes('${'));
+
   /** The page-wide waits in `source` whose argument is a message body. */
   const unscopedContentWaits = (source) =>
     [...source.matchAll(CONTENT_WAIT)]
       .map((match) => match[1].trim())
-      .filter((argument) => argument && !/^['"`/]/.test(argument));
+      .filter((argument) => argument && !isChrome(argument));
 
   it('tells a message body from a piece of UI chrome', () => {
     // The whole rule rests on this distinction, and the real specs are clean —
@@ -123,7 +136,14 @@ describe('the e2e suite cannot be silently emptied', () => {
     // cases it has to get right, in both directions.
     assert.deepEqual(unscopedContentWaits("await expect(page.getByText(body)).toBeVisible();"), ['body']);
     assert.deepEqual(unscopedContentWaits("await expect(page.getByText(original).first()).toBeVisible();"), ['original']);
-    assert.deepEqual(unscopedContentWaits("await expect(page.getByText(`x ${id}`)).toBeVisible();"), []);
+    // An interpolated template is content, not chrome — this case asserted the
+    // opposite until review caught it.
+    assert.deepEqual(
+      unscopedContentWaits('await expect(page.getByText(`x ${id}`)).toBeVisible();'),
+      ['`x ${id}`'],
+    );
+    // ...but a template with nothing in it is just a string.
+    assert.deepEqual(unscopedContentWaits('await expect(page.getByText(`Forward`)).toBeVisible();'), []);
     assert.deepEqual(unscopedContentWaits("await expect(page.getByText('Forward Message')).toBeVisible();"), []);
     assert.deepEqual(unscopedContentWaits('await expect(page.getByText("Call ended")).toHaveCount(0);'), []);
     assert.deepEqual(unscopedContentWaits("await expect(page.getByText(/muted/i)).toBeVisible();"), []);
