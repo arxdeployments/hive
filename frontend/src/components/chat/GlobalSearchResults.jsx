@@ -1,26 +1,45 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { FileText } from 'lucide-react';
 import client from '../../api/client';
+import { createRequestTicket } from '../../utils/latestRequest';
 
 export const GlobalSearchResults = ({ query, isOpen, onSelectConversation, onSelectContact, onSelectMessage, onClose }) => {
   const [results, setResults] = useState({ conversations: [], contacts: [], messages: [] });
   const [loading, setLoading] = useState(false);
 
+  // One counter for every search this panel makes. The debounce below only cancels
+  // a load that has not STARTED; once a request is open, clearing the timer does
+  // nothing and the response still writes. A short prefix matches more rows and
+  // answers slower, so it can land after the longer query typed after it and
+  // leave results for text the search box no longer contains.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
   const search = useCallback(async () => {
     if (!query || query.trim().length < 1) { setResults({ conversations: [], contacts: [], messages: [] }); return; }
+    const ticket = ticketRef.current.take();
     setLoading(true);
     try {
       const { data } = await client.get('/api/search', { params: { q: query, types: 'conversations,contacts,messages' } });
+      if (!ticketRef.current.isCurrent(ticket)) return;
       setResults(data);
     } catch { /* ignore */ }
-    finally { setLoading(false); }
+    finally {
+      // Only the newest search owns the spinner. A stale response clearing it
+      // would show a settled result list while the current query is still running.
+      if (ticketRef.current.isCurrent(ticket)) setLoading(false);
+    }
   }, [query]);
 
   useEffect(() => {
     if (!isOpen) return;
     const timer = setTimeout(search, 400);
-    return () => clearTimeout(timer);
+    // Bumping as well as clearing, the way ChatSidebar does: if the timer has
+    // already fired, the request it started is in the air, and this keystroke —
+    // or the close, or an unmount — disowns it rather than leaving a window in
+    // which it could still write.
+    return () => { clearTimeout(timer); ticketRef.current.invalidate(); };
   }, [query, isOpen, search]);
 
   if (!isOpen || !query?.trim()) return null;
