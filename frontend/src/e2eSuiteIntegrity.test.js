@@ -18,7 +18,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
@@ -27,7 +28,21 @@ const CONFIG = join(FRONTEND, 'playwright.config.js');
 const SPEC_DIR = join(FRONTEND, 'tests');
 
 const config = () => readFileSync(CONFIG, 'utf8');
-const specs = () => readdirSync(SPEC_DIR).filter((name) => name.endsWith('.spec.js'));
+
+/**
+ * Every spec Playwright would discover under `dir`, as paths relative to it.
+ *
+ * Recursive, because `testDir` is: Playwright walks subdirectories and a flat
+ * readdir does not. A spec in tests/<anything>/ would be run by the e2e job and
+ * skipped by the scan below, which is the one place a focused test could still
+ * hide from this file.
+ */
+const specsIn = (dir) =>
+  readdirSync(dir, { recursive: true })
+    .map(String)
+    .filter((name) => name.endsWith('.spec.js'));
+
+const specs = () => specsIn(SPEC_DIR);
 
 describe('the e2e suite cannot be silently emptied', () => {
   it('has specs to protect', () => {
@@ -61,6 +76,21 @@ describe('the e2e suite cannot be silently emptied', () => {
       'reuseExistingServer is not tied to CI. Reusing whatever answers on the ' +
         'port means the suite can pass against something other than the build.',
     );
+  });
+
+
+  it('looks inside subdirectories, the way Playwright does', () => {
+    // Asserted against a temporary tree rather than the real one, which is flat
+    // today — so this would pass either way and prove nothing about recursion.
+    const root = mkdtempSync(join(tmpdir(), 'e2e-specs-'));
+    mkdirSync(join(root, 'nested', 'deeper'), { recursive: true });
+    writeFileSync(join(root, 'top.spec.js'), '');
+    writeFileSync(join(root, 'nested', 'mid.spec.js'), '');
+    writeFileSync(join(root, 'nested', 'deeper', 'low.spec.js'), '');
+    writeFileSync(join(root, 'nested', 'helper.js'), '');
+
+    const found = specsIn(root).sort();
+    assert.deepEqual(found, ['nested/deeper/low.spec.js', 'nested/mid.spec.js', 'top.spec.js']);
   });
 
   for (const name of specs()) {
