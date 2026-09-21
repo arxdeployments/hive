@@ -11,10 +11,12 @@
  * render "Document · report.pdf".
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AudioLines, File as FileIcon, Film, Star } from 'lucide-react';
 import { toast } from 'sonner';
 import client from '../../../api/client';
+import { createRequestTicket } from '../../../utils/latestRequest';
+import { restoreRemovedRow } from '../../../utils/restoreRemovedRow';
 import { FILE_ICONS } from '../DocumentBubble';
 import { FullscreenImageViewer } from '../FullscreenImageViewer';
 import { FullscreenVideoViewer } from '../FullscreenVideoViewer';
@@ -166,23 +168,50 @@ export const StarredSection = ({ conversationId, onJumpToMessage, testIdPrefix =
   // { kind: 'image', index } | { kind: 'video' | 'pdf', msg }
   const [viewer, setViewer] = useState(null);
 
+  // One counter for every load this panel makes. `load` is keyed on
+  // conversationId, so switching conversations puts two in flight with nothing
+  // ordering them, and the loser writing last leaves one conversation's starred
+  // messages under another's header — with Jump and Unstar acting on them. The
+  // same mechanism MediaLinksDocsSection next door already uses; this panel was
+  // missed when that sweep went through.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
+  // Which conversation the panel is showing RIGHT NOW, readable from a callback
+  // that closed over an older one. ChatPanel is not keyed on the conversation —
+  // pages/Chat.jsx renders <ChatPanel conversationId={activeConversationId}>
+  // with no key, and says so: "every sidebar click changes activeConversationId
+  // in place". So this panel survives a switch and its prop simply changes.
+  const conversationIdRef = useRef(conversationId);
+  conversationIdRef.current = conversationId;
+
   const load = useCallback(async () => {
     if (!conversationId) return;
+    const ticket = ticketRef.current.take();
     setLoading(true);
     setError(false);
     try {
       const { data } = await client.get(`/api/conversations/${conversationId}/starred`);
+      if (!ticketRef.current.isCurrent(ticket)) return;
       setMessages(data?.data || []);
     } catch {
+      if (!ticketRef.current.isCurrent(ticket)) return;
       setMessages([]);
       setError(true);
     } finally {
-      setLoading(false);
+      // Only the newest load owns the spinner. A stale response clearing it
+      // would show an idle panel while the current conversation is still loading.
+      if (ticketRef.current.isCurrent(ticket)) setLoading(false);
     }
   }, [conversationId]);
 
   useEffect(() => {
     load();
+    // Disown whatever is in flight when this effect is torn down. The guards
+    // inside `load` only fire once a NEWER load has taken a ticket, and the
+    // teardown paths where none does — the panel closing, the section changing
+    // — would otherwise leave a response able to write on its way out.
+    return () => ticketRef.current.invalidate();
   }, [load]);
 
   // The lightbox pages across every starred photo, not just the one clicked.
@@ -193,12 +222,26 @@ export const StarredSection = ({ conversationId, onJumpToMessage, testIdPrefix =
 
   const handleUnstar = async (msgId) => {
     // Optimistic: the row leaves immediately, and comes back if the toggle fails.
-    const previous = messages;
+    //
+    // Restoring the ONE row, not a snapshot of the list. A snapshot taken before
+    // the click also undoes whatever happened while the request was in flight —
+    // a second un-star that succeeded, or a reload's fresh rows. See
+    // utils/restoreRemovedRow.js for both, reproduced.
+    const index = messages.findIndex((m) => m._id === msgId);
+    const removed = index < 0 ? null : messages[index];
+    const startedIn = conversationId;
     setMessages((prev) => prev.filter((m) => m._id !== msgId));
     try {
       await client.post(`/api/conversations/messages/${msgId}/star`);
     } catch {
-      setMessages(previous);
+      // Only put it back into the list it came out of. Switching conversations
+      // while this was in flight leaves `messages` holding the OTHER thread's
+      // rows, and restoring into that puts one conversation's starred message
+      // in another's panel — where Jump would then navigate to it. Reproduced:
+      // A's list [a1, a2], un-star a1, switch to B, the request fails, and B's
+      // panel shows [a1, b1, b2].
+      if (conversationIdRef.current !== startedIn) return;
+      setMessages((prev) => restoreRemovedRow(prev, removed, index));
       toast.error('Could not remove star');
     }
   };
