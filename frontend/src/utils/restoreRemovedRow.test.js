@@ -93,6 +93,32 @@ describe('StarredSection uses both rules', () => {
     );
   });
 
+  it('only rolls back into the conversation the row came from', () => {
+    // ChatPanel is not keyed on the conversation, so this panel survives a
+    // sidebar click and its prop changes underneath an in-flight request.
+    // Without the guard: A's list [a1, a2], un-star a1, switch to B, the
+    // request fails, and B's panel shows [a1, b1, b2] — with Jump pointing at
+    // another conversation's message.
+    const src = source();
+    assert.match(src, /const startedIn = conversationId;/, 'the unstar does not record its conversation.');
+    assert.match(
+      src,
+      /conversationIdRef\.current !== startedIn\)\s*return;/,
+      'the rollback runs regardless of which conversation is showing.',
+    );
+  });
+
+  it('disowns an in-flight load when the effect is torn down', () => {
+    // The guards inside load only fire once a NEWER load has taken a ticket.
+    // Closing the panel or changing section takes none, so without this a
+    // response can still write on its way out.
+    assert.match(
+      source(),
+      /return \(\) => ticketRef\.current\.invalidate\(\);/,
+      'the load effect has no cleanup, so a late response can still write.',
+    );
+  });
+
   it('orders its loads through the shared ticket', () => {
     // The same race MediaLinksDocsSection next door was fixed for: switching
     // conversations leaves one thread's starred messages under another's header.

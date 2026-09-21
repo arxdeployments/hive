@@ -177,6 +177,14 @@ export const StarredSection = ({ conversationId, onJumpToMessage, testIdPrefix =
   const ticketRef = useRef(null);
   ticketRef.current ??= createRequestTicket();
 
+  // Which conversation the panel is showing RIGHT NOW, readable from a callback
+  // that closed over an older one. ChatPanel is not keyed on the conversation —
+  // pages/Chat.jsx renders <ChatPanel conversationId={activeConversationId}>
+  // with no key, and says so: "every sidebar click changes activeConversationId
+  // in place". So this panel survives a switch and its prop simply changes.
+  const conversationIdRef = useRef(conversationId);
+  conversationIdRef.current = conversationId;
+
   const load = useCallback(async () => {
     if (!conversationId) return;
     const ticket = ticketRef.current.take();
@@ -199,6 +207,11 @@ export const StarredSection = ({ conversationId, onJumpToMessage, testIdPrefix =
 
   useEffect(() => {
     load();
+    // Disown whatever is in flight when this effect is torn down. The guards
+    // inside `load` only fire once a NEWER load has taken a ticket, and the
+    // teardown paths where none does — the panel closing, the section changing
+    // — would otherwise leave a response able to write on its way out.
+    return () => ticketRef.current.invalidate();
   }, [load]);
 
   // The lightbox pages across every starred photo, not just the one clicked.
@@ -216,10 +229,18 @@ export const StarredSection = ({ conversationId, onJumpToMessage, testIdPrefix =
     // utils/restoreRemovedRow.js for both, reproduced.
     const index = messages.findIndex((m) => m._id === msgId);
     const removed = index < 0 ? null : messages[index];
+    const startedIn = conversationId;
     setMessages((prev) => prev.filter((m) => m._id !== msgId));
     try {
       await client.post(`/api/conversations/messages/${msgId}/star`);
     } catch {
+      // Only put it back into the list it came out of. Switching conversations
+      // while this was in flight leaves `messages` holding the OTHER thread's
+      // rows, and restoring into that puts one conversation's starred message
+      // in another's panel — where Jump would then navigate to it. Reproduced:
+      // A's list [a1, a2], un-star a1, switch to B, the request fails, and B's
+      // panel shows [a1, b1, b2].
+      if (conversationIdRef.current !== startedIn) return;
       setMessages((prev) => restoreRemovedRow(prev, removed, index));
       toast.error('Could not remove star');
     }
