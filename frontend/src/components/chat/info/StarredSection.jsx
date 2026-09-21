@@ -11,10 +11,12 @@
  * render "Document · report.pdf".
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AudioLines, File as FileIcon, Film, Star } from 'lucide-react';
 import { toast } from 'sonner';
 import client from '../../../api/client';
+import { createRequestTicket } from '../../../utils/latestRequest';
+import { restoreRemovedRow } from '../../../utils/restoreRemovedRow';
 import { FILE_ICONS } from '../DocumentBubble';
 import { FullscreenImageViewer } from '../FullscreenImageViewer';
 import { FullscreenVideoViewer } from '../FullscreenVideoViewer';
@@ -166,18 +168,32 @@ export const StarredSection = ({ conversationId, onJumpToMessage, testIdPrefix =
   // { kind: 'image', index } | { kind: 'video' | 'pdf', msg }
   const [viewer, setViewer] = useState(null);
 
+  // One counter for every load this panel makes. `load` is keyed on
+  // conversationId, so switching conversations puts two in flight with nothing
+  // ordering them, and the loser writing last leaves one conversation's starred
+  // messages under another's header — with Jump and Unstar acting on them. The
+  // same mechanism MediaLinksDocsSection next door already uses; this panel was
+  // missed when that sweep went through.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
   const load = useCallback(async () => {
     if (!conversationId) return;
+    const ticket = ticketRef.current.take();
     setLoading(true);
     setError(false);
     try {
       const { data } = await client.get(`/api/conversations/${conversationId}/starred`);
+      if (!ticketRef.current.isCurrent(ticket)) return;
       setMessages(data?.data || []);
     } catch {
+      if (!ticketRef.current.isCurrent(ticket)) return;
       setMessages([]);
       setError(true);
     } finally {
-      setLoading(false);
+      // Only the newest load owns the spinner. A stale response clearing it
+      // would show an idle panel while the current conversation is still loading.
+      if (ticketRef.current.isCurrent(ticket)) setLoading(false);
     }
   }, [conversationId]);
 
@@ -193,12 +209,18 @@ export const StarredSection = ({ conversationId, onJumpToMessage, testIdPrefix =
 
   const handleUnstar = async (msgId) => {
     // Optimistic: the row leaves immediately, and comes back if the toggle fails.
-    const previous = messages;
+    //
+    // Restoring the ONE row, not a snapshot of the list. A snapshot taken before
+    // the click also undoes whatever happened while the request was in flight —
+    // a second un-star that succeeded, or a reload's fresh rows. See
+    // utils/restoreRemovedRow.js for both, reproduced.
+    const index = messages.findIndex((m) => m._id === msgId);
+    const removed = index < 0 ? null : messages[index];
     setMessages((prev) => prev.filter((m) => m._id !== msgId));
     try {
       await client.post(`/api/conversations/messages/${msgId}/star`);
     } catch {
-      setMessages(previous);
+      setMessages((prev) => restoreRemovedRow(prev, removed, index));
       toast.error('Could not remove star');
     }
   };
