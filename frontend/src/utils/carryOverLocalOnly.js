@@ -45,6 +45,14 @@
  */
 const LOCAL_ONLY_STATUSES = new Set(['sending', 'failed']);
 
+/**
+ * The bubbles from `existing` that a replace with `fetched` must not drop.
+ *
+ * @param {Array<object>} existing - the window being replaced, newest last.
+ * @param {Array<object>} fetched - the server's rows for the same window.
+ * @returns {Array<object>} the local-only bubbles to re-append after `fetched`,
+ *   in their existing order, minus any whose message the fetch already carries.
+ */
 export function carryOverLocalOnly(existing, fetched) {
   const landed = new Set((fetched || []).map((m) => m.client_msg_id).filter(Boolean));
   return (existing || []).filter(
