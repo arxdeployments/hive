@@ -100,8 +100,17 @@ test('photos and reply quotes are operable from the keyboard', async ({ page }) 
   // preview of the same message, and an unscoped getByText matches THAT first.
   // Measured — at the moment the unscoped wait passed, the only match was in
   // chat-sidebar and zero message-menu-trigger elements were mounted, so the
-  // click below was racing the thread's first render. Flaky in 5 of 7 CI runs.
-  await expect(thread(page).getByText(original)).toBeVisible();
+  // click below was racing the thread's first render.
+  //
+  // The longer budget is for the cold start, not for the render. The two tests
+  // above this one never open a conversation, so this is the first point in the
+  // whole run where the dev server has to compile the chat panel, the bubble
+  // and Virtuoso on demand — measured at 12.8s here against 3.9s on the retry,
+  // once everything is cached. 10s (the project default) sits between the two,
+  // which is why this test and no other kept needing its retry. Serving a built
+  // preview in CI instead of `npm run dev` would remove the cold cost outright;
+  // until then the wait has to be able to outlast it.
+  await expect(thread(page).getByText(original)).toBeVisible({ timeout: 30000 });
 
   await page.getByTestId('message-menu-trigger').last().click();
   const replyItem = page.getByRole('menuitem').filter({ hasText: /^Reply$/ });
