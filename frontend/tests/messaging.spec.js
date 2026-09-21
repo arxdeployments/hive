@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { seedOrgWithUsers, uiLogin } from './helpers.js';
+import { seedOrgWithUsers, thread, uiLogin } from './helpers.js';
 
 // Unique suffix per run so seeded users/messages don't collide across runs.
 const suffix = `${process.pid}${Math.floor(Math.random() * 1000)}`;
@@ -86,10 +86,13 @@ test('message persists across reload', async ({ page }) => {
 
   const text = `persisted ${suffix} ${Math.floor(Math.random() * 1e6)}`;
   await sendMessage(page, text);
-  await expect(page.getByText(text).first()).toBeVisible();
+  await expect(thread(page).getByText(text)).toBeVisible();
 
   await page.reload();
   await expect(page.getByTestId('conversation-search')).toBeVisible();
   await openConversationWith(page, 'Bob E2E');
-  await expect(page.getByText(text).first()).toBeVisible();
+  // The point of this test is that the message came back from history and
+  // RENDERED. The sidebar preview also comes back from the API, so an
+  // unscoped match would pass with an empty thread.
+  await expect(thread(page).getByText(text)).toBeVisible();
 });

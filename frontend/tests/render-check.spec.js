@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { seedOrgWithUsers, uiLogin } from './helpers.js';
+import { seedOrgWithUsers, thread, uiLogin } from './helpers.js';
 
 /**
  * Guards the "list is mounted but renders nothing" class of bug.
@@ -38,14 +38,14 @@ test('history renders in the message list, at a small viewport too', async ({ pa
   const marker = `render check ${suffix}`;
   await page.getByTestId('message-input').fill(marker);
   await page.getByTestId('message-send-btn').click();
-  await expect(page.getByText(marker).first()).toBeVisible();
+  await expect(thread(page).getByText(marker)).toBeVisible();
 
   // The decisive assertion: after a reload the list is populated from history.
   await page.reload();
   await expect(page.getByTestId('conversation-search')).toBeVisible();
   await openWith(page, 'Bob E2E');
 
-  await expect(page.getByText(marker).first()).toBeVisible({ timeout: 10000 });
+  await expect(thread(page).getByText(marker)).toBeVisible({ timeout: 10000 });
 
   // Assert on rendered, on-screen message content rather than virtuoso's
   // internal DOM: its row container is not the element carrying

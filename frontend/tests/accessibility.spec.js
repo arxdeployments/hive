@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { seedOrgWithUsers, uiLogin } from './helpers.js';
+import { seedOrgWithUsers, thread, uiLogin } from './helpers.js';
 
 /**
  * The chat surface, operated without a mouse and without sight.
@@ -96,7 +96,12 @@ test('photos and reply quotes are operable from the keyboard', async ({ page }) 
   const original = `quotable ${suffix}`;
   await page.getByTestId('message-input').fill(original);
   await page.getByTestId('message-send-btn').click();
-  await expect(page.getByText(original).first()).toBeVisible();
+  // Scoped to the thread, not the page: the sidebar renders a `You: <text>`
+  // preview of the same message, and an unscoped getByText matches THAT first.
+  // Measured — at the moment the unscoped wait passed, the only match was in
+  // chat-sidebar and zero message-menu-trigger elements were mounted, so the
+  // click below was racing the thread's first render. Flaky in 5 of 7 CI runs.
+  await expect(thread(page).getByText(original)).toBeVisible();
 
   await page.getByTestId('message-menu-trigger').last().click();
   const replyItem = page.getByRole('menuitem').filter({ hasText: /^Reply$/ });
@@ -164,7 +169,7 @@ test('message text and the composer placeholder meet WCAG AA contrast', async ({
   const body = `contrast ${suffix}`;
   await page.getByTestId('message-input').fill(body);
   await page.getByTestId('message-send-btn').click();
-  await expect(page.getByText(body).first()).toBeVisible();
+  await expect(thread(page).getByText(body)).toBeVisible();
 
   // Read the painted colours rather than the source: what matters is the pixels,
   // and the bubble background is set several classes deep.

@@ -93,6 +93,56 @@ describe('the e2e suite cannot be silently emptied', () => {
     assert.deepEqual(found, ['nested/deeper/low.spec.js', 'nested/mid.spec.js', 'top.spec.js']);
   });
 
+
+  // A wait for message CONTENT has to be scoped to the thread. The sidebar
+  // renders a `You: <text>` preview of the newest message and comes earlier in
+  // the DOM, so `page.getByText(body)` matches THAT and is satisfied before the
+  // thread has rendered anything. Measured, sending a message and waiting:
+  //
+  //     unscoped   first match in chat-sidebar,       0 message-menu-trigger mounted
+  //     scoped     thread has rendered,               2 message-menu-trigger mounted
+  //
+  // accessibility.spec.js clicked a trigger straight after the unscoped wait and
+  // was flaky in 5 of 7 CI runs. messaging.spec.js and render-check.spec.js
+  // asserted a message had come back from history, which the sidebar preview
+  // satisfies with an empty thread — the test passed without checking its point.
+  //
+  // A string literal is UI chrome ("Forward Message", "Call ended") and stays
+  // page-wide; a variable is a message body somebody built for the test.
+  const CONTENT_WAIT = /expect\(\s*page\.getByText\(\s*([^)]*)\)/g;
+
+  /** The page-wide waits in `source` whose argument is a message body. */
+  const unscopedContentWaits = (source) =>
+    [...source.matchAll(CONTENT_WAIT)]
+      .map((match) => match[1].trim())
+      .filter((argument) => argument && !/^['"`/]/.test(argument));
+
+  it('tells a message body from a piece of UI chrome', () => {
+    // The whole rule rests on this distinction, and the real specs are clean —
+    // so running it over them proves only that it found nothing. These are the
+    // cases it has to get right, in both directions.
+    assert.deepEqual(unscopedContentWaits("await expect(page.getByText(body)).toBeVisible();"), ['body']);
+    assert.deepEqual(unscopedContentWaits("await expect(page.getByText(original).first()).toBeVisible();"), ['original']);
+    assert.deepEqual(unscopedContentWaits("await expect(page.getByText(`x ${id}`)).toBeVisible();"), []);
+    assert.deepEqual(unscopedContentWaits("await expect(page.getByText('Forward Message')).toBeVisible();"), []);
+    assert.deepEqual(unscopedContentWaits('await expect(page.getByText("Call ended")).toHaveCount(0);'), []);
+    assert.deepEqual(unscopedContentWaits("await expect(page.getByText(/muted/i)).toBeVisible();"), []);
+    // Already scoped, so not a page-wide wait at all.
+    assert.deepEqual(unscopedContentWaits("await expect(thread(page).getByText(body)).toBeVisible();"), []);
+  });
+
+  for (const name of specs()) {
+    it(`${name} scopes its message-content waits to the thread`, () => {
+      const unscoped = unscopedContentWaits(readFileSync(join(SPEC_DIR, name), 'utf8'));
+      assert.deepEqual(
+        unscoped,
+        [],
+        `${name} waits page-wide for ${unscoped.join(', ')}. The sidebar preview ` +
+          'satisfies that before the thread renders — use thread(page).getByText(…).',
+      );
+    });
+  }
+
   for (const name of specs()) {
     it(`${name} leaves no focused test behind`, () => {
       // Belt and braces: forbidOnly already fails the CI run, but it fails it
