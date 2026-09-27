@@ -907,12 +907,19 @@ struct GroupMemberPickerView: View {
 
     @State private var query = ""
     @State private var contacts: [Contact] = []
-    @State private var selected: Set<String> = []
+    @State private var selection = MemberSelection()
     @State private var state: InfoLoadState = .idle
     @State private var isAdding = false
 
     private var candidates: [Contact] {
         contacts.filter { !excludedUserIDs.contains($0.id) }
+    }
+
+    /// Who the confirm button adds. The button's count reads this too, so the number
+    /// it shows is the number it sends — see `MemberSelection` for what happened when
+    /// the two were computed separately.
+    private var toAdd: [Contact] {
+        selection.toAdd(excluding: excludedUserIDs)
     }
 
     var body: some View {
@@ -952,11 +959,7 @@ struct GroupMemberPickerView: View {
                         LazyVStack(spacing: 0) {
                             ForEach(candidates) { contact in
                                 Button {
-                                    if selected.contains(contact.id) {
-                                        selected.remove(contact.id)
-                                    } else {
-                                        selected.insert(contact.id)
-                                    }
+                                    selection.toggle(contact)
                                 } label: {
                                     contactRow(contact)
                                 }
@@ -980,7 +983,7 @@ struct GroupMemberPickerView: View {
                     Button {
                         Task {
                             isAdding = true
-                            await onAdd(candidates.filter { selected.contains($0.id) })
+                            await onAdd(toAdd)
                             isAdding = false
                             dismiss()
                         }
@@ -988,12 +991,12 @@ struct GroupMemberPickerView: View {
                         if isAdding {
                             ProgressView().tint(Theme.Color.primary)
                         } else {
-                            Text(selected.isEmpty ? "Add" : "Add \(selected.count)")
+                            Text(toAdd.isEmpty ? "Add" : "Add \(toAdd.count)")
                                 .font(Theme.Typography.font(size: 16, weight: .medium))
                         }
                     }
-                    .disabled(selected.isEmpty || isAdding)
-                    .foregroundStyle(selected.isEmpty ? Theme.Color.textMuted : Theme.Color.primary)
+                    .disabled(toAdd.isEmpty || isAdding)
+                    .foregroundStyle(toAdd.isEmpty ? Theme.Color.textMuted : Theme.Color.primary)
                 }
             }
             // Debounced: the roster endpoint takes the query server-side, so typing
@@ -1024,9 +1027,9 @@ struct GroupMemberPickerView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            Image(systemName: selected.contains(contact.id) ? "checkmark.circle.fill" : "circle")
+            Image(systemName: selection.contains(contact.id) ? "checkmark.circle.fill" : "circle")
                 .font(.system(size: 20))
-                .foregroundStyle(selected.contains(contact.id) ? Theme.Color.primary : Theme.Color.border2)
+                .foregroundStyle(selection.contains(contact.id) ? Theme.Color.primary : Theme.Color.border2)
         }
         .padding(.horizontal, Theme.Layout.gutter)
         .padding(.vertical, Theme.Layout.spacing3)

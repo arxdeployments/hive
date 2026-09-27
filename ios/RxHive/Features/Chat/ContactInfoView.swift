@@ -857,9 +857,24 @@ struct ContactInfoView: View {
     private func loadDirectoryRow() async {
         guard let userID = person?.userId else { return }
         // A miss here only blanks two rows, so it fails quietly: the panel's primary
-        // job (presence, media, mute, actions) does not depend on the roster.
-        guard let rows = try? await RxHiveAPI.contacts() else { return }
-        directoryRow = rows.first { $0.id == userID }
+        // job (presence, media, mute, actions) does not depend on the directory.
+        guard let row = await ContactInfoView.directoryRow(userID: userID),
+              person?.userId == userID
+        else { return }
+        directoryRow = row
+    }
+
+    /// This person's email and department.
+    ///
+    /// Asked for BY ID. It used to fetch the whole roster and search it here, which
+    /// stopped working when batch 18 capped the roster at the first 200 names: anyone
+    /// who sorts after the 200th was simply not in the list, and the panel read "Email
+    /// not available" with a blank department, with no error to say why. The web panel
+    /// moved to the by-id endpoint in that batch; this one was missed.
+    ///
+    /// Nil for a colleague in another org (the endpoint 404s them) and on any failure.
+    static func directoryRow(userID: String, client: APIClient? = nil) async -> Contact? {
+        try? await RxHiveAPI.directoryEntry(userID: userID, client: client)
     }
 
     private func loadGroupsInCommon(force: Bool = false) async {
