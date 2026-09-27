@@ -854,6 +854,10 @@ struct ContactInfoView: View {
 
     // MARK: Loading
 
+    /// Fills the email and department rows for the person this panel is about.
+    ///
+    /// The result is dropped if the panel has moved on to someone else by the time it
+    /// answers, so a slow lookup cannot label one person with another's details.
     private func loadDirectoryRow() async {
         guard let userID = person?.userId else { return }
         // A miss here only blanks two rows, so it fails quietly: the panel's primary

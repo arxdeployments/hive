@@ -15,6 +15,8 @@ import XCTest
 ///   after the cap found nobody who sorts after the 200th name.
 final class DirectoryConsumerTests: XCTestCase {
 
+    /// A directory row as the roster or the by-id endpoint would decode it. `status` is
+    /// the one field that varies between two result lists for the same person.
     private func contact(_ id: String, _ name: String, status: PresenceStatus = .online) -> Contact {
         Contact(
             id: id,
@@ -56,6 +58,8 @@ final class DirectoryConsumerTests: XCTestCase {
         XCTAssertEqual(selection.toAdd(excluding: []), [])
     }
 
+    /// Un-picking Anna after picking Raj must leave Raj picked — the removal is by
+    /// person, not "the last one" or "all of them".
     func testUnpickingRemovesOnlyThatPerson() {
         var selection = MemberSelection()
         selection.toggle(anna)
@@ -113,11 +117,15 @@ final class DirectoryConsumerTests: XCTestCase {
      "avatar_url":null,"department_name":"Pharmacy","status":"online","last_seen":null}
     """
 
+    /// `MockURLProtocol`'s script and request log are process-wide; leaving them set
+    /// would answer, and count, the next test's requests.
     override func tearDown() {
         MockURLProtocol.reset()
         super.tearDown()
     }
 
+    /// A client whose every request is answered by `MockURLProtocol`, so the tests can
+    /// see which path the panel asked for and never reach a real server.
     private func makeClient() -> APIClient {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [MockURLProtocol.self]

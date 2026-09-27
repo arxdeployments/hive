@@ -922,6 +922,9 @@ struct GroupMemberPickerView: View {
         selection.toAdd(excluding: excludedUserIDs)
     }
 
+    /// The search box over the directory's matches, with Cancel and Add in the toolbar.
+    /// Tapping a row picks or un-picks that person; the list itself is only ever the
+    /// current query's results, which is why it is not what Add sends.
     var body: some View {
         NavigationStack {
             VStack(spacing: Theme.Layout.spacing3) {
@@ -1011,6 +1014,8 @@ struct GroupMemberPickerView: View {
         }
     }
 
+    /// One directory match: avatar with presence, name, department, and a checkmark
+    /// when that person is picked — under this search or any earlier one.
     private func contactRow(_ contact: Contact) -> some View {
         HStack(spacing: Theme.Layout.spacing3) {
             Avatar(name: contact.displayName, urlPath: contact.avatarURL, size: 38, presence: contact.status)
