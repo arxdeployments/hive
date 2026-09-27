@@ -67,8 +67,15 @@ _IMAGE_TOKEN = re.compile(
 )
 
 # Repositories that have stopped serving this image to anonymous pulls. Each one
-# broke CI at container start, before a single step ran.
-_WITHDRAWN = ("minio/minio", "docker.io/minio/minio", "quay.io/minio/minio", "bitnami/minio")
+# broke CI at container start, before a single step ran. Docker Hub names are
+# listed in their short form; `_repository` folds every spelling of Docker Hub's
+# host onto it, so `docker.io/bitnami/minio` cannot slip past `bitnami/minio`.
+_WITHDRAWN = ("minio/minio", "bitnami/minio", "quay.io/minio/minio")
+
+# Hosts Docker resolves to Docker Hub. A reference may spell any of them out.
+_DOCKER_HUB_HOSTS = ("docker.io", "index.docker.io", "registry-1.docker.io")
+
+CURRENT_IMAGE_EXAMPLE = "ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z@sha256:" + "0" * 64
 
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 
@@ -176,8 +183,46 @@ def test_the_start_step_waits_for_health(job: str):
 
 
 def _repository(image: str) -> str:
-    """`registry/name` with the tag and digest removed."""
-    return image.split("@", 1)[0].rpartition(":")[0]
+    """`registry/name` with the tag and digest removed, Docker Hub in short form.
+
+    `minio/minio`, `docker.io/minio/minio` and `index.docker.io/minio/minio` are
+    one repository, so they have to compare equal against `_WITHDRAWN`.
+    """
+    name = image.split("@", 1)[0].rpartition(":")[0]
+    host, _, rest = name.partition("/")
+    return rest if host in _DOCKER_HUB_HOSTS and rest else name
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "minio/minio:RELEASE.2025-09-07T16-13-09Z",
+        "docker.io/minio/minio:edge-cicd",
+        "index.docker.io/minio/minio:latest",
+        "bitnami/minio:2025.7.23",
+        "docker.io/bitnami/minio:2025.7.23@sha256:" + "0" * 64,
+        "registry-1.docker.io/bitnami/minio:latest",
+        "quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:" + "0" * 64,
+    ],
+)
+def test_every_spelling_of_a_withdrawn_repository_is_recognised(image: str):
+    """The check itself, not just today's references.
+
+    Docker accepts a Docker Hub image with or without its host spelled out, so a
+    list of short names on its own would wave `docker.io/bitnami/minio` through.
+    """
+    assert _repository(image) in _WITHDRAWN, f"{image} reads as {_repository(image)!r}"
+
+
+def test_only_docker_hub_hosts_are_folded():
+    """`ghcr.io/minio/minio` is a different repository from Docker Hub's `minio/minio`.
+
+    Stripping every registry host, rather than Docker Hub's, would read the two as
+    one and reject — or, once something is taken off the list, accept — the wrong
+    image.
+    """
+    assert _repository("ghcr.io/minio/minio:RELEASE.2025-10-15T17-29-55Z") == "ghcr.io/minio/minio"
+    assert _repository(CURRENT_IMAGE_EXAMPLE) == "ghcr.io/coollabsio/minio"
 
 
 @pytest.mark.parametrize(("source", "image"), _minio_image_references())
