@@ -1,7 +1,8 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Search, X, Users } from 'lucide-react';
 import client from '../../api/client';
+import { createRequestTicket } from '../../utils/latestRequest';
 import { useModalDialog } from '../../hooks/useModalDialog';
 
 export const NewChatModal = ({ isOpen, onClose, onSelectContact }) => {
@@ -10,22 +11,38 @@ export const NewChatModal = ({ isOpen, onClose, onSelectContact }) => {
   const [loading, setLoading] = useState(false);
   const { titleId, dialogProps } = useModalDialog({ isOpen, onClose });
 
+  // One counter for every search this modal makes. The debounce below only cancels
+  // a load that has not STARTED; once a request is open, clearing the timer does
+  // nothing and the response still writes. A short prefix matches more rows and
+  // answers slower, so it can land after the longer query typed after it and
+  // leave the picker showing people the search box no longer asks for.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
   const fetchContacts = useCallback(async () => {
+    const ticket = ticketRef.current.take();
     setLoading(true);
     try {
       const { data } = await client.get('/api/users/contacts', { params: { search } });
+      if (!ticketRef.current.isCurrent(ticket)) return;
       setContacts(data);
     } catch (err) {
       console.error('Failed to fetch contacts', err);
     } finally {
-      setLoading(false);
+      // Only the newest load owns the spinner. A stale response clearing it
+      // would show an idle picker while the current search is still running.
+      if (ticketRef.current.isCurrent(ticket)) setLoading(false);
     }
   }, [search]);
 
   useEffect(() => {
     if (!isOpen) return;
     const timer = setTimeout(fetchContacts, 300);
-    return () => clearTimeout(timer);
+    // Bumping as well as clearing, the way ChatSidebar does: if the timer has
+    // already fired, the request it started is in the air, and this keystroke —
+    // or the close, or an unmount — disowns it rather than leaving a window in
+    // which it could still write.
+    return () => { clearTimeout(timer); ticketRef.current.invalidate(); };
   }, [isOpen, fetchContacts]);
 
   if (!isOpen) return null;

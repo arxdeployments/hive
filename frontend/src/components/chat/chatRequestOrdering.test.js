@@ -102,6 +102,77 @@ const CASES = [
       },
     ],
   },
+  {
+    name: 'NewChatModal contact search',
+    file: 'NewChatModal.jsx',
+    importFrom: '../../utils/latestRequest',
+    guards: [
+      {
+        what: 'writes contacts only while its ticket is current',
+        pattern: guarding('setContacts(data)'),
+        why: 'a stale search result would replace the picker the current query is filling',
+      },
+      {
+        what: 'clears the spinner only while its ticket is current',
+        pattern: guarding('setLoading(false)'),
+        why: 'a stale response clearing it would show an idle picker mid-search',
+      },
+      {
+        what: 'disowns anything in flight when the debounce is torn down',
+        pattern: /clearTimeout\(timer\);\s*ticketRef\.current\.invalidate\(\)/,
+        why: 'a request already in the air outlives the timer that started it',
+      },
+    ],
+  },
+  {
+    name: 'GlobalSearchResults query',
+    file: 'GlobalSearchResults.jsx',
+    importFrom: '../../utils/latestRequest',
+    guards: [
+      {
+        what: 'writes results only while its ticket is current',
+        pattern: guarding('setResults(data)'),
+        why: 'a stale query would show conversations and messages the box no longer asks for',
+      },
+      {
+        what: 'clears the spinner only while its ticket is current',
+        pattern: guarding('setLoading(false)'),
+        why: 'a stale response clearing it would show a settled list mid-search',
+      },
+      {
+        what: 'disowns anything in flight when the debounce is torn down',
+        pattern: /clearTimeout\(timer\);\s*ticketRef\.current\.invalidate\(\)/,
+        why: 'a request already in the air outlives the timer that started it',
+      },
+    ],
+  },
+  {
+    name: 'AddParticipantsModal invite search',
+    file: '../calls/AddParticipantsModal.jsx',
+    importFrom: '../../utils/latestRequest',
+    guards: [
+      {
+        what: 'writes contacts only while its ticket is current',
+        pattern: guarding('setContacts(Array.isArray(data) ? data : [])'),
+        why: 'this list decides who gets pulled into a live call',
+      },
+      {
+        what: 'reports a failure only while its ticket is current',
+        pattern: guarding("console.error('[call] could not load contacts for the invite list', err);"),
+        why: 'a stale rejection would toast an error over a list that loaded fine',
+      },
+      {
+        what: 'marks the sheet loaded only while its ticket is current',
+        pattern: guarding('setLoaded(true)'),
+        why: 'a stale response would lift the spinner off a list still being fetched',
+      },
+      {
+        what: 'disowns anything in flight when the debounce is torn down',
+        pattern: /clearTimeout\(timer\);\s*ticketRef\.current\.invalidate\(\)/,
+        why: 'a request already in the air outlives the timer that started it',
+      },
+    ],
+  },
 ];
 
 describe('chat loads that reload on user input are ordered', () => {

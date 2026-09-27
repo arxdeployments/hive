@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Check, Search, UserPlus, X } from 'lucide-react';
 import { toast } from 'sonner';
 import client from '../../api/client';
+import { createRequestTicket } from '../../utils/latestRequest';
 import useCallStore from '../../stores/callStore';
 import { useModalDialog } from '../../hooks/useModalDialog';
 
@@ -52,22 +53,40 @@ export const AddParticipantsModal = ({ isOpen, onClose, callId }) => {
     return ids;
   }, [remoteParticipants, pendingInvitees]);
 
+  // One counter for every search this sheet makes. The debounce below only cancels
+  // a load that has not STARTED; once a request is open, clearing the timer does
+  // nothing and the response still writes. A short prefix matches more rows and
+  // answers slower, so it can land after the longer query typed after it and
+  // leave the invite list showing people the search box no longer asks for —
+  // and this list decides who gets pulled into a live call.
+  const ticketRef = useRef(null);
+  ticketRef.current ??= createRequestTicket();
+
   const fetchContacts = useCallback(async () => {
+    const ticket = ticketRef.current.take();
     try {
       const { data } = await client.get('/api/users/contacts', { params: { search } });
+      if (!ticketRef.current.isCurrent(ticket)) return;
       setContacts(Array.isArray(data) ? data : []);
     } catch (err) {
+      if (!ticketRef.current.isCurrent(ticket)) return;
       console.error('[call] could not load contacts for the invite list', err);
       toast.error('Could not load your contacts');
     } finally {
-      setLoaded(true);
+      // Only the newest load may declare the sheet loaded; a stale response
+      // doing it would lift the spinner off a list still being fetched.
+      if (ticketRef.current.isCurrent(ticket)) setLoaded(true);
     }
   }, [search]);
 
   useEffect(() => {
     if (!isOpen) return undefined;
     const timer = setTimeout(fetchContacts, 250);
-    return () => clearTimeout(timer);
+    // Bumping as well as clearing, the way ChatSidebar does: if the timer has
+    // already fired, the request it started is in the air, and this keystroke —
+    // or the close, or an unmount — disowns it rather than leaving a window in
+    // which it could still write.
+    return () => { clearTimeout(timer); ticketRef.current.invalidate(); };
   }, [isOpen, fetchContacts]);
 
   // A fresh sheet each time it opens — a selection carried over from the last invite
