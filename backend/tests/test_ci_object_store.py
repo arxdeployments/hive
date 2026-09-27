@@ -20,10 +20,23 @@ a service container that never becomes healthy. MINIO_VOLUMES does not supply
 the missing subcommand either. Starting the container in a step is the only form
 that can pass `server /data`.
 
-So there are four rules, and each one is a way the fix could be quietly undone:
-MinIO must not go back under `services:`, it must be started with the server
-subcommand, it must come from quay, and it must be pinned to a dated RELEASE
-rather than a floating tag — a floating tag is exactly what disappeared.
+THE THIRD WITHDRAWAL
+
+quay.io/minio/minio, where the second fix moved, then stopped serving anonymous
+pulls too: its pull token grants no actions and the manifest answers 401, so main
+went red again on a commit with nothing wrong in it. dl.min.io answers 410 Gone —
+the open-source MinIO server is archived and MinIO publishes no image or binary
+for it at all. So "come from MinIO's own registry" is no longer a rule anyone can
+follow. The image now is a rebuild of the final upstream release from MinIO's own
+Dockerfile, published by a third party, and a third party's tag can be re-pushed.
+That is what the digest pin is for.
+
+So the rules, each one a way the fix could be quietly undone: MinIO must not go
+back under `services:`, it must be started with the server subcommand, it must
+not reference a repository that has been withdrawn, it must be pinned to a dated
+RELEASE rather than a floating tag — a floating tag is what disappeared first —
+and by digest, and every reference must be the same image so the next move cannot
+fix CI and leave the dev stack pointing at a dead registry.
 
 The fifth test is the one that would have caught an older bug in this file: the
 backend job carried S3 credentials and real upload tests for a long time with no
@@ -47,9 +60,17 @@ COMPOSE_FILES = (
 # this shape is a fixed artefact. `latest`, `latest-cicd` and `edge-cicd` are not.
 _DATED_RELEASE = re.compile(r"^RELEASE\.\d{4}-\d{2}-\d{2}T[\d-]+Z(?:[.-][\w.-]+)?$")
 
-# A registry/name:tag token. Matched against script lines only after comments are
-# dropped, so the prose above `docker run` does not read as a reference.
-_IMAGE_TOKEN = re.compile(r"(?<![\w./-])((?:[\w.-]+(?::\d+)?/)*minio[\w.-]*:[\w.+-]+)")
+# A registry/name:tag[@digest] token. Matched against script lines only after
+# comments are dropped, so the prose above `docker run` does not read as a reference.
+_IMAGE_TOKEN = re.compile(
+    r"(?<![\w./-])((?:[\w.-]+(?::\d+)?/)*minio[\w.-]*:[\w.+-]+(?:@sha256:[0-9a-f]{64})?)"
+)
+
+# Repositories that have stopped serving this image to anonymous pulls. Each one
+# broke CI at container start, before a single step ran.
+_WITHDRAWN = ("minio/minio", "docker.io/minio/minio", "quay.io/minio/minio", "bitnami/minio")
+
+_DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 
 
 def _workflow() -> dict:
@@ -66,7 +87,7 @@ def _uncommented(text: str) -> str:
 
     The comments in ci.yml name minio/minio:edge-cicd deliberately, to record
     what was withdrawn and why. Scanning the raw text would read that prose as a
-    reference and fail the quay rule on the explanation for the quay rule.
+    reference and fail the withdrawn-repository rule on the explanation for it.
     """
     return "\n".join(line for line in text.splitlines() if not line.strip().startswith("#"))
 
@@ -154,18 +175,47 @@ def test_the_start_step_waits_for_health(job: str):
     assert re.search(r"\bexit 1\b", shell), f"{job} never fails when MinIO does not come up"
 
 
-@pytest.mark.parametrize(("source", "image"), _minio_image_references())
-def test_minio_images_come_from_quay(source: str, image: str):
-    """Docker Hub's minio/minio cannot be pulled by anyone any more.
+def _repository(image: str) -> str:
+    """`registry/name` with the tag and digest removed."""
+    return image.split("@", 1)[0].rpartition(":")[0]
 
-    An authenticated pull token gets 401 there where library/redis gets 200, so a
-    reference that goes back is not slow or rate-limited — it is dead, and it
+
+@pytest.mark.parametrize(("source", "image"), _minio_image_references())
+def test_minio_images_avoid_withdrawn_repositories(source: str, image: str):
+    """Docker Hub's minio/minio, then quay.io/minio/minio, stopped serving pulls.
+
+    A reference that goes back is not slow or rate-limited — it is dead, and it
     fails at container start before any step of the job runs.
     """
-    assert image.startswith("quay.io/"), (
-        f"{source} pulls {image}. Docker Hub's minio/minio is withdrawn — that reference "
-        "cannot be pulled by anyone."
+    assert _repository(image) not in _WITHDRAWN, (
+        f"{source} pulls {image}. {_repository(image)} no longer serves anonymous pulls — "
+        "that reference cannot be pulled by anyone."
     )
+
+
+@pytest.mark.parametrize(("source", "image"), _minio_image_references())
+def test_minio_images_are_pinned_by_digest(source: str, image: str):
+    """MinIO itself publishes nothing any more, so whoever does is a third party.
+
+    A dated tag is a fixed artefact only while its publisher never re-pushes it,
+    which was a safe assumption about MinIO and is not one about anyone else. The
+    digest is what makes two runs of the same commit pull the same bytes.
+    """
+    assert _DIGEST.search(image), (
+        f"{source} pulls {image} by tag alone. The publisher is not MinIO, so the tag can be "
+        "re-pushed; pin it as name:RELEASE...@sha256:<digest>."
+    )
+
+
+def test_every_minio_reference_is_the_same_image():
+    """Three references, one image.
+
+    Each withdrawal so far had to be fixed in ci.yml twice and in the dev compose
+    file once. Holding them equal means the next move cannot fix CI and leave the
+    local stack pulling from a registry that has already gone away.
+    """
+    images = {image for _, image in _minio_image_references()}
+    assert len(images) == 1, f"MinIO references disagree: {sorted(images)}"
 
 
 @pytest.mark.parametrize(("source", "image"), _minio_image_references())
@@ -177,7 +227,7 @@ def test_minio_images_are_pinned_to_a_dated_release(source: str, image: str):
     tag is a fixed artefact that cannot change meaning between two runs of the
     same commit.
     """
-    tag = image.rpartition(":")[2]
+    tag = image.split("@", 1)[0].rpartition(":")[2]
     assert _DATED_RELEASE.match(tag), (
         f"{source} pins MinIO at {tag!r}. A floating tag is what disappeared; use a dated "
         "RELEASE, which MinIO never reuses."
