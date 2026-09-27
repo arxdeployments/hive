@@ -171,7 +171,87 @@ final class DirectoryConsumerTests: XCTestCase {
         XCTAssertEqual(MockURLProtocol.count(path: "/api/users/directory/u-elsewhere", method: "GET"), 1)
     }
 
+    // MARK: Contact panel — a change of person
+
+    /// Coming back from the panel's own Search or Media screen re-runs its `.task`. The
+    /// email already loaded for this person has to survive that, or it blanks on every
+    /// return and stays blank whenever the reload fails.
+    func testReturningToThePanelKeepsThatPersonsDetails() {
+        let tom = contact("u-tom", "Tom Walsh")
+        XCTAssertEqual(ContactInfoView.retainedDirectoryRow(tom, for: "u-tom"), tom)
+    }
+
+    /// CodeRabbit's case: the panel's person changes under it. The previous person's
+    /// email must be gone before the new lookup, not after it — and if that lookup
+    /// fails, it must not be left standing under the new name.
+    func testAnotherPersonsDetailsAreClearedBeforeTheLookup() {
+        let tom = contact("u-tom", "Tom Walsh")
+        XCTAssertNil(ContactInfoView.retainedDirectoryRow(tom, for: "u-anna"))
+        XCTAssertNil(ContactInfoView.retainedDirectoryRow(tom, for: nil))
+        XCTAssertNil(ContactInfoView.retainedDirectoryRow(nil, for: "u-tom"))
+    }
+
+    /// "Loaded" is only current for the person it was loaded for.
+    func testGroupsLoadedForSomeoneElseAreNotCurrent() {
+        XCTAssertTrue(ContactInfoView.groupsAreCurrent(.loaded, loadedFor: "u-tom", userID: "u-tom"))
+        XCTAssertFalse(ContactInfoView.groupsAreCurrent(.loaded, loadedFor: "u-tom", userID: "u-anna"))
+        XCTAssertFalse(ContactInfoView.groupsAreCurrent(.loaded, loadedFor: nil, userID: "u-anna"))
+        XCTAssertFalse(ContactInfoView.groupsAreCurrent(.failed, loadedFor: "u-tom", userID: "u-tom"))
+    }
+
+    /// The rules above only help if the loaders use them, and in the right place: the
+    /// row has to be cleared BEFORE the lookup's await, and the groups guard has to be
+    /// the person-keyed one, with the person recorded when they load.
+    func testThePanelLoadersUseThoseRules() throws {
+        // Line by line, comments dropped, so "before the await" in the prose is not
+        // read as code. The clear has to be a statement of its own — not deferred, not
+        // inside a failure branch — on a line before the first one that awaits.
+        let rowLines = try functionSource("private func loadDirectoryRow()", in: "ContactInfoView.swift")
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.hasPrefix("//") }
+        let retain = try XCTUnwrap(
+            rowLines.firstIndex { $0.hasPrefix("directoryRow = ContactInfoView.retainedDirectoryRow(") },
+            "loadDirectoryRow no longer clears, as a statement of its own, a row loaded for someone else"
+        )
+        XCTAssertTrue(rowLines.contains { $0.contains("await ContactInfoView.directoryRow(") },
+                      "loadDirectoryRow no longer awaits the by-id lookup")
+        let firstSuspension = try XCTUnwrap(rowLines.firstIndex { $0.contains("await ") },
+                                            "loadDirectoryRow awaits nothing")
+        XCTAssertLessThan(retain, firstSuspension,
+                          "the row must be cleared before the first await — any suspension point "
+                          + "before it shows the previous person's details under the new name")
+
+        let groups = try functionSource("private func loadGroupsInCommon(", in: "ContactInfoView.swift")
+        XCTAssertTrue(groups.contains("ContactInfoView.groupsAreCurrent(groupsState, loadedFor: groupsUserID"),
+                      "loadGroupsInCommon must decide 'already loaded' per person")
+        XCTAssertFalse(groups.contains("groupsState == .loaded &&"),
+                       "a bare `.loaded` guard keeps the previous person's groups")
+        XCTAssertTrue(groups.contains("groupsUserID = userID"),
+                      "a successful load must record whose groups these are")
+    }
+
     // MARK: Helpers
+
+    /// One function's source, from its signature to the first line that closes it at
+    /// its own indentation.
+    private func functionSource(
+        _ signature: String,
+        in file: String,
+        caller: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> String {
+        let url = URL(fileURLWithPath: "\(#filePath)")
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("RxHive/Features/Chat/\(file)")
+        let whole = try String(contentsOf: url, encoding: .utf8)
+        let start = try XCTUnwrap(whole.range(of: signature), "\(signature) not found in \(file)",
+                                  file: caller, line: line)
+        let rest = whole[start.lowerBound...]
+        let end = rest.range(of: "\n    }\n")?.upperBound ?? rest.endIndex
+        return String(rest[..<end])
+    }
 
     /// `GroupMemberPickerView`'s declaration, up to the next top-level declaration.
     private func pickerSource(file: StaticString = #filePath, line: UInt = #line) throws -> String {

@@ -521,6 +521,9 @@ struct ContactInfoView: View {
     @State private var directoryRow: Contact?
     @State private var groups: [Conversation] = []
     @State private var groupsState: InfoLoadState = .idle
+    /// Whose groups `groups` are. The panel outlives a change of person, so "loaded"
+    /// on its own would mean "loaded for whoever it showed before".
+    @State private var groupsUserID: String?
     @State private var mutePending = false
     @State private var confirmDelete = false
     @State private var isWorking = false
@@ -859,6 +862,9 @@ struct ContactInfoView: View {
     /// The result is dropped if the panel has moved on to someone else by the time it
     /// answers, so a slow lookup cannot label one person with another's details.
     private func loadDirectoryRow() async {
+        // First, before the await: a row loaded for somebody else must not sit under
+        // this person's name while their own lookup runs, or stay there if it fails.
+        directoryRow = ContactInfoView.retainedDirectoryRow(directoryRow, for: person?.userId)
         guard let userID = person?.userId else { return }
         // A miss here only blanks two rows, so it fails quietly: the panel's primary
         // job (presence, media, mute, actions) does not depend on the directory.
@@ -881,17 +887,45 @@ struct ContactInfoView: View {
         try? await RxHiveAPI.directoryEntry(userID: userID, client: client)
     }
 
+    /// What the directory rows may keep showing while `userID`'s lookup runs: the row
+    /// already loaded for them, and nothing loaded for anyone else.
+    ///
+    /// Not simply nil. `.task` re-runs every time the panel reappears — coming back
+    /// from its own Search or Media screens — and clearing then would blank a correct
+    /// email on every return, and leave it blank whenever that reload failed.
+    static func retainedDirectoryRow(_ row: Contact?, for userID: String?) -> Contact? {
+        guard let row, row.id == userID else { return nil }
+        return row
+    }
+
+    /// Whether the groups on screen are already `userID`'s. Keyed on the person as well
+    /// as the state: a bare `.loaded` check returned early after a change of person and
+    /// kept showing the previous person's groups in common, with nothing to reload them.
+    static func groupsAreCurrent(_ state: InfoLoadState, loadedFor owner: String?, userID: String) -> Bool {
+        state == .loaded && owner == userID
+    }
+
+    /// Loads the groups this person and I are both in, unless they are already on screen.
     private func loadGroupsInCommon(force: Bool = false) async {
         guard let userID = person?.userId else {
+            groups = []
+            groupsUserID = nil
             groupsState = .loaded
             return
         }
-        if groupsState == .loaded && !force { return }
+        if !force, ContactInfoView.groupsAreCurrent(groupsState, loadedFor: groupsUserID, userID: userID) {
+            return
+        }
+        if groupsUserID != userID { groups = [] }
         groupsState = .loading
         do {
-            groups = try await ContactInfoView.groupsInCommon(userID: userID)
+            let fetched = try await ContactInfoView.groupsInCommon(userID: userID)
+            guard person?.userId == userID else { return }
+            groups = fetched
+            groupsUserID = userID
             groupsState = .loaded
         } catch {
+            guard person?.userId == userID else { return }
             groups = []
             groupsState = .failed
         }
