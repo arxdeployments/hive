@@ -570,6 +570,9 @@ struct ContactInfoView: View {
         .navigationTitle("Contact info")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: person?.userId) {
+            // First, and synchronous: nothing loaded for somebody else may still be on
+            // screen under this person's name when the first await below suspends.
+            forgetDetailsOfSomeoneElse()
             await loadDirectoryRow()
             await loadGroupsInCommon()
         }
@@ -857,14 +860,29 @@ struct ContactInfoView: View {
 
     // MARK: Loading
 
+    /// Drops the directory row and the groups in common if they were loaded for anyone
+    /// other than the person now on screen, and keeps them if they were not.
+    ///
+    /// Runs synchronously at the top of the panel's task, ahead of both loads. Clearing
+    /// inside each load was not enough: the loads run one after the other, so the
+    /// previous person's groups stayed up, under the new name, for the whole directory
+    /// lookup that runs first. Kept for the same person because the task also re-runs
+    /// whenever the panel reappears, and clearing then would blank correct details.
+    private func forgetDetailsOfSomeoneElse() {
+        directoryRow = ContactInfoView.retainedDirectoryRow(directoryRow, for: person?.userId)
+        if groupsUserID != person?.userId {
+            groups = []
+            groupsUserID = nil
+            groupsState = .idle
+        }
+    }
+
     /// Fills the email and department rows for the person this panel is about.
     ///
     /// The result is dropped if the panel has moved on to someone else by the time it
-    /// answers, so a slow lookup cannot label one person with another's details.
+    /// answers, so a slow lookup cannot label one person with another's details. A row
+    /// loaded for someone else is already gone — `forgetDetailsOfSomeoneElse` runs first.
     private func loadDirectoryRow() async {
-        // First, before the await: a row loaded for somebody else must not sit under
-        // this person's name while their own lookup runs, or stay there if it fails.
-        directoryRow = ContactInfoView.retainedDirectoryRow(directoryRow, for: person?.userId)
         guard let userID = person?.userId else { return }
         // A miss here only blanks two rows, so it fails quietly: the panel's primary
         // job (presence, media, mute, actions) does not depend on the directory.
@@ -916,7 +934,6 @@ struct ContactInfoView: View {
         if !force, ContactInfoView.groupsAreCurrent(groupsState, loadedFor: groupsUserID, userID: userID) {
             return
         }
-        if groupsUserID != userID { groups = [] }
         groupsState = .loading
         do {
             let fetched = try await ContactInfoView.groupsInCommon(userID: userID)

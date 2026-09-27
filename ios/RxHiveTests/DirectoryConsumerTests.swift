@@ -199,33 +199,37 @@ final class DirectoryConsumerTests: XCTestCase {
         XCTAssertFalse(ContactInfoView.groupsAreCurrent(.failed, loadedFor: "u-tom", userID: "u-tom"))
     }
 
-    /// The rules above only help if the loaders use them, and in the right place: the
-    /// row has to be cleared BEFORE the lookup's await, and the groups guard has to be
-    /// the person-keyed one, with the person recorded when they load.
-    func testThePanelLoadersUseThoseRules() throws {
-        // Line by line, comments dropped, so "before the await" in the prose is not
-        // read as code. The clear has to be a statement of its own — not deferred, not
-        // inside a failure branch — on a line before the first one that awaits.
-        let rowLines = try functionSource("private func loadDirectoryRow()", in: "ContactInfoView.swift")
-            .split(separator: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.hasPrefix("//") }
-        let retain = try XCTUnwrap(
-            rowLines.firstIndex { $0.hasPrefix("directoryRow = ContactInfoView.retainedDirectoryRow(") },
-            "loadDirectoryRow no longer clears, as a statement of its own, a row loaded for someone else"
+    /// The rules above only help if the panel uses them, and in the right place.
+    ///
+    /// Everything loaded for somebody else has to be dropped as the FIRST, synchronous
+    /// step of the panel's task, before any await: the two loads run one after the
+    /// other, so a clear inside either one left the other's stale data on screen for
+    /// the whole of the first request (CodeRabbit, review of 8f63ca1). The groups guard
+    /// has to be the person-keyed one, with the person recorded when they load.
+    func testThePanelDropsSomeoneElsesDetailsBeforeItsFirstAwait() throws {
+        let task = try codeLines(
+            of: ".task(id: person?.userId) {", in: "ContactInfoView.swift", closingIndent: 8
         )
-        XCTAssertTrue(rowLines.contains { $0.contains("await ContactInfoView.directoryRow(") },
-                      "loadDirectoryRow no longer awaits the by-id lookup")
-        let firstSuspension = try XCTUnwrap(rowLines.firstIndex { $0.contains("await ") },
-                                            "loadDirectoryRow awaits nothing")
-        XCTAssertLessThan(retain, firstSuspension,
-                          "the row must be cleared before the first await — any suspension point "
-                          + "before it shows the previous person's details under the new name")
+        let forget = try XCTUnwrap(task.firstIndex(of: "forgetDetailsOfSomeoneElse()"),
+                                   "the panel's task no longer drops someone else's details")
+        let firstSuspension = try XCTUnwrap(task.firstIndex { $0.contains("await ") },
+                                            "the panel's task awaits nothing")
+        XCTAssertLessThan(forget, firstSuspension,
+                          "someone else's details must be dropped before the first await, not after")
 
-        let groups = try functionSource("private func loadGroupsInCommon(", in: "ContactInfoView.swift")
-        XCTAssertTrue(groups.contains("ContactInfoView.groupsAreCurrent(groupsState, loadedFor: groupsUserID"),
+        let dropped = try codeLines(of: "private func forgetDetailsOfSomeoneElse()", in: "ContactInfoView.swift")
+        XCTAssertFalse(dropped.first?.contains("async") ?? true, "the drop has to be synchronous")
+        XCTAssertTrue(dropped.contains("directoryRow = ContactInfoView.retainedDirectoryRow(directoryRow, for: person?.userId)"),
+                      "the directory row loaded for someone else is no longer dropped")
+        let owned = try XCTUnwrap(dropped.firstIndex(of: "if groupsUserID != person?.userId {"),
+                                  "groups must be dropped only when they belong to someone else")
+        XCTAssertTrue(dropped[owned...].contains("groupsState = .idle"),
+                      "someone else's groups are no longer hidden")
+
+        let groups = try codeLines(of: "private func loadGroupsInCommon(", in: "ContactInfoView.swift")
+        XCTAssertTrue(groups.contains { $0.contains("ContactInfoView.groupsAreCurrent(groupsState, loadedFor: groupsUserID") },
                       "loadGroupsInCommon must decide 'already loaded' per person")
-        XCTAssertFalse(groups.contains("groupsState == .loaded &&"),
+        XCTAssertFalse(groups.contains { $0.contains("groupsState == .loaded &&") },
                        "a bare `.loaded` guard keeps the previous person's groups")
         XCTAssertTrue(groups.contains("groupsUserID = userID"),
                       "a successful load must record whose groups these are")
@@ -233,24 +237,30 @@ final class DirectoryConsumerTests: XCTestCase {
 
     // MARK: Helpers
 
-    /// One function's source, from its signature to the first line that closes it at
-    /// its own indentation.
-    private func functionSource(
-        _ signature: String,
+    /// The code lines of one block — a function or a modifier's closure — from the line
+    /// that opens it to the first `}` at `closingIndent`, trimmed, with comment lines
+    /// dropped so prose such as "before the await" is never read as code.
+    private func codeLines(
+        of opening: String,
         in file: String,
+        closingIndent: Int = 4,
         caller: StaticString = #filePath,
         line: UInt = #line
-    ) throws -> String {
+    ) throws -> [String] {
         let url = URL(fileURLWithPath: "\(#filePath)")
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .appendingPathComponent("RxHive/Features/Chat/\(file)")
         let whole = try String(contentsOf: url, encoding: .utf8)
-        let start = try XCTUnwrap(whole.range(of: signature), "\(signature) not found in \(file)",
+        let start = try XCTUnwrap(whole.range(of: opening), "\(opening) not found in \(file)",
                                   file: caller, line: line)
         let rest = whole[start.lowerBound...]
-        let end = rest.range(of: "\n    }\n")?.upperBound ?? rest.endIndex
-        return String(rest[..<end])
+        let close = "\n" + String(repeating: " ", count: closingIndent) + "}\n"
+        let end = rest.range(of: close)?.upperBound ?? rest.endIndex
+        return rest[..<end]
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.hasPrefix("//") }
     }
 
     /// `GroupMemberPickerView`'s declaration, up to the next top-level declaration.
