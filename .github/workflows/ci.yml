@@ -76,21 +76,26 @@ jobs:
       #
       # The service form gives the image no command. That only ever worked
       # because minio/minio:edge-cicd defaulted to `minio server /data` — and
-      # Docker Hub's minio/minio repository is now withdrawn entirely: an
-      # authenticated pull token gets 401 there where library/redis gets 200.
-      # The job failed at container start, before a single step ran. Second time
-      # an upstream withdrawal has done this to this file; Bitnami was the first.
+      # Docker Hub's minio/minio repository was withdrawn: an authenticated pull
+      # token gets 401 there where library/redis gets 200. The job failed at
+      # container start, before a single step ran. Bitnami's image went the same
+      # way before that.
       #
-      # quay.io is MinIO's own other registry, but nothing there is a drop-in for
-      # edge-cicd: `latest`, `latest-cicd` and every RELEASE tag default to
-      # Cmd ["minio"], which prints its help and exits 0 — a service container
-      # that is never healthy. MINIO_VOLUMES does not stand in for the missing
-      # subcommand either. Starting the container in a step is the only form that
-      # can pass `server /data`, and it is immune to the next default-command
-      # change as well.
+      # Every MinIO image defaults to Cmd ["minio"], which prints its help and
+      # exits 0 — a service container that is never healthy. MINIO_VOLUMES does
+      # not stand in for the missing subcommand either. Starting the container in
+      # a step is the only form that can pass `server /data`, and it is immune to
+      # the next default-command change as well.
       #
-      # Pinned to a dated RELEASE rather than latest/latest-cicd: a floating tag
-      # is exactly what disappeared, and MinIO never reuses a RELEASE.
+      # Third withdrawal: quay.io/minio/minio, the registry the second fix moved
+      # to, now refuses anonymous pulls (its pull token grants no actions and the
+      # manifest answers 401), and dl.min.io answers 410 Gone — the open-source
+      # MinIO server is archived and MinIO publishes no image or binary for it.
+      # What runs here is a rebuild of the FINAL upstream release from MinIO's own
+      # Dockerfile (upstream commit da2e68be, `mc` included) published by the
+      # Coolify project. Because that is a third party, it is pinned by DIGEST as
+      # well as by dated RELEASE: a re-push under the same tag cannot change what
+      # CI runs. backend/tests/test_ci_object_store.py holds all of this in place.
       #
       # The suite has always contained tests that upload for real —
       # test_media_upload_and_authenticated_serving predates all of this — and
@@ -99,7 +104,7 @@ jobs:
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=rxhive -e MINIO_ROOT_PASSWORD=rxhive-dev \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9 server /data
           for _ in $(seq 1 40); do
             if curl -fsS http://localhost:9000/minio/health/live >/dev/null; then
               echo "MinIO is up"
@@ -411,26 +416,31 @@ jobs:
       #
       # The service form gives the image no command. That only ever worked
       # because minio/minio:edge-cicd defaulted to `minio server /data` — and
-      # Docker Hub's minio/minio repository is now withdrawn entirely: an
-      # authenticated pull token gets 401 there where library/redis gets 200.
-      # The job failed at container start, before a single step ran. Second time
-      # an upstream withdrawal has done this to this file; Bitnami was the first.
+      # Docker Hub's minio/minio repository was withdrawn: an authenticated pull
+      # token gets 401 there where library/redis gets 200. The job failed at
+      # container start, before a single step ran. Bitnami's image went the same
+      # way before that.
       #
-      # quay.io is MinIO's own other registry, but nothing there is a drop-in for
-      # edge-cicd: `latest`, `latest-cicd` and every RELEASE tag default to
-      # Cmd ["minio"], which prints its help and exits 0 — a service container
-      # that is never healthy. MINIO_VOLUMES does not stand in for the missing
-      # subcommand either. Starting the container in a step is the only form that
-      # can pass `server /data`, and it is immune to the next default-command
-      # change as well.
+      # Every MinIO image defaults to Cmd ["minio"], which prints its help and
+      # exits 0 — a service container that is never healthy. MINIO_VOLUMES does
+      # not stand in for the missing subcommand either. Starting the container in
+      # a step is the only form that can pass `server /data`, and it is immune to
+      # the next default-command change as well.
       #
-      # Pinned to a dated RELEASE rather than latest/latest-cicd: a floating tag
-      # is exactly what disappeared, and MinIO never reuses a RELEASE.
+      # Third withdrawal: quay.io/minio/minio, the registry the second fix moved
+      # to, now refuses anonymous pulls (its pull token grants no actions and the
+      # manifest answers 401), and dl.min.io answers 410 Gone — the open-source
+      # MinIO server is archived and MinIO publishes no image or binary for it.
+      # What runs here is a rebuild of the FINAL upstream release from MinIO's own
+      # Dockerfile (upstream commit da2e68be, `mc` included) published by the
+      # Coolify project. Because that is a third party, it is pinned by DIGEST as
+      # well as by dated RELEASE: a re-push under the same tag cannot change what
+      # CI runs. backend/tests/test_ci_object_store.py holds all of this in place.
       - name: Start MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=rxhive -e MINIO_ROOT_PASSWORD=rxhive-dev \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            ghcr.io/coollabsio/minio:RELEASE.2025-10-15T17-29-55Z@sha256:69b55a1c1c5dc285ce04db96689f5b2102317fc77a50680a1874ca6efd1c87f9 server /data
           for _ in $(seq 1 40); do
             if curl -fsS http://localhost:9000/minio/health/live >/dev/null; then
               echo "MinIO is up"

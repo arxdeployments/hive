@@ -338,8 +338,23 @@ enum RxHiveAPI {
     // MARK: - Contacts & directory
 
     /// Everyone active in my org except me, name-ascending.
+    ///
+    /// Capped server-side (`contacts.py`, `limit` defaults to 200), so this is for
+    /// narrowing with `search`, never for finding one known person — see
+    /// `directoryEntry(userID:)`.
     static func contacts(search: String = "") async throws -> [Contact] {
         try await api.send(.get, "/api/users/contacts", query: ["search": search], as: [Contact].self)
+    }
+
+    /// One colleague's directory record, by id: `GET /api/users/directory/{user_id}`.
+    ///
+    /// The roster above is capped at the first 200 names, so looking a person up in it
+    /// finds nobody who sorts after the 200th — in a hospital-sized org, most people.
+    /// Org-scoped: a user in another org 404s exactly as an unknown id does.
+    ///
+    /// `client` exists for tests; production passes nothing and uses the shared one.
+    static func directoryEntry(userID: String, client: APIClient? = nil) async throws -> Contact {
+        try await (client ?? api).send(.get, "/api/users/directory/\(userID)", as: Contact.self)
     }
 
     /// `contacts.py:groups_in_common` answers `{"data": [...]}` — not `{"groups": …}`

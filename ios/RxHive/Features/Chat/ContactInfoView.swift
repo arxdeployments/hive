@@ -521,6 +521,9 @@ struct ContactInfoView: View {
     @State private var directoryRow: Contact?
     @State private var groups: [Conversation] = []
     @State private var groupsState: InfoLoadState = .idle
+    /// Whose groups `groups` are. The panel outlives a change of person, so "loaded"
+    /// on its own would mean "loaded for whoever it showed before".
+    @State private var groupsUserID: String?
     @State private var mutePending = false
     @State private var confirmDelete = false
     @State private var isWorking = false
@@ -567,6 +570,9 @@ struct ContactInfoView: View {
         .navigationTitle("Contact info")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: person?.userId) {
+            // First, and synchronous: nothing loaded for somebody else may still be on
+            // screen under this person's name when the first await below suspends.
+            forgetDetailsOfSomeoneElse()
             await loadDirectoryRow()
             await loadGroupsInCommon()
         }
@@ -854,25 +860,89 @@ struct ContactInfoView: View {
 
     // MARK: Loading
 
+    /// Drops the directory row and the groups in common if they were loaded for anyone
+    /// other than the person now on screen, and keeps them if they were not.
+    ///
+    /// Runs synchronously at the top of the panel's task, ahead of both loads. Clearing
+    /// inside each load was not enough: the loads run one after the other, so the
+    /// previous person's groups stayed up, under the new name, for the whole directory
+    /// lookup that runs first. Kept for the same person because the task also re-runs
+    /// whenever the panel reappears, and clearing then would blank correct details.
+    private func forgetDetailsOfSomeoneElse() {
+        directoryRow = ContactInfoView.retainedDirectoryRow(directoryRow, for: person?.userId)
+        if groupsUserID != person?.userId {
+            groups = []
+            groupsUserID = nil
+            groupsState = .idle
+        }
+    }
+
+    /// Fills the email and department rows for the person this panel is about.
+    ///
+    /// The result is dropped if the panel has moved on to someone else by the time it
+    /// answers, so a slow lookup cannot label one person with another's details. A row
+    /// loaded for someone else is already gone — `forgetDetailsOfSomeoneElse` runs first.
     private func loadDirectoryRow() async {
         guard let userID = person?.userId else { return }
         // A miss here only blanks two rows, so it fails quietly: the panel's primary
-        // job (presence, media, mute, actions) does not depend on the roster.
-        guard let rows = try? await RxHiveAPI.contacts() else { return }
-        directoryRow = rows.first { $0.id == userID }
+        // job (presence, media, mute, actions) does not depend on the directory.
+        guard let row = await ContactInfoView.directoryRow(userID: userID),
+              person?.userId == userID
+        else { return }
+        directoryRow = row
     }
 
+    /// This person's email and department.
+    ///
+    /// Asked for BY ID. It used to fetch the whole roster and search it here, which
+    /// stopped working when batch 18 capped the roster at the first 200 names: anyone
+    /// who sorts after the 200th was simply not in the list, and the panel read "Email
+    /// not available" with a blank department, with no error to say why. The web panel
+    /// moved to the by-id endpoint in that batch; this one was missed.
+    ///
+    /// Nil for a colleague in another org (the endpoint 404s them) and on any failure.
+    static func directoryRow(userID: String, client: APIClient? = nil) async -> Contact? {
+        try? await RxHiveAPI.directoryEntry(userID: userID, client: client)
+    }
+
+    /// What the directory rows may keep showing while `userID`'s lookup runs: the row
+    /// already loaded for them, and nothing loaded for anyone else.
+    ///
+    /// Not simply nil. `.task` re-runs every time the panel reappears — coming back
+    /// from its own Search or Media screens — and clearing then would blank a correct
+    /// email on every return, and leave it blank whenever that reload failed.
+    static func retainedDirectoryRow(_ row: Contact?, for userID: String?) -> Contact? {
+        guard let row, row.id == userID else { return nil }
+        return row
+    }
+
+    /// Whether the groups on screen are already `userID`'s. Keyed on the person as well
+    /// as the state: a bare `.loaded` check returned early after a change of person and
+    /// kept showing the previous person's groups in common, with nothing to reload them.
+    static func groupsAreCurrent(_ state: InfoLoadState, loadedFor owner: String?, userID: String) -> Bool {
+        state == .loaded && owner == userID
+    }
+
+    /// Loads the groups this person and I are both in, unless they are already on screen.
     private func loadGroupsInCommon(force: Bool = false) async {
         guard let userID = person?.userId else {
+            groups = []
+            groupsUserID = nil
             groupsState = .loaded
             return
         }
-        if groupsState == .loaded && !force { return }
+        if !force, ContactInfoView.groupsAreCurrent(groupsState, loadedFor: groupsUserID, userID: userID) {
+            return
+        }
         groupsState = .loading
         do {
-            groups = try await ContactInfoView.groupsInCommon(userID: userID)
+            let fetched = try await ContactInfoView.groupsInCommon(userID: userID)
+            guard person?.userId == userID else { return }
+            groups = fetched
+            groupsUserID = userID
             groupsState = .loaded
         } catch {
+            guard person?.userId == userID else { return }
             groups = []
             groupsState = .failed
         }
