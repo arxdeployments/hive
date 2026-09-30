@@ -18,6 +18,7 @@ struct ChatView: View {
 
     let conversationID: String
 
+    /// A thread screen for one conversation, by id.
     init(conversationID: String) {
         self.conversationID = conversationID
     }
@@ -112,6 +113,9 @@ struct ChatView: View {
 
     // MARK: - Body
 
+    /// The header, banners for an ongoing call and the current pin, the message list, and
+    /// the composer — with the lifecycle hooks that keep the thread current while it is on
+    /// screen.
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -354,6 +358,8 @@ struct ChatView: View {
 
     // MARK: - Pinned banner
 
+    /// The bar showing the current pinned message; tapping it jumps there and moves on to
+    /// the next pin.
     private func pinnedBanner(_ pin: Message) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: Theme.Layout.spacing3) {
@@ -418,6 +424,7 @@ struct ChatView: View {
         return calls.activeGroupCalls[conversationID]
     }
 
+    /// The bar offering to join a group call already running in this conversation.
     private func ongoingCallBanner(_ signal: CallSignal) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: Theme.Layout.spacing3) {
@@ -463,6 +470,7 @@ struct ChatView: View {
         .background(Theme.Color.surface)
     }
 
+    /// Who is on the ongoing group call, for the banner offering to join it.
     private func ongoingCallSubtitle(_ signal: CallSignal) -> String {
         let names = (signal.participants ?? []).map(\.displayName)
         switch names.count {
@@ -709,6 +717,7 @@ struct ChatView: View {
 
     // MARK: - Sheets
 
+    /// The one sheet this thread can present at a time, by kind.
     @ViewBuilder
     private func sheetContent(_ sheet: ChatSheet) -> some View {
         switch sheet {
@@ -739,6 +748,8 @@ struct ChatView: View {
 
     // MARK: - Pushed destinations
 
+    /// The screen for each place this thread can push: search, starred, pinned, the info
+    /// panels, or another conversation.
     @ViewBuilder
     private func routeContent(_ destination: ChatRoute) -> some View {
         switch destination {
@@ -781,6 +792,8 @@ struct ChatView: View {
 
     // MARK: - Lifecycle
 
+    /// Load the thread and mark it read when the screen first appears; on a reappearance,
+    /// catch up without undoing a jump or moving the reader.
     private func open() async {
         if didInitialScroll {
             // `.task` re-runs whenever this screen reappears — popping back from
@@ -829,6 +842,8 @@ struct ChatView: View {
         await loadPinned()
     }
 
+    /// React to a new newest row: follow it and mark it read if the reader is at the
+    /// bottom, otherwise count it on the scroll-to-bottom button.
     private func newMessagesArrived() {
         guard didInitialScroll else { return }
         if isAtBottom {
@@ -850,6 +865,7 @@ struct ChatView: View {
         }
     }
 
+    /// Page back from the top sentinel, keeping the row that was at the top pinned there.
     private func loadOlder() async {
         isLoadingOlder = true
         // The returned id is the message that used to be at the top; pinning it back

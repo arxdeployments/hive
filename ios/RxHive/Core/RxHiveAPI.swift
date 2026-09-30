@@ -74,8 +74,9 @@ enum RxHiveAPI {
     }
 
     /// Leaves the conversation for me (participant row removed).
-    static func deleteConversation(id: String) async throws {
-        _ = try await api.sendIgnoringResponse(.delete, "/api/conversations/\(id)")
+    /// `client` exists for tests; production passes nothing and uses the shared one.
+    static func deleteConversation(id: String, client: APIClient? = nil) async throws {
+        _ = try await (client ?? api).sendIgnoringResponse(.delete, "/api/conversations/\(id)")
     }
 
     // clearConversation and exportConversation were removed along with the

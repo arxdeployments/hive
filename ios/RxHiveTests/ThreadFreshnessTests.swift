@@ -23,6 +23,8 @@ final class ThreadFreshnessTests: XCTestCase {
     private var messagesPath: String { "/api/conversations/\(conv)/messages" }
     private var readPath: String { "/api/conversations/\(conv)/read" }
 
+    /// `MockURLProtocol`'s script and request log are process-wide; clear them for the next
+    /// test.
     override func tearDown() {
         MockURLProtocol.reset()
         super.tearDown()
@@ -30,6 +32,7 @@ final class ThreadFreshnessTests: XCTestCase {
 
     // MARK: Fixtures
 
+    /// A client whose every request is answered by `MockURLProtocol`.
     private func makeClient() -> APIClient {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [MockURLProtocol.self]
@@ -37,6 +40,8 @@ final class ThreadFreshnessTests: XCTestCase {
         return APIClient(session: URLSession(configuration: config))
     }
 
+    /// A store wired to that client, with no socket attached — so it behaves as connected
+    /// until a test says otherwise through `socketStateChanged`.
     private func makeStore() -> ChatStore {
         ChatStore(api: makeClient())
     }
@@ -53,6 +58,7 @@ final class ThreadFreshnessTests: XCTestCase {
         """
     }
 
+    /// A `GET .../messages` response wrapping `messages`.
     private func pageJSON(_ messages: [String], hasNewer: Bool = false, anchor: String? = nil) -> String {
         let anchorJSON = anchor.map { "\"\($0)\"" } ?? "null"
         return """
@@ -86,6 +92,7 @@ final class ThreadFreshnessTests: XCTestCase {
         }
     }
 
+    /// The thread's message ids, oldest first — what the screen would draw.
     private func ids(_ chat: ChatStore) -> [String] {
         (chat.messages[conv] ?? []).map(\.id)
     }
@@ -222,6 +229,8 @@ final class ThreadFreshnessTests: XCTestCase {
         XCTAssertEqual(MockURLProtocol.count(path: readPath), 1)
     }
 
+    /// A jump's slice of old history is not the thread's newest end, so it is not marked
+    /// read either.
     func testMarkReadIsWithheldForAJumpedSlice() async {
         serve(newest: [messageJSON("m9", second: 9)], around: messageJSON("m-old", second: 1))
         let chat = makeStore()
@@ -532,6 +541,72 @@ final class ThreadFreshnessTests: XCTestCase {
         XCTAssertTrue(chat.loadingThreads.isEmpty)
     }
 
+    // MARK: A thread that is gone
+
+    /// Deleting the conversation — or being removed from it — forgets its thread. A page
+    /// that was already on its way must not bring the messages back.
+    func testANewestPageInFlightWhenTheThreadIsDeletedWritesNothing() async throws {
+        let page = pageJSON([messageJSON("m1", second: 1)])
+        MockURLProtocol.install { request, _ in
+            request.httpMethod == "DELETE" ? .json(200, "{}") : .json(200, page, delay: 0.5)
+        }
+        let chat = makeStore()
+
+        let load = Task { await chat.loadMessages(conversationID: conv) }
+        try await Task.sleep(for: .milliseconds(100))
+        let deleted = await chat.deleteConversation(id: conv)
+        _ = await load.value
+
+        XCTAssertTrue(deleted)
+        XCTAssertNil(chat.messages[conv], "a deleted conversation's messages came back")
+        XCTAssertFalse(chat.loadedWindows.contains(conv))
+    }
+
+    /// The same for a jump: its slice must not bring a deleted conversation back.
+    func testAJumpInFlightWhenTheThreadIsDeletedWritesNothing() async throws {
+        let slice = pageJSON([messageJSON("m-old", second: 1)], hasNewer: true, anchor: "m-old")
+        MockURLProtocol.install { request, _ in
+            request.httpMethod == "DELETE" ? .json(200, "{}") : .json(200, slice, delay: 0.5)
+        }
+        let chat = makeStore()
+
+        let jump = Task { await chat.loadWindow(conversationID: conv, around: "m-old") }
+        try await Task.sleep(for: .milliseconds(100))
+        _ = await chat.deleteConversation(id: conv)
+        let resolved = await jump.value
+
+        XCTAssertFalse(resolved)
+        XCTAssertNil(chat.messages[conv], "a deleted conversation's slice came back")
+        XCTAssertNil(chat.hasNewerMessages[conv])
+    }
+
+    /// Loads still waiting their turn when the thread is forgotten never run at all.
+    func testLoadsQueuedBehindADeletionNeverRun() async throws {
+        let page = pageJSON([messageJSON("m1", second: 1)])
+        let slice = pageJSON([messageJSON("m-old", second: 0)], hasNewer: true, anchor: "m-old")
+        MockURLProtocol.install { request, _ in
+            if request.httpMethod == "DELETE" { return .json(200, "{}") }
+            if (request.url?.query ?? "").contains("around=") { return .json(200, slice) }
+            return .json(200, page, delay: 0.5)
+        }
+        let chat = makeStore()
+
+        let first = Task { await chat.loadMessages(conversationID: conv) }
+        try await Task.sleep(for: .milliseconds(100))
+        let queuedPage = Task { await chat.loadMessages(conversationID: conv, force: true) }
+        let queuedJump = Task { await chat.loadWindow(conversationID: conv, around: "m-old") }
+        try await Task.sleep(for: .milliseconds(50))
+        _ = await chat.deleteConversation(id: conv)
+        _ = await first.value
+        _ = await queuedPage.value
+        _ = await queuedJump.value
+
+        XCTAssertEqual(pageFetches, 1, "a newest-page load queued before the deletion still ran")
+        XCTAssertEqual(MockURLProtocol.requests.filter { ($0.url.query ?? "").contains("around=") }.count, 0,
+                       "a jump queued before the deletion still ran")
+        XCTAssertNil(chat.messages[conv])
+    }
+
     /// The history rule on its own: kept only when the page joins the held rows.
     func testHistoryIsKeptOnlyWhenThePageJoinsTheHeldRows() throws {
         let held = [try row("m1", second: 1), try row("m2", second: 2), try row("temp-x", second: 9)]
@@ -646,6 +721,7 @@ final class ThreadFreshnessTests: XCTestCase {
                       "a live arrival marks read a thread whose last fetch failed")
     }
 
+    /// An app source file, read from the checkout, for the wiring checks.
     private func source(_ path: String) throws -> String {
         let url = URL(fileURLWithPath: "\(#filePath)")
             .deletingLastPathComponent()

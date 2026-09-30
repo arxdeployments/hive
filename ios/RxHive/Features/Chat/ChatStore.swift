@@ -61,6 +61,9 @@ final class ChatStore: ObservableObject {
     /// Bumped by `reset`. A fetch that answers after a sign-out holds the previous
     /// person's messages and must not write them into the next session.
     private var sessionGeneration = 0
+    /// Bumped per thread by `forgetThread`. A load admitted before the conversation
+    /// was deleted, or before I was removed from it, must not bring its messages back.
+    private var threadGenerations: [String: Int] = [:]
     /// The tail of each thread's window-fetch queue; see `inWindowQueue`.
     private var windowQueues: [String: Task<Void, Never>] = [:]
     private var socketStateWatch: AnyCancellable?
@@ -92,6 +95,8 @@ final class ChatStore: ObservableObject {
         self.api = api
     }
 
+    /// Connect the store to the signed-in session: register for sign-out, watch the socket's
+    /// state, and start consuming realtime events. Called once, at launch.
     func attach(auth: AuthStore) {
         self.auth = auth
         // The reciprocal half: a session ending has to be able to clear this store.
@@ -154,6 +159,7 @@ final class ChatStore: ObservableObject {
         visibleThreads = [:]
         trustLostToGap = []
         windowQueues = [:]
+        threadGenerations = [:]
         sessionGeneration &+= 1
         typingUsers = [:]
         presence = [:]
@@ -205,6 +211,7 @@ final class ChatStore: ObservableObject {
 
     // MARK: - Conversations
 
+    /// Replace the conversation list with the first page for `filter` and `search`.
     func loadConversations(filter: String = "all", search: String = "", reset: Bool = true) async {
         if reset { isLoadingConversations = true }
         conversationsError = nil
@@ -218,6 +225,7 @@ final class ChatStore: ObservableObject {
         isLoadingConversations = false
     }
 
+    /// Append the next page of the conversation list, skipping rows an event already added.
     func loadMoreConversations(filter: String = "all", search: String = "") async {
         guard hasMoreConversations, let cursor = conversationCursor else { return }
         do {
@@ -285,7 +293,11 @@ final class ChatStore: ObservableObject {
         afterReconnect: Bool,
         keepingHistory: Bool
     ) async -> Bool {
-        await inWindowQueue(conversationID) { [self] in
+        // Captured at admission, not when the queue reaches this: a sign-out or a
+        // deletion while it waits has to stop it too.
+        let admitted = admission(for: conversationID)
+        return await inWindowQueue(conversationID) { [self] in
+            guard mayWrite(conversationID, admitted) else { return false }
             // Decided HERE, once any fetch queued ahead of this one has landed: a
             // thread that fetch made current is served, not fetched a second time.
             if !force, loadedWindows.contains(conversationID), messages[conversationID]?.isEmpty == false {
@@ -295,19 +307,45 @@ final class ChatStore: ObservableObject {
             // it. A reconnect leaves it in place; back-to-latest fetches the newest
             // page when they want it.
             if afterReconnect, hasNewerMessages[conversationID] == true { return false }
-            return await fetchNewestPage(conversationID, keepingHistory: keepingHistory)
+            return await fetchNewestPage(conversationID, keepingHistory: keepingHistory, admitted: admitted)
         }
     }
 
-    private func fetchNewestPage(_ conversationID: String, keepingHistory: Bool) async -> Bool {
+    /// The session and thread generations a load was admitted under.
+    private struct Admission {
+        let session: Int
+        let thread: Int
+    }
+
+    /// The generations in force now, for a load about to join the thread's queue.
+    private func admission(for conversationID: String) -> Admission {
+        Admission(session: sessionGeneration, thread: threadGenerations[conversationID, default: 0])
+    }
+
+    /// Whether a load admitted under `admitted` may still write to this thread: not
+    /// after a sign-out, whose next session must not see these messages, and not after
+    /// the conversation was deleted or I was removed from it.
+    private func mayWrite(_ conversationID: String, _ admitted: Admission) -> Bool {
+        admitted.session == sessionGeneration
+            && admitted.thread == threadGenerations[conversationID, default: 0]
+    }
+
+    /// The network half of `loadNewestPage`: fetch, merge, and grant trust if it is earned.
+    /// Only ever runs inside the thread's window queue. Writes nothing if the session ended,
+    /// or the thread was forgotten, while the request was out.
+    private func fetchNewestPage(
+        _ conversationID: String,
+        keepingHistory: Bool,
+        admitted: Admission
+    ) async -> Bool {
         let epoch = trustEpoch
-        let session = sessionGeneration
         loadingThreads.insert(conversationID)
-        defer { if session == sessionGeneration { loadingThreads.remove(conversationID) } }
+        defer { if admitted.session == sessionGeneration { loadingThreads.remove(conversationID) } }
         do {
             let page = try await RxHiveAPI.messages(conversationID: conversationID, limit: 50, client: api)
-            // Signed out while the page was in flight: it belongs to the last person.
-            guard session == sessionGeneration else { return false }
+            // Signed out, or the thread deleted or left, while the page was in flight:
+            // it belongs to a thread this store no longer holds.
+            guard mayWrite(conversationID, admitted) else { return false }
             let thread = Self.threadAfterFetch(
                 page.messages,
                 replacing: messages[conversationID] ?? [],
@@ -327,7 +365,7 @@ final class ChatStore: ObservableObject {
             grantTrust(conversationID, fetchedAt: epoch)
             return true
         } catch {
-            guard session == sessionGeneration else { return false }
+            guard mayWrite(conversationID, admitted) else { return false }
             // A failed re-fetch leaves whatever was held, which may be stale — so it
             // stops being trusted, and `markRead` will not vouch for it.
             loadedWindows.remove(conversationID)
@@ -456,14 +494,15 @@ final class ChatStore: ObservableObject {
     /// window fetch for the thread, so a newest-page answer that lands late cannot
     /// undo the jump.
     func loadWindow(conversationID: String, around messageID: String) async -> Bool {
-        await inWindowQueue(conversationID) { [self] in
+        let admitted = admission(for: conversationID)
+        return await inWindowQueue(conversationID) { [self] in
+            guard mayWrite(conversationID, admitted) else { return false }
             let epoch = trustEpoch
-            let session = sessionGeneration
             do {
                 let page = try await RxHiveAPI.messages(
                     conversationID: conversationID, around: messageID, limit: 50, client: api
                 )
-                guard session == sessionGeneration else { return false }
+                guard mayWrite(conversationID, admitted) else { return false }
                 messages[conversationID] = Self.threadAfterFetch(
                     page.messages,
                     replacing: messages[conversationID] ?? [],
@@ -615,6 +654,7 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Edit one of my messages, and show the server's copy of the result.
     func edit(messageID: String, content: String, in conversationID: String) async -> Bool {
         do {
             let updated = try await RxHiveAPI.editMessage(messageID: messageID, content: content)
@@ -627,6 +667,7 @@ final class ChatStore: ObservableObject {
 
     // MARK: - Conversation actions
 
+    /// Pin or unpin a conversation for me, and re-sort the list to match.
     func togglePin(conversationID: String) async {
         do {
             let state = try await RxHiveAPI.togglePin(conversationID: conversationID)
@@ -636,6 +677,8 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Mute or unmute a conversation for me. Returns the new state, or nil if the server
+    /// refused.
     func toggleMute(conversationID: String) async -> Bool? {
         do {
             let state = try await RxHiveAPI.toggleMute(conversationID: conversationID)
@@ -698,6 +741,9 @@ final class ChatStore: ObservableObject {
         if !isConnected { untrustAll() }
     }
 
+    /// Withdraw trust from every cached thread, remembering which were current so a
+    /// reconnect can keep their history, and advance the epoch so fetches already in flight
+    /// cannot restore it.
     private func untrustAll() {
         trustEpoch &+= 1
         trustLostToGap.formUnion(loadedWindows)
@@ -731,9 +777,10 @@ final class ChatStore: ObservableObject {
         await loadConversations()
     }
 
+    /// Delete a conversation for me, and drop everything held about its thread.
     func deleteConversation(id: String) async -> Bool {
         do {
-            try await RxHiveAPI.deleteConversation(id: id)
+            try await RxHiveAPI.deleteConversation(id: id, client: api)
             conversations.removeAll { $0.id == id }
             forgetThread(id)
             return true
@@ -780,6 +827,7 @@ final class ChatStore: ObservableObject {
         auth?.realtime.send(.typingStart(conversationID: conversationID))
     }
 
+    /// Announce that I stopped typing, and let the next keystroke announce again at once.
     func stopTyping(in conversationID: String) {
         outgoingTypingSentAt[conversationID] = nil
         auth?.realtime.send(.typingStop(conversationID: conversationID))
@@ -787,6 +835,8 @@ final class ChatStore: ObservableObject {
 
     // MARK: - Realtime
 
+    /// Apply one realtime event. Events are handled one at a time, in arrival order, by the
+    /// loop `attach` starts.
     private func handle(_ event: RealtimeEvent) async {
         switch event {
         case .connected:
@@ -888,6 +938,9 @@ final class ChatStore: ObservableObject {
     /// A thread the user can no longer see at all: its messages and every flag about
     /// its window go together.
     private func forgetThread(_ conversationID: String) {
+        // Loads queued or in flight for it were admitted under the old value, so none
+        // of them can write the messages back.
+        threadGenerations[conversationID, default: 0] &+= 1
         messages[conversationID] = nil
         hasMoreHistory[conversationID] = nil
         hasNewerMessages[conversationID] = nil
