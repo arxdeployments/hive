@@ -23,9 +23,26 @@ final class ThreadFreshnessTests: XCTestCase {
     private var messagesPath: String { "/api/conversations/\(conv)/messages" }
     private var readPath: String { "/api/conversations/\(conv)/read" }
 
-    /// `MockURLProtocol`'s script and request log are process-wide; clear them for the next
-    /// test.
+    /// When the running test began, for the time check in `tearDown`.
+    private var startedAt = Date()
+
+    /// Starts the clock for this test.
+    override func setUp() {
+        super.setUp()
+        startedAt = Date()
+    }
+
+    /// Fails a test that ran long enough to have been saved by a timeout, then clears
+    /// `MockURLProtocol`'s script and request log, which are process-wide.
     override func tearDown() {
+        // Several tests here assert that nothing was written, and a response that never
+        // arrives satisfies that just as well as one that arrived and was discarded. A
+        // lost reply shows up only as time — URLSession's 60 s timeout, and then some —
+        // so time is what is checked. Every test here finishes in well under a second.
+        XCTAssertLessThan(
+            Date().timeIntervalSince(startedAt), 10,
+            "a scripted reply went undelivered; any 'nothing was written' assertion above passed on a timeout"
+        )
         MockURLProtocol.reset()
         super.tearDown()
     }
@@ -240,6 +257,22 @@ final class ThreadFreshnessTests: XCTestCase {
         await chat.markRead(conversationID: conv)
 
         XCTAssertEqual(MockURLProtocol.count(path: readPath), 0, "a slice of old history was marked read")
+    }
+
+    /// "I just fetched the newest page" stops being true the moment a jump queued behind
+    /// that fetch replaces it with a slice (CodeRabbit, review of cd6c290). Back-to-latest
+    /// waits before marking read, and the pinned banner stays tappable meanwhile.
+    func testJustFetchedDoesNotVouchForASliceThatReplacedThePage() async {
+        serve(newest: [messageJSON("m9", second: 9)], around: messageJSON("m-old", second: 1))
+        let chat = makeStore()
+        let current = await chat.loadMessages(conversationID: conv, force: true)
+        _ = await chat.loadWindow(conversationID: conv, around: "m-old")
+
+        await chat.markRead(conversationID: conv, justFetched: current)
+
+        XCTAssertTrue(current)
+        XCTAssertEqual(MockURLProtocol.count(path: readPath), 0,
+                       "the newest page was marked read while a jump's slice was on screen")
     }
 
     /// A re-fetch that fails leaves whatever was held, which may be stale — it must not

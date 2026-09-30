@@ -698,9 +698,14 @@ final class ChatStore: ObservableObject {
     /// messages the phone never displayed as Read to the person who sent them.
     ///
     /// `justFetched` is a caller that has just had `loadMessages` return true: the
-    /// newest page is on screen whether or not the socket is up to keep it there.
+    /// newest page is on screen whether or not the socket is up to keep it there — unless
+    /// a jump queued behind that fetch has since replaced it with a slice of history.
+    /// Back-to-latest waits 80 ms before this call, and the pinned banner stays tappable
+    /// meanwhile, so the fetch having succeeded does not mean its page is still showing.
     func markRead(conversationID: String, justFetched: Bool = false) async {
-        guard justFetched || loadedWindows.contains(conversationID) else { return }
+        guard loadedWindows.contains(conversationID)
+            || (justFetched && hasNewerMessages[conversationID] != true)
+        else { return }
         // Zero the badge immediately; the server agrees a moment later.
         replaceConversation(id: conversationID) { $0.applying(unreadCount: 0) }
         if auth?.realtime.state == .connected {
