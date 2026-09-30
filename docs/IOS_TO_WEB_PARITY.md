@@ -8,6 +8,7 @@
 > re-verified by a second pass whose job was to *disprove* it by finding a web implementation. 37
 > candidates were raised; 4 were thrown out because the web already had the capability. What remains
 > is 33 verified gaps. Section 1 lists 53 things that are **already on the web** — read it first.
+> Item 34 was added later, by audit batch 71, when iOS gained a read-receipt rule the web lacks.
 
 ---
 
@@ -843,6 +844,52 @@ Portability correction: "direct" is wrong as stated. `CloseEvent.reason` is full
 **Porting notes.** Browsers do not suspend a backgrounded tab's socket the way iOS suspends a process; a hidden tab keeps sending frames, and throttled timers are already handled by the server's 65s heartbeat window (backend/app/realtime/hub.py HEARTBEAT_TIMEOUT). Deliberately tearing down on hide would cost the user incoming messages and call rings in exactly the case the web supports and iOS cannot.
 
 **Corrections from verification.** Two details in the finding are slightly off. (a) "websocket.js has no visibility handling" is wrong as stated — it reads document.visibilityState at :189 and :767; what it has no visibility handling for is the socket's lifetime. (b) "no visibility handling" in the web generally is wrong — ChatSidebar.jsx:87-93 has a visibilitychange listener whose comment names precisely the dead-socket-while-hidden case, but it responds with a conversations refetch rather than a socket check, so a foregrounded tab can render a fresh sidebar over a dead socket. The rest of the claim (socket lifetime = session lifetime, owned by RealtimeSession.jsx:36-48; 30s heartbeat at websocket.js:666-677 keeps running while hidden) is accurate.
+
+### 34. iOS sends a read receipt only for a thread that is showing its newest messages
+
+**Direct port** · effort: small
+
+**What iOS does.** `ChatStore.markRead(conversationID:justFetched:)` returns without a receipt unless
+the thread's loaded window is the newest page, fetched by the store and kept current by the socket
+since (`loadedWindows`), or the caller has just had `loadMessages` return that page. So no receipt is
+sent for a jump's slice of history (`hasNewerMessages`), after a failed fetch, for a thread served
+from cache while the socket was down, or once the user has left the thread (`ChatView` re-checks
+`isThreadOnScreen` before every receipt). Added in batch 71 (PR #111), where it was rated critical:
+iOS was marking read messages it had never displayed.
+
+**Why it matters.** The server stamps `last_read_at` with the current time whatever anchor it is
+given (`backend/app/services/messaging.py`, `mark_read`). So any receipt for a thread that is not
+showing its newest messages tells the sender that messages the reader never saw have been Read.
+
+**iOS code to read.**
+
+- ios/RxHive/Features/Chat/ChatStore.swift — `markRead`, `loadedWindows`, `socketStateChanged`
+- ios/RxHive/Features/Chat/ChatView.swift — `open()`, `newMessagesArrived()`, `backToLatest(_:)`
+
+**What the web does today.** Two paths receipt without that check:
+
+1. `frontend/src/components/chat/ChatPanel.jsx:313-320` sends `PUT /read` in the same effect that
+   calls `fetchMessages()`. It does not wait for the page, and it does not care whether the fetch
+   succeeds. If the fetch fails, the previous window, or none, stays on screen with the thread
+   already marked read.
+2. `frontend/src/services/websocket.js:612-621` sends `read_receipt` for any `new_message` in the
+   active, visible conversation, including while a jump's around-window is on screen
+   (`hasNewerByConv` true). That marks read every message between the slice and the live end.
+
+**Web files to change.** `frontend/src/components/chat/ChatPanel.jsx`, `frontend/src/services/websocket.js`
+
+**Porting notes.** Move the `PUT /read` into `fetchMessages`' success path, including its cache-hit
+branch. Gate the socket receipt on the active window not being a slice, which means lifting
+`hasNewerByConv` out of ChatPanel state and into the store so websocket.js can read it.
+
+A related difference, deliberately not ported yet: on reconnect, both clients re-fetch the open
+thread. iOS keeps history the reader paged back through when the new page joins it, and leaves a
+jump's slice alone. The web's force-fetch (`ChatPanel.jsx:325-329`) replaces the window outright.
+The stakes differ. iOS reconnects on every unlock and every token refresh, while a web tab keeps its
+socket while hidden (item 33). So the web case is rare.
+
+**Corrections from verification.** Not yet re-verified by an independent second pass. The web
+line references were read on `main` at the time of batch 71.
 
 ---
 

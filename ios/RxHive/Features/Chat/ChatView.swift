@@ -790,6 +790,10 @@ struct ChatView: View {
             // is still caught: an untrusted thread is fetched here.
             if !hasNewer && !isJumping {
                 let current = await chat.loadMessages(conversationID: conversationID)
+                // `.task` is cancelled when the screen goes, but the queued fetch is not,
+                // so this can resume after the user has left — and a receipt then would
+                // mark read a newest page they never saw.
+                guard chat.isThreadOnScreen(conversationID) else { return }
                 await chat.markRead(conversationID: conversationID, justFetched: current)
             }
             await loadPinned()
@@ -818,6 +822,9 @@ struct ChatView: View {
         if let proxy = scrollProxy { scrollToBottom(proxy, animated: false) }
         didInitialScroll = true
 
+        // Same reason as the reappear branch: the user may have backed out while the
+        // first page was loading.
+        guard chat.isThreadOnScreen(conversationID) else { return }
         await chat.markRead(conversationID: conversationID, justFetched: current)
         await loadPinned()
     }
@@ -833,6 +840,9 @@ struct ChatView: View {
             guard !hasNewer, !isJumping else { return }
             Task {
                 let current = await chat.loadMessages(conversationID: conversationID)
+                // Unstructured, so it outlives the screen: an untrusted thread is fetched
+                // here, and the user can leave while it loads.
+                guard chat.isThreadOnScreen(conversationID) else { return }
                 await chat.markRead(conversationID: conversationID, justFetched: current)
             }
         } else if let last = messages.last, last.senderId != chat.currentUserID {

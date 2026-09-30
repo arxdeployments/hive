@@ -611,6 +611,25 @@ final class ThreadFreshnessTests: XCTestCase {
         XCTAssertTrue(beforeToast.contains(onScreen), "back-to-latest toasts a failure over whatever screen the user moved to")
         XCTAssertTrue(betweenToastAndScroll.contains(onScreen), "back-to-latest scrolls and marks read after the user has left")
 
+        // Every read receipt the thread screen sends comes after at least one await, and
+        // work the screen started can resume after the user has left it. Each one has to
+        // re-check that the thread is still on screen immediately before it (CodeRabbit,
+        // review of 64c638e) — otherwise a newest page fetched as they left is marked read.
+        let viewLines = view.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        let receipts = viewLines.indices.filter { viewLines[$0].hasPrefix("await chat.markRead(") }
+        XCTAssertEqual(receipts.count, 4, "the thread screen's read receipts changed; re-check each is guarded")
+        for index in receipts {
+            // Walking back from the receipt, the on-screen guard must come before any
+            // suspension point: nothing can change between a guard and code that does not
+            // await, but anything can across an await.
+            var guarded = false
+            for line in viewLines[..<index].reversed() where !line.hasPrefix("//") {
+                if line == "guard chat.isThreadOnScreen(conversationID) else { return }" { guarded = true; break }
+                if line.contains("await ") { break }
+            }
+            XCTAssertTrue(guarded, "the read receipt at line \(index + 1) can be sent after the user left the thread")
+        }
+
         // The unread divider counts the rows the server's unread count counts.
         XCTAssertTrue(view.contains("let countable = messages.filter { $0.senderId != nil && $0.senderId != me && !$0.isDeleted }"),
                       "the unread divider counts my own carried sends and shifts past an unread message")
