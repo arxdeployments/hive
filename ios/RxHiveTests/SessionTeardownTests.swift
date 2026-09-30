@@ -45,6 +45,8 @@ final class SessionTeardownTests: XCTestCase {
             failedSends: ["temp-2"],
             loadingThreads: ["conv-a"],
             hasMoreHistory: ["conv-a": true],
+            hasNewerMessages: ["conv-a": true],
+            loadedWindows: ["conv-a"],
             isLoadingConversations: true,
             hasMoreConversations: true,
             conversationsError: "stale"
@@ -68,6 +70,8 @@ final class SessionTeardownTests: XCTestCase {
         XCTAssertTrue(chat.failedSends.isEmpty)
         XCTAssertTrue(chat.loadingThreads.isEmpty)
         XCTAssertTrue(chat.hasMoreHistory.isEmpty)
+        XCTAssertTrue(chat.hasNewerMessages.isEmpty)
+        XCTAssertTrue(chat.loadedWindows.isEmpty, "the next session would trust this one's windows")
         XCTAssertNil(chat.conversationsError)
         XCTAssertFalse(chat.isLoadingConversations)
         XCTAssertFalse(chat.hasMoreConversations)

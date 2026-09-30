@@ -81,6 +81,9 @@ struct ChatView: View {
 
     private var conversation: Conversation? { chat.conversation(id: conversationID) }
     private var messages: [Message] { chat.messages[conversationID] ?? [] }
+
+    /// A jump left a slice of history loaded, not the thread's newest end.
+    private var hasNewer: Bool { chat.hasNewerMessages[conversationID] == true }
     private var isGroup: Bool { conversation?.type.isGroup ?? false }
     private var title: String { conversation.map { chat.title(for: $0) } ?? "Conversation" }
 
@@ -136,6 +139,11 @@ struct ChatView: View {
         // thread for the same reason.
         .toolbar(.hidden, for: .tabBar)
         .task { await open() }
+        // So a reconnect re-fetches this thread while it is on screen — the socket
+        // closes whenever the phone is locked, and anything sent meanwhile is lost to
+        // it. Appear/disappear rather than the task, which is not re-run on unlock.
+        .onAppear { chat.threadDidAppear(conversationID) }
+        .onDisappear { chat.threadDidDisappear(conversationID) }
         .onChange(of: messages.count) { _, _ in newMessagesArrived() }
         .navigationDestination(item: $route) { destination in
             routeContent(destination)
@@ -510,9 +518,15 @@ struct ChatView: View {
                 }
             }
             .overlay(alignment: .bottomTrailing) {
-                if !isAtBottom && !isSelecting {
+                // Also shown AT the bottom of a jump's slice: its end is not the
+                // thread's end, and nothing else says so.
+                if (!isAtBottom || hasNewer) && !isSelecting {
                     ScrollToBottomButton(unreadCount: missedWhileAway) {
-                        scrollToBottom(proxy, animated: true)
+                        if hasNewer {
+                            Task { await backToLatest(proxy) }
+                        } else {
+                            scrollToBottom(proxy, animated: true)
+                        }
                     }
                     .padding(.trailing, Theme.Layout.spacing2)
                     .padding(.bottom, Theme.Layout.spacing3)
@@ -806,6 +820,18 @@ struct ChatView: View {
             scrollProxy?.scrollTo(anchor, anchor: .top)
         }
         isLoadingOlder = false
+    }
+
+    /// After a jump the newest messages are not loaded at all, so "scroll to the
+    /// bottom" has to fetch them before there is a bottom to scroll to.
+    private func backToLatest(_ proxy: ScrollViewProxy) async {
+        guard await chat.loadMessages(conversationID: conversationID, force: true) else {
+            toasts.error("Couldn't load the latest messages")
+            return
+        }
+        try? await Task.sleep(for: .milliseconds(80))
+        scrollToBottom(proxy, animated: true)
+        await chat.markRead(conversationID: conversationID)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {

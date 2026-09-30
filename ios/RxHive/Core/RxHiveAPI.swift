@@ -43,9 +43,10 @@ enum RxHiveAPI {
         cursor: String? = nil,
         limit: Int = 30,
         search: String = "",
-        filter: String = "all"
+        filter: String = "all",
+        client: APIClient? = nil
     ) async throws -> ConversationPage {
-        try await api.send(
+        try await (client ?? api).send(
             .get, "/api/conversations",
             query: ["cursor": cursor, "limit": String(limit), "search": search, "filter": filter],
             as: ConversationPage.self
@@ -84,8 +85,9 @@ enum RxHiveAPI {
 
     /// Mark read up to now. The socket's `read_receipt` frame does the same thing;
     /// this exists for the cold path (opening a chat before the socket is up).
-    static func markRead(conversationID: String) async throws {
-        _ = try await api.sendIgnoringResponse(.put, "/api/conversations/\(conversationID)/read")
+    /// `client` exists for tests; production passes nothing and uses the shared one.
+    static func markRead(conversationID: String, client: APIClient? = nil) async throws {
+        _ = try await (client ?? api).sendIgnoringResponse(.put, "/api/conversations/\(conversationID)/read")
     }
 
     // MARK: - Messages
@@ -96,13 +98,16 @@ enum RxHiveAPI {
     /// paging back, `around` to centre on a specific message — which is what makes
     /// "jump to pinned/replied/search-hit message" possible without paging back
     /// through everything.
+    ///
+    /// `client` exists for tests; production passes nothing and uses the shared one.
     static func messages(
         conversationID: String,
         before: String? = nil,
         around: String? = nil,
-        limit: Int = 50
+        limit: Int = 50,
+        client: APIClient? = nil
     ) async throws -> MessagePage {
-        try await api.send(
+        try await (client ?? api).send(
             .get, "/api/conversations/\(conversationID)/messages",
             query: ["before": before, "around": around, "limit": String(limit)],
             as: MessagePage.self

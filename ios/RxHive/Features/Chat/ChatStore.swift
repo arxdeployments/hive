@@ -27,6 +27,26 @@ final class ChatStore: ObservableObject {
     @Published private(set) var loadingThreads: Set<String> = []
     /// Whether older history exists, per conversation.
     @Published private(set) var hasMoreHistory: [String: Bool] = [:]
+    /// Conversations whose loaded window is a slice of history that stops short of
+    /// the newest message — what a jump to an old message leaves behind.
+    @Published private(set) var hasNewerMessages: [String: Bool] = [:]
+
+    /// Conversations whose thread is the newest page, fetched by `loadMessages`, and
+    /// kept current by the socket since. Only these may be served from cache.
+    ///
+    /// "There are messages in the store" is NOT the same thing, and treating it as
+    /// if it were is what hid messages. Three writers leave a non-empty thread that
+    /// is not the newest page: `insertIncoming` puts a live message into a thread
+    /// that was never opened (a one-message "window"), `loadWindow` replaces the
+    /// thread with a slice around an old message, and a thread loaded before the
+    /// socket dropped misses everything sent while it was down — the socket closes
+    /// every time the phone is locked, and the broker does not replay.
+    private(set) var loadedWindows: Set<String> = []
+
+    /// Threads on screen, counted because a thread can appear on the navigation
+    /// stack more than once. A reconnect re-fetches these straight away; every other
+    /// cached thread just stops being trusted until it is next opened.
+    private var visibleThreads: [String: Int] = [:]
 
     /// Who is typing, per conversation: user id -> display name.
     @Published private(set) var typingUsers: [String: [String: String]] = [:]
@@ -42,12 +62,18 @@ final class ChatStore: ObservableObject {
     // MARK: Dependencies
 
     private weak var auth: AuthStore?
+    private let api: APIClient
     private var eventTask: Task<Void, Never>?
     private var typingTimers: [String: Task<Void, Never>] = [:]
     private var outgoingTypingSentAt: [String: Date] = [:]
     private let log = Logger(subsystem: "ai.rhythmrx.rxhive", category: "chat")
 
     var currentUserID: String? { auth?.currentUser?.id }
+
+    /// `api` exists for tests; the app passes nothing and uses the shared client.
+    init(api: APIClient = .shared) {
+        self.api = api
+    }
 
     func attach(auth: AuthStore) {
         self.auth = auth
@@ -98,6 +124,9 @@ final class ChatStore: ObservableObject {
         messages = [:]
         loadingThreads = []
         hasMoreHistory = [:]
+        hasNewerMessages = [:]
+        loadedWindows = []
+        visibleThreads = [:]
         typingUsers = [:]
         presence = [:]
         pendingSends = []
@@ -124,6 +153,8 @@ final class ChatStore: ObservableObject {
         failedSends: Set<String> = [],
         loadingThreads: Set<String> = [],
         hasMoreHistory: [String: Bool] = [:],
+        hasNewerMessages: [String: Bool] = [:],
+        loadedWindows: Set<String> = [],
         isLoadingConversations: Bool = false,
         hasMoreConversations: Bool = false,
         conversationsError: String? = nil
@@ -136,6 +167,8 @@ final class ChatStore: ObservableObject {
         self.failedSends = failedSends
         self.loadingThreads = loadingThreads
         self.hasMoreHistory = hasMoreHistory
+        self.hasNewerMessages = hasNewerMessages
+        self.loadedWindows = loadedWindows
         self.isLoadingConversations = isLoadingConversations
         self.hasMoreConversations = hasMoreConversations
         self.conversationsError = conversationsError
@@ -148,7 +181,7 @@ final class ChatStore: ObservableObject {
         if reset { isLoadingConversations = true }
         conversationsError = nil
         do {
-            let page = try await RxHiveAPI.conversations(limit: 30, search: search, filter: filter)
+            let page = try await RxHiveAPI.conversations(limit: 30, search: search, filter: filter, client: api)
             conversations = page.data
             hasMoreConversations = page.hasMore
         } catch {
@@ -201,17 +234,84 @@ final class ChatStore: ObservableObject {
 
     // MARK: - Messages
 
-    func loadMessages(conversationID: String, force: Bool = false) async {
-        if !force, messages[conversationID]?.isEmpty == false { return }
-        loadingThreads.insert(conversationID)
-        do {
-            let page = try await RxHiveAPI.messages(conversationID: conversationID, limit: 50)
-            messages[conversationID] = page.messages
-            hasMoreHistory[conversationID] = page.hasMore
-        } catch {
-            log.error("Loading messages failed: \(String(describing: error), privacy: .public)")
+    /// Load the newest page of a thread, unless the one already held is current.
+    ///
+    /// Returns whether the thread now shows its newest messages. Cache-first, but only
+    /// for a window this method fetched itself and the socket has kept current since
+    /// — see `loadedWindows` for why a non-empty thread is not proof of that. `force`
+    /// re-fetches regardless.
+    ///
+    /// The page is MERGED into what is held rather than replacing it; see
+    /// `threadAfterFetch` for what a replace used to delete.
+    @discardableResult
+    func loadMessages(conversationID: String, force: Bool = false) async -> Bool {
+        if !force, loadedWindows.contains(conversationID), messages[conversationID]?.isEmpty == false {
+            return true
         }
-        loadingThreads.remove(conversationID)
+        loadingThreads.insert(conversationID)
+        defer { loadingThreads.remove(conversationID) }
+        do {
+            let page = try await RxHiveAPI.messages(conversationID: conversationID, limit: 50, client: api)
+            messages[conversationID] = Self.threadAfterFetch(
+                page.messages,
+                replacing: messages[conversationID] ?? [],
+                unsent: pendingSends.union(failedSends),
+                keepingLiveRows: true
+            )
+            hasMoreHistory[conversationID] = page.hasMore
+            // The default page is anchored to the newest message, so nothing newer is
+            // missing. This is also what ends a jump's slice-of-history state.
+            hasNewerMessages[conversationID] = false
+            loadedWindows.insert(conversationID)
+            return true
+        } catch {
+            // A failed re-fetch leaves whatever was held, which may be stale — so it
+            // stops being trusted, and `markRead` will not vouch for it.
+            loadedWindows.remove(conversationID)
+            log.error("Loading messages failed: \(String(describing: error), privacy: .public)")
+            return false
+        }
+    }
+
+    /// The thread after a fetched page replaces the one held: the page, plus the rows
+    /// the page cannot contain yet.
+    ///
+    /// A plain replace deleted two kinds of row, and neither came back:
+    ///
+    /// * **A send the server has not answered.** The optimistic bubble exists only
+    ///   here, and the server leaves the sender out of its own `new_message`
+    ///   broadcast (`services/messaging.py`), so once the bubble is gone the ack finds
+    ///   nothing to resolve and the message never appears. Opening a thread and
+    ///   sending before its first page lands was enough. A FAILED send goes the same
+    ///   way, taking its retry with it. The web fixed this in batch 67
+    ///   (`utils/carryOverLocalOnly.js`); this is the same rule.
+    /// * **A message that arrived live while the page was in flight.** The page was
+    ///   read before it was sent, so it is newer than anything on the page.
+    ///
+    /// A carried send that DID land is dropped: the page's row for it carries its
+    /// `temp_id` as `client_msg_id`, and showing both would invite a resend.
+    ///
+    /// `keepingLiveRows` is false for a jump's slice of history: rows newer than that
+    /// page are not live arrivals but the old newest end of the thread, and stitching
+    /// them on would draw one list with an invisible gap in the middle.
+    static func threadAfterFetch(
+        _ fetched: [Message],
+        replacing held: [Message],
+        unsent: Set<String>,
+        keepingLiveRows: Bool
+    ) -> [Message] {
+        let fetchedIDs = Set(fetched.map(\.id))
+        let landed = Set(fetched.compactMap(\.clientMsgId))
+        let newestFetched = fetched.compactMap(\.createdAt).max()
+
+        let liveRows = keepingLiveRows
+            ? held.filter { row in
+                !unsent.contains(row.id) && !fetchedIDs.contains(row.id)
+                    && (newestFetched.map { newest in (row.createdAt ?? .distantPast) > newest } ?? true)
+            }
+            : []
+        let unsentRows = held.filter { unsent.contains($0.id) && !landed.contains($0.id) }
+        return fetched + liveRows + unsentRows
     }
 
     /// Page backwards. Returns the id of the message that was at the top, so the
@@ -243,10 +343,24 @@ final class ChatStore: ObservableObject {
     func loadWindow(conversationID: String, around messageID: String) async -> Bool {
         do {
             let page = try await RxHiveAPI.messages(
-                conversationID: conversationID, around: messageID, limit: 50
+                conversationID: conversationID, around: messageID, limit: 50, client: api
             )
-            messages[conversationID] = page.messages
+            messages[conversationID] = Self.threadAfterFetch(
+                page.messages,
+                replacing: messages[conversationID] ?? [],
+                unsent: pendingSends.union(failedSends),
+                keepingLiveRows: !page.hasNewer
+            )
             hasMoreHistory[conversationID] = page.hasMore
+            // A slice that stops short of the newest message is not the thread: the
+            // next open must fetch the newest page rather than reuse this, and it must
+            // not be marked read (see `markRead`).
+            hasNewerMessages[conversationID] = page.hasNewer
+            if page.hasNewer {
+                loadedWindows.remove(conversationID)
+            } else {
+                loadedWindows.insert(conversationID)
+            }
             // anchorID is nil when the server could not resolve the anchor and
             // returned the newest window instead — the caller should not then try
             // to scroll to a message that isn't there.
@@ -415,22 +529,59 @@ final class ChatStore: ObservableObject {
         }
     }
 
+    /// Tell the server, and so the sender, that this thread has been read.
+    ///
+    /// Only for a thread that is showing its newest messages. The server stamps
+    /// `last_read_at` with the current time whatever anchor it is given
+    /// (`services/messaging.py`), so marking a stale thread read — one that missed
+    /// messages while the phone was locked, or a jump's slice of history — reported
+    /// messages the phone never displayed as Read to the person who sent them.
     func markRead(conversationID: String) async {
+        guard loadedWindows.contains(conversationID) else { return }
         // Zero the badge immediately; the server agrees a moment later.
         replaceConversation(id: conversationID) { $0.applying(unreadCount: 0) }
         if auth?.realtime.state == .connected {
             let lastID = messages[conversationID]?.last?.id
             auth?.realtime.send(.readReceipt(conversationID: conversationID, lastReadMessageID: lastID))
         } else {
-            try? await RxHiveAPI.markRead(conversationID: conversationID)
+            try? await RxHiveAPI.markRead(conversationID: conversationID, client: api)
         }
+    }
+
+    // MARK: - Threads on screen
+
+    /// `ChatView` reports itself on screen, so a reconnect knows what to re-fetch.
+    func threadDidAppear(_ conversationID: String) {
+        visibleThreads[conversationID, default: 0] += 1
+    }
+
+    /// The other half of `threadDidAppear`.
+    func threadDidDisappear(_ conversationID: String) {
+        guard let count = visibleThreads[conversationID] else { return }
+        visibleThreads[conversationID] = count > 1 ? count - 1 : nil
+    }
+
+    /// After any socket gap: nothing cached can be trusted, and what is on screen is
+    /// re-fetched now.
+    ///
+    /// The broker is fire-and-forget (`redis_bus.py`: "clients refetch on
+    /// reconnect"), and the socket closes every time the phone is locked, so a
+    /// message sent while it was down is simply not delivered. This used to reload
+    /// only the conversation list — which then showed the new message as a preview
+    /// and an unread badge, while the thread it opened into did not contain it.
+    func resyncAfterReconnect() async {
+        loadedWindows.removeAll()
+        for conversationID in visibleThreads.keys.sorted() {
+            await loadMessages(conversationID: conversationID, force: true)
+        }
+        await loadConversations()
     }
 
     func deleteConversation(id: String) async -> Bool {
         do {
             try await RxHiveAPI.deleteConversation(id: id)
             conversations.removeAll { $0.id == id }
-            messages[id] = nil
+            forgetThread(id)
             return true
         } catch {
             return false
@@ -486,7 +637,7 @@ final class ChatStore: ObservableObject {
         switch event {
         case .connected:
             // Re-sync after any gap: events that arrived while disconnected are gone.
-            await loadConversations()
+            await resyncAfterReconnect()
 
         case .pong, .unknown:
             break
@@ -555,7 +706,7 @@ final class ChatStore: ObservableObject {
         case .removedFromConversation(let id):
             guard let id else { return }
             conversations.removeAll { $0.id == id }
-            messages[id] = nil
+            forgetThread(id)
 
         case .profileUpdated:
             // Cheapest correct response: names and avatars live on the conversation
@@ -579,6 +730,15 @@ final class ChatStore: ObservableObject {
     }
 
     // MARK: - State mutation helpers
+
+    /// A thread the user can no longer see at all: its messages and every flag about
+    /// its window go together.
+    private func forgetThread(_ conversationID: String) {
+        messages[conversationID] = nil
+        hasMoreHistory[conversationID] = nil
+        hasNewerMessages[conversationID] = nil
+        loadedWindows.remove(conversationID)
+    }
 
     private func insertIncoming(_ message: Message) {
         let conversationID = message.conversationId

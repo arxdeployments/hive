@@ -1,0 +1,359 @@
+import XCTest
+
+@testable import RxHive
+
+/// Whether the thread on screen is the thread on the server.
+///
+/// `ChatStore.loadMessages` used to return early whenever the store held ANY messages
+/// for a conversation — `if !force, messages[id]?.isEmpty == false { return }` — and
+/// nothing ever passed `force`. Three things leave a thread non-empty without it being
+/// the newest page: a live message landing in a thread that was never opened, a jump
+/// to an old message, and a socket gap. The socket closes every time the phone is
+/// locked, the broker does not replay, and the reconnect re-read only the conversation
+/// list. So a message sent to a locked phone showed up as a preview and an unread
+/// badge, and the thread it opened into did not contain it — and opening that thread
+/// then told the sender it had been read.
+///
+/// The page is served over `MockURLProtocol`, and every test drives the store's real
+/// methods through it.
+@MainActor
+final class ThreadFreshnessTests: XCTestCase {
+
+    private let conv = "conv-a"
+    private var messagesPath: String { "/api/conversations/\(conv)/messages" }
+    private var readPath: String { "/api/conversations/\(conv)/read" }
+
+    override func tearDown() {
+        MockURLProtocol.reset()
+        super.tearDown()
+    }
+
+    // MARK: Fixtures
+
+    private func makeClient() -> APIClient {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return APIClient(session: URLSession(configuration: config))
+    }
+
+    private func makeStore() -> ChatStore {
+        ChatStore(api: makeClient())
+    }
+
+    /// A message as the API serializes it. `second` orders them in time.
+    private func messageJSON(_ id: String, second: Int, clientMsgId: String? = nil) -> String {
+        let key = clientMsgId.map { "\"\($0)\"" } ?? "null"
+        return """
+        {"_id":"\(id)","conversation_id":"\(conv)","sender_id":"u-doc","type":"text",
+         "content":"\(id)","reactions":[],"read_by":[],"delivered_to":[],"is_deleted":false,
+         "is_forwarded":false,"is_starred":false,"is_pinned":false,"sender_name":"Dr A",
+         "attachments":[],"created_at":"2026-09-30T08:00:\(String(format: "%02d", second))Z",
+         "client_msg_id":\(key)}
+        """
+    }
+
+    private func pageJSON(_ messages: [String], hasNewer: Bool = false, anchor: String? = nil) -> String {
+        let anchorJSON = anchor.map { "\"\($0)\"" } ?? "null"
+        return """
+        {"messages":[\(messages.joined(separator: ","))],"has_more":false,
+         "has_newer":\(hasNewer),"anchor_id":\(anchorJSON)}
+        """
+    }
+
+    /// The same message as a Swift value, for the rules that take one.
+    private func row(_ id: String, second: Int, clientMsgId: String? = nil) throws -> Message {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let text = try decoder.singleValueContainer().decode(String.self)
+            return try XCTUnwrap(RxDate.parse(text))
+        }
+        return try decoder.decode(Message.self, from: Data(messageJSON(id, second: second, clientMsgId: clientMsgId).utf8))
+    }
+
+    /// Answers the newest page with `newest`, and an `around=` request with `around`.
+    private func serve(newest: [String], around: String? = nil, hasNewer: Bool = true) {
+        let newestPage = pageJSON(newest)
+        let aroundPage = around.map { pageJSON([$0], hasNewer: hasNewer, anchor: "m-old") }
+        MockURLProtocol.install { request, _ in
+            let query = request.url?.query ?? ""
+            if query.contains("around="), let aroundPage { return .json(200, aroundPage) }
+            if request.url?.path.hasSuffix("/read") == true { return .json(200, "{}") }
+            if request.url?.path == "/api/conversations" {
+                return .json(200, #"{"data":[],"has_more":false}"#)
+            }
+            return .json(200, newestPage)
+        }
+    }
+
+    private func ids(_ chat: ChatStore) -> [String] {
+        (chat.messages[conv] ?? []).map(\.id)
+    }
+
+    private var pageFetches: Int {
+        MockURLProtocol.requests.filter { $0.path == messagesPath && !($0.url.query ?? "").contains("around=") }.count
+    }
+
+    // MARK: Which threads are trusted
+
+    /// A live message for a thread that was never opened leaves a one-message thread.
+    /// That is not a window anybody fetched, and it must not be served as one.
+    func testAThreadHoldingOnlyALiveMessageIsFetchedWhenOpened() async throws {
+        serve(newest: [messageJSON("m1", second: 1), messageJSON("m2", second: 2), messageJSON("m3", second: 3)])
+        let chat = makeStore()
+        chat.applyForTesting(messages: [conv: [try row("m3", second: 3)]])
+
+        let current = await chat.loadMessages(conversationID: conv)
+
+        XCTAssertTrue(current)
+        XCTAssertEqual(pageFetches, 1, "a one-message thread was served as if it were the thread")
+        XCTAssertEqual(ids(chat), ["m1", "m2", "m3"])
+    }
+
+    /// The cache still works: a window this store fetched, with the socket keeping it
+    /// current, re-opens without a round trip. The fix is not "always fetch".
+    func testAWindowTheStoreFetchedIsReusedOnReopen() async {
+        serve(newest: [messageJSON("m1", second: 1)])
+        let chat = makeStore()
+
+        await chat.loadMessages(conversationID: conv)
+        await chat.loadMessages(conversationID: conv)
+
+        XCTAssertEqual(pageFetches, 1)
+    }
+
+    // MARK: Reconnect
+
+    /// The reported bug. The thread is open, the phone is locked, Dr A sends
+    /// "hold the 10:00 metoprolol", the phone is unlocked. The reconnect has to bring
+    /// the message into the thread on screen, not just into the conversation list.
+    func testReconnectRefetchesTheThreadOnScreen() async {
+        serve(newest: [messageJSON("m1", second: 1)])
+        let chat = makeStore()
+        await chat.loadMessages(conversationID: conv)
+        chat.threadDidAppear(conv)
+
+        serve(newest: [messageJSON("m1", second: 1), messageJSON("m-while-locked", second: 2)])
+        await chat.resyncAfterReconnect()
+
+        XCTAssertEqual(ids(chat), ["m1", "m-while-locked"], "the message sent while locked never reached the thread")
+    }
+
+    /// A thread that is cached but not on screen is not re-fetched on the spot — only
+    /// untrusted, so its next open fetches.
+    func testReconnectMakesEveryOtherCachedThreadFetchOnItsNextOpen() async {
+        serve(newest: [messageJSON("m1", second: 1)])
+        let chat = makeStore()
+        await chat.loadMessages(conversationID: conv)
+
+        await chat.resyncAfterReconnect()
+        XCTAssertEqual(pageFetches, 1, "a thread nobody is looking at was re-fetched on reconnect")
+
+        await chat.loadMessages(conversationID: conv)
+        XCTAssertEqual(pageFetches, 2, "a thread cached before the gap was trusted after it")
+    }
+
+    /// Appear and disappear balance, and a thread shown twice stays on screen until
+    /// both copies have gone.
+    func testOnlyThreadsStillOnScreenAreRefetchedOnReconnect() async {
+        serve(newest: [messageJSON("m1", second: 1)])
+        let chat = makeStore()
+        await chat.loadMessages(conversationID: conv)
+
+        chat.threadDidAppear(conv)
+        chat.threadDidAppear(conv)
+        chat.threadDidDisappear(conv)
+        await chat.resyncAfterReconnect()
+        XCTAssertEqual(pageFetches, 2, "still on screen once, so it should have been re-fetched")
+
+        chat.threadDidDisappear(conv)
+        await chat.resyncAfterReconnect()
+        XCTAssertEqual(pageFetches, 2, "off screen, so it should only have been untrusted")
+    }
+
+    // MARK: Jumps
+
+    /// A jump replaces the thread with a slice around an old message. That slice is
+    /// not the thread: the next open must fetch the newest page, and until then the
+    /// store has to say that newer messages exist.
+    func testAJumpedSliceIsNotReusedAsTheThread() async {
+        serve(newest: [messageJSON("m9", second: 9)], around: messageJSON("m-old", second: 1))
+        let chat = makeStore()
+        await chat.loadMessages(conversationID: conv)
+
+        let resolved = await chat.loadWindow(conversationID: conv, around: "m-old")
+        XCTAssertTrue(resolved)
+        XCTAssertEqual(chat.hasNewerMessages[conv], true)
+        XCTAssertEqual(ids(chat), ["m-old"], "the old newest rows were stitched onto the jump's slice")
+
+        await chat.loadMessages(conversationID: conv)
+        XCTAssertEqual(pageFetches, 2, "the jump's slice was served as the thread")
+        XCTAssertEqual(ids(chat), ["m9"])
+        XCTAssertEqual(chat.hasNewerMessages[conv], false)
+    }
+
+    /// A slice that happens to reach the newest message is the thread after all.
+    func testAJumpThatReachesTheNewestMessageIsTheThread() async {
+        serve(newest: [messageJSON("m9", second: 9)], around: messageJSON("m9", second: 9), hasNewer: false)
+        let chat = makeStore()
+
+        _ = await chat.loadWindow(conversationID: conv, around: "m9")
+        await chat.loadMessages(conversationID: conv)
+
+        XCTAssertEqual(pageFetches, 0)
+        XCTAssertEqual(chat.hasNewerMessages[conv], false)
+    }
+
+    // MARK: Read receipts
+
+    /// The server stamps last_read_at with the current time whatever it is told, so
+    /// marking a thread read that is not showing its newest messages reports messages
+    /// the phone never displayed as Read to the person who sent them.
+    func testMarkReadIsWithheldUntilTheThreadShowsItsNewestMessages() async throws {
+        serve(newest: [messageJSON("m1", second: 1), messageJSON("m2", second: 2)])
+        let chat = makeStore()
+        chat.applyForTesting(messages: [conv: [try row("m2", second: 2)]])
+
+        await chat.markRead(conversationID: conv)
+        XCTAssertEqual(MockURLProtocol.count(path: readPath), 0, "a thread nobody fetched was marked read")
+
+        await chat.loadMessages(conversationID: conv)
+        await chat.markRead(conversationID: conv)
+        XCTAssertEqual(MockURLProtocol.count(path: readPath), 1)
+    }
+
+    func testMarkReadIsWithheldForAJumpedSlice() async {
+        serve(newest: [messageJSON("m9", second: 9)], around: messageJSON("m-old", second: 1))
+        let chat = makeStore()
+        await chat.loadMessages(conversationID: conv)
+        _ = await chat.loadWindow(conversationID: conv, around: "m-old")
+
+        await chat.markRead(conversationID: conv)
+
+        XCTAssertEqual(MockURLProtocol.count(path: readPath), 0, "a slice of old history was marked read")
+    }
+
+    /// A re-fetch that fails leaves whatever was held, which may be stale — it must not
+    /// be vouched for either.
+    func testAFailedRefetchStopsTheThreadBeingTrusted() async {
+        serve(newest: [messageJSON("m1", second: 1)])
+        let chat = makeStore()
+        await chat.loadMessages(conversationID: conv)
+
+        MockURLProtocol.install { _, _ in .failing(URLError(.notConnectedToInternet)) }
+        let current = await chat.loadMessages(conversationID: conv, force: true)
+        await chat.markRead(conversationID: conv)
+
+        XCTAssertFalse(current)
+        XCTAssertEqual(MockURLProtocol.count(path: readPath), 0)
+    }
+
+    // MARK: What a fetch keeps
+
+    /// The iOS twin of web batch 67: send while the first page is in flight. The
+    /// server leaves the sender out of its own broadcast, so if the fetch deletes the
+    /// bubble the message never appears, and the ack has nothing to resolve.
+    func testASendMadeDuringTheFetchSurvivesIt() throws {
+        let held = [try row("m1", second: 1), try row("temp-x", second: 5)]
+        let fetched = [try row("m1", second: 1)]
+
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: ["temp-x"], keepingLiveRows: true)
+
+        XCTAssertEqual(thread.map(\.id), ["m1", "temp-x"])
+    }
+
+    /// A send that landed comes back on the page carrying its temp id; the bubble has
+    /// to go, or the message shows twice and invites a resend.
+    func testASendThatLandedIsNotShownTwice() throws {
+        let held = [try row("m1", second: 1), try row("temp-x", second: 5)]
+        let fetched = [try row("m1", second: 1), try row("m2", second: 5, clientMsgId: "temp-x")]
+
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: ["temp-x"], keepingLiveRows: true)
+
+        XCTAssertEqual(thread.map(\.id), ["m1", "m2"])
+    }
+
+    /// A message that arrives over the socket while the page is in flight is newer
+    /// than anything on the page, because the page was read before it was sent.
+    func testAMessageThatArrivedLiveDuringTheFetchSurvivesIt() throws {
+        let held = [try row("m1", second: 1), try row("m3-live", second: 3)]
+        let fetched = [try row("m1", second: 1), try row("m2", second: 2)]
+
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: [], keepingLiveRows: true)
+
+        XCTAssertEqual(thread.map(\.id), ["m1", "m2", "m3-live"])
+    }
+
+    /// Rows older than the page that the page does not include are the old window, not
+    /// live arrivals, and the page replaces them.
+    func testOldRowsThePageDoesNotIncludeAreReplaced() throws {
+        let held = [try row("m-older", second: 0), try row("m1", second: 1)]
+        let fetched = [try row("m1", second: 1), try row("m2", second: 2)]
+
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: [], keepingLiveRows: true)
+
+        XCTAssertEqual(thread.map(\.id), ["m1", "m2"])
+    }
+
+    /// For a jump's slice the newer held rows are the old end of the thread; stitching
+    /// them on would draw one list with a gap in it. Unsent bubbles still survive.
+    func testAJumpedSliceDoesNotStitchTheOldNewestRowsOn() throws {
+        let held = [try row("m8", second: 8), try row("m9", second: 9), try row("temp-x", second: 10)]
+        let fetched = [try row("m2", second: 2)]
+
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: ["temp-x"], keepingLiveRows: false)
+
+        XCTAssertEqual(thread.map(\.id), ["m2", "temp-x"])
+    }
+
+    /// The same rules, reached through the store's own fetches rather than called
+    /// directly: a send the server has not answered survives opening the thread, and
+    /// survives a jump — jumping is something people do while they wait.
+    func testTheStoresOwnFetchesKeepASendItHasNotHeardBackAbout() async throws {
+        serve(newest: [messageJSON("m1", second: 1)], around: messageJSON("m-old", second: 0))
+        let chat = makeStore()
+        chat.applyForTesting(
+            messages: [conv: [try row("temp-x", second: 5)]],
+            pendingSends: ["temp-x"]
+        )
+
+        await chat.loadMessages(conversationID: conv)
+        XCTAssertEqual(ids(chat), ["m1", "temp-x"], "opening the thread deleted a send in flight")
+
+        _ = await chat.loadWindow(conversationID: conv, around: "m-old")
+        XCTAssertEqual(ids(chat), ["m-old", "temp-x"], "jumping deleted a send in flight")
+    }
+
+    // MARK: Wiring
+
+    /// The rules above only help if the socket and the thread screen reach them.
+    /// `handle(_:)` is private and the thread screen has no view harness, so this
+    /// reads their source, the way the web suite's wiring guards do.
+    func testTheReconnectAndTheThreadScreenReachTheseRules() throws {
+        let store = try source("Features/Chat/ChatStore.swift")
+        let connected = try XCTUnwrap(store.range(of: "case .connected:"))
+        let nextCase = try XCTUnwrap(store.range(of: "case .pong", range: connected.upperBound..<store.endIndex))
+        XCTAssertTrue(
+            store[connected.upperBound..<nextCase.lowerBound].contains("await resyncAfterReconnect()"),
+            "a reconnect no longer re-syncs threads, only whatever else it does"
+        )
+
+        let view = try source("Features/Chat/ChatView.swift")
+        XCTAssertTrue(view.contains(".onAppear { chat.threadDidAppear(conversationID) }"),
+                      "the thread screen no longer reports itself on screen")
+        XCTAssertTrue(view.contains(".onDisappear { chat.threadDidDisappear(conversationID) }"),
+                      "the thread screen no longer reports itself gone")
+        XCTAssertTrue(view.contains("if (!isAtBottom || hasNewer) && !isSelecting {"),
+                      "the end of a jump's slice no longer offers a way back to the newest messages")
+        XCTAssertTrue(view.contains("Task { await backToLatest(proxy) }"),
+                      "the way back no longer fetches the newest page before scrolling")
+    }
+
+    private func source(_ path: String) throws -> String {
+        let url = URL(fileURLWithPath: "\(#filePath)")
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("RxHive/\(path)")
+        return try String(contentsOf: url, encoding: .utf8)
+    }
+}
