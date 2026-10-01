@@ -107,6 +107,8 @@ final class MockURLProtocol: URLProtocol {
 
     private let stopped = NSLock()
     private var isStopped = false
+    /// A delayed reply waiting for its moment, and the thread it has to be delivered on.
+    private var pendingReply: Reply?
 
     override class func canInit(with request: URLRequest) -> Bool { true }
 
@@ -127,12 +129,33 @@ final class MockURLProtocol: URLProtocol {
 
         let reply = handler(request, ordinal)
         if reply.delay > 0 {
-            Self.deliveryQueue.asyncAfter(deadline: .now() + reply.delay) { [weak self] in
-                self?.deliver(reply)
+            // `URLProtocol`'s contract is that `client` is messaged on the thread that
+            // called `startLoading`. Delivering from `deliveryQueue` itself broke that,
+            // and a reply sent from the wrong thread could be dropped: the request then
+            // sat until URLSession's 60 s timeout, retried, and a test asserting that
+            // nothing was written passed four minutes later on the timeout instead of
+            // on the reply. So the queue only keeps time, and the delivery is handed
+            // back to the loading thread. `self` is held strongly until then.
+            pendingReply = reply
+            let loadingThread = Thread.current
+            Self.deliveryQueue.asyncAfter(deadline: .now() + reply.delay) { [self] in
+                perform(
+                    #selector(deliverPendingReply),
+                    on: loadingThread,
+                    with: nil,
+                    waitUntilDone: false,
+                    modes: [RunLoop.Mode.common.rawValue]
+                )
             }
         } else {
             deliver(reply)
         }
+    }
+
+    @objc private func deliverPendingReply() {
+        guard let reply = pendingReply else { return }
+        pendingReply = nil
+        deliver(reply)
     }
 
     override func stopLoading() {

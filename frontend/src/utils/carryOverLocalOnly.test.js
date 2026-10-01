@@ -142,6 +142,8 @@ describe('ChatPanel actually uses the rule', () => {
   it('replaces a fetched window only through it', () => {
     // Both fetch paths — the initial load and the jump — end by replacing the
     // window wholesale. Each has to fold the local-only bubbles back in first.
+    // Since batch 71 each also keeps live arrivals (carryOverLiveArrivals), so what
+    // is written is `kept` — which must itself be built from localOnly.
     const replacements = [...source().matchAll(/setMessages\(\s*conversationId\s*,([^;]*);/g)]
       .map((match) => match[1])
       .filter((argument) => argument.includes('fetched'));
@@ -149,10 +151,12 @@ describe('ChatPanel actually uses the rule', () => {
     for (const argument of replacements) {
       assert.match(
         argument,
-        /localOnly/,
+        /\bkept\b/,
         `a fetched window is written without the carried bubbles: setMessages(conversationId,${argument}`,
       );
     }
+    const keeps = source().match(/const kept = \[\.\.\.live, \.\.\.localOnly\];/g) || [];
+    assert.equal(keeps.length, 2, `each fetch path must fold localOnly into what it writes; found ${keeps.length}`);
   });
 
   it('derives those bubbles from the helper, not by hand', () => {

@@ -18,6 +18,7 @@ struct ChatView: View {
 
     let conversationID: String
 
+    /// A thread screen for one conversation, by id.
     init(conversationID: String) {
         self.conversationID = conversationID
     }
@@ -26,6 +27,7 @@ struct ChatView: View {
     @EnvironmentObject private var calls: CallStore
     @EnvironmentObject private var toasts: ToastCenter
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
 
     // Composer / editing
     @State private var replyTo: Message?
@@ -81,6 +83,9 @@ struct ChatView: View {
 
     private var conversation: Conversation? { chat.conversation(id: conversationID) }
     private var messages: [Message] { chat.messages[conversationID] ?? [] }
+
+    /// A jump left a slice of history loaded, not the thread's newest end.
+    private var hasNewer: Bool { chat.hasNewerMessages[conversationID] == true }
     private var isGroup: Bool { conversation?.type.isGroup ?? false }
     private var title: String { conversation.map { chat.title(for: $0) } ?? "Conversation" }
 
@@ -109,6 +114,9 @@ struct ChatView: View {
 
     // MARK: - Body
 
+    /// The header, banners for an ongoing call and the current pin, the message list, and
+    /// the composer — with the lifecycle hooks that keep the thread current while it is on
+    /// screen.
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -136,7 +144,27 @@ struct ChatView: View {
         // thread for the same reason.
         .toolbar(.hidden, for: .tabBar)
         .task { await open() }
-        .onChange(of: messages.count) { _, _ in newMessagesArrived() }
+        // So a reconnect re-fetches this thread while it is on screen — the socket
+        // closes whenever the phone is locked, and anything sent meanwhile is lost to
+        // it. Appear/disappear rather than the task, which is not re-run on unlock.
+        .onAppear { chat.threadDidAppear(conversationID) }
+        // Coming back to the foreground is the moment an open thread is seen. Arrivals
+        // while the app was not active — the socket stays open during a call — were
+        // withheld (`isThreadOnScreen` needs the app active), and nothing else would
+        // mark them read until the next one. Only a trusted window: `markRead` without
+        // `justFetched` refuses a slice or one the socket stopped keeping current.
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active, !hasNewer, !isJumping else { return }
+            Task {
+                guard chat.isThreadOnScreen(conversationID) else { return }
+                await chat.markRead(conversationID: conversationID)
+            }
+        }
+        .onDisappear { chat.threadDidDisappear(conversationID) }
+        // The newest row, not the row count. A reconnect's re-fetch can slide the
+        // window forward with the count unchanged — new messages in, old ones out —
+        // and paging back changes the count without anything arriving at all.
+        .onChange(of: messages.last?.id) { _, _ in newMessagesArrived() }
         .navigationDestination(item: $route) { destination in
             routeContent(destination)
         }
@@ -343,6 +371,8 @@ struct ChatView: View {
 
     // MARK: - Pinned banner
 
+    /// The bar showing the current pinned message; tapping it jumps there and moves on to
+    /// the next pin.
     private func pinnedBanner(_ pin: Message) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: Theme.Layout.spacing3) {
@@ -407,6 +437,7 @@ struct ChatView: View {
         return calls.activeGroupCalls[conversationID]
     }
 
+    /// The bar offering to join a group call already running in this conversation.
     private func ongoingCallBanner(_ signal: CallSignal) -> some View {
         VStack(spacing: 0) {
             HStack(spacing: Theme.Layout.spacing3) {
@@ -452,6 +483,7 @@ struct ChatView: View {
         .background(Theme.Color.surface)
     }
 
+    /// Who is on the ongoing group call, for the banner offering to join it.
     private func ongoingCallSubtitle(_ signal: CallSignal) -> String {
         let names = (signal.participants ?? []).map(\.displayName)
         switch names.count {
@@ -510,9 +542,15 @@ struct ChatView: View {
                 }
             }
             .overlay(alignment: .bottomTrailing) {
-                if !isAtBottom && !isSelecting {
+                // Also shown AT the bottom of a jump's slice: its end is not the
+                // thread's end, and nothing else says so.
+                if (!isAtBottom || hasNewer) && !isSelecting {
                     ScrollToBottomButton(unreadCount: missedWhileAway) {
-                        scrollToBottom(proxy, animated: true)
+                        if hasNewer {
+                            Task { await backToLatest(proxy) }
+                        } else {
+                            scrollToBottom(proxy, animated: true)
+                        }
                     }
                     .padding(.trailing, Theme.Layout.spacing2)
                     .padding(.bottom, Theme.Layout.spacing3)
@@ -692,6 +730,7 @@ struct ChatView: View {
 
     // MARK: - Sheets
 
+    /// The one sheet this thread can present at a time, by kind.
     @ViewBuilder
     private func sheetContent(_ sheet: ChatSheet) -> some View {
         switch sheet {
@@ -722,6 +761,8 @@ struct ChatView: View {
 
     // MARK: - Pushed destinations
 
+    /// The screen for each place this thread can push: search, starred, pinned, the info
+    /// panels, or another conversation.
     @ViewBuilder
     private func routeContent(_ destination: ChatRoute) -> some View {
         switch destination {
@@ -764,16 +805,41 @@ struct ChatView: View {
 
     // MARK: - Lifecycle
 
+    /// Load the thread and mark it read when the screen first appears; on a reappearance,
+    /// catch up without undoing a jump or moving the reader.
     private func open() async {
+        if didInitialScroll {
+            // `.task` re-runs whenever this screen reappears — popping back from
+            // Search, Starred, Pinned, Media or an info panel. A jump started there, or
+            // a jump's slice being read, must not be replaced by the newest page, and
+            // the reader's place must not be scrolled away. A reconnect while covered
+            // is still caught: an untrusted thread is fetched here.
+            if !hasNewer && !isJumping {
+                let current = await chat.loadMessages(conversationID: conversationID)
+                // `.task` is cancelled when the screen goes, but the queued fetch is not,
+                // so this can resume after the user has left — and a receipt then would
+                // mark read a newest page they never saw.
+                guard chat.isThreadOnScreen(conversationID) else { return }
+                await chat.markRead(conversationID: conversationID, justFetched: current)
+            }
+            await loadPinned()
+            return
+        }
+
         // Captured before `markRead`, which zeroes it within the same turn.
         let unread = conversation?.unreadCount ?? 0
 
-        await chat.loadMessages(conversationID: conversationID)
+        let current = await chat.loadMessages(conversationID: conversationID)
 
-        let loaded = messages
-        if unread > 0, unread <= loaded.count {
+        // The rows the server's unread count counts (`enrich.unread_counts`): other
+        // people's, not system notes, not deleted. My own sends — including ones a
+        // fetch carried over after the page — would otherwise push the divider down
+        // past an unread message.
+        let me = chat.currentUserID
+        let countable = messages.filter { $0.senderId != nil && $0.senderId != me && !$0.isDeleted }
+        if unread > 0, unread <= countable.count {
             unreadAnchorCount = unread
-            unreadAnchorID = loaded[loaded.count - unread].id
+            unreadAnchorID = countable[countable.count - unread].id
         }
 
         // One frame for the rows to exist before scrolling to the end of them.
@@ -782,21 +848,37 @@ struct ChatView: View {
         if let proxy = scrollProxy { scrollToBottom(proxy, animated: false) }
         didInitialScroll = true
 
-        await chat.markRead(conversationID: conversationID)
+        // Same reason as the reappear branch: the user may have backed out while the
+        // first page was loading.
+        guard chat.isThreadOnScreen(conversationID) else { return }
+        await chat.markRead(conversationID: conversationID, justFetched: current)
         await loadPinned()
     }
 
+    /// React to a new newest row: follow it and mark it read if the reader is at the
+    /// bottom, otherwise count it on the scroll-to-bottom button.
     private func newMessagesArrived() {
         guard didInitialScroll else { return }
         if isAtBottom {
             if let proxy = scrollProxy { scrollToBottom(proxy, animated: true) }
-            // Still on screen and still at the newest message, so this is read.
-            Task { await chat.markRead(conversationID: conversationID) }
+            // Still on screen and at the newest message, so this is read — if the
+            // thread IS current. `loadMessages` answers from cache when it is, and
+            // re-fetches one whose last fetch failed rather than vouching for it. A
+            // jump's slice is not current and is left alone.
+            guard !hasNewer, !isJumping else { return }
+            Task {
+                let current = await chat.loadMessages(conversationID: conversationID)
+                // Unstructured, so it outlives the screen: an untrusted thread is fetched
+                // here, and the user can leave while it loads.
+                guard chat.isThreadOnScreen(conversationID) else { return }
+                await chat.markRead(conversationID: conversationID, justFetched: current)
+            }
         } else if let last = messages.last, last.senderId != chat.currentUserID {
             missedWhileAway += 1
         }
     }
 
+    /// Page back from the top sentinel, keeping the row that was at the top pinned there.
     private func loadOlder() async {
         isLoadingOlder = true
         // The returned id is the message that used to be at the top; pinning it back
@@ -806,6 +888,26 @@ struct ChatView: View {
             scrollProxy?.scrollTo(anchor, anchor: .top)
         }
         isLoadingOlder = false
+    }
+
+    /// After a jump the newest messages are not loaded at all, so "scroll to the
+    /// bottom" has to fetch them before there is a bottom to scroll to.
+    private func backToLatest(_ proxy: ScrollViewProxy) async {
+        // One at a time: a second tap would queue a second full fetch.
+        guard !isJumping else { return }
+        isJumping = true
+        defer { isJumping = false }
+        let current = await chat.loadMessages(conversationID: conversationID, force: true)
+        // Left while it loaded: no toast over another screen, no scroll, no receipt.
+        guard chat.isThreadOnScreen(conversationID) else { return }
+        guard current else {
+            toasts.error("Couldn't load the latest messages")
+            return
+        }
+        try? await Task.sleep(for: .milliseconds(80))
+        guard chat.isThreadOnScreen(conversationID) else { return }
+        scrollToBottom(proxy, animated: true)
+        await chat.markRead(conversationID: conversationID, justFetched: true)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
@@ -829,12 +931,20 @@ struct ChatView: View {
             flash(messageID)
             return
         }
+        // Set before the task, not inside it: a jump started from Search or Pinned runs
+        // just before that screen pops, and the `.task` that re-runs `open()` on the way
+        // back has to see it, or it loads the newest page over the jump.
+        isJumping = true
         Task {
-            isJumping = true
             let resolved = await chat.loadWindow(conversationID: conversationID, around: messageID)
             isJumping = false
             guard resolved else {
                 toasts.error("That message is no longer available")
+                // The load `open()` skipped for this jump still has to happen if the
+                // thread lost its trust meanwhile (a reconnect while it was covered).
+                if !hasNewer, !chat.loadedWindows.contains(conversationID) {
+                    await chat.loadMessages(conversationID: conversationID)
+                }
                 return
             }
             try? await Task.sleep(for: .milliseconds(80))

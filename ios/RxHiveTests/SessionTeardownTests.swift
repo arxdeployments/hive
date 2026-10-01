@@ -30,10 +30,13 @@ final class SessionTeardownTests: XCTestCase {
      "is_pinned":false,"sender_name":"Dr Okafor","attachments":[]}
     """
 
+    /// A model from its JSON, the way the API would send it.
     private func decode<T: Decodable>(_ json: String, as type: T.Type) throws -> T {
         try JSONDecoder().decode(T.self, from: Data(json.utf8))
     }
 
+    /// A store holding one of everything a session leaves behind, including trusted and
+    /// jumped-away window state.
     private func filledChatStore() throws -> ChatStore {
         let chat = ChatStore()
         chat.applyForTesting(
@@ -45,6 +48,8 @@ final class SessionTeardownTests: XCTestCase {
             failedSends: ["temp-2"],
             loadingThreads: ["conv-a"],
             hasMoreHistory: ["conv-a": true],
+            hasNewerMessages: ["conv-a": true],
+            loadedWindows: ["conv-a"],
             isLoadingConversations: true,
             hasMoreConversations: true,
             conversationsError: "stale"
@@ -52,6 +57,8 @@ final class SessionTeardownTests: XCTestCase {
         return chat
     }
 
+    /// Every field a session wrote is empty after `reset`, window-trust state included —
+    /// the next person must not inherit the last one's trusted windows.
     func testResetLeavesNothingOfThePreviousSession() throws {
         let chat = try filledChatStore()
         XCTAssertEqual(chat.messages["conv-a"]?.first?.content,
@@ -68,6 +75,8 @@ final class SessionTeardownTests: XCTestCase {
         XCTAssertTrue(chat.failedSends.isEmpty)
         XCTAssertTrue(chat.loadingThreads.isEmpty)
         XCTAssertTrue(chat.hasMoreHistory.isEmpty)
+        XCTAssertTrue(chat.hasNewerMessages.isEmpty)
+        XCTAssertTrue(chat.loadedWindows.isEmpty, "the next session would trust this one's windows")
         XCTAssertNil(chat.conversationsError)
         XCTAssertFalse(chat.isLoadingConversations)
         XCTAssertFalse(chat.hasMoreConversations)

@@ -617,7 +617,19 @@ class RxHiveWebSocket {
           // Only receipt when the user can actually SEE it. This used to fire for
           // an open-but-hidden tab, so a locked phone or a background window
           // marked messages read and suppressed the notification entirely.
-          this.sendReadReceipt(convId, msg._id);
+          //
+          // Nor unless the window on screen is the newest page, kept current: the
+          // server marks read up to now whatever anchor it is given, so a receipt
+          // over a jump's slice, a first page still loading, or a failed fetch's
+          // error strip covered messages nobody saw. ChatPanel marks the thread read
+          // once its newest page is showing (markThreadRead). Parity item 34.
+          if (store.windowCurrent?.[convId]) {
+            this.sendReadReceipt(convId, msg._id);
+          } else if (msg.sender_id && msg.sender_id !== this._currentUserId() && msg.type !== 'system') {
+            // Withheld, so the server counts it unread (enrich.unread_counts); count
+            // it here too, or the badge drifts until the next list refresh.
+            store.incrementUnread(convId);
+          }
           break;
         }
 

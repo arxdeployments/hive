@@ -316,6 +316,12 @@ struct Message: Codable, Identifiable, Hashable {
     /// Present only when the message is a reply.
     var replyToMessage: ReplyPreview?
 
+    /// The `temp_id` this message was sent with, on MY messages only — the server
+    /// withholds other senders' (`enrich.serialize_message`). It is what lets a
+    /// fetched page recognise a send whose optimistic bubble is still on screen, so
+    /// the message is not shown twice. Nil on the realtime wire and on old rows.
+    var clientMsgId: String? = nil
+
     var isEdited: Bool { editedAt != nil }
 
     enum CodingKeys: String, CodingKey {
@@ -341,6 +347,7 @@ struct Message: Codable, Identifiable, Hashable {
         case filename, duration, attachments
         case pageCount = "page_count"
         case replyToMessage = "reply_to_message"
+        case clientMsgId = "client_msg_id"
     }
 }
 

@@ -28,6 +28,9 @@ struct RxHiveApp: App {
                 }
         }
         .onChange(of: scenePhase) { _, phase in
+            // Read receipts need the app in the foreground, not just the thread on the
+            // navigation stack (`ChatStore.isThreadOnScreen`).
+            chat.scenePhaseChanged(isActive: phase == .active)
             switch phase {
             case .background:
                 auth.applicationDidEnterBackground()
