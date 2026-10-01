@@ -345,6 +345,8 @@ final class ChatStore: ObservableObject {
         admitted: Admission
     ) async -> Bool {
         let epoch = trustEpoch
+        // What the thread holds as the request goes out; see `threadAfterFetch`.
+        let heldAtRequest = Set((messages[conversationID] ?? []).map(\.id))
         loadingThreads.insert(conversationID)
         defer { if admitted.session == sessionGeneration { loadingThreads.remove(conversationID) } }
         do {
@@ -355,6 +357,7 @@ final class ChatStore: ObservableObject {
             let thread = Self.threadAfterFetch(
                 page.messages,
                 replacing: messages[conversationID] ?? [],
+                heldAtRequest: heldAtRequest,
                 unsent: pendingSends.union(failedSends),
                 keepingLiveRows: true,
                 keepingHistory: keepingHistory
@@ -423,8 +426,20 @@ final class ChatStore: ObservableObject {
     ///   sending before its first page lands was enough. A FAILED send goes the same
     ///   way, taking its retry with it. The web fixed this in batch 67
     ///   (`utils/carryOverLocalOnly.js`); this is the same rule.
-    /// * **A message that arrived live while the page was in flight.** The page was
-    ///   read before it was sent, so it is newer than anything on the page.
+    /// * **A message that arrived live while the page was in flight.** Decided by
+    ///   identity, not time: a held row the thread did NOT hold when the request went
+    ///   out (`heldAtRequest`) arrived meanwhile, so it is kept unless the page has it.
+    ///   A row it DID hold was on the server by then, so the page has it if it is newer
+    ///   than the page's oldest row, and otherwise it is the old window.
+    ///
+    ///   Batch 72 compared timestamps (at or after the page's newest), and review of
+    ///   PR #112 found both ways that is wrong. The server stamps `created_at` before
+    ///   it commits (`services/messaging.py`, `send_message`), so a media send stamped
+    ///   before the page's newest row can commit after the page was read: dropped, then
+    ///   marked read. And a system-message batch (group create, add members) stamps one
+    ///   row per member a microsecond apart while a `Date` from `RxDate` keeps
+    ///   milliseconds, so with more than a page of them the rows that fell off the page
+    ///   compared EQUAL to its newest and were carried under it.
     ///
     /// A carried send that DID land is dropped: the page's row for it carries its
     /// `temp_id` as `client_msg_id`, and showing both would invite a resend.
@@ -443,25 +458,27 @@ final class ChatStore: ObservableObject {
     static func threadAfterFetch(
         _ fetched: [Message],
         replacing held: [Message],
+        heldAtRequest: Set<String>,
         unsent: Set<String>,
         keepingLiveRows: Bool,
         keepingHistory: Bool = false
     ) -> [Message] {
         let fetchedIDs = Set(fetched.map(\.id))
         let landed = Set(fetched.compactMap(\.clientMsgId))
-        let newestFetched = fetched.compactMap(\.createdAt).max()
 
         var olderRows: [Message] = []
         if keepingHistory, let firstID = fetched.first?.id,
            let joint = held.firstIndex(where: { $0.id == firstID }) {
             olderRows = held[..<joint].filter { !unsent.contains($0.id) && !fetchedIDs.contains($0.id) }
         }
+        // A held row is history or a live arrival, never both: `insertIncoming` sorts by
+        // time, so an arrival stamped early can sit above the joint, and it was drawn
+        // twice (CodeRabbit, review of 89408b2).
+        let olderIDs = Set(olderRows.map(\.id))
         let liveRows = keepingLiveRows
             ? held.filter { row in
-                !unsent.contains(row.id) && !fetchedIDs.contains(row.id)
-                    // At or after: two messages can share a timestamp, and the page's
-                    // own rows are already excluded by id.
-                    && (newestFetched.map { newest in (row.createdAt ?? .distantPast) >= newest } ?? true)
+                !unsent.contains(row.id) && !fetchedIDs.contains(row.id) && !olderIDs.contains(row.id)
+                    && !heldAtRequest.contains(row.id)
             }
             : []
         let unsentRows = held.filter { unsent.contains($0.id) && !landed.contains($0.id) }
@@ -506,6 +523,7 @@ final class ChatStore: ObservableObject {
         return await inWindowQueue(conversationID) { [self] in
             guard mayWrite(conversationID, admitted) else { return false }
             let epoch = trustEpoch
+            let heldAtRequest = Set((messages[conversationID] ?? []).map(\.id))
             do {
                 let page = try await RxHiveAPI.messages(
                     conversationID: conversationID, around: messageID, limit: 50, client: api
@@ -514,6 +532,7 @@ final class ChatStore: ObservableObject {
                 messages[conversationID] = Self.threadAfterFetch(
                     page.messages,
                     replacing: messages[conversationID] ?? [],
+                    heldAtRequest: heldAtRequest,
                     unsent: pendingSends.union(failedSends),
                     keepingLiveRows: !page.hasNewer
                 )

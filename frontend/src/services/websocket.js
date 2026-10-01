@@ -188,6 +188,9 @@ class RxHiveWebSocket {
         useCallStore.getState().setSignalLinkState(LINK_RECONNECTING);
       }
       useChatStore.getState().setWsConnected(false);
+      // What `_noteSignalAlive` may undo: this withdrawal, for this socket. Kept by
+      // identity, so a later socket never matches it.
+      this._offlineWithdrewFor = this.ws;
     });
 
     document.addEventListener('visibilitychange', () => {
@@ -455,9 +458,11 @@ class RxHiveWebSocket {
    *
    * This runs before anything can reconnect, and that ordering is the whole
    * point. ChatPanel force-refetches when `wsConnected` goes false -> true;
-   * `wsConnected` only goes true in `_onOpen`; and `connect()` early-returns
-   * while the socket is CONNECTING or OPEN — so no `_onOpen` can happen without
-   * passing through `_onClose` or `_abandonSocket` first. The bubble is
+   * `wsConnected` goes true in `_onOpen`, and `connect()` early-returns while the
+   * socket is CONNECTING or OPEN — so no `_onOpen` can happen without passing
+   * through `_onClose` or `_abandonSocket` first. (`_noteSignalAlive` also sets it
+   * true, but only for a socket that never closed, whose acks are still owed by
+   * that same socket and still arrive.) The bubble is
    * therefore already 'failed' by the time the refetch's carry-over filter looks
    * at it, however fast the reconnect is. The 15s deadline on its own would lose
    * that race against a wake() that abandons a ghost after one pong timeout.
@@ -512,8 +517,28 @@ class RxHiveWebSocket {
     // going true — never ran. Setting it back here runs that re-fetch, which grants
     // "current" again only once the fresh page has landed (CodeRabbit, review of
     // b789477).
-    if (!useChatStore.getState().wsConnected && this.isOpen()) {
+    //
+    // Only that withdrawal, on that socket, and only for the user it belongs to
+    // (review of PR #112). A sign-out's store reset also sets wsConnected false over
+    // an open socket, one a live call keeps for the PREVIOUS user; restored, the next
+    // user's chat trusted a socket that never delivers their messages.
+    //
+    // And the rest of what a reconnect does (CodeRabbit, review of 89408b2): the
+    // conversation list, and the call — LiveKit's media connection is not this
+    // socket and can drop in an outage the socket survives, and `_resumeCallState`
+    // is what rejoins it.
+    const owner = this._socketOwner;
+    if (
+      !useChatStore.getState().wsConnected
+      && this.isOpen()
+      && this._offlineWithdrewFor === this.ws
+      && owner?.ws === this.ws
+      && owner.userId === this._currentUserId()
+    ) {
+      this._offlineWithdrewFor = null;
       useChatStore.getState().setWsConnected(true);
+      this._syncAfterReconnect();
+      this._resumeCallState();
     }
     if (useCallStore.getState().signalLinkState !== LINK_RECONNECTING) return;
     useCallStore.getState().setSignalLinkState(LINK_OK);
@@ -576,6 +601,10 @@ class RxHiveWebSocket {
 
     switch (data.type) {
       case 'connected':
+        // Whose socket this is: it can outlive a sign-out while a call holds it open
+        // (RealtimeSession), and `_noteSignalAlive` must not vouch for it to the next
+        // user. Kept with the socket, so a later socket never matches it.
+        this._socketOwner = { ws: this.ws, userId: data.user_id };
         break;
 
       case 'pong':

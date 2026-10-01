@@ -64,13 +64,14 @@ final class ThreadFreshnessTests: XCTestCase {
     }
 
     /// A message as the API serializes it. `second` orders them in time.
-    private func messageJSON(_ id: String, second: Int, clientMsgId: String? = nil) -> String {
+    private func messageJSON(_ id: String, second: Int, clientMsgId: String? = nil, createdAt: String? = nil) -> String {
         let key = clientMsgId.map { "\"\($0)\"" } ?? "null"
+        let stamp = createdAt ?? "2026-09-30T08:00:\(String(format: "%02d", second))Z"
         return """
         {"_id":"\(id)","conversation_id":"\(conv)","sender_id":"u-doc","type":"text",
          "content":"\(id)","reactions":[],"read_by":[],"delivered_to":[],"is_deleted":false,
          "is_forwarded":false,"is_starred":false,"is_pinned":false,"sender_name":"Dr A",
-         "attachments":[],"created_at":"2026-09-30T08:00:\(String(format: "%02d", second))Z",
+         "attachments":[],"created_at":"\(stamp)",
          "client_msg_id":\(key)}
         """
     }
@@ -85,13 +86,14 @@ final class ThreadFreshnessTests: XCTestCase {
     }
 
     /// The same message as a Swift value, for the rules that take one.
-    private func row(_ id: String, second: Int, clientMsgId: String? = nil) throws -> Message {
+    private func row(_ id: String, second: Int = 0, clientMsgId: String? = nil, createdAt: String? = nil) throws -> Message {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom { decoder in
             let text = try decoder.singleValueContainer().decode(String.self)
             return try XCTUnwrap(RxDate.parse(text))
         }
-        return try decoder.decode(Message.self, from: Data(messageJSON(id, second: second, clientMsgId: clientMsgId).utf8))
+        let json = messageJSON(id, second: second, clientMsgId: clientMsgId, createdAt: createdAt)
+        return try decoder.decode(Message.self, from: Data(json.utf8))
     }
 
     /// Answers the newest page with `newest`, and an `around=` request with `around`.
@@ -299,7 +301,8 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m1", second: 1), try row("temp-x", second: 5)]
         let fetched = [try row("m1", second: 1)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: ["temp-x"], keepingLiveRows: true)
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "temp-x"], unsent: ["temp-x"],
+                                                keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m1", "temp-x"])
     }
@@ -310,18 +313,19 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m1", second: 1), try row("temp-x", second: 5)]
         let fetched = [try row("m1", second: 1), try row("m2", second: 5, clientMsgId: "temp-x")]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: ["temp-x"], keepingLiveRows: true)
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "temp-x"], unsent: ["temp-x"],
+                                                keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m1", "m2"])
     }
 
-    /// A message that arrives over the socket while the page is in flight is newer
-    /// than anything on the page, because the page was read before it was sent.
+    /// A message that arrives over the socket while the page is in flight, which the
+    /// page was read too early to carry.
     func testAMessageThatArrivedLiveDuringTheFetchSurvivesIt() throws {
         let held = [try row("m1", second: 1), try row("m3-live", second: 3)]
         let fetched = [try row("m1", second: 1), try row("m2", second: 2)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: [], keepingLiveRows: true)
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1"], unsent: [], keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m1", "m2", "m3-live"])
     }
@@ -332,7 +336,7 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m2", second: 2), try row("m2-twin", second: 2)]
         let fetched = [try row("m1", second: 1), try row("m2", second: 2)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: [], keepingLiveRows: true)
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m2"], unsent: [], keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m1", "m2", "m2-twin"])
     }
@@ -343,7 +347,8 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m-older", second: 0), try row("m1", second: 1)]
         let fetched = [try row("m1", second: 1), try row("m2", second: 2)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: [], keepingLiveRows: true)
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m-older", "m1"], unsent: [],
+                                                keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m1", "m2"])
     }
@@ -354,7 +359,8 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m8", second: 8), try row("m9", second: 9), try row("temp-x", second: 10)]
         let fetched = [try row("m2", second: 2)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: ["temp-x"], keepingLiveRows: false)
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m8", "m9", "temp-x"],
+                                                unsent: ["temp-x"], keepingLiveRows: false)
 
         XCTAssertEqual(thread.map(\.id), ["m2", "temp-x"])
     }
@@ -743,22 +749,103 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m1", second: 1), try row("m2", second: 2), try row("temp-x", second: 9)]
         let joining = [try row("m2", second: 2), try row("m3", second: 3)]
         let apart = [try row("m7", second: 7), try row("m8", second: 8)]
+        let atRequest: Set<String> = ["m1", "m2", "temp-x"]
 
         XCTAssertEqual(
-            ChatStore.threadAfterFetch(joining, replacing: held, unsent: ["temp-x"], keepingLiveRows: true,
+            ChatStore.threadAfterFetch(joining, replacing: held, heldAtRequest: atRequest, unsent: ["temp-x"], keepingLiveRows: true,
                                        keepingHistory: true).map(\.id),
             ["m1", "m2", "m3", "temp-x"]
         )
         XCTAssertEqual(
-            ChatStore.threadAfterFetch(apart, replacing: held, unsent: ["temp-x"], keepingLiveRows: true,
+            ChatStore.threadAfterFetch(apart, replacing: held, heldAtRequest: atRequest, unsent: ["temp-x"], keepingLiveRows: true,
                                        keepingHistory: true).map(\.id),
             ["m7", "m8", "temp-x"]
         )
         XCTAssertEqual(
-            ChatStore.threadAfterFetch(joining, replacing: held, unsent: ["temp-x"], keepingLiveRows: true,
+            ChatStore.threadAfterFetch(joining, replacing: held, heldAtRequest: atRequest, unsent: ["temp-x"], keepingLiveRows: true,
                                        keepingHistory: false).map(\.id),
             ["m2", "m3", "temp-x"]
         )
+    }
+
+    /// A system-message batch (group create, add members) stamps one row per member a
+    /// microsecond apart, and a `Date` from `RxDate` keeps milliseconds. With more than
+    /// a page of them, the rows that fell off the page compared EQUAL to its newest
+    /// under batch 72's at-or-after rule and were carried under it, and with history
+    /// kept they were drawn twice (review of PR #112). Held when the request went out,
+    /// they are the old window.
+    func testASystemBatchInOneMillisecondIsNotCarriedUnderThePage() throws {
+        let batch = try (0...60).map { i in
+            try row("s\(i)", createdAt: String(format: "2026-09-30T08:00:00.412%03dZ", i))
+        }
+        let page = Array(batch[11...])
+        let atRequest = Set(batch.map(\.id))
+
+        let replaced = ChatStore.threadAfterFetch(page, replacing: batch, heldAtRequest: atRequest, unsent: [],
+                                                  keepingLiveRows: true)
+        XCTAssertEqual(replaced.map(\.id), page.map(\.id))
+
+        let kept = ChatStore.threadAfterFetch(page, replacing: batch, heldAtRequest: atRequest, unsent: [],
+                                              keepingLiveRows: true, keepingHistory: true)
+        XCTAssertEqual(kept.map(\.id), batch.map(\.id))
+    }
+
+    /// The server stamps `created_at` before it commits, so a media send stamped before
+    /// the page's newest row can commit after the page was read. Its time says older;
+    /// it arrived during the fetch, so it survives it (review of PR #112).
+    func testAnArrivalStampedBeforeThePagesNewestRowSurvives() throws {
+        let held = [try row("m1", second: 1), try row("m2-late", second: 2), try row("m3", second: 3)]
+        let fetched = [try row("m1", second: 1), try row("m3", second: 3)]
+
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "m3"], unsent: [],
+                                                keepingLiveRows: true)
+
+        XCTAssertEqual(thread.map(\.id), ["m1", "m3", "m2-late"])
+    }
+
+    /// A held row is history or a live arrival, never both. `insertIncoming` sorts by
+    /// time, so an arrival stamped early can sit above the page's first row, where the
+    /// history rule keeps it too, and it was drawn twice (CodeRabbit, review of 89408b2).
+    func testAnArrivalAboveThePagesFirstRowIsDrawnOnce() throws {
+        let held = [try row("m0-late", second: 0), try row("m1", second: 1), try row("m2", second: 2)]
+        let fetched = [try row("m1", second: 1), try row("m3", second: 3)]
+
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "m2"], unsent: [],
+                                                keepingLiveRows: true, keepingHistory: true)
+
+        XCTAssertEqual(thread.map(\.id), ["m0-late", "m1", "m3"])
+    }
+
+    /// Through the store: the thread's ids are taken as the request goes out, so a row
+    /// the socket delivers while it is in flight is kept whatever its timestamp, and a
+    /// row held before it is the old window (review of PR #112).
+    func testTheStoreDecidesArrivalsByWhatTheThreadHeldWhenItAsked() async throws {
+        let page = pageJSON([messageJSON("m1", second: 1), messageJSON("m3", second: 3)])
+        MockURLProtocol.install { _, _ in .json(200, page, delay: 0.5) }
+        let chat = makeStore()
+        chat.applyForTesting(messages: [conv: [try row("m-old", second: 0)]])
+
+        let load = Task { await chat.loadMessages(conversationID: conv, force: true) }
+        try await Task.sleep(for: .milliseconds(100))
+        chat.applyForTesting(messages: [conv: [try row("m-old", second: 0), try row("m2-late", second: 2)]])
+        _ = await load.value
+
+        XCTAssertEqual(ids(chat), ["m1", "m3", "m2-late"])
+    }
+
+    /// The same for a jump that lands on the newest page.
+    func testAJumpDecidesArrivalsByWhatTheThreadHeldWhenItAsked() async throws {
+        let window = pageJSON([messageJSON("m1", second: 1), messageJSON("m3", second: 3)], hasNewer: false, anchor: "m1")
+        MockURLProtocol.install { _, _ in .json(200, window, delay: 0.5) }
+        let chat = makeStore()
+        chat.applyForTesting(messages: [conv: [try row("m-old", second: 0)]])
+
+        let jump = Task { await chat.loadWindow(conversationID: conv, around: "m1") }
+        try await Task.sleep(for: .milliseconds(100))
+        chat.applyForTesting(messages: [conv: [try row("m-old", second: 0), try row("m2-late", second: 2)]])
+        _ = await jump.value
+
+        XCTAssertEqual(ids(chat), ["m1", "m3", "m2-late"])
     }
 
     // MARK: Wiring

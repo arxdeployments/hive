@@ -32,7 +32,7 @@ import { withDerivedStatuses } from '../../utils/messageStatus';
 import { toast } from 'sonner';
 import { apiError } from '../../utils/helpers';
 import { carryOverLocalOnly } from '../../utils/carryOverLocalOnly';
-import { carryOverLiveArrivals } from '../../utils/carryOverLiveArrivals';
+import { carryOverLiveArrivals, heldIds } from '../../utils/carryOverLiveArrivals';
 import { markThreadRead } from '../../services/readReceipts';
 
 const EMPTY_PINNED = [];
@@ -125,6 +125,10 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   const callState = useCallStore(s => s.callState);
 
   const [loading, setLoading] = useState(false);
+  // Read by a jump after its await, to tell whether it took the window over from a
+  // newest-page fetch still on its spinner (see handleJumpToMessage).
+  const loadingRef = useRef(loading);
+  loadingRef.current = loading;
   // Keyed by conversation: a single `hasMore` flag leaked the previous thread's
   // pagination state onto the next one now that re-opens serve from cache.
   const [hasMoreByConv, setHasMoreByConv] = useState({});
@@ -268,6 +272,9 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     // over a spinner, or over a failed fetch's error strip. Success sets it back and
     // marks the thread read, which covers anything withheld meanwhile.
     setWindowCurrent(conversationId, false);
+    // What the thread holds as the request goes out: anything it holds by the time
+    // the page lands that is not in here arrived meanwhile (carryOverLiveArrivals).
+    const heldAtRequest = heldIds(useChatStore.getState().messages[conversationId]);
     try {
       const { data } = await client.get(`/api/conversations/${conversationId}/messages`, {
         params: { limit: 50 }
@@ -298,11 +305,11 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // is what the dedupe is for.
       const held = useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES;
       const localOnly = carryOverLocalOnly(held, fetched);
-      // And the messages the socket delivered while this request was out, which
-      // are newer than the page and not on it — dropping them and then marking the
-      // thread read below told their senders they had been read. See
+      // And the messages the socket delivered while this request was out, which the
+      // page was read too early to carry — dropping them and then marking the thread
+      // read below told their senders they had been read. See
       // utils/carryOverLiveArrivals.js.
-      const live = carryOverLiveArrivals(held, fetched);
+      const live = carryOverLiveArrivals(held, fetched, heldAtRequest);
       const kept = [...live, ...localOnly];
       setMessages(conversationId, kept.length ? [...fetched, ...kept] : fetched);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
@@ -1178,7 +1185,16 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     // paths race each other. A jump that resolves after a newer fetch (or a
     // newer jump) must not swap its window back in.
     const seq = ++fetchSeqRef.current;
+    // A jump can take the window over from a newest-page fetch still on its spinner
+    // (the pinned banner, the search and the info panels all stay clickable over
+    // it), and that fetch then bails without clearing the spinner. A jump that
+    // fails as well loads the page it interrupted, so the spinner ends in the
+    // thread or in the error strip instead of staying up until the user leaves.
+    const resumeInterruptedLoad = () => {
+      if (seq === fetchSeqRef.current && loadingRef.current) fetchMessages({ force: true });
+    };
     setJumpLoading(true);
+    const heldAtRequest = heldIds(useChatStore.getState().messages[conversationId]);
     try {
       const { data } = await client.get(`/api/conversations/${conversationId}/messages`, {
         params: { around: originalMsgId, limit: 50 },
@@ -1188,6 +1204,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
         // The server could not resolve the anchor — the message is gone, or was
         // never in this conversation. Say so rather than silently doing nothing.
         toast.error('That message is no longer available');
+        resumeInterruptedLoad();
         return false;
       }
       const fetched = withDerivedStatuses(data.messages, myUserId);
@@ -1204,11 +1221,16 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // A window that reaches the newest message keeps what arrived while it loaded,
       // as fetchMessages does. A slice does not: rows newer than it are the old end
       // of the thread, not arrivals (see utils/carryOverLiveArrivals.js).
-      const live = data.has_newer ? [] : carryOverLiveArrivals(held, fetched);
+      const live = data.has_newer ? [] : carryOverLiveArrivals(held, fetched, heldAtRequest);
       const kept = [...live, ...localOnly];
       setMessages(conversationId, kept.length ? [...fetched, ...kept] : fetched);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
       setHasNewerByConv(prev => ({ ...prev, [conversationId]: !!data.has_newer }));
+      // This window is the one on screen now, so show it, as fetchMessages shows its
+      // page: a spinner left by a fetch this jump took over would otherwise stay up
+      // for good, over a thread the mark below calls read.
+      setLoading(false);
+      setLoadErrorByConv(prev => (prev[conversationId] ? { ...prev, [conversationId]: false } : prev));
       // A slice is not current; a window that reaches the newest message is, if the
       // socket is up to keep it so. websocket.js receipts live arrivals only then.
       const connected = useChatStore.getState().wsConnected;
@@ -1223,11 +1245,12 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     } catch (err) {
       console.error('Failed to jump to message', err);
       toast.error('Could not load that message');
+      resumeInterruptedLoad();
       return false;
     } finally {
       setJumpLoading(false);
     }
-  }, [conversationId, scrollToLoaded, setMessages, myUserId]);
+  }, [conversationId, scrollToLoaded, setMessages, myUserId, fetchMessages]);
 
   /**
    * Banner list: everything currently pinned. Live store state wins (an optimistic
