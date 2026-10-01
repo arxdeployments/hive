@@ -881,18 +881,21 @@ showing its newest messages tells the sender that messages the reader never saw 
 
 **How it was ported.** It follows the iOS rules:
 
-- `ChatPanel.markThreadRead` is the only place `PUT /read` is sent. Like iOS's
+- `services/readReceipts.markThreadRead` is the only place `PUT /read` is sent. Like iOS's
   `isThreadOnScreen`, it re-checks at the moment of sending that the thread is still open and the
-  tab visible.
-- It is called from `fetchMessages`' success path after the page is written, and from the cache-hit
-  branch only for a window that is current.
+  tab visible. Callers that have not just fetched the newest page pass `requireCurrent`.
+- ChatPanel calls it from `fetchMessages`' success path after the page is written, and from the
+  cache-hit branch with `requireCurrent`. The sidebar calls it, with `requireCurrent`, only when
+  the open thread is re-clicked. It no longer zeroes a badge on the click.
+- A newest-page fetch keeps the messages the socket delivered while it was in flight
+  (`utils/carryOverLiveArrivals`), as iOS's `threadAfterFetch` does. A jump keeps them only when it
+  reaches the newest message.
 - `chatStore.windowCurrent` is the web's `loadedWindows`. A replacing fetch clears it for the
-  thread when it starts. A successful fetch sets it, but only while the socket is up. A jump sets it
-  to `!has_newer`. A socket drop clears every thread. Unknown counts as not current.
+  thread when it starts. A successful fetch sets it, but only while the socket is up. A jump sets
+  it to `!has_newer`. Unknown counts as not current. A socket drop clears every thread inside
+  `setWsConnected(false)`, synchronously, not in a React effect.
 - websocket.js sends the live receipt only while the window is current, and otherwise counts the
   message as unread, as the server does.
-- The sidebar no longer zeroes a badge on the click. ChatPanel clears it together with the
-  `PUT /read`.
 - Leaving a thread disowns its in-flight fetch.
 
 Wiring guards are in `frontend/src/components/chat/readReceiptParity.test.js`.

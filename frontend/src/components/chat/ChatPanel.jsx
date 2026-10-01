@@ -32,6 +32,8 @@ import { withDerivedStatuses } from '../../utils/messageStatus';
 import { toast } from 'sonner';
 import { apiError } from '../../utils/helpers';
 import { carryOverLocalOnly } from '../../utils/carryOverLocalOnly';
+import { carryOverLiveArrivals } from '../../utils/carryOverLiveArrivals';
+import { markThreadRead } from '../../services/readReceipts';
 
 const EMPTY_PINNED = [];
 
@@ -114,9 +116,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   const setMessages = useChatStore(s => s.setMessages);
   const prependMessages = useChatStore(s => s.prependMessages);
   const addOptimisticMessage = useChatStore(s => s.addOptimisticMessage);
-  const clearUnread = useChatStore(s => s.clearUnread);
   const setWindowCurrent = useChatStore(s => s.setWindowCurrent);
-  const clearWindowsCurrent = useChatStore(s => s.clearWindowsCurrent);
   const bumpConversation = useChatStore(s => s.bumpConversation);
   const updateConversation = useChatStore(s => s.updateConversation);
   // Subscribed, not read through getState() at render time: the old header read
@@ -229,35 +229,10 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   useEffect(() => {
     // A fresh socket session invalidates nothing that is already loaded, but a
     // disconnect does: force the next open of each thread to re-fetch.
-    // websocket.js's live receipts trust the same thing, so they lose it too.
-    if (!wsConnected) {
-      loadedWindowsRef.current = new Set();
-      clearWindowsCurrent();
-    }
-  }, [wsConnected, clearWindowsCurrent]);
-
-  /**
-   * Tell the server, and so the sender, that this thread has been read — once the
-   * newest messages are on screen.
-   *
-   * This used to be sent from the open effect alongside fetchMessages(), without
-   * waiting for the page and whether or not it ever arrived: a failed fetch left
-   * the old window (or none) on screen with the thread already marked read. The
-   * server stamps last_read_at with the current time whatever anchor it is given,
-   * so a receipt is only honest once the newest page is showing. iOS gained the
-   * same rule in batch 71; parity item 34 records it.
-   *
-   * Re-checked here, at the moment of sending, like iOS's isThreadOnScreen: a fetch
-   * can outlive the visit (back on mobile, Close chat on desktop), and a tab can be
-   * hidden while one is in flight — a reconnect's re-fetch of a background tab
-   * included. Either way nobody saw the page.
-   */
-  const markThreadRead = useCallback((convId) => {
-    const s = useChatStore.getState();
-    if (s.activeConversationId !== convId || document.visibilityState !== 'visible') return;
-    client.put(`/api/conversations/${convId}/read`).catch(() => {});
-    clearUnread(convId);
-  }, [clearUnread]);
+    // (websocket.js's live receipts trust the same thing; the store withdraws that
+    // synchronously in setWsConnected(false), not here after a commit.)
+    if (!wsConnected) loadedWindowsRef.current = new Set();
+  }, [wsConnected]);
 
   /**
    * Load the message window for this conversation.
@@ -272,7 +247,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
    * `force` is the escape hatch for the one case the cache can be stale: a
    * socket reconnect, where messages may have been missed while it was down.
    *
-   * Marks the thread read once the newest page is on screen (markThreadRead).
+   * Marks the thread read once the newest page is on screen (services/readReceipts).
    */
   const fetchMessages = useCallback(async ({ force = false } = {}) => {
     if (!conversationId) return;
@@ -285,9 +260,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       setLoadErrorByConv(prev => (prev[conversationId] ? { ...prev, [conversationId]: false } : prev));
       // The cached window is on screen at once — but it is only vouched for if it is
       // the newest page and still current, not a jump's slice.
-      if (useChatStore.getState().windowCurrent[conversationId]) {
-        markThreadRead(conversationId);
-      }
+      markThreadRead(conversationId, { requireCurrent: true });
       return;
     }
     setLoading(true);
@@ -323,11 +296,15 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // before the sender is told anything, so a lost response or a 502 marks a
       // bubble failed for a message that is already in the conversation. That
       // is what the dedupe is for.
-      const localOnly = carryOverLocalOnly(
-        useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES,
-        fetched,
-      );
-      setMessages(conversationId, localOnly.length ? [...fetched, ...localOnly] : fetched);
+      const held = useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES;
+      const localOnly = carryOverLocalOnly(held, fetched);
+      // And the messages the socket delivered while this request was out, which
+      // are newer than the page and not on it — dropping them and then marking the
+      // thread read below told their senders they had been read. See
+      // utils/carryOverLiveArrivals.js.
+      const live = carryOverLiveArrivals(held, fetched);
+      const kept = [...live, ...localOnly];
+      setMessages(conversationId, kept.length ? [...fetched, ...kept] : fetched);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
       // The default window is anchored to the newest message, so by definition
       // nothing newer is missing. This also clears the flag after a "jump to
@@ -355,7 +332,7 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // stale window is underneath as if it were loaded.
       if (seq === fetchSeqRef.current) setLoading(false);
     }
-  }, [conversationId, setMessages, myUserId, markThreadRead, setWindowCurrent]);
+  }, [conversationId, setMessages, myUserId, setWindowCurrent]);
 
   useEffect(() => {
     // Marks the thread read itself, once the newest page is on screen — see
@@ -1206,11 +1183,14 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // and dropping it left the ack deadline with no row to mark failed. The
       // dedupe is a no-op on this path by construction: an `around` window is
       // centred on an older message and cannot contain the send.
-      const localOnly = carryOverLocalOnly(
-        useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES,
-        fetched,
-      );
-      setMessages(conversationId, localOnly.length ? [...fetched, ...localOnly] : fetched);
+      const held = useChatStore.getState().messages[conversationId] || EMPTY_MESSAGES;
+      const localOnly = carryOverLocalOnly(held, fetched);
+      // A window that reaches the newest message keeps what arrived while it loaded,
+      // as fetchMessages does. A slice does not: rows newer than it are the old end
+      // of the thread, not arrivals (see utils/carryOverLiveArrivals.js).
+      const live = data.has_newer ? [] : carryOverLiveArrivals(held, fetched);
+      const kept = [...live, ...localOnly];
+      setMessages(conversationId, kept.length ? [...fetched, ...kept] : fetched);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
       setHasNewerByConv(prev => ({ ...prev, [conversationId]: !!data.has_newer }));
       // A slice is not current; a window that reaches the newest message is, if the

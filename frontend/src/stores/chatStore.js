@@ -282,11 +282,16 @@ const useChatStore = create((set) => ({
     };
   }),
 
-  setWsConnected: (connected) => set((state) => (
-    state.wsConnected === connected && !state.wsConnecting
-      ? state
-      : { wsConnected: connected, wsConnecting: false }
-  )),
+  setWsConnected: (connected) => set((state) => {
+    if (state.wsConnected === connected && !state.wsConnecting) return state;
+    // A drop withdraws every window's "current" here, in the same synchronous
+    // write that records it. Clearing it in a React effect left the time until the
+    // next commit — and all of it while ChatPanel was unmounted — in which a live
+    // message could be receipted over a window the gap had made stale.
+    return connected
+      ? { wsConnected: true, wsConnecting: false }
+      : { wsConnected: false, wsConnecting: false, windowCurrent: {} };
+  }),
   setWsConnecting: (connecting) => set((state) => (
     state.wsConnecting === connecting ? state : { wsConnecting: connecting }
   )),
@@ -361,11 +366,6 @@ const useChatStore = create((set) => ({
     !!state.windowCurrent[convId] === !!current
       ? state
       : { windowCurrent: { ...state.windowCurrent, [convId]: !!current } }
-  )),
-
-  /** The socket dropped: nothing it was keeping current can be vouched for now. */
-  clearWindowsCurrent: () => set((state) => (
-    Object.keys(state.windowCurrent).length === 0 ? state : { windowCurrent: {} }
   )),
 
   clearUnread: (convId) => set((state) => {

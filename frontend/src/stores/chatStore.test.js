@@ -158,13 +158,24 @@ describe('chatStore.setWindowCurrent', () => {
     assert.equal(store().windowCurrent, before);
   });
 
-  it('forgets every window when the socket drops', () => {
+  it('forgets every window in the same write that records the socket dropping', () => {
+    store().setWsConnected(true);
     store().setWindowCurrent('conv-a', true);
     store().setWindowCurrent('conv-b', true);
 
-    store().clearWindowsCurrent();
+    store().setWsConnected(false);
 
-    assert.deepEqual(store().windowCurrent, {});
+    assert.equal(store().wsConnected, false);
+    assert.deepEqual(store().windowCurrent, {}, 'a live receipt could be sent over a window the gap made stale');
+  });
+
+  it('keeps the windows when the socket connects', () => {
+    store().setWsConnected(true);
+    store().setWindowCurrent('conv-a', true);
+
+    store().setWsConnected(true);
+
+    assert.equal(store().windowCurrent['conv-a'], true);
   });
 
   it('is cleared by a sign-out, like every other per-conversation map', () => {

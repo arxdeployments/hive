@@ -735,10 +735,23 @@ final class ChatStore: ObservableObject {
         visibleThreads[conversationID] = count > 1 ? count - 1 : nil
     }
 
-    /// Whether any copy of the thread is on screen — for work that finishes after the
-    /// user may have left it.
+    /// Whether the app is in the foreground. `visibleThreads` stays populated when it is
+    /// not — backgrounding does not fire `onDisappear` — and has to, so a reconnect on
+    /// return re-fetches what was open. But nothing on it is being seen.
+    private var appIsActive = true
+
+    /// The scene phase, from `RxHiveApp`.
+    func scenePhaseChanged(isActive: Bool) {
+        appIsActive = isActive
+    }
+
+    /// Whether any copy of the thread is on screen, in an app the user is looking at —
+    /// for work that finishes after the user may have left it, and above all for read
+    /// receipts. In the background the socket stays open during a call, so a live
+    /// arrival in an open thread would otherwise be marked read with the phone in a
+    /// pocket.
     func isThreadOnScreen(_ conversationID: String) -> Bool {
-        visibleThreads[conversationID] != nil
+        appIsActive && visibleThreads[conversationID] != nil
     }
 
     /// The socket's state, from `attach`'s observer (and directly from tests).

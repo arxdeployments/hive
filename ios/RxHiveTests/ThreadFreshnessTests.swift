@@ -516,6 +516,36 @@ final class ThreadFreshnessTests: XCTestCase {
                        "a cancelled re-sync went on to reload the list")
     }
 
+    /// A thread left open when the app goes to the background is still on the
+    /// navigation stack — `onDisappear` does not fire — but nobody is looking at it.
+    /// During a call the socket stays open, so a live arrival there would otherwise be
+    /// marked read with the phone in a pocket (CodeRabbit, review of 39368d3).
+    func testAThreadIsNotOnScreenWhileTheAppIsNotActive() {
+        let chat = makeStore()
+        chat.threadDidAppear(conv)
+        XCTAssertTrue(chat.isThreadOnScreen(conv))
+
+        chat.scenePhaseChanged(isActive: false)
+        XCTAssertFalse(chat.isThreadOnScreen(conv), "a backgrounded thread counts as seen")
+
+        chat.scenePhaseChanged(isActive: true)
+        XCTAssertTrue(chat.isThreadOnScreen(conv))
+    }
+
+    /// The background still leaves the thread counted for the reconnect, which is
+    /// what re-fetches it when the app comes back.
+    func testABackgroundedThreadIsStillRefetchedOnReconnect() async {
+        serve(newest: [messageJSON("m1", second: 1)])
+        let chat = makeStore()
+        await chat.loadMessages(conversationID: conv)
+        chat.threadDidAppear(conv)
+        chat.scenePhaseChanged(isActive: false)
+
+        await chat.resyncAfterReconnect()
+
+        XCTAssertEqual(pageFetches, 2, "going to the background stopped the thread being re-fetched")
+    }
+
     // MARK: Fetches for one thread, in order
 
     /// A newest-page fetch still in flight when the user jumps must not land on top of
@@ -807,6 +837,16 @@ final class ThreadFreshnessTests: XCTestCase {
     }
 
     /// An app source file, read from the checkout, for the wiring checks.
+    /// `RxHiveApp` reports the scene phase to the store; without that the app-active
+    /// gate above never closes.
+    func testTheAppReportsItsScenePhaseToTheStore() throws {
+        let app = try source("RxHiveApp.swift")
+        let handler = try XCTUnwrap(app.range(of: ".onChange(of: scenePhase) { _, phase in"))
+        let body = app[handler.upperBound...].prefix(400)
+        XCTAssertTrue(body.contains("chat.scenePhaseChanged(isActive: phase == .active)"),
+                      "the store never learns the app went to the background")
+    }
+
     private func source(_ path: String) throws -> String {
         let url = URL(fileURLWithPath: "\(#filePath)")
             .deletingLastPathComponent()

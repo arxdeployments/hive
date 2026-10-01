@@ -11,6 +11,7 @@ import { GlobalSearchResults } from './GlobalSearchResults';
 import { ProfileDrawer } from './ProfileDrawer';
 import useChatStore from '../../stores/chatStore';
 import client from '../../api/client';
+import { markThreadRead } from '../../services/readReceipts';
 
 import { CallsTab } from '../calls/CallsTab';
 import { WorkspaceSwitcher } from '../shared/WorkspaceSwitcher';
@@ -35,7 +36,6 @@ export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
   const activeConversationId = useChatStore(s => s.activeConversationId);
   const wsConnected = useChatStore(s => s.wsConnected);
   const setConversations = useChatStore(s => s.setConversations);
-  const clearUnread = useChatStore(s => s.clearUnread);
 
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('all');
@@ -134,19 +134,21 @@ export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
 
   const handleConversationClick = useCallback((conv) => {
     // Another thread's badge clears when ChatPanel marks it read — once its newest
-    // page is on screen, together with the PUT /read (markThreadRead, parity item
-    // 34) — not here on the click, before that page has arrived. A failed fetch or
-    // a jump's slice leaves the thread unread on the server, and a badge cleared
-    // early would come back at the next conversations refresh.
+    // page is on screen, together with the PUT /read (services/readReceipts, parity
+    // item 34) — not here on the click, before that page has arrived. A failed
+    // fetch or a jump's slice leaves the thread unread on the server, and a badge
+    // cleared early would come back at the next conversations refresh.
     //
-    // Re-clicking the thread already open changes nothing in ChatPanel, so the
-    // badge from arrivals while the tab was hidden is still dismissed here. Read
-    // through getState so this callback keeps one identity for the memoised rows.
-    if (conv._id === useChatStore.getState().activeConversationId && conv.unread_count > 0) {
-      clearUnread(conv._id);
+    // Re-clicking the thread already open changes nothing in ChatPanel, so it is
+    // marked read here — through the same guarded path, and only if its window is
+    // the newest page and still current. Over a jump's slice the badge stays until
+    // the newest page has been fetched. Read through getState so this callback
+    // keeps one identity for the memoised rows.
+    if (conv._id === useChatStore.getState().activeConversationId) {
+      markThreadRead(conv._id, { requireCurrent: true });
     }
     onSelectConversation(conv._id);
-  }, [onSelectConversation, clearUnread]);
+  }, [onSelectConversation]);
 
   return (
     <div className="h-full flex flex-col bg-[#0F0F0F] border-r border-[#1F1F1F] overflow-hidden" data-testid="chat-sidebar">
