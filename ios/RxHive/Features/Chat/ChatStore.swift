@@ -459,7 +459,9 @@ final class ChatStore: ObservableObject {
         let liveRows = keepingLiveRows
             ? held.filter { row in
                 !unsent.contains(row.id) && !fetchedIDs.contains(row.id)
-                    && (newestFetched.map { newest in (row.createdAt ?? .distantPast) > newest } ?? true)
+                    // At or after: two messages can share a timestamp, and the page's
+                    // own rows are already excluded by id.
+                    && (newestFetched.map { newest in (row.createdAt ?? .distantPast) >= newest } ?? true)
             }
             : []
         let unsentRows = held.filter { unsent.contains($0.id) && !landed.contains($0.id) }
@@ -761,6 +763,11 @@ final class ChatStore: ObservableObject {
     /// token-refresh reconnect — a thread served from cache was missing whatever was
     /// sent in the gap, and opening it marked those messages read.
     func socketStateChanged(isConnected: Bool) {
+        // Every transition advances the epoch, the way up as well as down: a fetch begun
+        // while the socket was down read a page before the socket subscribed, so a
+        // message sent in between is missing from it, and finishing after the socket
+        // came back must not let it earn trust (CodeRabbit, review of b789477).
+        if isConnected != socketUp { trustEpoch &+= 1 }
         socketUp = isConnected
         if !isConnected { untrustAll() }
     }

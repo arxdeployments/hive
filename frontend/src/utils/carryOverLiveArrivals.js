@@ -34,6 +34,8 @@ export function carryOverLiveArrivals(existing, fetched) {
     m._id
     && !LOCAL_ONLY_STATUSES.has(m.status)
     && !onPage.has(m._id)
-    && Date.parse(m.created_at) > newest
+    // At or after: Date has millisecond precision, so a distinct message can share
+    // the page's newest timestamp, and `onPage` has already excluded the page's own.
+    && Date.parse(m.created_at) >= newest
   ));
 }

@@ -504,6 +504,17 @@ class RxHiveWebSocket {
    * has since ended is exactly the state that must not survive into the next one.
    */
   _noteSignalAlive() {
+    // The same proof restores chat. The `offline` listener sets wsConnected false
+    // (and the store withdraws every window's "current" with it), and if the SAME
+    // socket survives the outage `_onOpen` never runs again: wsConnected stayed
+    // false, every live receipt for the open thread was withheld while its messages
+    // kept appearing, and ChatPanel's reconnect re-fetch — keyed on wsConnected
+    // going true — never ran. Setting it back here runs that re-fetch, which grants
+    // "current" again only once the fresh page has landed (CodeRabbit, review of
+    // b789477).
+    if (!useChatStore.getState().wsConnected && this.isOpen()) {
+      useChatStore.getState().setWsConnected(true);
+    }
     if (useCallStore.getState().signalLinkState !== LINK_RECONNECTING) return;
     useCallStore.getState().setSignalLinkState(LINK_OK);
   }
