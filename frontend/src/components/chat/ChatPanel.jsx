@@ -115,6 +115,8 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   const prependMessages = useChatStore(s => s.prependMessages);
   const addOptimisticMessage = useChatStore(s => s.addOptimisticMessage);
   const clearUnread = useChatStore(s => s.clearUnread);
+  const setWindowCurrent = useChatStore(s => s.setWindowCurrent);
+  const clearWindowsCurrent = useChatStore(s => s.clearWindowsCurrent);
   const bumpConversation = useChatStore(s => s.bumpConversation);
   const updateConversation = useChatStore(s => s.updateConversation);
   // Subscribed, not read through getState() at render time: the old header read
@@ -227,8 +229,35 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   useEffect(() => {
     // A fresh socket session invalidates nothing that is already loaded, but a
     // disconnect does: force the next open of each thread to re-fetch.
-    if (!wsConnected) loadedWindowsRef.current = new Set();
-  }, [wsConnected]);
+    // websocket.js's live receipts trust the same thing, so they lose it too.
+    if (!wsConnected) {
+      loadedWindowsRef.current = new Set();
+      clearWindowsCurrent();
+    }
+  }, [wsConnected, clearWindowsCurrent]);
+
+  /**
+   * Tell the server, and so the sender, that this thread has been read — once the
+   * newest messages are on screen.
+   *
+   * This used to be sent from the open effect alongside fetchMessages(), without
+   * waiting for the page and whether or not it ever arrived: a failed fetch left
+   * the old window (or none) on screen with the thread already marked read. The
+   * server stamps last_read_at with the current time whatever anchor it is given,
+   * so a receipt is only honest once the newest page is showing. iOS gained the
+   * same rule in batch 71; parity item 34 records it.
+   *
+   * Re-checked here, at the moment of sending, like iOS's isThreadOnScreen: a fetch
+   * can outlive the visit (back on mobile, Close chat on desktop), and a tab can be
+   * hidden while one is in flight — a reconnect's re-fetch of a background tab
+   * included. Either way nobody saw the page.
+   */
+  const markThreadRead = useCallback((convId) => {
+    const s = useChatStore.getState();
+    if (s.activeConversationId !== convId || document.visibilityState !== 'visible') return;
+    client.put(`/api/conversations/${convId}/read`).catch(() => {});
+    clearUnread(convId);
+  }, [clearUnread]);
 
   /**
    * Load the message window for this conversation.
@@ -242,6 +271,8 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
    *
    * `force` is the escape hatch for the one case the cache can be stale: a
    * socket reconnect, where messages may have been missed while it was down.
+   *
+   * Marks the thread read once the newest page is on screen (markThreadRead).
    */
   const fetchMessages = useCallback(async ({ force = false } = {}) => {
     if (!conversationId) return;
@@ -252,9 +283,18 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     if (hasWindow && !force) {
       setLoading(false);
       setLoadErrorByConv(prev => (prev[conversationId] ? { ...prev, [conversationId]: false } : prev));
+      // The cached window is on screen at once — but it is only vouched for if it is
+      // the newest page and still current, not a jump's slice.
+      if (useChatStore.getState().windowCurrent[conversationId]) {
+        markThreadRead(conversationId);
+      }
       return;
     }
     setLoading(true);
+    // Not current until this page lands: websocket.js must not receipt live arrivals
+    // over a spinner, or over a failed fetch's error strip. Success sets it back and
+    // marks the thread read, which covers anything withheld meanwhile.
+    setWindowCurrent(conversationId, false);
     try {
       const { data } = await client.get(`/api/conversations/${conversationId}/messages`, {
         params: { limit: 50 }
@@ -293,7 +333,14 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // nothing newer is missing. This also clears the flag after a "jump to
       // latest" from an around-window.
       setHasNewerByConv(prev => ({ ...prev, [conversationId]: false }));
-      loadedWindowsRef.current.add(conversationId);
+      // Current — and reusable from cache — only if the socket is up to keep it so.
+      // A page fetched while it is down is still the newest page right now, so it
+      // is marked read; it just is not trusted afterwards.
+      const connected = useChatStore.getState().wsConnected;
+      setWindowCurrent(conversationId, connected);
+      // Only now is the newest page on screen; see markThreadRead.
+      markThreadRead(conversationId);
+      if (connected) loadedWindowsRef.current.add(conversationId);
       // No seq check needed: the bail above already established that this is
       // still the newest fetch, and nothing since then has awaited.
       setLoadErrorByConv(prev => (prev[conversationId] ? { ...prev, [conversationId]: false } : prev));
@@ -308,22 +355,24 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // stale window is underneath as if it were loaded.
       if (seq === fetchSeqRef.current) setLoading(false);
     }
-  }, [conversationId, setMessages, myUserId]);
+  }, [conversationId, setMessages, myUserId, markThreadRead, setWindowCurrent]);
 
   useEffect(() => {
+    // Marks the thread read itself, once the newest page is on screen — see
+    // markThreadRead. The API broadcasts messages_read to the other side, so no
+    // separate WS read-receipt frame is needed.
     fetchMessages();
-    // Mark read server-side; the API broadcasts messages_read to the other side,
-    // so no separate WS read-receipt frame is needed here.
-    if (conversationId) {
-      client.put(`/api/conversations/${conversationId}/read`).catch(() => {});
-      clearUnread(conversationId);
-    }
-  }, [fetchMessages, conversationId, clearUnread]);
+    // Leaving the thread disowns its fetch, so a page that answers after the user
+    // has gone writes nothing and marks nothing.
+    return () => { fetchSeqRef.current += 1; };
+  }, [fetchMessages]);
 
   // Re-sync the open thread after a socket reconnect — that is the only window
   // in which the cache can have missed messages.
   const wasConnectedRef = useRef(wsConnected);
   useEffect(() => {
+    // A hidden tab is brought up to date but not marked read — markThreadRead
+    // checks visibility when the page lands. Same rule as websocket.js's `looking`.
     if (wsConnected && !wasConnectedRef.current) fetchMessages({ force: true });
     wasConnectedRef.current = wsConnected;
   }, [wsConnected, fetchMessages]);
@@ -1164,7 +1213,11 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       setMessages(conversationId, localOnly.length ? [...fetched, ...localOnly] : fetched);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
       setHasNewerByConv(prev => ({ ...prev, [conversationId]: !!data.has_newer }));
-      loadedWindowsRef.current.add(conversationId);
+      // A slice is not current; a window that reaches the newest message is, if the
+      // socket is up to keep it so. websocket.js receipts live arrivals only then.
+      const connected = useChatStore.getState().wsConnected;
+      setWindowCurrent(conversationId, !data.has_newer && connected);
+      if (connected) loadedWindowsRef.current.add(conversationId);
       pendingJumpRef.current = originalMsgId;
       return true;
     } catch (err) {

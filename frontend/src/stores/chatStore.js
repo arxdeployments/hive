@@ -76,6 +76,11 @@ const emptyState = () => ({
   // see bumpPinnedVersion below for what it is for. Keyed by conversation id, so
   // left unreset it is a map of the previous user's threads.
   pinnedVersion: {},
+  // Per conversation: true only while the window on screen is the newest page and
+  // the socket has kept it current since it was fetched. ChatPanel owns the window
+  // and writes this; websocket.js reads it to decide whether a live message has
+  // been seen. Unknown counts as not current. See setWindowCurrent.
+  windowCurrent: {},
 });
 
 const useChatStore = create((set) => ({
@@ -340,6 +345,28 @@ const useChatStore = create((set) => ({
     });
     return changed ? { conversations } : state;
   }),
+
+  /**
+   * Record whether a conversation's window is the newest page, kept current.
+   *
+   * The server stamps last_read_at with the current time whatever anchor a receipt
+   * names (services/messaging.py, mark_read). So a live receipt is only honest for a
+   * thread whose newest page is on screen — not for a jump's slice of old history,
+   * not while the first page is still loading, not after its fetch failed, and not
+   * for a window the socket stopped updating. ChatPanel knows which of those holds;
+   * the socket's new_message handler, which sends the receipt, did not. Unknown
+   * counts as not current. Parity item 34 (docs/IOS_TO_WEB_PARITY.md).
+   */
+  setWindowCurrent: (convId, current) => set((state) => (
+    !!state.windowCurrent[convId] === !!current
+      ? state
+      : { windowCurrent: { ...state.windowCurrent, [convId]: !!current } }
+  )),
+
+  /** The socket dropped: nothing it was keeping current can be vouched for now. */
+  clearWindowsCurrent: () => set((state) => (
+    Object.keys(state.windowCurrent).length === 0 ? state : { windowCurrent: {} }
+  )),
 
   clearUnread: (convId) => set((state) => {
     let changed = false;

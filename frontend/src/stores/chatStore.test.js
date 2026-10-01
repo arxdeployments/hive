@@ -135,3 +135,43 @@ describe('chatStore.reset', () => {
     assert.equal(store().activeConversationId, 'conv-z');
   });
 });
+
+describe('chatStore.setWindowCurrent', () => {
+  afterEach(() => store().reset());
+
+  it('records, per conversation, whether the window is the newest page, kept current', () => {
+    store().setWindowCurrent('conv-a', true);
+
+    assert.equal(store().windowCurrent['conv-a'], true);
+    assert.equal(store().windowCurrent['conv-b'], undefined, 'one current thread must not vouch for another');
+
+    store().setWindowCurrent('conv-a', false);
+    assert.equal(store().windowCurrent['conv-a'], false);
+  });
+
+  it('does not re-render subscribers when nothing changed', () => {
+    store().setWindowCurrent('conv-a', true);
+    const before = store().windowCurrent;
+
+    store().setWindowCurrent('conv-a', true);
+
+    assert.equal(store().windowCurrent, before);
+  });
+
+  it('forgets every window when the socket drops', () => {
+    store().setWindowCurrent('conv-a', true);
+    store().setWindowCurrent('conv-b', true);
+
+    store().clearWindowsCurrent();
+
+    assert.deepEqual(store().windowCurrent, {});
+  });
+
+  it('is cleared by a sign-out, like every other per-conversation map', () => {
+    store().setWindowCurrent('conv-a', true);
+
+    store().reset();
+
+    assert.deepEqual(store().windowCurrent, {});
+  });
+});

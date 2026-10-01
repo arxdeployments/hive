@@ -133,10 +133,19 @@ export const ChatSidebar = ({ onSelectConversation, isMobile }) => {
   };
 
   const handleConversationClick = useCallback((conv) => {
+    // Another thread's badge clears when ChatPanel marks it read — once its newest
+    // page is on screen, together with the PUT /read (markThreadRead, parity item
+    // 34) — not here on the click, before that page has arrived. A failed fetch or
+    // a jump's slice leaves the thread unread on the server, and a badge cleared
+    // early would come back at the next conversations refresh.
+    //
+    // Re-clicking the thread already open changes nothing in ChatPanel, so the
+    // badge from arrivals while the tab was hidden is still dismissed here. Read
+    // through getState so this callback keeps one identity for the memoised rows.
+    if (conv._id === useChatStore.getState().activeConversationId && conv.unread_count > 0) {
+      clearUnread(conv._id);
+    }
     onSelectConversation(conv._id);
-    // Clear the badge immediately; ChatPanel issues the PUT /read for every open
-    // path (this one included), so doing it here too just doubled the request.
-    if (conv.unread_count > 0) clearUnread(conv._id);
   }, [onSelectConversation, clearUnread]);
 
   return (

@@ -847,7 +847,8 @@ Portability correction: "direct" is wrong as stated. `CloseEvent.reason` is full
 
 ### 34. iOS sends a read receipt only for a thread that is showing its newest messages
 
-**Direct port** · effort: small
+**Ported in the same PR (#111)** · the read-receipt rule is now on both clients; the reconnect note
+at the end is still open
 
 **What iOS does.** `ChatStore.markRead(conversationID:justFetched:)` returns without a receipt unless
 the thread's loaded window is the newest page, fetched by the store and kept current by the socket
@@ -866,7 +867,7 @@ showing its newest messages tells the sender that messages the reader never saw 
 - ios/RxHive/Features/Chat/ChatStore.swift — `markRead`, `loadedWindows`, `socketStateChanged`
 - ios/RxHive/Features/Chat/ChatView.swift — `open()`, `newMessagesArrived()`, `backToLatest(_:)`
 
-**What the web does today.** Two paths receipt without that check:
+**What the web did, before it was ported.** Two paths receipted without that check:
 
 1. `frontend/src/components/chat/ChatPanel.jsx:313-320` sends `PUT /read` in the same effect that
    calls `fetchMessages()`. It does not wait for the page, and it does not care whether the fetch
@@ -878,9 +879,23 @@ showing its newest messages tells the sender that messages the reader never saw 
 
 **Web files to change.** `frontend/src/components/chat/ChatPanel.jsx`, `frontend/src/services/websocket.js`
 
-**Porting notes.** Move the `PUT /read` into `fetchMessages`' success path, including its cache-hit
-branch. Gate the socket receipt on the active window not being a slice, which means lifting
-`hasNewerByConv` out of ChatPanel state and into the store so websocket.js can read it.
+**How it was ported.** It follows the iOS rules:
+
+- `ChatPanel.markThreadRead` is the only place `PUT /read` is sent. Like iOS's
+  `isThreadOnScreen`, it re-checks at the moment of sending that the thread is still open and the
+  tab visible.
+- It is called from `fetchMessages`' success path after the page is written, and from the cache-hit
+  branch only for a window that is current.
+- `chatStore.windowCurrent` is the web's `loadedWindows`. A replacing fetch clears it for the
+  thread when it starts. A successful fetch sets it, but only while the socket is up. A jump sets it
+  to `!has_newer`. A socket drop clears every thread. Unknown counts as not current.
+- websocket.js sends the live receipt only while the window is current, and otherwise counts the
+  message as unread, as the server does.
+- The sidebar no longer zeroes a badge on the click. ChatPanel clears it together with the
+  `PUT /read`.
+- Leaving a thread disowns its in-flight fetch.
+
+Wiring guards are in `frontend/src/components/chat/readReceiptParity.test.js`.
 
 A related difference, deliberately not ported yet: on reconnect, both clients re-fetch the open
 thread. iOS keeps history the reader paged back through when the new page joins it, and leaves a
