@@ -1213,6 +1213,10 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // socket is up to keep it so. websocket.js receipts live arrivals only then.
       const connected = useChatStore.getState().wsConnected;
       setWindowCurrent(conversationId, !data.has_newer && connected);
+      // A jump that reaches the newest message has just put it on screen, with any
+      // arrivals a slice was holding back; mark it read as fetchMessages would. A
+      // slice is never marked (CodeRabbit, review of b789477).
+      if (!data.has_newer) markThreadRead(conversationId);
       if (connected) loadedWindowsRef.current.add(conversationId);
       pendingJumpRef.current = originalMsgId;
       return true;

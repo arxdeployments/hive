@@ -55,6 +55,16 @@ describe('carryOverLiveArrivals', () => {
     assert.deepEqual(carryOverLiveArrivals([msg('m1', 1)], []).map((m) => m._id), ['m1']);
   });
 
+  it('keeps a distinct message that shares the page\'s newest timestamp', () => {
+    // Date has millisecond precision, so two messages can parse to the same time.
+    // The page's own row is excluded by id; a different one at that instant is an
+    // arrival, and dropping it then marked it read unseen (CodeRabbit, PR #111).
+    const existing = [msg('m2', 2), msg('m2-twin', 2)];
+    const fetched = [msg('m1', 1), msg('m2', 2)];
+
+    assert.deepEqual(carryOverLiveArrivals(existing, fetched).map((m) => m._id), ['m2-twin']);
+  });
+
   it('ignores a row with no usable timestamp rather than guessing', () => {
     assert.deepEqual(carryOverLiveArrivals([{ _id: 'mx' }], [msg('m1', 1)]), []);
   });

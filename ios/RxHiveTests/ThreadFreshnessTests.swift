@@ -326,6 +326,17 @@ final class ThreadFreshnessTests: XCTestCase {
         XCTAssertEqual(thread.map(\.id), ["m1", "m2", "m3-live"])
     }
 
+    /// Two messages can share a timestamp. A distinct one at the page's newest instant
+    /// is an arrival the page does not carry, and must survive (CodeRabbit, PR #111).
+    func testAnArrivalSharingThePagesNewestTimestampSurvives() throws {
+        let held = [try row("m2", second: 2), try row("m2-twin", second: 2)]
+        let fetched = [try row("m1", second: 1), try row("m2", second: 2)]
+
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, unsent: [], keepingLiveRows: true)
+
+        XCTAssertEqual(thread.map(\.id), ["m1", "m2", "m2-twin"])
+    }
+
     /// Rows older than the page that the page does not include are the old window, not
     /// live arrivals, and the page replaces them.
     func testOldRowsThePageDoesNotIncludeAreReplaced() throws {
@@ -405,6 +416,24 @@ final class ThreadFreshnessTests: XCTestCase {
 
         XCTAssertEqual(ids(chat), ["m1"], "the page itself is still the best there is")
         XCTAssertFalse(chat.loadedWindows.contains(conv), "a page read before the gap was trusted after it")
+    }
+
+    /// The way up as well as the way down: a fetch begun while the socket was down read
+    /// its page before the socket subscribed, so it must not earn trust by finishing
+    /// after the socket came back (CodeRabbit, review of b789477).
+    func testAFetchBegunWhileTheSocketWasDownIsNotTrustedWhenItComesBack() async throws {
+        let page = pageJSON([messageJSON("m1", second: 1)])
+        MockURLProtocol.install { _, _ in .json(200, page, delay: 0.5) }
+        let chat = makeStore()
+        chat.socketStateChanged(isConnected: false)
+
+        let load = Task { await chat.loadMessages(conversationID: conv) }
+        try await Task.sleep(for: .milliseconds(100))
+        chat.socketStateChanged(isConnected: true)
+        _ = await load.value
+
+        XCTAssertEqual(ids(chat), ["m1"])
+        XCTAssertFalse(chat.loadedWindows.contains(conv), "a page read before the socket subscribed was trusted")
     }
 
     // MARK: A reconnect keeps the reader's place

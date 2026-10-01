@@ -121,6 +121,16 @@ describe('ChatPanel: the thread is marked read once its newest page is on screen
       'the listener outlives the thread it was added for');
   });
 
+  it('marks a jump read when it reaches the newest message, after writing it, and never a slice', () => {
+    // CodeRabbit, review of b789477: the jump restored currency and showed the
+    // arrivals a slice had held back, but never told the server.
+    const lines = code(jumpBlock());
+    const write = lines.indexOf('setMessages(conversationId, kept.length ? [...fetched, ...kept] : fetched);');
+    const mark = lines.indexOf('if (!data.has_newer) markThreadRead(conversationId);');
+    assert.ok(mark !== -1, 'a jump that lands on the newest page leaves the thread unread');
+    assert.ok(write !== -1 && write < mark, 'the jump marks the thread read before its window is written');
+  });
+
   it('keeps live arrivals for a jump that reaches the newest message, never for a slice', () => {
     const lines = code(jumpBlock());
     assert.ok(lines.includes('const live = data.has_newer ? [] : carryOverLiveArrivals(held, fetched);'),
@@ -135,6 +145,20 @@ describe('chatStore: a socket drop withdraws "current" synchronously', () => {
     const setter = block(store, 'setWsConnected: (connected) => set((state) => {', '  }),');
     assert.ok(code(setter).includes(': { wsConnected: false, wsConnecting: false, windowCurrent: {} };'),
       'a drop leaves windows vouched for until React next commits');
+  });
+});
+
+describe('websocket.js: a socket that survives an outage restores chat', () => {
+  it('sets wsConnected back when an inbound frame proves the same socket alive', () => {
+    // CodeRabbit, review of b789477: the offline listener sets wsConnected false; a
+    // socket that survives never re-runs _onOpen, so receipts stayed withheld and
+    // ChatPanel's reconnect re-fetch never ran.
+    const alive = code(block(socket, '  _noteSignalAlive() {', '\n  }'));
+    const restore = alive.indexOf('if (!useChatStore.getState().wsConnected && this.isOpen()) {');
+    assert.ok(restore !== -1 && alive[restore + 1] === 'useChatStore.getState().setWsConnected(true);',
+      'a socket that comes back from an outage leaves chat believing it is down');
+    const callGate = alive.indexOf('if (useCallStore.getState().signalLinkState !== LINK_RECONNECTING) return;');
+    assert.ok(callGate !== -1 && restore < callGate, 'the chat restore sits behind the call-state early return');
   });
 });
 
