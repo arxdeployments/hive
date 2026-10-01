@@ -84,6 +84,9 @@ final class ChatStore: ObservableObject {
     private weak var auth: AuthStore?
     private let api: APIClient
     private var eventTask: Task<Void, Never>?
+    /// The re-fetches after a reconnect, run beside the event loop rather than in it;
+    /// see the `.connected` case in `handle`.
+    private var reconnectTask: Task<Void, Never>?
     private var typingTimers: [String: Task<Void, Never>] = [:]
     private var outgoingTypingSentAt: [String: Date] = [:]
     private let log = Logger(subsystem: "ai.rhythmrx.rxhive", category: "chat")
@@ -147,6 +150,9 @@ final class ChatStore: ObservableObject {
     /// session; cancelling it here would leave the second sign-in with no live
     /// events at all.
     func reset() {
+        // The re-fetches belong to the session being ended.
+        reconnectTask?.cancel()
+        reconnectTask = nil
         conversations = []
         isLoadingConversations = false
         conversationsError = nil
@@ -767,11 +773,24 @@ final class ChatStore: ObservableObject {
     /// A thread that was current when the socket dropped keeps the history paged in
     /// above the new page, and a jump's slice on screen is left where the reader is.
     func resyncAfterReconnect() async {
-        // Also covers a `connected` that arrives without the drop having been seen.
+        await refetchAfterReconnect(currentAtDrop: beginResync())
+    }
+
+    /// The synchronous half of a re-sync: withdraw trust — also covering a `connected`
+    /// that arrives without the drop having been seen — and hand back which threads
+    /// were current when the socket dropped.
+    private func beginResync() -> Set<String> {
         untrustAll()
         let currentAtDrop = trustLostToGap
         trustLostToGap = []
+        return currentAtDrop
+    }
+
+    /// The asynchronous half: re-fetch the threads on screen, then the list. Stops
+    /// between fetches once cancelled — by a newer reconnect, or by a sign-out.
+    private func refetchAfterReconnect(currentAtDrop: Set<String>) async {
         for conversationID in visibleThreads.keys.sorted() {
+            guard !Task.isCancelled else { return }
             await loadNewestPage(
                 conversationID,
                 force: true,
@@ -779,6 +798,7 @@ final class ChatStore: ObservableObject {
                 keepingHistory: currentAtDrop.contains(conversationID)
             )
         }
+        guard !Task.isCancelled else { return }
         await loadConversations()
     }
 
@@ -846,7 +866,18 @@ final class ChatStore: ObservableObject {
         switch event {
         case .connected:
             // Re-sync after any gap: events that arrived while disconnected are gone.
-            await resyncAfterReconnect()
+            //
+            // Trust is withdrawn here, in order with the events on either side of this
+            // one. The re-fetches are NOT awaited here: events are handled one at a
+            // time, a re-fetch per thread on screen can each wait behind other window
+            // work, and meanwhile live events pile up in a stream that keeps only the
+            // newest 64 (`RealtimeClient.subscribe`) — so a busy reconnect dropped
+            // messages. They run beside the loop, and a newer reconnect supersedes them.
+            let currentAtDrop = beginResync()
+            reconnectTask?.cancel()
+            reconnectTask = Task { [weak self] in
+                await self?.refetchAfterReconnect(currentAtDrop: currentAtDrop)
+            }
 
         case .pong, .unknown:
             break

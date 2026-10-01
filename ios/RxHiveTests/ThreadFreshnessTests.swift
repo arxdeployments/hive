@@ -477,6 +477,45 @@ final class ThreadFreshnessTests: XCTestCase {
         XCTAssertEqual(ids(chat), ["m-old"])
     }
 
+    /// A re-sync stops between threads once it is cancelled — by a newer reconnect, or a
+    /// sign-out — rather than fetching every thread that was on screen.
+    func testACancelledResyncStopsBetweenThreads() async throws {
+        let page = pageJSON([messageJSON("m1", second: 1)])
+        MockURLProtocol.install { _, _ in .json(200, page, delay: 0.4) }
+        let chat = makeStore()
+        chat.threadDidAppear("conv-a")
+        chat.threadDidAppear("conv-b")
+
+        let resync = Task { await chat.resyncAfterReconnect() }
+        try await Task.sleep(for: .milliseconds(100))
+        resync.cancel()
+        await resync.value
+
+        XCTAssertEqual(MockURLProtocol.count(path: "/api/conversations/conv-a/messages"), 1)
+        XCTAssertEqual(MockURLProtocol.count(path: "/api/conversations/conv-b/messages"), 0,
+                       "a cancelled re-sync went on to fetch the next thread")
+        XCTAssertEqual(MockURLProtocol.count(path: "/api/conversations"), 0,
+                       "a cancelled re-sync went on to reload the list")
+    }
+
+    /// Cancelled during the last thread's fetch, a re-sync does not go on to reload the
+    /// conversation list either.
+    func testACancelledResyncDoesNotReloadTheList() async throws {
+        let page = pageJSON([messageJSON("m1", second: 1)])
+        MockURLProtocol.install { _, _ in .json(200, page, delay: 0.4) }
+        let chat = makeStore()
+        chat.threadDidAppear(conv)
+
+        let resync = Task { await chat.resyncAfterReconnect() }
+        try await Task.sleep(for: .milliseconds(100))
+        resync.cancel()
+        await resync.value
+
+        XCTAssertEqual(pageFetches, 1)
+        XCTAssertEqual(MockURLProtocol.count(path: "/api/conversations"), 0,
+                       "a cancelled re-sync went on to reload the list")
+    }
+
     // MARK: Fetches for one thread, in order
 
     /// A newest-page fetch still in flight when the user jumps must not land on top of
@@ -672,10 +711,23 @@ final class ThreadFreshnessTests: XCTestCase {
         let store = try source("Features/Chat/ChatStore.swift")
         let connected = try XCTUnwrap(store.range(of: "case .connected:"))
         let nextCase = try XCTUnwrap(store.range(of: "case .pong", range: connected.upperBound..<store.endIndex))
-        XCTAssertTrue(
-            store[connected.upperBound..<nextCase.lowerBound].contains("await resyncAfterReconnect()"),
-            "a reconnect no longer re-syncs threads, only whatever else it does"
-        )
+        let connectedCase = String(store[connected.upperBound..<nextCase.lowerBound])
+        let untrust = try XCTUnwrap(connectedCase.range(of: "let currentAtDrop = beginResync()"),
+                                    "a reconnect no longer withdraws trust")
+        let spawn = try XCTUnwrap(connectedCase.range(of: "reconnectTask = Task {"),
+                                  "a reconnect no longer re-fetches the threads on screen")
+        XCTAssertLessThan(untrust.lowerBound, spawn.lowerBound,
+                          "trust must be withdrawn in order with the events, before the re-fetches start")
+        XCTAssertTrue(connectedCase.contains("await self?.refetchAfterReconnect(currentAtDrop: currentAtDrop)"))
+        // Awaited in the event loop, the re-fetches back events up past the stream's
+        // 64-event buffer and messages are dropped (CodeRabbit, review of 02512f0).
+        XCTAssertFalse(connectedCase.contains("await resyncAfterReconnect()"),
+                       "the re-fetches block the realtime event loop again")
+        XCTAssertTrue(connectedCase.contains("reconnectTask?.cancel()"),
+                      "an older re-sync is not superseded by a newer one")
+        let reset = try XCTUnwrap(store.range(of: "    func reset() {"))
+        XCTAssertTrue(store[reset.upperBound...].prefix(300).contains("reconnectTask?.cancel()"),
+                      "a sign-out leaves the last session's re-sync running")
 
         let view = try source("Features/Chat/ChatView.swift")
         XCTAssertTrue(view.contains(".onAppear { chat.threadDidAppear(conversationID) }"),
