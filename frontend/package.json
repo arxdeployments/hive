@@ -31,7 +31,7 @@
   "devDependencies": {
     "@eslint/js": "^9.24.0",
     "@playwright/test": "^1.51.1",
-    "@vitejs/plugin-react": "^4.3.4",
+    "@vitejs/plugin-react": "^6.1.1",
     "autoprefixer": "^10.4.21",
     "eslint": "^9.24.0",
     "eslint-plugin-react": "^7.37.5",
