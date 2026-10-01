@@ -807,7 +807,7 @@ final class ThreadFreshnessTests: XCTestCase {
         // review of 64c638e) — otherwise a newest page fetched as they left is marked read.
         let viewLines = view.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
         let receipts = viewLines.indices.filter { viewLines[$0].hasPrefix("await chat.markRead(") }
-        XCTAssertEqual(receipts.count, 4, "the thread screen's read receipts changed; re-check each is guarded")
+        XCTAssertEqual(receipts.count, 5, "the thread screen's read receipts changed; re-check each is guarded")
         for index in receipts {
             // Walking back from the receipt, the on-screen guard must come before any
             // suspension point: nothing can change between a guard and code that does not
@@ -837,6 +837,21 @@ final class ThreadFreshnessTests: XCTestCase {
     }
 
     /// An app source file, read from the checkout, for the wiring checks.
+    /// Returning to the foreground marks an open, trusted thread read — the receipts
+    /// withheld while the app was not active are otherwise owed until the next arrival
+    /// (CodeRabbit, review of f0f668e, on the web twin of this gap).
+    func testComingBackToTheForegroundMarksAnOpenTrustedThreadRead() throws {
+        let view = try source("Features/Chat/ChatView.swift")
+        let handler = try XCTUnwrap(view.range(of: ".onChange(of: scenePhase) { _, phase in"),
+                                    "nothing marks the thread read when the app comes back")
+        let body = String(view[handler.upperBound...].prefix(500))
+        XCTAssertTrue(body.contains("guard phase == .active, !hasNewer, !isJumping else { return }"),
+                      "coming back marks a jump's slice read, or does so on the way out")
+        XCTAssertTrue(body.contains("await chat.markRead(conversationID: conversationID)\n"),
+                      "coming back vouches for a window that was not trusted")
+        XCTAssertFalse(body.contains("justFetched"), "coming back has not fetched anything to vouch for")
+    }
+
     /// `RxHiveApp` reports the scene phase to the store; without that the app-active
     /// gate above never closes.
     func testTheAppReportsItsScenePhaseToTheStore() throws {

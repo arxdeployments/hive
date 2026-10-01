@@ -109,6 +109,18 @@ describe('ChatPanel: the thread is marked read once its newest page is on screen
       'a page fetched with the socket down is reused from cache as if current');
   });
 
+  it('marks a current window read when a hidden tab becomes visible', () => {
+    // CodeRabbit, review of f0f668e: a fetch finishing in a hidden tab marks nothing,
+    // and without this nothing told the server until the next message.
+    const effect = code(block(panel, "    document.addEventListener('visibilitychange', onVisible);", '}, [conversationId]);'));
+    const listener = code(block(panel, '    const onVisible = () => {', '    };'));
+    assert.ok(listener.includes("if (document.visibilityState === 'visible') {"));
+    assert.ok(listener.includes('markThreadRead(conversationId, { requireCurrent: true });'),
+      'a tab coming back into view marks a slice or a stale window read, or nothing at all');
+    assert.ok(effect.includes("return () => document.removeEventListener('visibilitychange', onVisible);"),
+      'the listener outlives the thread it was added for');
+  });
+
   it('keeps live arrivals for a jump that reaches the newest message, never for a slice', () => {
     const lines = code(jumpBlock());
     assert.ok(lines.includes('const live = data.has_newer ? [] : carryOverLiveArrivals(held, fetched);'),

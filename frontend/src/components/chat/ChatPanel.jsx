@@ -354,6 +354,22 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     wasConnectedRef.current = wsConnected;
   }, [wsConnected, fetchMessages]);
 
+  // A tab coming back into view is the moment its thread is seen. A fetch that
+  // finished while it was hidden marked nothing (markThreadRead checks visibility),
+  // and live arrivals meanwhile were counted unread; without this, nothing told the
+  // server until the next message arrived. Only a current window is vouched for —
+  // never a jump's slice or a window the socket stopped keeping current.
+  useEffect(() => {
+    if (!conversationId) return undefined;
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        markThreadRead(conversationId, { requireCurrent: true });
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [conversationId]);
+
   /**
    * Pinned messages for the banner. Fetched once per conversation because a pin
    * can live far outside the loaded window; live pins/unpins are folded in from

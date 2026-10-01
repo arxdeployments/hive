@@ -27,6 +27,7 @@ struct ChatView: View {
     @EnvironmentObject private var calls: CallStore
     @EnvironmentObject private var toasts: ToastCenter
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
 
     // Composer / editing
     @State private var replyTo: Message?
@@ -147,6 +148,18 @@ struct ChatView: View {
         // closes whenever the phone is locked, and anything sent meanwhile is lost to
         // it. Appear/disappear rather than the task, which is not re-run on unlock.
         .onAppear { chat.threadDidAppear(conversationID) }
+        // Coming back to the foreground is the moment an open thread is seen. Arrivals
+        // while the app was not active — the socket stays open during a call — were
+        // withheld (`isThreadOnScreen` needs the app active), and nothing else would
+        // mark them read until the next one. Only a trusted window: `markRead` without
+        // `justFetched` refuses a slice or one the socket stopped keeping current.
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .active, !hasNewer, !isJumping else { return }
+            Task {
+                guard chat.isThreadOnScreen(conversationID) else { return }
+                await chat.markRead(conversationID: conversationID)
+            }
+        }
         .onDisappear { chat.threadDidDisappear(conversationID) }
         // The newest row, not the row count. A reconnect's re-fetch can slide the
         // window forward with the count unchanged — new messages in, old ones out —
