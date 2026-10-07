@@ -16,7 +16,12 @@ Deliberate contract-preserving fixes (coordinated with the frontend):
   login path reads Organization.is_active, so the suspension is carried by the
   users.is_active cascade alone and these are the routes that could undo it.
 - reset-password sets must_change_password and revokes sessions; the
-  temporary password is still returned per contract.
+  temporary password is still returned per contract. Since batch 73 the flag is
+  enforced — the account is refused everywhere but change-password until it
+  chooses its own — and the reset also deletes the account's push subscriptions,
+  so notification previews stop reaching devices signed in before it. It stamps
+  users.sessions_valid_after too (batch 73 review), so an access token issued
+  before the reset stays refused after the password is changed, not only until.
 - Create/update user validates the department exists in the target org;
   bulk change_dept skips users whose org doesn't match the department.
 - Passwords go through the org password policy; emails are unique
@@ -29,14 +34,14 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import wire_role
 from app.core.deps import require_superadmin
 from app.core.errors import conflict_as_400
 from app.core.security import PasswordPolicyError, enforce_password_policy, hash_password
-from app.db.models import AuditLog, Department, Organization, RefreshToken, User, UserRole
+from app.db.models import AuditLog, Department, Organization, PushSubscription, RefreshToken, User, UserRole
 from app.db.session import get_db
 from app.services import presence
 from app.services.audit import log_audit, serialize_audit
@@ -1160,8 +1165,23 @@ async def reset_user_password(
     temporary_password = generate_password(12)
     user.password_hash = await hash_password(temporary_password)
     # Fixes: the account must change it on next login, and old sessions die.
+    # The flag is what makes the first half true: get_current_user refuses the
+    # account everywhere but change-password from the moment this commits (batch 73).
     user.must_change_password = True
     await _revoke_refresh_tokens(db, [user.id])
+    # The flag alone did not keep the second half: an access token is a JWT nothing
+    # can revoke, so the target's pre-reset token was refused only until the owner
+    # chose a new password, and then worked again for the rest of its life (batch 73
+    # review). The epoch ends it for good — get_current_user refuses any token
+    # issued before this. Stamped AFTER the revocation above so every refresh row it
+    # revoked carries revoked_at <= the epoch: that is how change-password tells a
+    # session this reset ended (re-issue it) from one a later logout ended (do not).
+    user.sessions_valid_after = now_utc()
+    # Push is the one channel the flag cannot gate, because it is the server that
+    # sends: a browser subscribed before the reset kept receiving message previews
+    # for an account its holder may no longer control. Deleted in the same
+    # transaction as the reset; the user re-subscribes after changing the password.
+    await db.execute(delete(PushSubscription).where(PushSubscription.user_id == user.id))
     await log_audit(
         db,
         actor_id=actor.id,

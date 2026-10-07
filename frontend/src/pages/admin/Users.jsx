@@ -288,8 +288,12 @@ export default function UsersPage() {
     try {
       const { data } = await client.post(`/api/admin/users/${editUser._id}/reset-password`);
       setResetPwResult(data.temporary_password);
+      // Says what happens next as well as what the password is (batch 73): the
+      // account is now refused everywhere until its owner replaces this, so an
+      // admin who thought they had simply set a new password would be fielding
+      // "the app won't let me in" without knowing why.
       toast.success('Password reset successfully', {
-        description: `New password: ${data.temporary_password}`,
+        description: `Temporary password: ${data.temporary_password}. They will be asked to choose a new password the next time they sign in.`,
         duration: 10000,
         action: {
           label: 'Copy',
@@ -1007,7 +1011,7 @@ export default function UsersPage() {
                       </button>
                       {resetPwResult && (
                         <div className="mt-2 p-3 bg-[#10B981]/5 border border-[#10B981]/20 rounded-[6px]">
-                          <p className="text-xs text-[#A3A3A3] mb-1">New password:</p>
+                          <p className="text-xs text-[#A3A3A3] mb-1">Temporary password:</p>
                           <div className="flex items-center gap-2">
                             <code className="flex-1 text-sm font-mono text-[#10B981]">{resetPwResult}</code>
                             <button onClick={() => copyToClipboard(resetPwResult)}
@@ -1015,6 +1019,9 @@ export default function UsersPage() {
                               <Copy size={14} />
                             </button>
                           </div>
+                          <p data-testid="users-reset-password-next-step" className="mt-2 text-xs text-[#A3A3A3]">
+                            Give this to the user. They will be asked to choose a new password the next time they sign in.
+                          </p>
                         </div>
                       )}
                     </div>

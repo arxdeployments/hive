@@ -391,6 +391,9 @@ jobs:
       RXHIVE_SEED_SUPERADMIN_PASSWORD: CiSuperadminPass123
       # All E2E traffic shares one source IP — raise the per-IP login budget.
       RXHIVE_RATE_LIMIT_LOGIN: "200"
+      # And the password budget (change-password, 5 a minute by default), which the
+      # forced-change spec spends, more than once if it is retried.
+      RXHIVE_RATE_LIMIT_PASSWORD: "200"
       E2E_API_URL: http://127.0.0.1:8000
       E2E_SUPERADMIN_PASSWORD: CiSuperadminPass123
     steps:

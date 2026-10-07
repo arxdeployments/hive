@@ -16,6 +16,7 @@
  */
 import axios from 'axios';
 import { tearDownPush } from '../lib/pushTeardown';
+import { announcePasswordChangeRequired, isPasswordChangeRequiredError } from '../lib/passwordChange';
 
 const API_BASE = import.meta.env.VITE_BACKEND_URL || '';
 
@@ -158,6 +159,19 @@ client.interceptors.response.use(
   async (error) => {
     const originalRequest = error.config;
     const skipRefresh = CREDENTIAL_401_PATHS.has(pathnameOf(originalRequest?.url));
+
+    // Batch 73: the API refuses an account whose password an admin reset until it
+    // chooses a new one. That is not a stale cookie and not the end of the
+    // session — the refresh cookie is fine, /api/auth/refresh will happily rotate
+    // it, and the user needs this session to make the change from. So no refresh
+    // and no sign-out: say so, and let the AuthProvider move the app onto the
+    // change-password screen. The request still rejects, so the screen that made
+    // it stops whatever it was doing instead of hanging on a promise that never
+    // settles.
+    if (isPasswordChangeRequiredError(error)) {
+      announcePasswordChangeRequired();
+      return Promise.reject(error);
+    }
 
     if (error.response?.status === 401 && !originalRequest._retry && !skipRefresh) {
       // Somebody else refreshed while this was in flight, so the 401 is an

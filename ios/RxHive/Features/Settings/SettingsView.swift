@@ -283,8 +283,10 @@ private struct ChangePasswordSheet: View {
     @State private var error: String?
 
     /// `core/security.py:enforce_password_policy`. The length is the *default*
-    /// `RXHIVE_PASSWORD_MIN_LENGTH`; the server is authoritative.
-    private static let assumedMinimumLength = 8
+    /// `RXHIVE_PASSWORD_MIN_LENGTH`, 10, as `PasswordPolicy` states it for the forced
+    /// change (batch 73); this said 8, so a 9-character password passed here and was
+    /// refused by the server. The server is authoritative.
+    private static let assumedMinimumLength = PasswordPolicy.minimumLength
 
     private var localValidationError: String? {
         if current.isEmpty || new.isEmpty { return nil }
@@ -353,8 +355,8 @@ private struct ChangePasswordSheet: View {
 
                     Text(
                         "At least \(Self.assumedMinimumLength) characters, with letters and numbers. "
-                        + "Changing your password signs out every session, including this one, so "
-                        + "you'll be asked to sign in again."
+                        + "Changing your password signs out your other sessions; this one stays "
+                        + "signed in."
                     )
                     .font(Theme.Typography.caption)
                     .foregroundStyle(Theme.Color.textMuted)

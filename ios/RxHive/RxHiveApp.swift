@@ -41,7 +41,16 @@ struct RxHiveApp: App {
                 // any `call:*` frame published in that window went to a channel with no
                 // subscriber and is gone. Asking the server is the only way to find out
                 // that a call is ringing right now.
-                Task { await calls.reconcileWithServer() }
+                //
+                // Only for a running session. `currentUser` is nil while the account
+                // is held at the change-password screen (batch 73), where every call
+                // route answers 403 and nothing session-scoped may start. A cold
+                // launch, where it is nil too, loses nothing: the socket's `connected`
+                // frame runs this same reconcile once the session is up
+                // (`CallStore.attach`, `onReconnected`).
+                if auth.currentUser != nil {
+                    Task { await calls.reconcileWithServer() }
+                }
             default:
                 break
             }
@@ -77,6 +86,12 @@ struct RootView: View {
                     auth.dismissAccessDenied()
                 }
                 .transition(.opacity)
+
+            case .passwordChangeRequired(let user):
+                // Instead of the app, not over it: `HomeView` and everything it
+                // starts must not exist while the server refuses all of it.
+                ForcedPasswordChangeView(email: user.email)
+                    .transition(.opacity)
 
             case .signedIn:
                 HomeView()

@@ -102,7 +102,31 @@ struct CurrentUser: Decodable, Identifiable, Hashable {
     let orgName: String?
     let deptName: String?
 
+    /// Set by every admin password reset (`api/admin.py`, `api/org_admin.py`) and
+    /// cleared only by `POST /api/auth/change-password`. While it is set the server
+    /// refuses every other route with a coded 403, because the administrator was
+    /// shown the temporary password and an account someone else knows the password
+    /// to must not stay usable (batch 73). `AuthStore` reads it to choose the forced
+    /// change-password phase instead of the app.
+    ///
+    /// Not optional, and decoded with `decodeIfPresent ?? false` rather than
+    /// `decode`: the profile `PUT` response, a backend that predates the flag, and
+    /// every `RememberedUser` record written before batch 73 all lack the key, and a
+    /// strict decode would turn each of them into a decoding failure — for the
+    /// remembered record, a silent fall to sign-in on every offline launch.
+    private(set) var mustChangePassword: Bool
+
     var isOrgAdmin: Bool { role == .admin }
+
+    /// The same user with the flag set as the server has just reported it — by a
+    /// coded 403 or a 4403 socket close, neither of which carries a fresh profile.
+    /// The phase and the remembered record both have to say so, or an offline
+    /// relaunch would come straight back up into the app it was just taken out of.
+    func applying(mustChangePassword: Bool) -> CurrentUser {
+        var copy = self
+        copy.mustChangePassword = mustChangePassword
+        return copy
+    }
 
     enum CodingKeys: String, CodingKey {
         case id, email, name, role
@@ -115,6 +139,7 @@ struct CurrentUser: Decodable, Identifiable, Hashable {
         case mobileAccess = "mobile_access"
         case orgName = "org_name"
         case deptName = "dept_name"
+        case mustChangePassword = "must_change_password"
     }
 
     /// Custom because **the backend spells this user's name two different ways.**
@@ -144,6 +169,7 @@ struct CurrentUser: Decodable, Identifiable, Hashable {
         mobileAccess = try c.decodeIfPresent(Bool.self, forKey: .mobileAccess)
         orgName = try c.decodeIfPresent(String.self, forKey: .orgName)
         deptName = try c.decodeIfPresent(String.self, forKey: .deptName)
+        mustChangePassword = try c.decodeIfPresent(Bool.self, forKey: .mustChangePassword) ?? false
     }
 }
 

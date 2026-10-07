@@ -1,7 +1,7 @@
 // Service-worker registration + Web Push subscription helpers.
 import client from '../api/client';
 import { tearDownPush } from './pushTeardown';
-import { hasPushSubscription, restorePushSubscription } from './pushRestore';
+import { hasPushSubscription, rebindPushSubscription, restorePushSubscription } from './pushRestore';
 import { wantsDesktopNotifications } from '../utils/notificationPrefs';
 import { withTimeout } from './withTimeout';
 
@@ -115,6 +115,33 @@ export async function healPushSubscription({ isCancelled } = {}) {
     // and this must not touch a preference it does not own.
     tearDown: () => tearDownPush({ nav: navigator, api: client }),
     isCancelled,
+  });
+}
+
+/**
+ * Re-register this browser's push subscription after a password reset deleted
+ * the server's copy (batch 73 review).
+ *
+ * A thin binder over rebindPushSubscription in pushRestore.js, which holds the
+ * reasoning and the tests. The forced password change calls it once the server
+ * has confirmed the change: the reset removed this account's push_subscriptions
+ * rows but left the browser's subscription in place, so healPushSubscription
+ * sees a subscription and never re-sends it, and push stays dead while Settings
+ * reports it on. Silent like the heal — never prompts, never throws, and does
+ * nothing unless the stored preference is an explicit yes and permission is
+ * already granted.
+ *
+ * @returns {Promise<boolean>} whether the subscription was re-registered
+ */
+export async function rebindPushAfterReset() {
+  return rebindPushSubscription({
+    pushSupported: pushSupported(),
+    getPermission: () => (typeof Notification === 'undefined' ? 'default' : Notification.permission),
+    wantsPush: wantsDesktopNotifications,
+    subscribe: subscribeToPush,
+    // Same as the heal: undoes the re-bind if a sign-out landed inside it. No
+    // `storage`, since the sign-out teardown has already cleared those keys.
+    tearDown: () => tearDownPush({ nav: navigator, api: client }),
   });
 }
 

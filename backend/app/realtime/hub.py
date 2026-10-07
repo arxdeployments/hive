@@ -20,7 +20,7 @@ import uuid
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import or_, select
 
-from app.core.deps import get_current_user_ws
+from app.core.deps import PasswordChangeRequiredError, get_current_user_ws
 from app.core.security import MOBILE_CLIENT
 from app.db.models import Conversation, ConversationParticipant, ConversationType, User, UserRole
 from app.db.session import SessionLocal
@@ -47,6 +47,22 @@ REVALIDATE_SECONDS = 30
 # a client that has stopped draining. 128 small frames bounds what a wedged client
 # can pin in memory while being far more headroom than any client legitimately uses.
 OUTBOX_MAX_FRAMES = 128
+
+# Close code for an account that must change its password before anything else
+# (batch 73): sent at the handshake, and by the periodic revalidation once an
+# administrator's reset lands on an open socket. Its own code, NOT 4001. Both
+# clients answer 4001 by refreshing and reconnecting, and for this account the
+# refresh succeeds — it has to, or the user could never reach change-password — so
+# 4001 would be an endless reconnect loop. 4403 tells them to stop reconnecting and
+# show the change-password screen. Mirrors the HTTP 403 PASSWORD_CHANGE_REQUIRED.
+WS_CLOSE_PASSWORD_CHANGE_REQUIRED = 4403
+WS_CLOSE_PASSWORD_CHANGE_REQUIRED_REASON = "Password change required"
+
+# The call frames that start a call or take one further, re-checked against the
+# account on every frame; see _handle_inbound. The hang-ups are deliberately absent.
+_CALL_FRAMES_NEEDING_AN_ACTIVE_ACCOUNT = frozenset(
+    {"call:initiate", "call:group_initiate", "call:accept", "call:join"}
+)
 
 
 class _Conn:
@@ -203,8 +219,10 @@ class LocalRegistry:
         Dropping the frame instead would leave a client that looks connected and
         silently receives nothing. Closing makes it reconnect and refetch, which is
         how every other lost-frame case in this file already self-heals. Code 1011,
-        not 4001: both clients treat 4001 as "refresh the session" and any other code
-        as a plain disconnect to retry with backoff.
+        not 4001 or 4403: both clients treat 4001 as "refresh the session", 4403
+        (WS_CLOSE_PASSWORD_CHANGE_REQUIRED, batch 73) as "stop reconnecting until the
+        password is changed", and any other code as a plain disconnect to retry with
+        backoff.
 
         Never awaited, and that is the point — close() sends a frame too, so on a
         socket that is already not draining it can block exactly like send_text, and
@@ -466,7 +484,55 @@ async def _handle_inbound(user: User, data: dict) -> None:
                 )
 
     elif isinstance(msg_type, str) and msg_type.startswith("call:"):
+        # Frames that START or JOIN a call carry the account checks the message
+        # paths get from assert_conversation_access (batch 73 review). Dispatched on
+        # the User loaded at the handshake, they let a socket an administrator had
+        # just reset ring a colleague, accept a call or join a group call until the
+        # next revalidation. The hang-ups stay un-gated on purpose: both clients send
+        # call:cancel / call:decline / call:end over the still-open socket on their
+        # way into the forced change-password screen, and refusing those would leave
+        # the other side waiting out the server's grace window instead.
+        if msg_type in _CALL_FRAMES_NEEDING_AN_ACTIVE_ACCOUNT:
+            async with SessionLocal() as db:
+                fresh = await db.get(User, user.id)
+            if fresh is None or not fresh.is_active or fresh.must_change_password:
+                await publish_to_users(
+                    [user.id], {"type": "call:error", "message": "Your account cannot place calls"}
+                )
+                return
         await handle_call_ws_message(user, data)
+
+
+async def _account_refusal(user_id: uuid.UUID, client: str, connected_at) -> tuple[int, str] | None:
+    """Why this socket's account may no longer hold it, as (close code, reason), or None.
+
+    The periodic re-check, in the order the HTTP path refuses (core/deps.py
+    _authenticate), so a socket and a request for the same account always get the
+    same answer.
+    """
+    async with SessionLocal() as db:
+        fresh = await db.get(User, user_id)
+    if fresh is None or not fresh.is_active:
+        return 4001, "Account inactive"
+    # Same re-check for the mobile grant. Without it a phone whose access a
+    # superadmin just revoked would keep receiving messages on this socket until its
+    # access token lapsed — up to the full token lifetime — even though its HTTP
+    # calls were already 401ing.
+    if client == MOBILE_CLIENT and (fresh.role == UserRole.superadmin or not fresh.mobile_access):
+        return 4001, "Mobile access revoked"
+    # An administrator reset this account after the socket opened, which ends every
+    # session from before it (batch 73 review): HTTP refuses the token this socket
+    # was opened with, and so does this. 4001, which both clients answer with a
+    # refresh that fails, because the reset revoked the refresh token too.
+    epoch = fresh.sessions_valid_after
+    if epoch is not None and epoch > connected_at:
+        return 4001, "Session ended"
+    # The flag on its own, for a socket opened with the temporary password. Last,
+    # matching the HTTP order, so the refusals above keep their 4001. Not 4001
+    # itself: see WS_CLOSE_PASSWORD_CHANGE_REQUIRED for why that would loop.
+    if fresh.must_change_password:
+        return WS_CLOSE_PASSWORD_CHANGE_REQUIRED, WS_CLOSE_PASSWORD_CHANGE_REQUIRED_REASON
+    return None
 
 
 def _parse_uuid(value) -> uuid.UUID | None:
@@ -478,8 +544,20 @@ def _parse_uuid(value) -> uuid.UUID | None:
 
 @router.websocket("/api/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    async with SessionLocal() as db:
-        auth = await get_current_user_ws(websocket, db)
+    try:
+        async with SessionLocal() as db:
+            auth = await get_current_user_ws(websocket, db)
+    except PasswordChangeRequiredError:
+        # Refused BEFORE anything below runs: no `connected`, no registry entry, no
+        # presence edge, no resumed call ring. An account an administrator has reset
+        # must not receive anything on the strength of a password someone else was
+        # shown. Accepted first so the client sees the close code rather than a
+        # failed upgrade, which both clients would retry blindly.
+        await websocket.accept()
+        await websocket.close(
+            code=WS_CLOSE_PASSWORD_CHANGE_REQUIRED, reason=WS_CLOSE_PASSWORD_CHANGE_REQUIRED_REASON
+        )
+        return
     if auth is None:
         await websocket.accept()
         await websocket.close(code=4001, reason="Invalid token")
@@ -500,7 +578,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.send_text(
         json.dumps({"type": "connected", "user_id": str(user.id), "timestamp": iso_z(now_utc())})
     )
-    last_active_check = now_utc()
+    connected_at = last_active_check = last_frame_at = now_utc()
     conn_id = uuid.uuid4().hex
     await registry.add(user.id, conn_id, websocket)
     # The try opens HERE — immediately after the socket enters the registry —
@@ -544,10 +622,58 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         window_start = now_utc()
         window_count = 0
         while True:
+            # EXPIRY AND REVALIDATION — on the clock, ahead of everything a frame
+            # can do.
+            #
+            # These checks used to live inside the `ping` branch, which a client
+            # that typed every 30s and never pinged walked straight past. Moving
+            # them to just after a frame had parsed still left two gaps, which the
+            # batch 73 review found: a socket that sends NOTHING was re-checked only
+            # when its next frame arrived, so a reset account kept receiving for up
+            # to REVALIDATE_SECONDS + HEARTBEAT_TIMEOUT; and an oversized, rate-
+            # limited or unparseable frame `continue`d past them, so a client that
+            # sent junk every minute was never re-checked at all — token expiry,
+            # deactivation and a revoked mobile grant included.
+            #
+            # So they run here, at the top of every pass, and the wait below wakes
+            # up for them whether or not the client sends anything. The wall-clock
+            # gate keeps the cost one row read per socket per interval however
+            # chatty or silent the client is.
+            now = now_utc()
+            if token_exp and now.timestamp() > token_exp:
+                await websocket.close(code=4001, reason="Token expired")
+                break
+            if (now - last_active_check).total_seconds() >= REVALIDATE_SECONDS:
+                last_active_check = now
+                refusal = await _account_refusal(user.id, client, connected_at)
+                if refusal is not None:
+                    await websocket.close(code=refusal[0], reason=refusal[1])
+                    break
+
+            # The heartbeat is still about FRAMES: a client that has sent nothing
+            # for HEARTBEAT_TIMEOUT is gone. The wait is cut short for the next
+            # revalidation or the token's expiry, and a wait cut short is not a
+            # missed heartbeat: cancelling a pending receive loses no frame (a
+            # queue get, or websockets' recv(), both documented as cancel-safe).
+            silence = (now - last_frame_at).total_seconds()
+            if silence >= HEARTBEAT_TIMEOUT:
+                break  # no frame for >60s — drop the connection
+            wait = HEARTBEAT_TIMEOUT - silence
+            # The next revalidation is always in the future here — the block above
+            # has just run if it was due — except when REVALIDATE_SECONDS is not
+            # positive, which means "on every pass" and must not shrink the wait to
+            # nothing.
+            next_check = REVALIDATE_SECONDS - (now - last_active_check).total_seconds()
+            if next_check > 0:
+                wait = min(wait, next_check)
+            if token_exp:
+                # A floor, so a token expiring this instant is caught by the next
+                # pass rather than spun on.
+                wait = min(wait, max(token_exp - now.timestamp(), 0.05))
             try:
-                raw = await asyncio.wait_for(websocket.receive_text(), timeout=HEARTBEAT_TIMEOUT)
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=wait)
             except TimeoutError:
-                break  # no ping for >60s — drop the connection
+                continue  # the top of the loop decides what the deadline was for
             except RuntimeError:
                 # Starlette raises RuntimeError, not WebSocketDisconnect, when a receive
                 # follows a disconnect it has already recorded internally — which happens
@@ -557,6 +683,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 # ASGI application" traceback for each one, which is exactly the noise
                 # that hides the errors worth reading.
                 break
+            last_frame_at = now_utc()
 
             if len(raw) > MAX_MESSAGE_BYTES:
                 await registry.send_to(
@@ -583,40 +710,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     user.id, conn_id, json.dumps({"type": "error", "detail": "Invalid frame"})
                 )
                 continue
-
-            # REVALIDATION — on every frame, not only on ping.
-            #
-            # These checks used to live inside the `ping` branch below, which was
-            # a real bypass rather than a theoretical one: the 65s receive
-            # timeout resets on ANY frame, so a client that sent `typing_start`
-            # every 30s and never pinged kept its socket open indefinitely and
-            # was never re-checked. A deactivated account, a revoked mobile
-            # grant and an expired access token all survived for as long as the
-            # client cared to keep typing.
-            #
-            # Hoisted here, after the frame has parsed and before it is
-            # dispatched, so no frame can be handled without the account having
-            # been validated within REVALIDATE_SECONDS.
-            #
-            # The wall-clock gate means the cost stays one row read per socket
-            # per interval regardless of how chatty the client is.
-            if token_exp and now.timestamp() > token_exp:
-                await websocket.close(code=4001, reason="Token expired")
-                break
-            if (now - last_active_check).total_seconds() > REVALIDATE_SECONDS:
-                last_active_check = now
-                async with SessionLocal() as db:
-                    fresh = await db.get(User, user.id)
-                if fresh is None or not fresh.is_active:
-                    await websocket.close(code=4001, reason="Account inactive")
-                    break
-                # Same re-check for the mobile grant. Without it a phone whose
-                # access a superadmin just revoked would keep receiving messages
-                # on this socket until its access token lapsed — up to the full
-                # token lifetime — even though its HTTP calls were already 401ing.
-                if client == MOBILE_CLIENT and (fresh.role == UserRole.superadmin or not fresh.mobile_access):
-                    await websocket.close(code=4001, reason="Mobile access revoked")
-                    break
 
             if data["type"] == "ping":
                 await presence.refresh(user.id, conn_id, org_id=user.org_id)

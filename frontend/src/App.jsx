@@ -1,4 +1,4 @@
-import { Suspense, lazy } from 'react';
+import { Suspense, lazy, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { Toaster } from 'sonner';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
@@ -7,6 +7,10 @@ import { Loader2 } from 'lucide-react';
 
 // Eager: the login screen, which is what an unauthenticated visitor is here for.
 import Login from './pages/Login';
+// Eager too, for a different reason: it renders OUTSIDE <Routes> and therefore
+// outside the Suspense boundary there, so a lazy import would have nothing to
+// suspend into. It is one small form.
+import ForcedPasswordChange from './pages/ForcedPasswordChange';
 
 // Lazy: the admin & org-admin portals load only when their routes are hit,
 // keeping the messenger's initial bundle lean. Chat joined them for a sharper
@@ -59,6 +63,10 @@ import { CallAudioSink } from './components/calls/CallAudioSink';
 import { CallConnectivityWatcher } from './components/calls/CallConnectivityWatcher';
 import { RealtimeSession } from './components/shared/RealtimeSession';
 import { ActiveCallView } from './components/calls/ActiveCallView';
+import useCallStore, { hasLiveCall } from './stores/callStore';
+import wsClient from './services/websocket';
+import livekitClient from './services/livekitLazy';
+import callSounds from './services/callSounds';
 
 // Route guards
 const AuthRoute = ({ children }) => {
@@ -165,18 +173,87 @@ const OrgAdminRoute = ({ children }) => {
   return children;
 };
 
+/**
+ * Hang up whatever call this tab is in, ahead of the forced password change.
+ *
+ * The Room is a module singleton in services/livekitClient.js, not something any
+ * component owns, so taking the call UI off screen does not take the call down
+ * with it. Gating the session over a live call would leave the microphone
+ * published to the other side with no hang-up button anywhere on screen.
+ *
+ * The hang-up frame goes out only over a socket that is open right now. send()
+ * reconnects when handed a call frame for a closed socket — the right reaction
+ * when a user presses a button, and exactly the wrong one here, where the server
+ * has just refused this account. After a 4403 close it therefore never leaves,
+ * and the server ends the call for the other side when its reconnect grace
+ * window (or, for a call still ringing, the ring timeout) runs out.
+ *
+ * Every state that is not idle is reset, the two-second 'ended' window included:
+ * RealtimeSession's cleanup only drops the socket when the call store is idle,
+ * so anything else would leave it connected behind the forced screen.
+ */
+function endCallForPasswordChange() {
+  const call = useCallStore.getState();
+  if (call.callState === 'idle') return;
+  callSounds.stopAll();
+  livekitClient.leave();
+  if (hasLiveCall(call) && call.callId && wsClient.isOpen()) {
+    // The same frame each state's own button sends: Cancel while it rings out,
+    // Decline while it rings in, Hang up once it is up.
+    const type = call.callState === 'outgoing_ringing' ? 'call:cancel'
+      : call.callState === 'incoming_ringing' ? 'call:decline'
+        : 'call:end';
+    wsClient.send({ type, call_id: call.callId });
+  }
+  call.resetCall();
+}
+
+/**
+ * The forced password change, batch 73.
+ *
+ * An admin reset leaves the account on a temporary password the admin has seen,
+ * so the API refuses it everywhere until its owner chooses a new one. This is
+ * the client's half: while `user.must_change_password` is set — from the login
+ * or /me payload, or because a request or the socket was refused for it — the
+ * whole session below is UNMOUNTED and only the change-password screen renders.
+ *
+ * Unmounting rather than teaching each piece to stand down is the point.
+ * RealtimeSession's cleanup already disconnects the socket, and its push heal is
+ * cancelled the same way; the call overlays, <Routes> and every page under them
+ * cannot fetch a conversation list, an avatar or an active call if they are not
+ * there. Nothing new has to remember the flag. Toaster and OfflineBanner sit
+ * outside, because neither talks to the API and the screen needs the first.
+ *
+ * A call in progress holds the session up for the one render it takes the
+ * effect to end it. The order matters: the call has to be idle BEFORE
+ * RealtimeSession unmounts, or its cleanup keeps the socket for the call's sake.
+ */
+const PasswordChangeGate = ({ children }) => {
+  const { user } = useAuth();
+  const required = Boolean(user?.must_change_password);
+  const callInProgress = useCallStore((s) => s.callState !== 'idle');
+
+  useEffect(() => {
+    if (required && callInProgress) endCallForPasswordChange();
+  }, [required, callInProgress]);
+
+  if (!required || callInProgress) return children;
+  return <ForcedPasswordChange />;
+};
+
 function App() {
   return (
     <ErrorBoundary>
     <BrowserRouter>
       <AuthProvider>
+        <OfflineBanner />
+        <PasswordChangeGate>
         {/* Realtime socket, scoped to the SESSION rather than to /chat. It lived
             inside the chat page, so navigating anywhere else disconnected it
             with no path back — see RealtimeSession for the full account. Sits
             with the call overlays because it has the same requirement: outlive
             every route. */}
         <RealtimeSession />
-        <OfflineBanner />
         <IncomingCallOverlay />
         <OutgoingCallScreen />
         <ActiveCallView />
@@ -191,28 +268,6 @@ function App() {
             useful precisely when the call is MINIMISED and the user is doing
             something else, so it cannot live inside a call view. */}
         <CallConnectivityWatcher />
-        {/* Toasts are confirmations, not reading material: they clear quickly and
-            can always be dismissed outright. Rapid toggles (mute/unmute) used to
-            stack and cover the content underneath, so cap how many show at once. */}
-        <Toaster
-          position="top-right"
-          duration={2000}
-          closeButton
-          visibleToasts={2}
-          gap={8}
-          toastOptions={{
-            style: {
-              background: '#141414',
-              border: '1px solid #1F1F1F',
-              color: '#F5F5F5',
-              fontSize: '14px',
-            },
-            classNames: {
-              closeButton: 'rxhive-toast-close',
-            },
-          }}
-          theme="dark"
-        />
         <AnimatePresence mode="wait">
           <Suspense fallback={<RouteFallback />}>
           <Routes>
@@ -268,6 +323,32 @@ function App() {
           </Routes>
           </Suspense>
         </AnimatePresence>
+        </PasswordChangeGate>
+        {/* Toasts are confirmations, not reading material: they clear quickly and
+            can always be dismissed outright. Rapid toggles (mute/unmute) used to
+            stack and cover the content underneath, so cap how many show at once.
+            Outside the password gate, so the forced screen can toast and a toast
+            already showing survives the gate opening or closing (a remounted
+            Toaster drops what was on screen). */}
+        <Toaster
+          position="top-right"
+          duration={2000}
+          closeButton
+          visibleToasts={2}
+          gap={8}
+          toastOptions={{
+            style: {
+              background: '#141414',
+              border: '1px solid #1F1F1F',
+              color: '#F5F5F5',
+              fontSize: '14px',
+            },
+            classNames: {
+              closeButton: 'rxhive-toast-close',
+            },
+          }}
+          theme="dark"
+        />
       </AuthProvider>
     </BrowserRouter>
     </ErrorBoundary>

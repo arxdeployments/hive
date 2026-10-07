@@ -288,6 +288,44 @@ final class CallStore: ObservableObject {
         pendingInvitees = []
     }
 
+    /// End whatever call is live, because the session carrying it has to stop: an
+    /// administrator reset this account's password and it must be changed first
+    /// (batch 73).
+    ///
+    /// The opposite of `resetSessionState`'s rule, and for a reason that rule does
+    /// not cover. A sign-out leaves a live call alone because the call can outlive
+    /// it; here nothing can — every call route now answers 403, the socket is
+    /// about to be stopped, and the change-password screen has no call UI behind
+    /// it. Left alone, the LiveKit room would keep the microphone published with
+    /// nobody able to hang up.
+    ///
+    /// The hang-up frame goes out synchronously, before the caller stops the
+    /// socket, because on the 403 path the socket is still open and that frame is
+    /// the only way the peer hears a hang-up rather than waiting out the server's
+    /// reconnect grace window. `reportEnded` is not used: it needs a signed-in user
+    /// and its REST call would only be refused. The room is left in the returned
+    /// task, which the caller may await.
+    @discardableResult
+    func endForPasswordChange() -> Task<Void, Never> {
+        if hasLiveCall, let callID = currentCallID {
+            switch phase {
+            case .outgoing:
+                auth?.realtime.send(.callCancel(callID: callID))
+            case .incoming where !isConnecting:
+                auth?.realtime.send(.callDecline(callID: callID))
+            default:
+                auth?.realtime.send(.callEnd(callID: callID))
+            }
+        }
+        return Task { [weak self] in
+            guard let self else { return }
+            // Re-read rather than captured: the room can have been lost, and torn
+            // down to `.ended`, in the turn between this call and the task running.
+            if self.hasLiveCall { await self.teardown(to: .idle) }
+            self.resetSessionState()
+        }
+    }
+
     #if DEBUG
     /// Seed the session-scoped fields directly; they are all `private(set)` and
     /// their real writers need a socket and an SFU.

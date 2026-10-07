@@ -47,6 +47,41 @@ so "not approved yet" can never be mistaken for "wrong password".
 Covered by [`backend/tests/test_mobile_access.py`](backend/tests/test_mobile_access.py).
 See [`ios/README.md`](ios/README.md) for the app itself.
 
+### After an admin resets a password
+
+An admin reset (super admin or org admin) shows the admin a temporary password,
+so until the account owner chooses a new one, the account is held to changing it.
+
+Every session from before the reset ends. The reset revokes the refresh tokens
+and stamps `users.sessions_valid_after`, so an older access token is refused with
+`401` and the client's refresh then fails. That holds after the password is
+changed too, so a token someone copied before the reset never works again. The
+one exception is the short list below, so a device that was signed in when the
+reset landed can still finish the change.
+
+While `users.must_change_password` is set, a session signed in with the temporary
+password can sign in, refresh, read `GET /api/auth/me`, change its password and
+sign out, and nothing else:
+
+- Every other HTTP route answers `403` with `code: "PASSWORD_CHANGE_REQUIRED"`,
+  never `401`, which both clients would answer by refreshing and replaying.
+- The socket is refused at the handshake, with close code `4403`. An open one is
+  re-checked every 30 seconds whether or not the client sends anything, and
+  frames that start or accept a call are checked as they arrive. Not `4001`: both
+  clients answer that by refreshing and reconnecting, which succeeds for this
+  account, so it would loop.
+- Change-password still needs the temporary password, and refuses a new password
+  equal to it.
+- The reset also deletes the account's push subscriptions. An org admin cannot
+  reset their own password this way; they use Change Password.
+
+Both clients read `user.must_change_password` from login and `/me`, and the `403`
+code or the `4403` close, and show only a change-password screen until it clears.
+Accounts an admin creates are not flagged. Enforced in `backend/app/core/deps.py`
+(one account check for HTTP and the socket), and covered by
+[`backend/tests/test_must_change_password.py`](backend/tests/test_must_change_password.py),
+including a walk of the route table that fails if any route stops being gated.
+
 ## One-command local stack
 
 ```bash
@@ -125,8 +160,10 @@ instead of silently degrading to polling. `tests/global-setup.js` fails loudly
 if the API isn't healthy, rather than letting a dead stack surface as opaque
 locator timeouts.
 
-All E2E traffic shares one source IP, so raise the login budget for those runs:
-`RXHIVE_RATE_LIMIT_LOGIN=200` (rate limits are settings-tunable per scope).
+All E2E traffic shares one source IP, so raise the login and password budgets
+for those runs: `RXHIVE_RATE_LIMIT_LOGIN=200 RXHIVE_RATE_LIMIT_PASSWORD=200`
+(rate limits are settings-tunable per scope). The password scope covers
+change-password, which the forced-change spec calls, at 5 a minute by default.
 
 ## Troubleshooting: "the call won't connect"
 

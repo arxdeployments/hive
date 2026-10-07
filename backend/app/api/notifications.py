@@ -8,7 +8,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, get_current_user_pending_password_change
 from app.core.rate_limit import push_subscribe_limiter
 from app.db.models import Notification, PushSubscription, User
 from app.db.session import get_db
@@ -149,7 +149,11 @@ async def subscribe(
 @router.delete("/subscribe")
 async def unsubscribe(
     body: UnsubscribeRequest,
-    user: User = Depends(get_current_user),
+    # Un-gated, unlike POST above (batch 73). Both clients unsubscribe on the way to
+    # signing out, and an account waiting to change its password must still be able
+    # to stop push arriving on a device it is leaving. Removing a subscription
+    # grants nothing; adding one stays refused until the password is changed.
+    user: User = Depends(get_current_user_pending_password_change),
     db: AsyncSession = Depends(get_db),
 ):
     await db.execute(

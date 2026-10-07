@@ -103,6 +103,11 @@ final class RealtimeClient: NSObject, ObservableObject {
     /// the server's close reason — `hub.py` sends "Mobile access revoked" there, and
     /// that sentence is the difference between the right screen and a wrong one.
     var onUnauthorized: ((String) -> Void)?
+    /// Called when the server closes with `passwordChangeRequiredCloseCode`: an
+    /// administrator reset this account's password and it must be changed before
+    /// the app may do anything else (batch 73). The socket has already stopped by
+    /// the time this runs, and stays stopped until `connect()`.
+    var onPasswordChangeRequired: (() -> Void)?
 
     /// Whether a call is live right now. Set by `CallStore`, and consulted for two
     /// decisions this class cannot make on its own:
@@ -132,6 +137,16 @@ final class RealtimeClient: NSObject, ObservableObject {
     /// Server closes with 4001 for both "invalid token" and "token expired", and
     /// with 4001 for "account inactive" too — the reason string distinguishes them.
     private let authCloseCode = 4001
+    /// The server closes with 4403 (`hub.py`: `WS_CLOSE_PASSWORD_CHANGE_REQUIRED`)
+    /// when the account must change its password (batch 73): straight after
+    /// accepting the handshake, before the socket is registered, and from the
+    /// 30-second revalidation on a socket already open.
+    ///
+    /// Deliberately not 4001. This client answers 4001 by refreshing and
+    /// reconnecting, the refresh succeeds for a flagged account, and the reconnect
+    /// would be closed again — a loop that never tells the user anything. 4403 is
+    /// answered by stopping. Static so the value can be pinned by a test.
+    static let passwordChangeRequiredCloseCode = 4403
 
     override init() {
         decoder = JSONDecoder()
@@ -247,8 +262,26 @@ final class RealtimeClient: NSObject, ObservableObject {
 
         let code = socket.closeCode
         log.notice("Socket closed (code \(code.rawValue), \(error.localizedDescription, privacy: .public))")
+        socketClosed(code: code.rawValue)
+    }
 
-        if code.rawValue == authCloseCode {
+    /// What a close code means for the connection. Split from `socketFailed` only so
+    /// a test can reach it: that method needs a real socket closed by a real server.
+    private func socketClosed(code: Int) {
+        if code == Self.passwordChangeRequiredCloseCode {
+            // Every reconnect would be accepted and closed the same way until the
+            // password is changed, so do not make one. `disconnect()` rather than a
+            // bare `state = .idle`: it bumps the generation, which strands a sleeping
+            // reconnect, and sets `intentionallyClosed`, which keeps foregrounding
+            // from reopening the socket behind the change-password screen. Only
+            // `connect()` clears that, and `AuthStore` calls it once the change is
+            // confirmed.
+            disconnect()
+            onPasswordChangeRequired?()
+            return
+        }
+
+        if code == authCloseCode {
             // The 15-minute access token lapsed — the common case. Refresh and
             // reconnect immediately rather than backing off, because the user is
             // very likely looking at the screen right now.
@@ -313,6 +346,16 @@ final class RealtimeClient: NSObject, ObservableObject {
         }
         scheduleReconnect()
     }
+
+    #if DEBUG
+    /// Run the close handling for `code` as if the server had just sent it. The
+    /// handling is the only part of a close that is this class's own decision, and
+    /// without this it could be exercised only against a live server.
+    func simulateCloseForTesting(code: Int) {
+        guard !intentionallyClosed else { return }
+        socketClosed(code: code)
+    }
+    #endif
 
     private func scheduleReconnect() {
         reconnectTask?.cancel()

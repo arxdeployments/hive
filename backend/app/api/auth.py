@@ -6,6 +6,13 @@ Changes vs the Mongo build (all deliberate, coordinated with the frontend):
   revoked on logout/deactivation. is_active is re-checked on refresh.
 - Superadmin sessions refresh like everyone else (fixes the 15-min logout bug).
 - The rate limiter is a dependency wired here — not dead code in main.py.
+- must_change_password is enforced (batch 73). Both admin resets set it and show
+  the admin the temporary password, and nothing read it, so a reset account stayed
+  fully usable with a password someone else knew. Every authenticated route now
+  answers 403 PASSWORD_CHANGE_REQUIRED until it is cleared; login, refresh, me,
+  logout and change-password stay reachable so the user can get out of that state.
+  change-password refuses a new password equal to the current one, and re-issues
+  the caller's session when the one it is using was revoked by the reset.
 
 Rotation is now delivery-safe as well as single-use. Revoking the presented token
 commits before its replacement can reach the client, so a lost response used to
@@ -28,7 +35,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user_pending_password_change, session_client
 from app.core.errors import CodedHTTPException
 from app.core.rate_limit import login_limiter, password_limiter, refresh_limiter
 from app.core.security import (
@@ -109,6 +116,10 @@ def _user_payload(user: User) -> dict:
         "email": user.email,
         "name": user.display_name,
         "role": wire_role(user.role),
+        # Every role, superadmin included, and on login, refresh and me alike: this
+        # is how a client learns to show the change-password screen before it makes
+        # a request that would be refused with PASSWORD_CHANGE_REQUIRED (batch 73).
+        "must_change_password": bool(user.must_change_password),
     }
     if user.role != UserRole.superadmin:
         payload["org_id"] = str(user.org_id) if user.org_id else None
@@ -191,6 +202,11 @@ async def login(
     # is never disclosed to someone who cannot authenticate as it.
     if body.client == MOBILE_CLIENT:
         _assert_mobile_allowed(user)
+    # must_change_password is deliberately NOT refused here. The temporary password
+    # is the only credential a reset account has, and changing it needs a session:
+    # refusing the sign-in would leave no way out. The session issued is gated
+    # everywhere else by get_current_user, and the flag in the payload below tells
+    # the client to go straight to the change-password screen.
 
     user.last_seen_at = now_utc()
     await _issue_session(db, user, response, request, client=body.client)
@@ -449,6 +465,9 @@ async def refresh(
             await db.commit()
             raise
 
+    # Nor is must_change_password refused here, for the reason login gives. Burning
+    # or failing the refresh of a reset account would sign the user out of the very
+    # session they need to change the password from, fifteen minutes in.
     token.revoked_at = now_utc()  # rotation: old token is single-use
     await _issue_session(db, user, response, request, client=session_client, replaces=token)
     return {"user": _user_payload(user)}
@@ -459,7 +478,9 @@ async def logout(
     request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    # Un-gated: a reset account must always be able to sign out, and refusing it
+    # would leave its refresh session live on the device it is leaving.
+    user: User = Depends(get_current_user_pending_password_change),
 ):
     raw = request.cookies.get(REFRESH_COOKIE)
     if raw:
@@ -488,7 +509,12 @@ async def logout(
 
 
 @router.get("/me")
-async def me(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def me(
+    # Un-gated, and the full payload: the client reads must_change_password here
+    # before and after a password change to decide which screen it is on.
+    user: User = Depends(get_current_user_pending_password_change),
+    db: AsyncSession = Depends(get_db),
+):
     payload = _user_payload(user)
     if user.role != UserRole.superadmin:
         statuses = await presence.get_statuses([user.id])
@@ -506,6 +532,38 @@ async def me(user: User = Depends(get_current_user), db: AsyncSession = Depends(
     return payload
 
 
+def _reissue_after_password_change(
+    raw_refresh: str | None, presented: RefreshToken | None, user: User
+) -> bool:
+    """Whether change-password should hand the caller a new session.
+
+    Only when the session it is changing the password from was ended by an
+    administrator's reset — and that has to be proven, not inferred from "no live
+    row". The inference was the batch 73 review's finding: pressing sign-out while
+    the change was in flight let logout revoke the caller's row first, and this
+    route, finding no live row, re-issued a fresh 30-day session into the device
+    that had just signed out, on web and iOS alike.
+
+    So, re-issue when:
+      * no refresh cookie came with the request at all — a caller that never held a
+        refresh session (API tooling on a bearer token) keeps today's behaviour; or
+      * the presented row is this user's, is revoked, and was revoked no later than
+        users.sessions_valid_after. Both resets stamp the epoch AFTER revoking every
+        refresh row, so revoked_at <= epoch means the reset (or a rotation before
+        it) ended this session. A logout, or any other revocation after the last
+        reset, lands after the epoch and is respected.
+
+    Never for a live row (it is kept, and a second session would be pointless), an
+    unknown cookie, or a revoked row on an account no reset has touched.
+    """
+    if not raw_refresh:
+        return True
+    if presented is None or presented.revoked_at is None:
+        return False
+    epoch = user.sessions_valid_after
+    return epoch is not None and _as_utc(presented.revoked_at) <= _as_utc(epoch)
+
+
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
@@ -515,8 +573,10 @@ class ChangePasswordRequest(BaseModel):
 async def change_password(
     body: ChangePasswordRequest,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_user),
+    # Un-gated: this is the route a reset account is being sent to.
+    user: User = Depends(get_current_user_pending_password_change),
     _rl: None = Depends(password_limiter),
 ):
     # Rate-limited like the admin reset it mirrors: this route verifies
@@ -526,6 +586,13 @@ async def change_password(
 
     if not await verify_password(body.current_password, user.password_hash):
         raise HTTPException(status_code=401, detail="Current password is incorrect")
+    # After the verify, so it reveals nothing to a caller who does not already know
+    # the current password. For every account, not only reset ones: "changing" a
+    # password to itself clears must_change_password while leaving the account on
+    # the temporary password the administrator was shown, which is the defect this
+    # flag exists to close (batch 73).
+    if body.new_password == body.current_password:
+        raise HTTPException(status_code=400, detail="Choose a password different from your current one.")
     try:
         enforce_password_policy(body.new_password)
     except PasswordPolicyError as exc:
@@ -543,15 +610,37 @@ async def change_password(
     # so every password change also logged a "token reuse — revoking that client's
     # session family" theft warning against an account that was never attacked.
     raw_refresh = request.cookies.get(REFRESH_COOKIE)
-    current_hash = hash_refresh_token(raw_refresh) if raw_refresh else None
+    # The row the caller presented, looked up whatever its state: whether it is live,
+    # and if not who revoked it, decides below whether this request may hand out a
+    # new session. Only this user's own row counts — a refresh cookie belonging to
+    # another account says nothing about this one's session.
+    presented = None
+    if raw_refresh:
+        presented = (
+            await db.execute(
+                select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw_refresh))
+            )
+        ).scalar_one_or_none()
+        if presented is not None and presented.user_id != user.id:
+            presented = None
     tokens = (
         await db.execute(
             select(RefreshToken).where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
         )
     ).scalars()
     for t in tokens:
-        if current_hash is not None and t.token_hash == current_hash:
+        if presented is not None and t.id == presented.id:
             continue
         t.revoked_at = now_utc()
-    await db.commit()
+    if _reissue_after_password_change(raw_refresh, presented, user):
+        # The caller's session was ended by an administrator's reset, so a client
+        # that was signed in before it is finishing the change on its access cookie
+        # alone. Answering 200 and leaving it there signs the user out when that
+        # cookie lapses, at most access_token_minutes later and with no visible
+        # connection to the password they just chose. A fresh session in the same
+        # transaction as the change, for the client this access token was minted
+        # for, is what "finished" means (batch 73).
+        await _issue_session(db, user, response, request, client=session_client(request))
+    else:
+        await db.commit()
     return {"message": "Password changed"}

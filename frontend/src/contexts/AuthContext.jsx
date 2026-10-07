@@ -2,6 +2,7 @@ import { createContext, useContext, useState, useEffect, useCallback } from 'rea
 import client, { setSignOutReason } from '../api/client';
 import useChatStore from '../stores/chatStore';
 import { tearDownPush } from '../lib/pushTeardown';
+import { onPasswordChangeRequired } from '../lib/passwordChange';
 
 /**
  * Both sign-outs that stay inside the SPA end up here.
@@ -84,6 +85,46 @@ export const AuthProvider = ({ children }) => {
     checkAuth();
   }, [checkAuth]);
 
+  /**
+   * Replace the signed-in user, keeping the localStorage mirror in step.
+   *
+   * The two have to move together: websocket.js reads the session's id from the
+   * mirror, and an offline boot restores from it — so a flag set in state alone
+   * would be forgotten by the next boot that could not reach /me, and that boot
+   * would render the app the server is refusing.
+   */
+  const updateUser = useCallback((next) => {
+    localStorage.setItem('user', JSON.stringify(next));
+    setUser(next);
+  }, []);
+
+  /**
+   * Set or clear the pending password change (batch 73) on the current user.
+   *
+   * App.jsx gates the whole session on `user.must_change_password`, so this is
+   * how the app enters and leaves the forced change-password screen. A no-op
+   * with nobody signed in, and when the flag already has that value — every
+   * refused request announces, so a screen that fired five at once calls this
+   * five times, and only the first may cost a render.
+   *
+   * The mirror is written inside the updater so it records the value React
+   * actually keeps, not one computed from a stale closure. StrictMode may run an
+   * updater twice in development; that writes the same string twice.
+   */
+  const setMustChangePassword = useCallback((required) => {
+    setUser((prev) => {
+      if (!prev || Boolean(prev.must_change_password) === required) return prev;
+      const next = { ...prev, must_change_password: required };
+      localStorage.setItem('user', JSON.stringify(next));
+      return next;
+    });
+  }, []);
+
+  // The API refusing this session until its password is changed, whoever saw it
+  // first: the axios interceptor for a 403 carrying PASSWORD_CHANGE_REQUIRED, or
+  // the socket for a 4403 close. Neither signs anybody out; both land here.
+  useEffect(() => onPasswordChangeRequired(() => setMustChangePassword(true)), [setMustChangePassword]);
+
   const login = async (email, password) => {
     const { data } = await client.post('/api/auth/login', { email, password });
     // Belt as well as braces. Signing out clears this, so by here it is normally
@@ -121,7 +162,7 @@ export const AuthProvider = ({ children }) => {
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout, checkAuth }}>
+    <AuthContext.Provider value={{ user, loading, login, logout, checkAuth, updateUser, setMustChangePassword }}>
       {children}
     </AuthContext.Provider>
   );

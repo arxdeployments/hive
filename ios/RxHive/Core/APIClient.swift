@@ -62,6 +62,17 @@ actor APIClient {
     static let statusKey = "status"
     static let denialKey = "denial"
 
+    /// Fires when a request to our API is refused with `PASSWORD_CHANGE_REQUIRED`: an
+    /// administrator reset this account's password (batch 73). `AuthStore` listens
+    /// and moves the session into the forced change-password phase.
+    ///
+    /// A notification of its own, not `sessionExpiredNotification` with a code in
+    /// it: that one means "the session is over" and its listener wipes the cookies,
+    /// and here the session is fine — it is what the password change is made with.
+    /// Posted from wherever the 403 lands (a list load, an upload, a call token),
+    /// for the same reason the expiry is: any layer can be the first to hear it.
+    static let passwordChangeRequiredNotification = Notification.Name("RxHivePasswordChangeRequired")
+
     /// Bumped on every successful refresh. A request that was already on the wire
     /// when someone else refreshed comes back 401 through no fault of the session;
     /// comparing the generation it was sent under against the current one tells us
@@ -266,10 +277,7 @@ actor APIClient {
                 return try await performRaw(request, isRetry: true)
             }
 
-            let outcome = await refreshCoordinator.refresh { [weak self] in
-                guard let self else { return .unreachable(reason: "Client released") }
-                return await self.performRefresh()
-            }
+            let outcome = await refreshSession()
 
             switch outcome {
             case .refreshed:
@@ -303,7 +311,42 @@ actor APIClient {
             if Self.skipsRefresh(request.url) { throw APIError.credentials(detail: detail) }
         }
 
+        // The account must change its password before anything else (batch 73).
+        // Our origin only, like the refresh above: a 403 from object storage is not
+        // the server speaking about this account. Announced here, at the one place
+        // every request passes, so the first refusal moves the whole app — a screen
+        // that merely toasted "You must change your password" would leave the user
+        // with no way to do it.
+        if http.statusCode == 403, Self.isOurAPI(request.url),
+           let envelope = try? decoder.decode(APIErrorBody.self, from: data),
+           envelope.code == APIError.passwordChangeRequiredCode {
+            await Self.announcePasswordChangeRequired()
+            throw APIError.passwordChangeRequired(detail: envelope.detail)
+        }
+
         throw Self.error(status: http.statusCode, data: data, headers: http, decoder: decoder)
+    }
+
+    /// Refresh the session now, through the same single-flight coordinator a 401
+    /// uses, and report what the server said.
+    ///
+    /// The 401 path above calls this, and so does `AuthStore` when it has to know
+    /// whether the session will survive before it starts it (batch 73 review): a
+    /// password changed on another device revokes this phone's refresh token while
+    /// its 15-minute access cookie keeps `/me` answering, so `/me` alone cannot tell
+    /// a usable session from one that will end the moment that cookie lapses. Going
+    /// through the coordinator rather than calling `performRefresh` directly keeps
+    /// the guarantee in the type comment: a forced refresh that races a 401 joins
+    /// it instead of presenting the same single-use token a second time.
+    ///
+    /// Nothing is announced here. The 401 path announces a refusal itself, because
+    /// for a request that was refused it means "the session expired"; `AuthStore`
+    /// has a more specific sentence for the refusal it asks about.
+    func refreshSession() async -> RefreshOutcome {
+        await refreshCoordinator.refresh { [weak self] in
+            guard let self else { return .unreachable(reason: "Client released") }
+            return await self.performRefresh()
+        }
     }
 
     /// The bare refresh call. Deliberately does not go through `performRaw`, so a
@@ -431,6 +474,11 @@ actor APIClient {
             object: nil,
             userInfo: userInfo
         )
+    }
+
+    @MainActor
+    private static func announcePasswordChangeRequired() {
+        NotificationCenter.default.post(name: passwordChangeRequiredNotification, object: nil)
     }
 
     private static func error(

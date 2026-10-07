@@ -8,13 +8,21 @@ session revocation on deactivate/reset-password, password policy on create,
 per-org department name uniqueness on rename, and global slug uniqueness on
 org rename. Every query is org-scoped — objects outside the caller's tenant
 404 without revealing existence.
+
+reset-password (batch 73): the must_change_password flag it sets is now enforced
+— the account is refused everywhere but change-password until it picks its own —
+and the reset deletes the target's push subscriptions and stamps
+users.sessions_valid_after, which keeps access tokens issued before the reset
+refused for good rather than only until the password changes. An admin cannot reset
+their OWN password here: it never asks for the current one, and it would revoke
+the session making the request. Self-service is /api/auth/change-password.
 """
 
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import wire_role
@@ -27,6 +35,7 @@ from app.db.models import (
     Conversation,
     Department,
     Organization,
+    PushSubscription,
     RefreshToken,
     User,
     UserRole,
@@ -446,10 +455,28 @@ async def reset_user_password(
     _rl: None = Depends(password_limiter),
 ):
     target = await _load_org_user(db, admin, user_id)
+    # _load_org_user lets an admin resolve their own row, deliberately, so they can
+    # edit their own profile. A reset is the exception (batch 73): it would revoke
+    # every session the admin has, including the one making this request, and lock
+    # their own account behind a temporary password shown on the screen they are
+    # looking at. Self-service lives in /api/auth/change-password, which checks the
+    # current password first. Refused before anything is written.
+    if target.id == admin.id:
+        raise HTTPException(status_code=400, detail="Use Change Password to change your own password.")
     temp = generate_password()
     target.password_hash = await hash_password(temp)
+    # Enforced by get_current_user from the moment this commits: the account is
+    # refused everywhere but change-password until it chooses its own password.
     target.must_change_password = True
     await _revoke_refresh_tokens(db, target.id)
+    # And the session epoch, so the target's pre-reset access token stays refused
+    # after they change the password rather than only until then (batch 73 review).
+    # After the revocation, for the ordering change-password depends on; see the
+    # superadmin route in admin.py.
+    target.sessions_valid_after = now_utc()
+    # Push is the one channel the flag cannot gate, because the server is the one
+    # sending. Same transaction as the reset; see the superadmin route in admin.py.
+    await db.execute(delete(PushSubscription).where(PushSubscription.user_id == target.id))
     await log_audit(
         db,
         actor_id=admin.id,

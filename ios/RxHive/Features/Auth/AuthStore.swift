@@ -13,6 +13,16 @@ final class AuthStore: ObservableObject {
         case signedOut
         /// Signed in and cleared for mobile.
         case signedIn(CurrentUser)
+        /// Signed in, but an administrator reset this account's password and the
+        /// server refuses everything except changing it (batch 73). Only the
+        /// change-password screen is shown, and nothing session-scoped runs: no
+        /// socket, no lists, no call reconcile. A phase of its own rather than a
+        /// flag read inside `.signedIn`, because `currentUser` is nil here — and
+        /// every store that starts work for a signed-in user asks that question, so
+        /// none of them can start it by forgetting to ask a second one.
+        ///
+        /// The cookies are kept: this session is the one the change is made with.
+        case passwordChangeRequired(CurrentUser)
         /// Authenticated, but this account may not use the mobile app. A separate
         /// phase from `signedOut` because the copy has to explain *why*, or the
         /// user will simply retype their password until they give up.
@@ -27,18 +37,52 @@ final class AuthStore: ObservableObject {
     /// Sign-in form error, shown inline under the fields.
     @Published var signInError: String?
     @Published var isSigningIn = false
+    /// The forced change-password form's request state (batch 73). Owned here, not
+    /// by the view, because the outcome is a phase change only this class may make.
+    @Published private(set) var isChangingPassword = false
+    @Published private(set) var passwordChangeError: String?
+    /// True from the moment Sign Out is pressed until it has finished (batch 73
+    /// review). `signOut` waits for an in-flight password change before it logs
+    /// out, which can take as long as that request does, and the change form stays
+    /// on screen meanwhile. A second change started in that window would have
+    /// nothing waiting for it, so the form is refused while this is set.
+    @Published private(set) var isSigningOut = false
 
     let realtime = RealtimeClient()
 
     private let api: APIClient
     private let log = Logger(subsystem: "ai.rhythmrx.rxhive", category: "auth")
     private var expiryObserver: NSObjectProtocol?
+    private var passwordChangeObserver: NSObjectProtocol?
 
     /// Incremented by every sign-in and every completed sign-out. A teardown that
     /// began under an older generation is stale and must not clear the cookies of
     /// the session that replaced it — the failure mode being "it signed me out
     /// immediately after I signed back in", which is unreproducible on demand.
     private var sessionGeneration = 0
+
+    /// The forced password change in flight, if any (batch 73 review). Kept so that
+    /// `signOut` can wait for it. Once `change-password` is on the wire the server
+    /// may commit it and answer with a new session's cookies, and cancelling the
+    /// `URLSession` task does not undo that commit; it only stops this device from
+    /// hearing about it. A logout sent before that answer landed would revoke the
+    /// old session, and the answer would then store the new one on a phone that
+    /// shows itself signed out.
+    private var passwordChangeTask: Task<Void, Never>?
+
+    /// The `sessionGeneration` in which this device's own `change-password` was
+    /// answered 200, if one was (batch 73 review). That answer re-issued this
+    /// device's session, so when `/me` later reports the flag clear the session can
+    /// start as it is. When the flag clears without it, the change was made
+    /// somewhere else, which revoked this device's refresh token; see
+    /// `releaseAfterChangeElsewhere`. Tied to the generation rather than reset by
+    /// hand, so every boundary that bumps it (a new hold, a sign-out, a refused
+    /// session) forgets it without each having to remember to.
+    private var passwordChangedHereInGeneration: Int?
+
+    private var passwordChangedHere: Bool {
+        passwordChangedHereInGeneration == sessionGeneration
+    }
 
     /// The stores holding the signed-in person's data, so a session ending can
     /// clear them. Weak, and registered by the stores themselves in their own
@@ -96,6 +140,20 @@ final class AuthStore: ObservableObject {
             Task { @MainActor in
                 await self?.handleSessionLost(status: 401, detail: reason, denial: nil)
             }
+        }
+
+        // An admin reset the password (batch 73). Either half can hear it first — a
+        // request refused with the coded 403, or the socket closed 4403 — and both
+        // land on the same transition, which keeps the cookies.
+        passwordChangeObserver = NotificationCenter.default.addObserver(
+            forName: APIClient.passwordChangeRequiredNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handlePasswordChangeRequired() }
+        }
+        realtime.onPasswordChangeRequired = { [weak self] in
+            Task { @MainActor in self?.handlePasswordChangeRequired() }
         }
     }
 
@@ -245,8 +303,25 @@ final class AuthStore: ObservableObject {
     // MARK: - Sign out
 
     func signOut() async {
+        isSigningOut = true
+        defer { isSigningOut = false }
+        // Bumped first (batch 73 review), so that anything still running for the
+        // session being ended, above all a forced password change waiting on its
+        // answer, stands down at its next generation check instead of starting the
+        // session this is ending. Bumped again below, once the session is gone, as
+        // every completed sign-out always has been.
+        sessionGeneration &+= 1
         realtime.disconnect()
         pendingRevalidation?.cancel()
+        // Waited for, not cancelled (batch 73 review). If `change-password` is on
+        // the wire, the server may already have committed it and be answering with
+        // a new session's cookies; cancelling only stops this device hearing that
+        // answer. Waiting means the logout below carries whichever session the
+        // server issued, so that session is the one revoked, and the cookie clear
+        // after it removes those cookies rather than running before they arrive.
+        if let change = passwordChangeTask {
+            await change.value
+        }
         // Best-effort: the point is to revoke the refresh token server-side, but a
         // user on a plane still expects the button to work.
         _ = try? await api.sendIgnoringResponse(.post, "/api/auth/logout")
@@ -256,11 +331,135 @@ final class AuthStore: ObservableObject {
         endSessionData()
         phase = .signedOut
         signInError = nil
+        passwordChangeError = nil
     }
 
     /// Leave the access-denied screen and go back to the form.
     func dismissAccessDenied() {
         phase = .signedOut
+    }
+
+    // MARK: - Forced password change
+
+    /// Finish the change an admin reset demands, and only then start the session.
+    ///
+    /// Three requests, in this order, through the injected client (not
+    /// `RxHiveAPI.changePassword`, which is wired to `.shared`):
+    ///
+    ///  1. `GET /api/auth/me` first, because it refreshes. `change-password` is a
+    ///     no-refresh credential path (`APIClient.nonRefreshablePaths`), so its 401
+    ///     can only mean "wrong current password" — and a 15-minute access cookie
+    ///     that lapsed while the user read the screen would produce exactly that
+    ///     401, telling them a correct temporary password was wrong.
+    ///  2. `POST /api/auth/change-password`.
+    ///  3. `GET /api/auth/me` again, and the phase leaves only if it says the flag is
+    ///     clear. The server is the one that decides the account is usable; a 200
+    ///     from step 2 is its word on the password, not on the account.
+    ///
+    /// The work runs in a stored `Task` (batch 73 review) so that `signOut`, which
+    /// the screen offers even mid-request, can wait for it before logging out.
+    func completeRequiredPasswordChange(current: String, new: String) async {
+        guard case .passwordChangeRequired = phase, !isChangingPassword, !isSigningOut else { return }
+        isChangingPassword = true
+        passwordChangeError = nil
+        let change = Task { await self.performRequiredPasswordChange(current: current, new: new) }
+        passwordChangeTask = change
+        await change.value
+        passwordChangeTask = nil
+        isChangingPassword = false
+    }
+
+    private func performRequiredPasswordChange(current: String, new: String) async {
+        // A sign-out (or a refused refresh) mid-request must not be overruled by the
+        // answer to a question asked for the session it ended.
+        let generation = sessionGeneration
+        var changed = false
+
+        struct Body: Encodable {
+            let current_password: String
+            let new_password: String
+        }
+
+        do {
+            let before = try await api.send(.get, "/api/auth/me", as: CurrentUser.self)
+            guard generation == sessionGeneration else { return }
+            if !before.mustChangePassword {
+                // The temporary password is no longer the current one, so posting it
+                // would only be refused. Either this device already changed it and
+                // lost the confirmation (an earlier press of this button got its 200),
+                // and its session was re-issued with that answer; or it was changed
+                // somewhere else meanwhile, the web app most likely, which revoked
+                // this device's refresh token, and the session has to be checked
+                // before it is started (batch 73 review).
+                if passwordChangedHere {
+                    enterSignedIn(before)
+                } else if await releaseAfterChangeElsewhere(before, generation: generation) == .unreachable {
+                    // Nothing was learned. Stay held, say why nothing happened, and
+                    // keep asking in the background; the next answer decides.
+                    passwordChangeError = APIError.transport(underlying: "Refresh undelivered").userMessage
+                    scheduleRevalidation()
+                }
+                return
+            }
+            try await api.sendIgnoringResponse(
+                .post,
+                "/api/auth/change-password",
+                body: Body(current_password: current, new_password: new)
+            )
+            // Checked the moment the answer is back (batch 73 review): a sign-out
+            // pressed while the change was out is waiting for this, and must find
+            // nothing started for the session it is ending, not a `/me` on the wire
+            // and a session about to be entered.
+            guard generation == sessionGeneration else { return }
+            changed = true
+            passwordChangedHereInGeneration = generation
+            let after = try await api.send(.get, "/api/auth/me", as: CurrentUser.self)
+            guard generation == sessionGeneration, case .passwordChangeRequired = phase else { return }
+            guard !after.mustChangePassword else {
+                RememberedUser.save(after)
+                phase = .passwordChangeRequired(after)
+                passwordChangeError = AuthCopy.passwordChangeUnconfirmed
+                return
+            }
+            enterSignedIn(after)
+        } catch let error as APIError {
+            guard generation == sessionGeneration else { return }
+            if let denial = error.mobileDenial {
+                await endSessionForDenial(reason: error.userMessage, denial: denial)
+                return
+            }
+            if changed, error.isRetryable {
+                // The new password is saved; only the confirmation was lost. Retyping
+                // the temporary one would now be refused as wrong, so keep asking the
+                // server instead — `revalidateSession` lets the session start the
+                // moment `/me` reports the flag clear, directly, because the 200 this
+                // device got re-issued its session (`passwordChangedHere`).
+                passwordChangeError = AuthCopy.passwordChangeSavedUnconfirmed
+                scheduleRevalidation()
+                return
+            }
+            switch error {
+            case .credentials:
+                // The only 401 `change-password` can give, now that step 1 has renewed
+                // the access cookie: the temporary password was mistyped. The server's
+                // "Current password is incorrect" names a field this screen calls
+                // something else.
+                passwordChangeError = AuthCopy.temporaryPasswordWrong
+            default:
+                // A 400 is the policy (or "Choose a password different from your
+                // current one."), shown verbatim because the server's numbers are the
+                // real ones; a 429 is "Too many attempts".
+                passwordChangeError = error.userMessage
+            }
+        } catch {
+            guard generation == sessionGeneration else { return }
+            if changed {
+                passwordChangeError = AuthCopy.passwordChangeSavedUnconfirmed
+                scheduleRevalidation()
+                return
+            }
+            passwordChangeError = APIError.transport(underlying: error.localizedDescription).userMessage
+        }
     }
 
     // MARK: - Internals
@@ -288,11 +487,49 @@ final class AuthStore: ObservableObject {
         calls?.resetSessionState()
     }
 
+    /// The single way into a session, so the single place the forced
+    /// change-password phase is decided (batch 73): sign-in, a restore, an offline
+    /// restore of a remembered account and a revalidation all come through here.
     private func enterSignedIn(_ user: CurrentUser) {
+        if user.mustChangePassword {
+            enterPasswordChangeRequired(user)
+            return
+        }
         sessionGeneration &+= 1
         RememberedUser.save(user)
+        passwordChangeError = nil
         phase = .signedIn(user)
         realtime.connect()
+    }
+
+    /// A coded 403 or a 4403 socket close. Only a running session moves: anywhere
+    /// else either there is no session to hold back, or it is already held.
+    private func handlePasswordChangeRequired() {
+        guard case .signedIn(let user) = phase else { return }
+        enterPasswordChangeRequired(user.applying(mustChangePassword: true))
+    }
+
+    /// Hold the session at the change-password screen.
+    ///
+    /// Everything session-scoped stops, and the cookies stay: unlike every other
+    /// exit from `.signedIn`, the session is not over — it is what the change is
+    /// made with. Safe to reach with nothing running (a flagged sign-in or
+    /// restore), since each step is a no-op then.
+    ///
+    /// The call goes first, while the socket can still carry its hang-up; see
+    /// `CallStore.endForPasswordChange`, which also does the call store's half of
+    /// `endSessionData()` once the room is left. Not `endSessionData()` itself: its
+    /// call half deliberately leaves a live call alone, and here nothing may be.
+    private func enterPasswordChangeRequired(_ user: CurrentUser) {
+        calls?.endForPasswordChange()
+        realtime.disconnect()
+        chat?.reset()
+        sessionGeneration &+= 1
+        // Saved with the flag, so an offline relaunch comes back up here rather than
+        // in an app whose every request would be refused.
+        RememberedUser.save(user)
+        passwordChangeError = nil
+        phase = .passwordChangeRequired(user)
     }
 
     /// Re-check the session, letting `APIClient` do its refresh-and-replay.
@@ -303,21 +540,50 @@ final class AuthStore: ObservableObject {
     /// health constantly. Reporting a missed sample as a rejection is what turned
     /// one bad moment on a lift ride into a forced re-login.
     private func revalidateSession() async -> SessionCheck {
+        let generation = sessionGeneration
         do {
             let user = try await api.send(.get, "/api/auth/me", as: CurrentUser.self)
-            if case .signedIn = phase {
+            // The session this asked about may have ended or changed hands while
+            // `/me` was out (batch 73 review): a sign-out still waiting on its
+            // logout, or a hold that began after this was sent, which a `/me` answered
+            // before the reset would otherwise release again. Its answer describes a
+            // session that is no longer the current one, so it is not acted on.
+            // `.valid` is what the stale cases already returned through `default`
+            // below, and the socket checks its own generation before using it.
+            guard generation == sessionGeneration else { return .valid }
+            switch phase {
+            case .signedIn where user.mustChangePassword:
+                // Reset by an admin since the last check (batch 73). `.valid`, not
+                // `.rejected`, is still the right answer to the socket that asked:
+                // the session is good, and the socket has just been stopped, so the
+                // reconnect it would make is stranded by the generation bump.
+                enterPasswordChangeRequired(user)
+            case .signedIn:
                 phase = .signedIn(user)
                 RememberedUser.save(user)
+            case .passwordChangeRequired where !user.mustChangePassword:
+                if passwordChangedHere {
+                    // This device's own change, whose confirmation was lost on the way
+                    // back. Its 200 re-issued this device's session, so the session it
+                    // was holding can start as it is.
+                    enterSignedIn(user)
+                } else {
+                    // Changed somewhere else — the web app, another phone. That change
+                    // revoked this device's refresh token, so the held session is not
+                    // simply released; whether it survived is asked first (batch 73
+                    // review). `.unreachable` reaches the caller, which retries.
+                    return await releaseAfterChangeElsewhere(user, generation: generation)
+                }
+            case .passwordChangeRequired:
+                phase = .passwordChangeRequired(user)
+                RememberedUser.save(user)
+            default:
+                break
             }
             return .valid
         } catch let error as APIError {
             if let denial = error.mobileDenial {
-                await api.clearSessionCookies()
-                sessionGeneration &+= 1
-                RememberedUser.clear()
-                endSessionData()
-                realtime.disconnect()
-                phase = .accessDenied(reason: error.userMessage, denial: denial)
+                await endSessionForDenial(reason: error.userMessage, denial: denial)
                 return .rejected
             }
             return error.isRetryable ? .unreachable : .rejected
@@ -326,10 +592,81 @@ final class AuthStore: ObservableObject {
         }
     }
 
+    /// Start a held session whose flag `/me` now reports clear, when this device did
+    /// not make the change (batch 73 review).
+    ///
+    /// A password changed somewhere else revokes every other session's refresh
+    /// token, this device's included. The access cookie outlives that by up to its
+    /// 15 minutes, which is why `/me` still answered; starting the session on that
+    /// answer alone lasts only until the cookie lapses, and then ends as "Your
+    /// session expired", which tells the user nothing about why. So one refresh is
+    /// forced first, through the client's single-flight coordinator, and its answer
+    /// decides:
+    ///
+    ///  - `.refreshed`: the session survived the change, so it starts.
+    ///  - `.rejected`: it did not. End it now and say why, so the user signs in
+    ///    with the password they just chose instead of wondering what expired. A
+    ///    refusal that names a mobile denial goes to that screen, as everywhere else.
+    ///  - `.unreachable`: nothing was learned. Stay held and return it, so the caller
+    ///    retries; the cookies are not touched for a delivery failure.
+    private func releaseAfterChangeElsewhere(_ user: CurrentUser, generation: Int) async -> SessionCheck {
+        let outcome = await api.refreshSession()
+        // A sign-out (or a refused session) while the refresh was out must not be
+        // overruled by its answer — least of all by starting the session it ended.
+        guard generation == sessionGeneration, case .passwordChangeRequired = phase else { return .valid }
+        switch outcome {
+        case .refreshed:
+            enterSignedIn(user)
+            return .valid
+        case .rejected(_, let detail, let denial?):
+            await endSessionForDenial(reason: detail, denial: denial)
+            return .rejected
+        case .rejected:
+            await endSessionForPasswordChangedElsewhere()
+            return .rejected
+        case .unreachable:
+            return .unreachable
+        }
+    }
+
+    /// The password was changed somewhere else and this device's session did not
+    /// survive it (batch 73 review). Ends the session as a refusal does, with the
+    /// sentence that explains it shown on the sign-in form.
+    private func endSessionForPasswordChangedElsewhere() async {
+        await api.clearSessionCookies()
+        sessionGeneration &+= 1
+        RememberedUser.clear()
+        endSessionData()
+        realtime.disconnect()
+        pendingRevalidation?.cancel()
+        passwordChangeError = nil
+        phase = .signedOut
+        signInError = AuthCopy.passwordChangedElsewhere
+    }
+
+    /// The mobile grant was withdrawn: drop the session and show the denial.
+    private func endSessionForDenial(reason: String, denial: MobileDenialKind) async {
+        await api.clearSessionCookies()
+        sessionGeneration &+= 1
+        RememberedUser.clear()
+        endSessionData()
+        realtime.disconnect()
+        phase = .accessDenied(reason: reason, denial: denial)
+    }
+
+    /// True while a session exists — running, or held at the change-password
+    /// screen. Either can be refused, and a refusal ends either (batch 73).
+    private var hasSession: Bool {
+        switch phase {
+        case .signedIn, .passwordChangeRequired: return true
+        case .launching, .signedOut, .accessDenied: return false
+        }
+    }
+
     /// End the session for real. Only reached when the server was contacted and
     /// refused — never for a transport failure, a 5xx or a 429.
     private func handleSessionLost(status: Int, detail: String, denial: MobileDenialKind?) async {
-        guard case .signedIn = phase else { return }
+        guard hasSession else { return }
         let generation = sessionGeneration
 
         realtime.disconnect()
@@ -340,7 +677,7 @@ final class AuthStore: ObservableObject {
         // the *new* session's cookies, producing a second spurious sign-out that
         // looks like a loop.
         await api.clearSessionCookies()
-        guard generation == sessionGeneration, case .signedIn = phase else { return }
+        guard generation == sessionGeneration, hasSession else { return }
         sessionGeneration &+= 1
         RememberedUser.clear()
         endSessionData()
@@ -367,8 +704,20 @@ final class AuthStore: ObservableObject {
     }
 
     func applicationWillEnterForeground() {
-        guard case .signedIn = phase else { return }
-        realtime.applicationWillEnterForeground()
+        switch phase {
+        case .signedIn:
+            realtime.applicationWillEnterForeground()
+        case .passwordChangeRequired:
+            // No socket while held (batch 73), but `/me` is allowed, and it is how
+            // this phone learns of a password changed on the web while it sat on the
+            // screen. That change revoked this phone's session, so what follows is
+            // a forced refresh that either starts the session (it survived) or ends
+            // it with a sentence saying why (batch 73 review), not a silent release
+            // into a session that dies when its access cookie lapses.
+            break
+        default:
+            return
+        }
         // Cheap liveness check: catches a grant revoked while backgrounded. If it
         // cannot be delivered, keep retrying rather than shrugging — this is also
         // the path that recovers a session restored offline at launch.
@@ -382,6 +731,18 @@ final class AuthStore: ObservableObject {
 enum AuthCopy {
     static let superadminWebOnly = "Super admin accounts can only sign in on the web app."
     static let sessionExpired = "Your session expired. Please sign in again."
+    /// Forced change-password screen (batch 73).
+    static let temporaryPasswordWrong = "That temporary password is not right."
+    static let passwordChangeUnconfirmed =
+        "Your password change could not be confirmed. Please try again."
+    static let passwordChangeSavedUnconfirmed =
+        "Your new password was saved, but the app could not confirm it yet. "
+        + "It will keep trying — or sign out and sign in with your new password."
+    /// Shown on the sign-in form, where `sessionExpired` is, when the password was
+    /// changed on another device and this one's session did not survive it (batch
+    /// 73 review). "Session expired" would leave the user guessing; this tells them
+    /// which password to use.
+    static let passwordChangedElsewhere = "Your password was changed. Sign in with your new password."
 }
 
 /// The last account known to be signed in, so a launch with no network can bring
@@ -413,6 +774,9 @@ enum RememberedUser {
         payload["avatar_url"] = user.avatarURL
         payload["about"] = user.about
         payload["mobile_access"] = user.mobileAccess
+        // Kept so an offline relaunch of a held account comes back up at the
+        // change-password screen, not in the app (batch 73).
+        payload["must_change_password"] = user.mustChangePassword
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
         UserDefaults.standard.set(data, forKey: key)
     }

@@ -8,11 +8,32 @@ import { withDerivedStatus, applyReadReceipt } from '../utils/messageStatus';
 import { handleCallJoinError, notifyCameraUnavailable } from '../utils/callErrors';
 import { isDesktopNotifDisabled } from '../utils/notificationPrefs';
 import { tearDownPush } from '../lib/pushTeardown';
+import { PASSWORD_CHANGE_CLOSE_CODE, announcePasswordChangeRequired } from '../lib/passwordChange';
 
 /**
  * Join the SFU and surface what happened. Every join site shares this so a
  * stopped LiveKit server, a blocked microphone, and a dead call each produce
  * their own message instead of one indistinguishable "could not connect".
+ *
+ * A failure is reported, and `onFatal` run, only while the call store still
+ * holds the call being joined (batch 73 review). The join is slow — a token
+ * POST, then the SFU — and the call can be torn down while it is out: the user
+ * hangs up, or the forced password change gate ends the call before unmounting
+ * the session (App.jsx endCallForPasswordChange). That gate's refusal is the
+ * very thing that then fails the token POST with a 403, so the late failure was
+ * guaranteed, not a corner case. Every `onFatal` here ends or resets the call,
+ * and run against a call that is already gone they did real damage: endCall
+ * moved an idle store back to 'ended', which made the gate hold the session up
+ * again; `call:end` went to send() on the socket the 4403 had just closed, whose
+ * loud branch toasted "No connection" and RECONNECTED for an account the server
+ * is refusing; and the join error itself toasted "Could not authorize the call"
+ * over the change-password screen. The check sits here, ahead of the toast and
+ * of all four callbacks, rather than in each callback, because the toast is
+ * just as wrong as the rest and lives here, and so no fifth join site can
+ * forget it. At every site the store already holds the id being joined when
+ * this is called (set just before it, or checked just before it), so a
+ * mismatch can only mean that call has ended — or that another has replaced
+ * it, which a stale failure must not end either.
  */
 function joinLiveKit(callId, context, onFatal) {
   return livekitClient
@@ -21,6 +42,10 @@ function joinLiveKit(callId, context, onFatal) {
       if (result?.cameraUnavailable) notifyCameraUnavailable(result.reason);
     })
     .catch((err) => {
+      if (useCallStore.getState().callId !== callId) {
+        console.info(`[call:${context}] join failed after the call was torn down; ignoring`, callId, err?.reason || '');
+        return;
+      }
       handleCallJoinError(err, context);
       onFatal(err);
     });
@@ -206,6 +231,13 @@ class RxHiveWebSocket {
     if ('serviceWorker' in navigator) {
       navigator.serviceWorker.addEventListener('message', (event) => {
         if (event.data?.type !== 'rxhive:incoming-call') return;
+        // Only while there is a session to resume into. wake() already bails
+        // when inactive, but _resumeCallState did not, so a notification tapped
+        // after sign-out — or while the app is held on the forced password
+        // change (batch 73) — still sent GET /api/calls/active for an account
+        // that is not using the socket. Nothing is lost by skipping it: _onOpen
+        // resumes call state on every connect, the first one included.
+        if (!this._active) return;
         console.info('[call] woken by a call notification', event.data.callId || '');
         wake('call notification');
         this._resumeCallState();
@@ -559,6 +591,24 @@ class RxHiveWebSocket {
     // client takes when its 15-minute access cookie lapses.
     if (hasLiveCall(useCallStore.getState())) {
       useCallStore.getState().setSignalLinkState(LINK_RECONNECTING);
+    }
+
+    // Batch 73: the server refuses this account until its owner replaces the
+    // password an admin reset — at the handshake, or on the 30-second
+    // revalidation of a socket that was already open. Reconnecting cannot help
+    // and refreshing cannot either: the refresh succeeds for a flagged account,
+    // which is exactly why the server does not use 4001 for this. Stand down the
+    // way disconnect() does, so neither the backoff timer, wake(), nor the
+    // heartbeat brings the socket back, and hand the decision to the AuthProvider.
+    // RealtimeSession's connect() is what restarts it, once the password has
+    // been changed and the app is let back in.
+    if (event.code === PASSWORD_CHANGE_CLOSE_CODE) {
+      this._intentionalClose = true;
+      this._active = false;
+      this._clearAcceptTimeout();
+      useChatStore.getState().setWsConnecting(false);
+      announcePasswordChangeRequired();
+      return;
     }
 
     if (event.code === 4001) {
@@ -1288,9 +1338,18 @@ class RxHiveWebSocket {
       // `call:toggle_media` is cosmetic, so those stay quiet; the rest are the
       // user pressing a button and deserve an answer. Reconnecting immediately
       // rather than waiting out the backoff gives the retry a chance to land.
+      //
+      // Only while the socket is WANTED (batch 73 review). `_active` is false
+      // after disconnect() — a sign-out — and after a 4403 close, when the
+      // server is refusing this account until its password is changed. A call
+      // frame that reaches here then (a late callback for a call that has
+      // already been torn down) used to call connect(), which sets `_active`
+      // back to true and opens a socket behind the forced password screen or
+      // after the session ended, undoing the stand-down. "Reconnecting…" would
+      // be untrue as well, so the toast goes with it; the warn above still logs.
       const loud = ['call:accept', 'call:join', 'call:initiate', 'call:group_initiate',
         'call:decline', 'call:cancel', 'call:end'];
-      if (loud.includes(data.type)) {
+      if (loud.includes(data.type) && this._active) {
         toast.error('No connection — the call could not be signalled. Reconnecting…');
         this.reconnectAttempts = 0;
         this.connect();
