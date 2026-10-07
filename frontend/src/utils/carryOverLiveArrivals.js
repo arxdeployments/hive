@@ -25,12 +25,16 @@
  *    them, the rows that fell off the page compared EQUAL to its newest and were
  *    carried under it: "You created the group" drawn below the newest message.
  *
- * A new id is not always an arrival, though: history paged in while the request
- * was out (prependMessages, from a scroll up during a jump) is new too. It sits at
- * the FRONT of the thread, where history goes, while arrivals are appended at the
- * back; so only a new row that sits after the first row the thread held when it
- * asked counts. Carried as an arrival, older history was stitched under the newest
- * page (CodeRabbit, review of 1fbc1de, on iOS; the web jump had the same gap).
+ * A new id is not always an arrival, though, and the page's own range tells them
+ * apart: an arrival is never older than the page's oldest row. Anything older is
+ * history — rows paged in while the request was out (prependMessages, from a scroll
+ * up during a jump), or a message so late-committed that it predates the whole
+ * page — and paging back brings it in, in its place. Carried as an arrival, older
+ * history was stitched under the newest page (CodeRabbit, review of 1fbc1de), and
+ * a row older than the page merged to the very top, where loadMore takes the
+ * oldest row as its `before` cursor and would have skipped everything between the
+ * two (CodeRabbit, review of 70495a4). Bounded by the page, every kept arrival
+ * merges after the page's first row, so that cursor stays the page's own.
  *
  * Kept arrivals are placed among the page's rows by time (`mergeByTime`), not
  * stacked after them: a send stamped before the page's newest row but committed
@@ -55,17 +59,19 @@ const LOCAL_ONLY_STATUSES = new Set(['sending', 'failed']);
  *   the request went out and are absent from `fetched`, in their existing order.
  */
 export function carryOverLiveArrivals(existing, fetched, heldAtRequest) {
-  const onPage = new Set((fetched || []).map((m) => m._id));
-  const rows = existing || [];
-  // Everything before this index was prepended while the request was out: history.
-  // -1 when the thread held nothing, and then every row is after it.
-  const firstHeld = rows.findIndex((m) => heldAtRequest.has(m._id));
-  return rows.filter((m, i) => (
+  const page = fetched || [];
+  const onPage = new Set(page.map((m) => m._id));
+  // The page's oldest instant; -Infinity for an empty page, which bounds nothing.
+  const times = page.map((m) => Date.parse(m.created_at)).filter(Number.isFinite);
+  const oldest = times.length ? Math.min(...times) : -Infinity;
+  return (existing || []).filter((m) => (
     m._id
     && !LOCAL_ONLY_STATUSES.has(m.status)
     && !onPage.has(m._id)
     && !heldAtRequest.has(m._id)
-    && i > firstHeld
+    // Not older than the page: anything older is history (see above). An undated
+    // row is not judged by a time it does not have.
+    && !(Date.parse(m.created_at) < oldest)
   ));
 }
 

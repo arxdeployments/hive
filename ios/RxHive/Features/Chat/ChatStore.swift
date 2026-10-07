@@ -475,20 +475,25 @@ final class ChatStore: ObservableObject {
         // time, so an arrival stamped early can sit above the joint, and it was drawn
         // twice (CodeRabbit, review of 89408b2).
         let olderIDs = Set(olderRows.map(\.id))
-        // And a new row is not always an arrival. History paged in while the request
-        // was out (`loadOlderMessages`) is new too, but it is PREPENDED, while arrivals
-        // are appended (`insertIncoming` sorts by time, so an early-stamped one can land
-        // among the held rows, never above the window's first row unless it is older
-        // than the whole window). So only a new row after the first row the thread held
-        // when it asked counts; carried as an arrival, older history was stitched under
-        // the newest page and the window called current (CodeRabbit, review of 1fbc1de).
-        let firstHeld = held.firstIndex { heldAtRequest.contains($0.id) }
+        // And a new row is not always an arrival; the page's own range tells them apart.
+        // An arrival is never older than the page's oldest row. Anything older is
+        // history — rows `loadOlderMessages` prepended while the request was out, or a
+        // message so late-committed that it predates the whole page — and paging back
+        // brings it in, in its place. Carried as an arrival, older history was stitched
+        // under the newest page (CodeRabbit, review of 1fbc1de). Judged by row position
+        // instead, a late arrival that `insertIncoming` sorted above every row the thread
+        // held was dropped although the page could not contain it; and one older than
+        // the page merged to the very top, where `loadOlderMessages` takes the first row
+        // as its cursor and would have skipped the rows between (CodeRabbit, review of
+        // 70495a4). Bounded by the page, every kept arrival merges after its first row.
+        let pageOldest = fetched.compactMap(\.createdAt).min()
         let liveRows = keepingLiveRows
-            ? held.enumerated().filter { index, row in
-                (firstHeld.map { index > $0 } ?? true)
-                    && !unsent.contains(row.id) && !fetchedIDs.contains(row.id) && !olderIDs.contains(row.id)
+            ? held.filter { row in
+                !unsent.contains(row.id) && !fetchedIDs.contains(row.id) && !olderIDs.contains(row.id)
                     && !heldAtRequest.contains(row.id)
-            }.map(\.element)
+                    // An undated row is not judged by a time it does not have.
+                    && !(pageOldest.map { oldest in row.createdAt.map { $0 < oldest } ?? false } ?? false)
+            }
             : []
         let unsentRows = held.filter { unsent.contains($0.id) && !landed.contains($0.id) }
         // Arrivals placed among the page by time, not stacked after it: a send stamped

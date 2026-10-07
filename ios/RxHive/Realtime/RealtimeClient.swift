@@ -450,14 +450,20 @@ final class RealtimeClient: NSObject, ObservableObject {
               let data = try? encoder.encode(frame),
               let text = String(data: data, encoding: .utf8) else { return false }
         let once = ResumeOnce()
-        return await withCheckedContinuation { continuation in
+        var timer: Task<Void, Never>?
+        let sent = await withCheckedContinuation { continuation in
             once.arm(continuation)
             task.send(.string(text)) { error in once.resume(error == nil) }
-            Task {
+            timer = Task {
                 try? await Task.sleep(for: timeout)
                 once.resume(false)
             }
         }
+        // The send answered first: no sleeper left behind for the rest of the second
+        // (CodeRabbit, review of 70495a4). Harmless either way; ResumeOnce already
+        // ignores the late side.
+        timer?.cancel()
+        return sent
     }
 
     private func startPinging() {

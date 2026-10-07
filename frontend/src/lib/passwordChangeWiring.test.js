@@ -282,9 +282,14 @@ describe('pages/ForcedPasswordChange.jsx: the submit sequence', () => {
 
   it('proves the session with one refresh, and signs out saying why when it was refused', () => {
     const helper = code(block(screen, '  const sessionSurvivedChangeElsewhere = async () => {', '\n  };'));
-    const refresh = helper.indexOf('await refreshSession();');
-    const refused = helper.indexOf('if (sessionRejected(err)) {');
-    assert.ok(refresh !== -1 && refused > refresh, 'the session is not proven by a refresh');
+    // The decision itself is unit-tested (settleSessionAfterChangeElsewhere in
+    // passwordChange.test.js); this pins that the screen asks it, with the real
+    // refresh, and acts on each outcome.
+    const asked = helper.indexOf('const verdict = await settleSessionAfterChangeElsewhere(refreshSession, sessionRejected);');
+    const refused = helper.indexOf("if (verdict.outcome === 'ended') {");
+    assert.ok(asked !== -1 && refused > asked, 'the session is not proven by a refresh');
+    assert.ok(helper.includes("if (verdict.outcome === 'survived') return true;"), 'a surviving session is not let in');
+    assert.ok(helper.includes('setError(verdict.message);'), 'an undelivered refresh is not explained');
     const why = helper.indexOf("setSignOutReason('password_changed');");
     const out = helper.indexOf('await logout();');
     assert.ok(why > refused && out > why, 'a refused session is not signed out with the password-change reason');
@@ -357,9 +362,13 @@ describe('contexts/AuthContext.jsx: the announcement moves the session', () => {
 
   it('sets the flag in state and in the localStorage mirror, and only on a signed-in user', () => {
     const setter = code(block(auth, 'const setMustChangePassword = useCallback((required) => {', '\n  }, []);'));
-    assert.ok(setter.includes('if (!prev || Boolean(prev.must_change_password) === required) return prev;'),
+    const unchanged = setter.indexOf('!prev || Boolean(prev.must_change_password) === required');
+    assert.ok(unchanged !== -1 && setter[unchanged + 1] === '? prev',
       'an announcement with nobody signed in invents a user, or every repeat costs a render');
-    assert.ok(setter.includes("localStorage.setItem('user', JSON.stringify(next));"),
+    // The updater stays pure (CodeRabbit, review of 70495a4); an effect mirrors
+    // the committed user instead.
+    assert.ok(!setter.some((l) => l.includes('localStorage')), 'the state updater writes storage, a side effect');
+    assert.ok(lines.includes("if (user) localStorage.setItem('user', JSON.stringify(user));"),
       'the mirror is not updated, so an offline boot forgets the flag and renders the app');
     const update = code(block(auth, 'const updateUser = useCallback((next) => {', '\n  }, []);'));
     assert.ok(update.includes("localStorage.setItem('user', JSON.stringify(next));"));

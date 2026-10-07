@@ -92,13 +92,33 @@ describe('carryOverLiveArrivals', () => {
   });
 
   it('does not carry history paged in while the request was out', () => {
-    // A scroll up during a jump prepends older rows: new ids, but at the front of
-    // the thread, where history goes. Carried as arrivals they were stitched under
-    // the newest page (CodeRabbit, review of 1fbc1de).
+    // A scroll up during a jump prepends older rows: new ids, but older than the
+    // page. Carried as arrivals they were stitched under the newest page
+    // (CodeRabbit, review of 1fbc1de).
     const existing = [msg('h1', 0), msg('h2', 0), msg('m1', 1), msg('m2-live', 2)];
     const fetched = [msg('m1', 1), msg('m3', 3)];
 
     assert.deepEqual(ids(carryOverLiveArrivals(existing, fetched, new Set(['m1']))), ['m2-live']);
+  });
+
+  it('leaves a row older than the whole page to paging back, keeping the history cursor', () => {
+    // A late-committed message older than the page's oldest row merged to the top,
+    // and loadMore pages back from the top row: everything between that message
+    // and the page was skipped (CodeRabbit, review of 70495a4).
+    const existing = [msg('m5', 5), msg('m0-late', 0)];
+    const fetched = [msg('m2', 2), msg('m5', 5)];
+    const carried = carryOverLiveArrivals(existing, fetched, new Set(['m5']));
+    assert.deepEqual(carried, []);
+    assert.equal(mergeByTime(fetched, carried)[0]._id, 'm2', 'the page no longer starts the window');
+  });
+
+  it('keeps an arrival anywhere inside the page, even above every row the thread held', () => {
+    // The thread held one recent row; the page reaches further back. An arrival
+    // stamped inside the page's range belongs to it, wherever it sat (CodeRabbit,
+    // review of 70495a4, against the old position rule).
+    const existing = [msg('m3-late', 3), msg('m8', 8)];
+    const fetched = [msg('m1', 1), msg('m8', 8)];
+    assert.deepEqual(ids(carryOverLiveArrivals(existing, fetched, new Set(['m8']))), ['m3-late']);
   });
 
   it('carries every new row when the thread held nothing', () => {

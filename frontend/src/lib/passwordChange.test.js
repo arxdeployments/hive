@@ -11,6 +11,7 @@ import {
   isPasswordChangeRequiredError,
   onPasswordChangeRequired,
   passwordChangeProblem,
+  settleSessionAfterChangeElsewhere,
 } from './passwordChange.js';
 
 /**
@@ -303,5 +304,40 @@ describe('changePasswordErrorMessage', () => {
       changePasswordErrorMessage(axiosError(422, { detail: [{ loc: ['body'], msg: 'Field required', type: 'missing' }] })),
       'Field required',
     );
+  });
+});
+
+describe('settleSessionAfterChangeElsewhere', () => {
+  // The forced screen asks this when the first /me shows the password already
+  // changed (CodeRabbit, reviews of 1fbc1de and 70495a4).
+  const rejected = (err) => err?.response?.status === 401 || err?.response?.status === 403;
+  const failingWith = (err) => () => Promise.reject(err);
+
+  it('lets a session in when its refresh succeeds', async () => {
+    assert.deepEqual(await settleSessionAfterChangeElsewhere(() => Promise.resolve({}), rejected), { outcome: 'survived' });
+  });
+
+  it('ends a session whose refresh is refused', async () => {
+    for (const status of [401, 403]) {
+      const verdict = await settleSessionAfterChangeElsewhere(failingWith({ response: { status } }), rejected);
+      assert.deepEqual(verdict, { outcome: 'ended' }, `a ${status} did not end the session`);
+    }
+  });
+
+  it('decides nothing when the refresh could not be answered, and says which', async () => {
+    const noConnection = await settleSessionAfterChangeElsewhere(failingWith(new Error('Network Error')), rejected);
+    assert.equal(noConnection.outcome, 'unknown');
+    assert.match(noConnection.message, /Could not reach the server/);
+    for (const status of [429, 502]) {
+      const verdict = await settleSessionAfterChangeElsewhere(failingWith({ response: { status } }), rejected);
+      assert.equal(verdict.outcome, 'unknown', `a ${status} ended or kept the session`);
+      assert.match(verdict.message, /Could not confirm your session/);
+    }
+  });
+
+  it('asks exactly once', async () => {
+    const refresh = mock.fn(() => Promise.resolve({}));
+    await settleSessionAfterChangeElsewhere(refresh, rejected);
+    assert.equal(refresh.mock.callCount(), 1);
   });
 });

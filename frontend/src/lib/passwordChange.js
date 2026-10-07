@@ -158,3 +158,33 @@ export function changePasswordErrorMessage(err) {
   if (!err?.response) return 'Could not reach the server. Check your connection and try again.';
   return apiError(err, 'Could not change your password. Please try again.');
 }
+
+/**
+ * Whether this session outlived a password change made somewhere else, asked
+ * with one refresh (CodeRabbit, reviews of 1fbc1de and 70495a4).
+ *
+ * Another tab in the same browser shares the cookie jar, so its change kept or
+ * re-issued this very session and the refresh succeeds. Another device's change
+ * revoked this browser's refresh token, so the refresh is refused — and the
+ * server answers that 401 without treating the revoked token as stolen, so asking
+ * costs no other session. Anything else (no connection, 429, 5xx) says nothing
+ * either way.
+ *
+ * @param {() => Promise<unknown>} refresh - POST /api/auth/refresh.
+ * @param {(err: unknown) => boolean} isRejected - the server refused the session.
+ * @returns {Promise<{ outcome: 'survived' | 'ended' | 'unknown', message?: string }>}
+ */
+export async function settleSessionAfterChangeElsewhere(refresh, isRejected) {
+  try {
+    await refresh();
+    return { outcome: 'survived' };
+  } catch (err) {
+    if (isRejected(err)) return { outcome: 'ended' };
+    return {
+      outcome: 'unknown',
+      message: err?.response
+        ? 'Could not confirm your session. Please try again.'
+        : 'Could not reach the server. Check your connection and try again.',
+    };
+  }
+}

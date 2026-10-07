@@ -825,6 +825,43 @@ async def test_change_password_is_refused_when_a_reset_lands_while_it_is_verifie
     assert await verify_password(TEMP, row.password_hash), "the reset's password must stand"
 
 
+@pytest.mark.parametrize(
+    ("change", "expected"),
+    [
+        ("org", (404, "User not found")),
+        ("role", (403, "Only a superadmin can manage another admin's account")),
+    ],
+)
+async def test_an_org_admin_reset_rechecks_its_scope_on_the_locked_row(client, monkeypatch, change, expected):
+    """A superadmin moving the target out of the org, or promoting it, while the reset hashes its temporary
+    password must not leave the org admin holding a password for an account outside their reach (CodeRabbit,
+    review of 70495a4)."""
+    from app.api import org_admin as org_admin_api
+
+    org, dept, target = await _org_member("Scope Co", "scoped@x.com")
+    await make_user("scope-oa@x.com", org_id=org.id, dept_id=dept.id, role=UserRole.org_admin)
+    elsewhere = await make_org("Elsewhere Co")
+    hash_before = (await _row(target.id)).password_hash
+    real_hash = org_admin_api.hash_password
+
+    async def _hash_while_the_target_moves(password):
+        """Hash as the route does, while a superadmin changes the target in another session."""
+        if change == "org":
+            await _set(target.id, org_id=elsewhere.id, dept_id=None)
+        else:
+            await _set(target.id, role=UserRole.org_admin)
+        return await real_hash(password)
+
+    monkeypatch.setattr(org_admin_api, "hash_password", _hash_while_the_target_moves)
+    async with _as("scope-oa@x.com") as admin:
+        resp = await admin.post(f"/api/org-admin/users/{target.id}/reset-password")
+    assert (resp.status_code, resp.json()["detail"]) == expected, resp.text
+    assert "temporary_password" not in resp.json()
+    row = await _row(target.id)
+    assert row.password_hash == hash_before
+    assert row.must_change_password is False
+
+
 @pytest.mark.parametrize("route", ["admin", "org-admin"])
 async def test_a_reset_waits_for_a_sign_in_holding_the_account_and_then_ends_its_session(client, route):
     """The other order of the login race: the sign-in locked the account first and is

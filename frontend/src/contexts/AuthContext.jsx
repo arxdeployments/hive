@@ -129,18 +129,24 @@ export const AuthProvider = ({ children }) => {
    * refused request announces, so a screen that fired five at once calls this
    * five times, and only the first may cost a render.
    *
-   * The mirror is written inside the updater so it records the value React
-   * actually keeps, not one computed from a stale closure. StrictMode may run an
-   * updater twice in development; that writes the same string twice.
+   * The updater stays pure; the localStorage mirror is written by the effect
+   * below, from the value React actually committed (CodeRabbit, review of
+   * 70495a4).
    */
   const setMustChangePassword = useCallback((required) => {
-    setUser((prev) => {
-      if (!prev || Boolean(prev.must_change_password) === required) return prev;
-      const next = { ...prev, must_change_password: required };
-      localStorage.setItem('user', JSON.stringify(next));
-      return next;
-    });
+    setUser((prev) => (
+      !prev || Boolean(prev.must_change_password) === required
+        ? prev
+        : { ...prev, must_change_password: required }
+    ));
   }, []);
+
+  // The mirror follows the committed user, so whatever changed it — above all the
+  // flag, which an offline boot must not forget — is what the next boot restores.
+  // Signing out removes the mirror itself; a null user writes nothing here.
+  useEffect(() => {
+    if (user) localStorage.setItem('user', JSON.stringify(user));
+  }, [user]);
 
   // The API refusing this session until its password is changed, whoever saw it
   // first: the axios interceptor for a 403 carrying PASSWORD_CHANGE_REQUIRED, or

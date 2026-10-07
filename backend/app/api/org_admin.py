@@ -477,8 +477,17 @@ async def reset_user_password(
     # revoked, so a sign-in racing this reset either sees the new password and is
     # refused or has its session revoked below (batch 73 review); see the superadmin
     # route in admin.py.
-    if await lock_user_row(db, target.id) is None:
+    locked = await lock_user_row(db, target.id)
+    # And the scope checks again, on the row as it is under that lock (CodeRabbit,
+    # review of 70495a4). _load_org_user judged the row as read before the bcrypt
+    # round; a superadmin moving the target to another org, or promoting it to
+    # admin, in that window would otherwise have this route write — and return to
+    # the caller — a temporary password for an account outside their reach. Same
+    # answers as _load_org_user's own.
+    if locked is None or locked.org_id != admin.org_id:
         raise HTTPException(status_code=404, detail="User not found")
+    if locked.role is not UserRole.member:
+        raise HTTPException(status_code=403, detail="Only a superadmin can manage another admin's account")
     target.password_hash = new_hash
     # Enforced by get_current_user from the moment this commits: the account is
     # refused everywhere but change-password until it chooses its own password.

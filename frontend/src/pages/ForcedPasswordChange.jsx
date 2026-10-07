@@ -10,6 +10,7 @@ import {
   MIN_PASSWORD_LENGTH,
   changePasswordErrorMessage,
   passwordChangeProblem,
+  settleSessionAfterChangeElsewhere,
 } from '../lib/passwordChange';
 import { rebindPushAfterReset } from '../lib/pwa';
 
@@ -82,21 +83,16 @@ export default function ForcedPasswordChange() {
    * @returns {Promise<boolean>} true to let the user in
    */
   const sessionSurvivedChangeElsewhere = async () => {
-    try {
-      await refreshSession();
-      return true;
-    } catch (err) {
-      if (sessionRejected(err)) {
-        setSignOutReason('password_changed');
-        await logout();
-        navigate('/login');
-      } else {
-        setError(err?.response
-          ? 'Could not confirm your session. Please try again.'
-          : 'Could not reach the server. Check your connection and try again.');
-      }
-      return false;
+    const verdict = await settleSessionAfterChangeElsewhere(refreshSession, sessionRejected);
+    if (verdict.outcome === 'survived') return true;
+    if (verdict.outcome === 'ended') {
+      setSignOutReason('password_changed');
+      await logout();
+      navigate('/login');
+    } else {
+      setError(verdict.message);
     }
+    return false;
   };
 
   /**

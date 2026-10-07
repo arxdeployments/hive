@@ -808,7 +808,9 @@ final class ThreadFreshnessTests: XCTestCase {
     /// time, so an arrival stamped early can sit above the page's first row, where the
     /// history rule keeps it too, and it was drawn twice (CodeRabbit, review of 89408b2).
     func testAnArrivalAboveThePagesFirstRowIsDrawnOnce() throws {
-        let held = [try row("h0", second: 0), try row("a-late", second: 0), try row("m1", second: 1),
+        // a-late shares the page's oldest instant, so it is inside the page's range
+        // and only the history rule keeps it from being carried a second time.
+        let held = [try row("h0", second: 0), try row("a-late", second: 1), try row("m1", second: 1),
                     try row("m2", second: 2)]
         let fetched = [try row("m1", second: 1), try row("m3", second: 3)]
 
@@ -833,6 +835,31 @@ final class ThreadFreshnessTests: XCTestCase {
         let kept = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1"], unsent: [],
                                               keepingLiveRows: true, keepingHistory: true)
         XCTAssertEqual(kept.map(\.id), ["h0", "m1", "m2-live", "m3"])
+    }
+
+    /// A late arrival older than the whole page is history: left to paging back, so the
+    /// page's own first row stays the window's first row and the history cursor (CodeRabbit,
+    /// review of 70495a4).
+    func testAnArrivalOlderThanThePageIsLeftToPagingBack() throws {
+        let held = [try row("m5", second: 5), try row("m0-late", second: 0)]
+        let fetched = [try row("m2", second: 2), try row("m5", second: 5)]
+
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m5"], unsent: [],
+                                                keepingLiveRows: true)
+
+        XCTAssertEqual(thread.map(\.id), ["m2", "m5"])
+    }
+
+    /// An arrival inside the page's range is kept wherever `insertIncoming` sorted it,
+    /// even above every row the thread held when it asked (CodeRabbit, review of 70495a4).
+    func testAnArrivalInsideThePageIsKeptEvenAboveEveryHeldRow() throws {
+        let held = [try row("m3-late", second: 3), try row("m8", second: 8)]
+        let fetched = [try row("m1", second: 1), try row("m8", second: 8)]
+
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m8"], unsent: [],
+                                                keepingLiveRows: true)
+
+        XCTAssertEqual(thread.map(\.id), ["m1", "m3-late", "m8"])
     }
 
     /// Through the store: an older page that lands while a newest-page fetch is out is
