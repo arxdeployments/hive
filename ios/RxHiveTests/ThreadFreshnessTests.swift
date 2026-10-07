@@ -800,20 +800,55 @@ final class ThreadFreshnessTests: XCTestCase {
         let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "m3"], unsent: [],
                                                 keepingLiveRows: true)
 
-        XCTAssertEqual(thread.map(\.id), ["m1", "m3", "m2-late"])
+        // In time order, between the two it was stamped between (CodeRabbit, 1fbc1de).
+        XCTAssertEqual(thread.map(\.id), ["m1", "m2-late", "m3"])
     }
 
     /// A held row is history or a live arrival, never both. `insertIncoming` sorts by
     /// time, so an arrival stamped early can sit above the page's first row, where the
     /// history rule keeps it too, and it was drawn twice (CodeRabbit, review of 89408b2).
     func testAnArrivalAboveThePagesFirstRowIsDrawnOnce() throws {
-        let held = [try row("m0-late", second: 0), try row("m1", second: 1), try row("m2", second: 2)]
+        let held = [try row("h0", second: 0), try row("a-late", second: 0), try row("m1", second: 1),
+                    try row("m2", second: 2)]
         let fetched = [try row("m1", second: 1), try row("m3", second: 3)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "m2"], unsent: [],
-                                                keepingLiveRows: true, keepingHistory: true)
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["h0", "m1", "m2"],
+                                                unsent: [], keepingLiveRows: true, keepingHistory: true)
 
-        XCTAssertEqual(thread.map(\.id), ["m0-late", "m1", "m3"])
+        XCTAssertEqual(thread.map(\.id), ["h0", "a-late", "m1", "m3"])
+    }
+
+    /// History paged in while the request was out is new to the thread too, but it
+    /// was prepended, not appended: it is history, not an arrival. Carried as one it
+    /// was stitched under the newest page (CodeRabbit, review of 1fbc1de).
+    func testHistoryPagedInDuringTheFetchIsNotCarriedAsAnArrival() throws {
+        let held = [try row("h0", second: 0), try row("m1", second: 1), try row("m2-live", second: 2)]
+        let fetched = [try row("m1", second: 1), try row("m3", second: 3)]
+
+        let replaced = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1"], unsent: [],
+                                                  keepingLiveRows: true)
+        XCTAssertEqual(replaced.map(\.id), ["m1", "m2-live", "m3"])
+
+        // Kept as what it is when a reconnect keeps the history above the page.
+        let kept = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1"], unsent: [],
+                                              keepingLiveRows: true, keepingHistory: true)
+        XCTAssertEqual(kept.map(\.id), ["h0", "m1", "m2-live", "m3"])
+    }
+
+    /// Through the store: an older page that lands while a newest-page fetch is out is
+    /// replaced by that page like any other history, not appended after it.
+    func testTheStoreDoesNotStitchHistoryPagedInDuringTheFetchUnderThePage() async throws {
+        let page = pageJSON([messageJSON("m1", second: 1), messageJSON("m3", second: 3)])
+        MockURLProtocol.install { _, _ in .json(200, page, delay: 0.5) }
+        let chat = makeStore()
+        chat.applyForTesting(messages: [conv: [try row("m-old", second: 0)]])
+
+        let load = Task { await chat.loadMessages(conversationID: conv, force: true) }
+        try await Task.sleep(for: .milliseconds(100))
+        chat.applyForTesting(messages: [conv: [try row("h-older", second: 0), try row("m-old", second: 0)]])
+        _ = await load.value
+
+        XCTAssertEqual(ids(chat), ["m1", "m3"])
     }
 
     /// Through the store: the thread's ids are taken as the request goes out, so a row
@@ -830,7 +865,7 @@ final class ThreadFreshnessTests: XCTestCase {
         chat.applyForTesting(messages: [conv: [try row("m-old", second: 0), try row("m2-late", second: 2)]])
         _ = await load.value
 
-        XCTAssertEqual(ids(chat), ["m1", "m3", "m2-late"])
+        XCTAssertEqual(ids(chat), ["m1", "m2-late", "m3"])
     }
 
     /// The same for a jump that lands on the newest page.
@@ -845,7 +880,7 @@ final class ThreadFreshnessTests: XCTestCase {
         chat.applyForTesting(messages: [conv: [try row("m-old", second: 0), try row("m2-late", second: 2)]])
         _ = await jump.value
 
-        XCTAssertEqual(ids(chat), ["m1", "m3", "m2-late"])
+        XCTAssertEqual(ids(chat), ["m1", "m2-late", "m3"])
     }
 
     // MARK: Wiring

@@ -21,7 +21,9 @@ Deliberate contract-preserving fixes (coordinated with the frontend):
   chooses its own — and the reset also deletes the account's push subscriptions,
   so notification previews stop reaching devices signed in before it. It stamps
   users.sessions_valid_after too (batch 73 review), so an access token issued
-  before the reset stays refused after the password is changed, not only until.
+  before the reset stays refused after the password is changed, not only until,
+  and it locks the target's users row before revoking anything, so a sign-in
+  racing the reset cannot keep a session it never saw.
 - Create/update user validates the department exists in the target org;
   bulk change_dept skips users whose org doesn't match the department.
 - Passwords go through the org password policy; emails are unique
@@ -37,7 +39,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth import wire_role
+from app.api.auth import lock_user_row, wire_role
 from app.core.deps import require_superadmin
 from app.core.errors import conflict_as_400
 from app.core.security import PasswordPolicyError, enforce_password_policy, hash_password
@@ -1161,9 +1163,34 @@ async def reset_user_password(
     db: AsyncSession = Depends(get_db),
     actor: User = Depends(require_superadmin),
 ):
+    """Give an account a temporary password and end every session it had.
+
+    Returns the temporary password for the superadmin to pass on. Under the target's row lock and in one
+    transaction, the account is flagged must_change_password, its refresh tokens are revoked,
+    users.sessions_valid_after is stamped so older access tokens stay refused, and its push subscriptions are
+    deleted.
+    """
     user = await _get_user_or_404(db, user_id)
     temporary_password = generate_password(12)
-    user.password_hash = await hash_password(temporary_password)
+    new_hash = await hash_password(temporary_password)
+    # The target's row lock, held to commit and taken BEFORE the refresh tokens are
+    # revoked (batch 73 review). The revocation below reaches only the rows that
+    # exist when it runs, so a sign-in that had verified the old password and was
+    # about to insert its session came out of the reset holding a live one. Login
+    # takes this same lock between its bcrypt round and its insert, so one of the
+    # two now waits for the other: the login is refused for a password that no
+    # longer matches, or its session exists by the time it is revoked here. Users
+    # row first, then refresh_tokens — the order api/auth.py's lock_user_row
+    # documents. After the bcrypt round, so the lock is held only for the writes.
+    #
+    # Today the users write below happens to take this lock anyway: the ORM
+    # autoflushes it ahead of the revocation's UPDATE. That is an accident of
+    # statement order and session configuration, not a guarantee — measured, with
+    # this line removed and autoflush off around the revocation, a sign-in holding
+    # the row kept its session — so it is taken here on purpose.
+    if await lock_user_row(db, user.id) is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.password_hash = new_hash
     # Fixes: the account must change it on next login, and old sessions die.
     # The flag is what makes the first half true: get_current_user refuses the
     # account everywhere but change-password from the moment this commits (batch 73).

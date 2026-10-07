@@ -30,6 +30,8 @@ final class PasswordChangeGateTests: XCTestCase {
     private static let temporary = "Temp0rary-pass"
     private static let chosen = "Brand-new-pass-42"
 
+    /// A fresh mock script, a cookie jar of this test's own and no remembered
+    /// account, with both of `APIClient`'s session notifications recorded.
     override func setUp() {
         super.setUp()
         MockURLProtocol.reset()
@@ -39,6 +41,8 @@ final class PasswordChangeGateTests: XCTestCase {
         passwordNotices = NotificationRecorder(name: APIClient.passwordChangeRequiredNotification)
     }
 
+    /// Stops every socket a built `AuthStore` opened, then clears the recorders, the
+    /// script, the jar and the remembered account.
     override func tearDown() {
         for auth in built { auth.realtime.disconnect() }
         built = []
@@ -53,6 +57,8 @@ final class PasswordChangeGateTests: XCTestCase {
 
     // MARK: - Fixture
 
+    /// A cookie jar shared with no other test and not with the app: the ephemeral
+    /// configuration's own when it has one, else a group-container jar under a unique id.
     private static func isolatedCookieJar() -> HTTPCookieStorage {
         if let jar = URLSessionConfiguration.ephemeral.httpCookieStorage,
            jar !== HTTPCookieStorage.shared {
@@ -63,6 +69,8 @@ final class PasswordChangeGateTests: XCTestCase {
         )
     }
 
+    /// An `APIClient` whose session answers from `MockURLProtocol` and keeps its
+    /// cookies in this test's jar.
     private func makeClient() -> APIClient {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [MockURLProtocol.self]
@@ -73,12 +81,16 @@ final class PasswordChangeGateTests: XCTestCase {
         return APIClient(session: URLSession(configuration: config))
     }
 
+    /// An `AuthStore` on `api`, or on a fresh mock client, registered so `tearDown`
+    /// stops its socket.
     private func makeAuth(api: APIClient? = nil) -> AuthStore {
         let auth = AuthStore(api: api ?? makeClient())
         built.append(auth)
         return auth
     }
 
+    /// Put a 30-day `rx_refresh` for the API host in the jar, so a launch asks `/me`,
+    /// and fail the test if it did not take.
     private func plantRefreshCookie(file: StaticString = #filePath, line: UInt = #line) {
         guard
             let host = AppConfig.apiBaseURL.host,
@@ -97,6 +109,7 @@ final class PasswordChangeGateTests: XCTestCase {
         XCTAssertTrue(hasRefreshCookie, "Test fixture: planting rx_refresh did not take", file: file, line: line)
     }
 
+    /// Whether the jar still holds `rx_refresh` for the API origin.
     private var hasRefreshCookie: Bool {
         (jar.cookies(for: AppConfig.apiBaseURL) ?? []).contains { $0.name == "rx_refresh" }
     }
@@ -129,6 +142,7 @@ final class PasswordChangeGateTests: XCTestCase {
         }
     }
 
+    /// The value of the cookie called `name` that `jar` would send to the API, if any.
     private static func cookieValue(_ name: String, in jar: HTTPCookieStorage) -> String? {
         jar.cookies(for: AppConfig.apiBaseURL)?.first { $0.name == name }?.value
     }
@@ -172,14 +186,18 @@ final class PasswordChangeGateTests: XCTestCase {
         return "{" + fields.joined(separator: ", ") + "}"
     }
 
+    /// The `/login` payload: the fixture user under `user`, with the flag as given.
     private static func loginJSON(flag: Bool) -> String {
         #"{"user": "# + userJSON(flag: flag) + "}"
     }
 
+    /// The fixture user, decoded through the real `CurrentUser` decoder.
     private func user(flag: Bool?) throws -> CurrentUser {
         try JSONDecoder().decode(CurrentUser.self, from: Data(Self.userJSON(flag: flag).utf8))
     }
 
+    /// Save the fixture user as the remembered account, with the flag as given, and
+    /// fail the test if it does not load back.
     private func plantRememberedUser(flag: Bool, file: StaticString = #filePath, line: UInt = #line) throws {
         RememberedUser.save(try user(flag: flag))
         XCTAssertNotNil(RememberedUser.load(), "Test fixture: remembering the user did not take",
@@ -210,11 +228,13 @@ final class PasswordChangeGateTests: XCTestCase {
         }
     }
 
+    /// Whether `auth` is in the forced change-password phase.
     private func isHeld(_ auth: AuthStore) -> Bool {
         if case .passwordChangeRequired = auth.phase { return true }
         return false
     }
 
+    /// Whether `auth` is in a running session.
     private func isSignedIn(_ auth: AuthStore) -> Bool {
         if case .signedIn = auth.phase { return true }
         return false
@@ -229,6 +249,8 @@ final class PasswordChangeGateTests: XCTestCase {
 
     // MARK: - The wire field
 
+    /// Pins the flag's decoding: false when the key is absent or null, true only when
+    /// the server sends true.
     func test_currentUser_flagDefaultsToFalseWhenAbsentOrNull_andReadsTrue() throws {
         let decode = { (json: String) in
             try JSONDecoder().decode(CurrentUser.self, from: Data(json.utf8)).mustChangePassword
@@ -240,6 +262,8 @@ final class PasswordChangeGateTests: XCTestCase {
         XCTAssertTrue(try decode(Self.userJSON(flag: true)))
     }
 
+    /// Pins that the remembered account round-trips the flag both ways, so an offline
+    /// relaunch comes back up in the right phase.
     func test_rememberedUser_keepsTheFlag() throws {
         try plantRememberedUser(flag: true)
         XCTAssertEqual(RememberedUser.load()?.mustChangePassword, true,
@@ -259,6 +283,8 @@ final class PasswordChangeGateTests: XCTestCase {
 
     // MARK: - Every way in honours the flag
 
+    /// Pins that a sign-in whose user carries the flag lands held, with no current
+    /// user, no socket, and the flag remembered.
     func test_flaggedSignIn_landsHeld_withNoSocket() async {
         MockURLProtocol.install { request, _ in
             switch request.url?.path {
@@ -280,6 +306,8 @@ final class PasswordChangeGateTests: XCTestCase {
         XCTAssertEqual(RememberedUser.load()?.mustChangePassword, true)
     }
 
+    /// Pins that a launch restoring a flagged user lands held, with the socket idle
+    /// and the refresh cookie kept.
     func test_flaggedRestore_landsHeld_withNoSocket_andKeepsTheCookie() async {
         plantRefreshCookie()
         MockURLProtocol.install { _, _ in .json(200, Self.userJSON(flag: true)) }
@@ -291,6 +319,8 @@ final class PasswordChangeGateTests: XCTestCase {
         XCTAssertTrue(hasRefreshCookie, "the session the change has to be made with was discarded")
     }
 
+    /// Pins that an offline launch whose remembered account carries the flag lands
+    /// held rather than in the app.
     func test_offlineRestoreOfAHeldAccount_landsHeld() async throws {
         plantRefreshCookie()
         try plantRememberedUser(flag: true)
@@ -306,6 +336,8 @@ final class PasswordChangeGateTests: XCTestCase {
 
     // MARK: - The way out
 
+    /// Pins the way out: `/me`, one `change-password` carrying both passwords, `/me`
+    /// again, then a running session with its socket and the flag cleared everywhere.
     func test_completingTheChange_asksMe_changesOnce_asksMeAgain_thenStartsTheSession() async throws {
         plantRefreshCookie()
         let bodies = BodyRecorder()
@@ -360,6 +392,8 @@ final class PasswordChangeGateTests: XCTestCase {
         XCTAssertEqual(auth.realtime.state, .idle)
     }
 
+    /// Pins that a 401 from `change-password` reads as a mistyped temporary password:
+    /// held, with that sentence, and no refresh, expiry notice or lost cookie.
     func test_completingTheChange_wrongTemporaryPassword_staysHeld_withItsOwnSentence() async {
         plantRefreshCookie()
         MockURLProtocol.install { request, _ in
@@ -380,6 +414,8 @@ final class PasswordChangeGateTests: XCTestCase {
         XCTAssertTrue(hasRefreshCookie)
     }
 
+    /// Pins that a 400 from `change-password` stays held and shows the server's own
+    /// sentence.
     func test_completingTheChange_policyRefusal_showsTheServersSentenceVerbatim() async {
         plantRefreshCookie()
         let refusal = "Choose a password different from your current one."
@@ -396,6 +432,8 @@ final class PasswordChangeGateTests: XCTestCase {
         XCTAssertEqual(auth.passwordChangeError, refusal)
     }
 
+    /// Pins that a 429 from `change-password` stays held and says, from
+    /// `Retry-After`, how long to wait.
     func test_completingTheChange_rateLimited_saysTooManyAttempts() async {
         plantRefreshCookie()
         MockURLProtocol.install { request, _ in
@@ -511,6 +549,8 @@ final class PasswordChangeGateTests: XCTestCase {
 
     // MARK: - Leaving without changing it
 
+    /// Pins that Sign Out from the held screen logs out once, drops the refresh
+    /// cookie and the remembered account, and lands signed out.
     func test_signOutFromTheHeldPhase_endsTheSession() async throws {
         plantRefreshCookie()
         MockURLProtocol.install { request, _ in
@@ -589,6 +629,71 @@ final class PasswordChangeGateTests: XCTestCase {
         XCTAssertNil(RememberedUser.load())
         XCTAssertFalse(auth.isChangingPassword)
         XCTAssertFalse(auth.isSigningOut)
+    }
+
+    /// Coming back to the app while Sign Out waits on its logout must not start a
+    /// check that can outrun it: the sign-out bumped the generation first, so a check
+    /// begun after that passes every generation guard, and a release there reconnected
+    /// the socket of a phone that then showed itself signed out (batch 73 review).
+    func test_aForegroundDuringSignOut_asksNothing_andTheSocketEndsClosed() async {
+        plantRefreshCookie()
+        MockURLProtocol.install { request, _ in
+            switch request.url?.path {
+            case "/api/auth/logout":
+                return .json(200, #"{"message":"Logged out successfully"}"#, delay: 0.4)
+            case "/api/auth/me":
+                return .json(200, Self.userJSON(flag: true))
+            default:
+                return .json(404, #"{"detail":"Not found"}"#)
+            }
+        }
+        let auth = await restored()
+        XCTAssertTrue(isHeld(auth), "precondition: held")
+        let mesBefore = MockURLProtocol.count(path: "/api/auth/me")
+
+        let signOut = Task { await auth.signOut() }
+        await waitUntil("the logout to be on the wire") {
+            MockURLProtocol.count(path: "/api/auth/logout") == 1
+        }
+        auth.applicationWillEnterForeground()
+        await signOut.value
+        try? await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(MockURLProtocol.count(path: "/api/auth/me"), mesBefore,
+                       "a check began while the sign-out was still running")
+        XCTAssertEqual(auth.phase, .signedOut)
+        XCTAssertEqual(auth.realtime.state, .idle, "a socket was left open on a signed-out phone")
+    }
+
+    /// The join has no injectable seam (its token request goes through the shared
+    /// client), so this pins the shape: every continuation after an await asks whether
+    /// the call is still the one being joined, and a room joined for a call that ended
+    /// meanwhile is left only if the session still belongs to it (CodeRabbit, review of
+    /// 1fbc1de).
+    func test_aJoinThatOutlivesItsCallStandsDown() throws {
+        let calls = try source("Features/Calls/CallStore.swift")
+        let start = try XCTUnwrap(calls.range(of: "    private func join(callID: String) async {"))
+        let end = try XCTUnwrap(calls.range(of: "    private func isStillJoining(_ callID: String) -> Bool {",
+                                            range: start.upperBound..<calls.endIndex))
+        let join = String(calls[start.upperBound..<end.lowerBound])
+        XCTAssertEqual(join.components(separatedBy: "guard isStillJoining(callID) else").count - 1, 6,
+                       "a continuation of the join no longer checks that its call is still live")
+        XCTAssertTrue(join.contains("if session.callID == callID { await session.leave() }"),
+                      "a stale join tears down a room it may not own, or keeps one it does")
+        let check = String(calls[end.upperBound...].prefix(120))
+        XCTAssertTrue(check.contains("currentCallID == callID && hasLiveCall"))
+    }
+
+    /// The Settings sheet judges a new password by the same rules as the forced screen
+    /// and the server (CodeRabbit, review of 1fbc1de): code points, A–Z letters, 72 bytes.
+    func test_theSettingsSheetUsesThePasswordPolicy() throws {
+        let settings = try source("Features/Settings/SettingsView.swift")
+        XCTAssertTrue(settings.contains("switch PasswordPolicy.problem(current: current, new: new, confirmation: new) {"),
+                      "the Settings sheet keeps its own password rules")
+        XCTAssertFalse(settings.contains("new.count < Self.assumedMinimumLength"),
+                       "length is counted in graphemes again")
+        XCTAssertFalse(settings.contains("new.rangeOfCharacter(from: .letters)"),
+                       "any Unicode letter counts again")
     }
 
     /// The form stays up while Sign Out waits on its logout, and nothing would wait
@@ -712,6 +817,8 @@ final class PasswordChangeGateTests: XCTestCase {
 
     // MARK: - A running session is taken out of the app
 
+    /// Pins that a coded 403 on an ordinary request holds a running session: cookies
+    /// kept, no expiry notice, socket stopped, list and live call cleared, flag remembered.
     func test_aCodedRefusalOnAnyRequest_holdsTheSession_withoutClearingCookies() async throws {
         plantRefreshCookie()
         MockURLProtocol.install { request, _ in
@@ -759,6 +866,8 @@ final class PasswordChangeGateTests: XCTestCase {
         await waitUntil("the call store's session state to clear") { calls.missedCallCount == 0 }
     }
 
+    /// Pins that a 4403 close stops the socket at once, then holds the session with
+    /// its cookie kept and no expiry notice.
     func test_aSocketClose4403_holdsTheSession_andStopsTheSocket() async {
         plantRefreshCookie()
         MockURLProtocol.install { _, _ in .json(200, Self.userJSON(flag: false)) }
@@ -777,6 +886,8 @@ final class PasswordChangeGateTests: XCTestCase {
 
     // MARK: - Revalidation moves both ways
 
+    /// Pins that a foreground `/me` reporting the flag holds a running session, with
+    /// the socket stopped and the cookie kept.
     func test_revalidation_holdsARunningSessionWhoseFlagWasSet() async {
         plantRefreshCookie()
         MockURLProtocol.install { _, ordinal in .json(200, Self.userJSON(flag: ordinal > 1)) }
@@ -810,6 +921,8 @@ final class PasswordChangeGateTests: XCTestCase {
         ], "the session was started without asking whether it survived the change")
     }
 
+    /// Pins that a foreground check finding the flag cleared elsewhere, with the
+    /// forced refresh refused, ends the session saying why and never starts it.
     func test_revalidation_changedElsewhere_sessionRevoked_endsIt_sayingWhy() async {
         plantRefreshCookie()
         installChangedElsewhere { _ in Self.refreshRefused }
@@ -849,6 +962,8 @@ final class PasswordChangeGateTests: XCTestCase {
         XCTAssertNil(RememberedUser.load())
     }
 
+    /// Pins that an undelivered forced refresh after a change elsewhere keeps the
+    /// session held, and that the retry starts it once a refresh is answered.
     func test_revalidation_changedElsewhere_refreshUnreachable_staysHeld_andRetries() async {
         plantRefreshCookie()
         installChangedElsewhere { ordinal in ordinal == 1 ? Self.refreshUnreachable : Self.refreshed }
@@ -933,6 +1048,8 @@ final class PasswordChangeGateTests: XCTestCase {
 
     // MARK: - APIClient
 
+    /// Pins that `APIClient` throws `.passwordChangeRequired` for the coded 403 and
+    /// announces it once, with no refresh, no expiry notice and the cookie kept.
     func test_aCodedRefusal_isItsOwnError_andIsAnnouncedOnce() async throws {
         plantRefreshCookie()
         MockURLProtocol.install { _, _ in .json(403, Self.codedRefusal) }
@@ -988,12 +1105,15 @@ final class PasswordChangeGateTests: XCTestCase {
 
     // MARK: - RealtimeClient
 
+    /// Pins the close code to the 4403 that `hub.py` sends.
     func test_theCloseCodeIsPinned() {
         // Literal on purpose: copied from `hub.py` (`WS_CLOSE_PASSWORD_CHANGE_REQUIRED`),
         // so a change on this side fails here instead of silently missing the close.
         XCTAssertEqual(RealtimeClient.passwordChangeRequiredCloseCode, 4403)
     }
 
+    /// Pins that a 4403 close cancels a pending reconnect, reports once, and leaves
+    /// the client stopped against later closes and foregrounding.
     func test_a4403Close_stopsAPendingReconnect_andReportsOnce() {
         let client = RealtimeClient()
         defer { client.disconnect() }
@@ -1025,7 +1145,7 @@ final class PasswordChangeGateTests: XCTestCase {
         let ringing = try JSONDecoder().decode(CallSignal.self, from: Data(#"{"call_id":"call-1"}"#.utf8))
         calls.applyForTesting(missedCallCount: 3, phase: .incoming(ringing))
 
-        await calls.endForPasswordChange().value
+        await calls.endForPasswordChange()
 
         XCTAssertEqual(calls.phase, .idle)
         XCTAssertFalse(calls.hasLiveCall)
@@ -1034,7 +1154,10 @@ final class PasswordChangeGateTests: XCTestCase {
 
     // MARK: - The form's own checks
 
+    /// Pins each `PasswordPolicy` verdict: incomplete, too short, missing a letter or
+    /// a digit (A–Z letters only), mismatched, and the same as the current password.
     func test_passwordPolicy_mirrorsTheServerRules() {
+        /// The policy's verdict on `new`, with a matching confirmation unless one is given.
         func check(_ new: String, current: String = "Temp0rary-pass", confirmation: String? = nil)
             -> PasswordPolicy.Problem? {
             PasswordPolicy.problem(current: current, new: new, confirmation: confirmation ?? new)
@@ -1073,6 +1196,8 @@ final class PasswordChangeGateTests: XCTestCase {
 
     // MARK: - Wiring that has no seam
 
+    /// The text of an app source file, found relative to this test file, for the
+    /// tests that pin wiring with no runtime seam.
     private func source(_ path: String) throws -> String {
         let url = URL(fileURLWithPath: "\(#filePath)")
             .deletingLastPathComponent()
@@ -1081,6 +1206,35 @@ final class PasswordChangeGateTests: XCTestCase {
         return try String(contentsOf: url, encoding: .utf8)
     }
 
+    /// The hang-up has to leave before the socket is stopped, and Apple does not
+    /// promise a close flushes a send still pending (CodeRabbit, review of 1fbc1de).
+    /// No test socket can show the frame on the wire, so this pins the order: the
+    /// call store awaits the send before leaving the room, and a running session is
+    /// held only after its call has ended.
+    func test_theHangUpIsAwaitedBeforeTheSocketStops() throws {
+        let calls = try source("Features/Calls/CallStore.swift")
+        let end = try XCTUnwrap(calls.range(of: "    func endForPasswordChange() async {"))
+        let body = String(calls[end.upperBound...].prefix(1400))
+        let sent = try XCTUnwrap(body.range(of: "await realtime.sendAndWait(.callEnd(callID: callID))"),
+                                 "the hang-up is not awaited")
+        let left = try XCTUnwrap(body.range(of: "if hasLiveCall { await teardown(to: .idle) }"))
+        XCTAssertLessThan(sent.lowerBound, left.lowerBound, "the room is left before the hang-up is sent")
+
+        let auth = try source("Features/Auth/AuthStore.swift")
+        let enter = try XCTUnwrap(auth.range(of: "    private func enterPasswordChangeRequired(_ user: CurrentUser) async {"))
+        let flow = String(auth[enter.upperBound...].prefix(400))
+        let ended = try XCTUnwrap(flow.range(of: "await calls?.endForPasswordChange()"),
+                                  "a running session is held without its call being ended first")
+        let held = try XCTUnwrap(flow.range(of: "holdAtPasswordChange(user)"))
+        XCTAssertLessThan(ended.lowerBound, held.lowerBound, "the socket is stopped before the call has ended")
+
+        let realtime = try source("Realtime/RealtimeClient.swift")
+        XCTAssertTrue(realtime.contains("func sendAndWait(_ frame: OutboundFrame, timeout: Duration = .seconds(1)) async -> Bool"),
+                      "the wait for the hang-up is not bounded")
+    }
+
+    /// Pins, from the source, that `RootView` shows `ForcedPasswordChangeView` for the
+    /// held phase and that the foreground call reconcile is gated on a running session.
     func test_theRootShowsTheChangeScreen_andTheForegroundReconcileNeedsARunningSession() throws {
         let app = try source("RxHiveApp.swift")
         let held = try XCTUnwrap(app.range(of: "case .passwordChangeRequired(let user):"),
@@ -1095,6 +1249,8 @@ final class PasswordChangeGateTests: XCTestCase {
                           "the gate no longer guards the reconcile")
     }
 
+    /// Pins, from the source, that the held screen loads no avatar or authenticated
+    /// image and still offers Sign Out.
     func test_theChangeScreenLoadsNoMedia() throws {
         let view = try source("Features/Auth/ForcedPasswordChangeView.swift")
         XCTAssertFalse(view.contains("Avatar("), "an avatar loads from /api/media, which a held account is refused")
@@ -1111,6 +1267,8 @@ final class PasswordChangeGateTests: XCTestCase {
                       "Change Password stays enabled while Sign Out is waiting on the change")
     }
 
+    /// Pins, from the source, that Reset Password is disabled on the admin's own row
+    /// and that `resetPassword()` refuses it as well.
     func test_orgAdminCannotResetTheirOwnPassword() throws {
         let view = try source("Features/OrgAdmin/OrgAdminView.swift")
         XCTAssertTrue(view.contains(".disabled(isSelf || busy != nil)\n\n                if isSelf {"),
@@ -1128,10 +1286,12 @@ private final class PhaseRecorder {
     private(set) var phases: [AuthStore.Phase] = []
     private var subscription: AnyCancellable?
 
+    /// Start recording `auth`'s phases; the subscription delivers the current one first.
     init(_ auth: AuthStore) {
         subscription = auth.$phase.sink { [weak self] phase in self?.phases.append(phase) }
     }
 
+    /// Whether any recorded phase was `.signedIn`.
     var everSignedIn: Bool {
         phases.contains { phase in
             if case .signedIn = phase { return true }
@@ -1146,12 +1306,14 @@ private final class EventLog: @unchecked Sendable {
     private let lock = NSLock()
     private var events: [String] = []
 
+    /// Append `event` to the log.
     func record(_ event: String) {
         lock.lock()
         events.append(event)
         lock.unlock()
     }
 
+    /// The events recorded so far, in order.
     var all: [String] {
         lock.lock()
         defer { lock.unlock() }
@@ -1165,6 +1327,8 @@ private final class BodyRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var bodies: [[String: Any]] = []
 
+    /// Read `request`'s JSON body, from `httpBody` or its stream, and keep it; a body
+    /// that is not a JSON object is kept as empty.
     func record(_ request: URLRequest) {
         var data = request.httpBody ?? Data()
         if data.isEmpty, let stream = request.httpBodyStream {
@@ -1183,6 +1347,7 @@ private final class BodyRecorder: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// The most recently recorded body, if any.
     var last: [String: Any]? {
         lock.lock()
         defer { lock.unlock() }

@@ -84,6 +84,11 @@ def create_access_token(
     org_id: uuid.UUID | None,
     client: str = WEB_CLIENT,
 ) -> str:
+    """Mint a signed access JWT for a user, valid for access_token_minutes.
+
+    It carries the role, the org, the client it was minted for, and `iat_ms` beside `iat` so the session epoch
+    can be compared to the millisecond.
+    """
     settings = get_settings()
     now = dt.datetime.now(dt.UTC)
     payload = {

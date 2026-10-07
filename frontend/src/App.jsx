@@ -241,6 +241,12 @@ const PasswordChangeGate = ({ children }) => {
   return <ForcedPasswordChange />;
 };
 
+/**
+ * The root component: providers, the session-wide realtime socket and call
+ * overlays, and the route table. Everything that talks to the API sits inside
+ * PasswordChangeGate; the offline banner and the Toaster sit outside it, since
+ * neither calls the API and the forced password screen needs the Toaster.
+ */
 function App() {
   return (
     <ErrorBoundary>

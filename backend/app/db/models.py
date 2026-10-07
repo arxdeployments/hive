@@ -110,6 +110,11 @@ class Department(Base):
 
 
 class User(Base):
+    """A person who signs in, with their organization, department, role, password hash and account flags.
+
+    must_change_password and sessions_valid_after are what an administrator's password reset sets.
+    """
+
     __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = _uuid_pk()

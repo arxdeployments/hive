@@ -3,6 +3,7 @@ import client, { setSignOutReason } from '../api/client';
 import useChatStore from '../stores/chatStore';
 import { tearDownPush } from '../lib/pushTeardown';
 import { onPasswordChangeRequired } from '../lib/passwordChange';
+import { rebindPushAfterReset } from '../lib/pwa';
 
 /**
  * Both sign-outs that stay inside the SPA end up here.
@@ -39,14 +40,35 @@ export const useAuth = () => {
   return context;
 };
 
+/**
+ * Owns the signed-in user for the whole app: proves the session with /me on
+ * mount, mirrors the user to localStorage, and exposes login, logout and the
+ * setters that move the app onto and off the forced password change (batch 73).
+ */
 export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
+  /**
+   * Ask /api/auth/me who is signed in and store the answer. A 401 or 403 ends the
+   * session; any other failure keeps the cached user, so a boot without network
+   * does not sign out a session whose cookies are still good. Re-binds push when
+   * the cache was held at the forced password change and /me now says it is done.
+   */
   const checkAuth = useCallback(async () => {
     try {
+      // Held at the forced password change when this tab last knew (batch 73)?
+      const wasHeld = cachedUser()?.must_change_password === true;
       // Session lives in httpOnly cookies; /me is the source of truth.
       const { data } = await client.get('/api/auth/me');
+      // Released since, so the password was changed: by this tab before a reload
+      // (the forced screen asks for one when the server's confirmation was lost)
+      // or by another. The reset deleted this account's push rows while the
+      // browser kept its subscription, and the heal that runs next never re-sends
+      // one the browser still holds, so push would stay dead with Settings showing
+      // it on. Re-bound here as the forced screen does; not awaited (batch 73
+      // review).
+      if (wasHeld && data?.must_change_password === false) rebindPushAfterReset();
       setUser(data);
       localStorage.setItem('user', JSON.stringify(data));
     } catch (err) {

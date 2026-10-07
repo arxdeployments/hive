@@ -269,7 +269,7 @@ enum SettingsKeys {
 ///
 /// The client checks the policy so a typo costs no round trip, and the server's
 /// message is shown verbatim on a 400 because the minimum length is configuration
-/// (`settings.password_min_length`) — this build's guess of 8 can be wrong, and
+/// (`settings.password_min_length`) — this build assumes the default, 10, which can be wrong, and
 /// "Password must be at least 12 characters" is only useful if it survives.
 private struct ChangePasswordSheet: View {
 
@@ -288,13 +288,22 @@ private struct ChangePasswordSheet: View {
     /// refused by the server. The server is authoritative.
     private static let assumedMinimumLength = PasswordPolicy.minimumLength
 
+    /// The first rule the new password breaks, or nil while either password field is
+    /// empty. Length, byte cap and letter-and-digit come from `PasswordPolicy`, so they
+    /// count as the server does; reuse and a mismatched confirmation keep this sheet's wording.
     private var localValidationError: String? {
         if current.isEmpty || new.isEmpty { return nil }
-        if new.count < Self.assumedMinimumLength {
-            return "New password must be at least \(Self.assumedMinimumLength) characters."
-        }
-        if new.rangeOfCharacter(from: .letters) == nil || new.rangeOfCharacter(from: .decimalDigits) == nil {
-            return "New password must contain both letters and numbers."
+        // The new password's own rules come from `PasswordPolicy`, which counts the
+        // way the server does: length in code points rather than graphemes, letters
+        // as A–Z only, and the 72-byte cap. Counted here with `.count` and `.letters`,
+        // a decomposed password the server takes was refused and an accented one it
+        // refuses was let through (CodeRabbit, review of 1fbc1de). This sheet keeps its
+        // own wording for the two checks below.
+        switch PasswordPolicy.problem(current: current, new: new, confirmation: new) {
+        case let problem? where [.tooShort, .tooLong, .needsLetterAndDigit].contains(problem):
+            return problem.message
+        default:
+            break
         }
         if new == current {
             return "New password must be different from your current one."
@@ -309,6 +318,8 @@ private struct ChangePasswordSheet: View {
         !current.isEmpty && !new.isEmpty && new == confirmation && localValidationError == nil
     }
 
+    /// The three password fields, the first error to show, the policy caption and the
+    /// submit button. The caption says this session stays signed in after the change.
     var body: some View {
         NavigationStack {
             ScrollView {

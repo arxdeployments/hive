@@ -156,6 +156,12 @@ const replay = (config) => client({ ...config, _retry: true });
 
 client.interceptors.response.use(
   (response) => response,
+  /**
+   * Handle a failed response. A PASSWORD_CHANGE_REQUIRED 403 is announced and
+   * rejected (batch 73); a 401 outside the credential paths refreshes the
+   * session once, shared across concurrent requests, and replays, signing out
+   * only if the server refuses the refresh. Everything else rejects unchanged.
+   */
   async (error) => {
     const originalRequest = error.config;
     const skipRefresh = CREDENTIAL_401_PATHS.has(pathnameOf(originalRequest?.url));

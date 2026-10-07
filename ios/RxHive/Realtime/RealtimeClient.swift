@@ -256,6 +256,9 @@ final class RealtimeClient: NSObject, ObservableObject {
         broadcast(event)
     }
 
+    /// The current socket's receive failed: the server closed it or the connection
+    /// dropped. Stops pinging, ignores a close this client asked for, and hands the
+    /// close code to `socketClosed`.
     private func socketFailed(_ socket: URLSessionWebSocketTask, error: Error) {
         pingTimer?.cancel(); pingTimer = nil
         guard !intentionallyClosed else { return }
@@ -407,6 +410,8 @@ final class RealtimeClient: NSObject, ObservableObject {
 
     // MARK: - Sending
 
+    /// Encode `frame` and hand it to the socket without waiting. Dropped, not queued,
+    /// when the socket is not connected.
     func send(_ frame: OutboundFrame) {
         guard let task, state == .connected else {
             // Dropped rather than queued. Every frame this app sends is either
@@ -426,6 +431,32 @@ final class RealtimeClient: NSObject, ObservableObject {
             }
         } catch {
             log.error("Encode failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// `send`, then wait at most `timeout` for the socket to report the frame
+    /// handed to the network. Returns whether that happened in time.
+    ///
+    /// For the one frame that must not be lost to the close right behind it: the
+    /// hang-up sent on the way into the forced change-password screen. Apple does
+    /// not promise that cancelling a URLSessionWebSocketTask flushes sends still
+    /// pending on it, so `disconnect()` straight after `send` could swallow the
+    /// hang-up and leave the peer waiting out the server's grace window
+    /// (CodeRabbit, review of 1fbc1de). Bounded, so a socket that never answers
+    /// cannot hold the transition up.
+    @discardableResult
+    func sendAndWait(_ frame: OutboundFrame, timeout: Duration = .seconds(1)) async -> Bool {
+        guard let task, state == .connected,
+              let data = try? encoder.encode(frame),
+              let text = String(data: data, encoding: .utf8) else { return false }
+        let once = ResumeOnce()
+        return await withCheckedContinuation { continuation in
+            once.arm(continuation)
+            task.send(.string(text)) { error in once.resume(error == nil) }
+            Task {
+                try? await Task.sleep(for: timeout)
+                once.resume(false)
+            }
         }
     }
 
@@ -679,5 +710,29 @@ extension RealtimeClient: URLSessionWebSocketDelegate {
             guard let self, self.task === webSocketTask else { return }
             self.lastCloseReason = text
         }
+    }
+}
+
+/// Resumes a continuation exactly once, from whichever of two racing sides gets
+/// there first (`RealtimeClient.sendAndWait`: the send's completion, or its timeout).
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool, Never>?
+
+    /// Store the continuation that the first `resume` will complete.
+    func arm(_ continuation: CheckedContinuation<Bool, Never>) {
+        lock.lock()
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    /// Resume the armed continuation with `value`, if nothing has resumed it yet;
+    /// every later call is a no-op.
+    func resume(_ value: Bool) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(returning: value)
     }
 }

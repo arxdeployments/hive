@@ -13,15 +13,29 @@ Changes vs the Mongo build (all deliberate, coordinated with the frontend):
   logout and change-password stay reachable so the user can get out of that state.
   change-password refuses a new password equal to the current one, and re-issues
   the caller's session when the one it is using was revoked by the reset.
+- A reset ends every session from before it (batch 73 review). The reset stamps
+  users.sessions_valid_after: core/deps.py refuses an access token issued before
+  it, and /refresh refuses a refresh row created before it. Login, logout,
+  change-password and both resets lock the users row before any refresh_tokens
+  row, in that order everywhere, so a sign-in racing a reset cannot come out of it
+  holding a session the reset never saw.
 
 Rotation is now delivery-safe as well as single-use. Revoking the presented token
 commits before its replacement can reach the client, so a lost response used to
 leave a healthy client holding a token the server had already spent, and its next
 refresh signed the user out of a session that was fine. A rotated token may now be
 replayed once, within a short grace window, while the successor it never received
-is still unused. Every other reuse is treated as a stolen cookie and burns that
-client's whole session family — stricter than failing the one token, which is what
-the previous build did.
+is still unused. Every other reuse of a ROTATED token is treated as a stolen
+cookie and burns that client's whole session family — stricter than failing the
+one token, which is what the previous build did.
+
+A revoked token that was never rotated is a different thing, and is simply refused
+(batch 73 review). Rotation is the only thing that records a successor, so a
+revoked row without one was ended on purpose — by a reset, a logout, a password
+change, a deactivation — and presenting it is what a device signed out from
+somewhere else does on its next refresh. Burning the family for it signed the user
+out of the session they had just made: the one they signed in to with the
+temporary password, or the one change-password had just re-issued.
 """
 
 import datetime as dt
@@ -111,6 +125,10 @@ def wire_role(role: UserRole) -> str:
 
 
 def _user_payload(user: User) -> dict:
+    """The user object login, refresh and me return, with must_change_password for every role.
+
+    Organization and department ids are included for every role but superadmin.
+    """
     payload = {
         "id": str(user.id),
         "email": user.email,
@@ -146,6 +164,41 @@ def clear_auth_cookies(response: Response) -> None:
         response.delete_cookie(name, domain=settings.cookie_domain, path="/")
 
 
+async def lock_user_row(db: AsyncSession, user_id: uuid.UUID) -> User | None:
+    """Lock one users row for the rest of the transaction, and return it as it is now.
+
+    The lock every path that both decides on an account's credentials and writes
+    its sessions takes FIRST — login, logout and change-password here, and both
+    admin resets — so they serialise against each other on the account rather than
+    racing (batch 73 review). Always the users row before any refresh_tokens row
+    those paths lock, so two of them can wait on each other but never deadlock.
+    /refresh takes no explicit users lock at all, for the same reason.
+
+    FOR NO KEY UPDATE, not FOR UPDATE, and that is load-bearing. Every INSERT into
+    refresh_tokens checks its foreign key by taking FOR KEY SHARE on the users row,
+    and /refresh inserts its successor while holding the presented refresh row's
+    lock — so it does reach the users row after a refresh_tokens row, implicitly.
+    FOR UPDATE conflicts with FOR KEY SHARE, and a reset holding it while its
+    revocation waited on that refresh row deadlocked against the rotation: measured,
+    by tests/test_must_change_password.py's rotation-race test, before this was
+    changed. FOR NO KEY UPDATE is the lock an ordinary UPDATE of this row takes: it
+    conflicts with itself and with any write to the row, so these paths still queue
+    on each other, and it lets a foreign-key check through.
+
+    populate_existing, because the caller has usually loaded this row already, and
+    without it the identity map hands back that copy as it was read — before a
+    bcrypt round, before the lock — rather than the row as it is now.
+    """
+    return (
+        await db.execute(
+            select(User)
+            .where(User.id == user_id)
+            .with_for_update(key_share=True)  # FOR NO KEY UPDATE on PostgreSQL
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+
+
 async def _issue_session(
     db: AsyncSession,
     user: User,
@@ -154,6 +207,11 @@ async def _issue_session(
     client: str = WEB_CLIENT,
     replaces: RefreshToken | None = None,
 ) -> None:
+    """Mint an access token and a new refresh session for the user, commit, and set both cookies.
+
+    With `replaces`, the rotated row is linked to the new one in the same transaction, so a later replay of
+    the rotated token can be recognised as a rotation that never arrived.
+    """
     settings = get_settings()
     access = create_access_token(user.id, wire_role(user.role), user.org_id, client=client)
     raw_refresh, token_hash = new_refresh_token()
@@ -163,6 +221,14 @@ async def _issue_session(
         user_agent=(request.headers.get("user-agent") or "")[:300],
         client=client,
         expires_at=now_utc() + dt.timedelta(days=settings.refresh_token_days),
+        # Stamped here, on the application clock, not left to the column's server
+        # default (batch 73 review). /refresh compares it with
+        # users.sessions_valid_after, which the resets stamp with now_utc(), so the
+        # comparison has one clock on both sides. The server default is Postgres'
+        # now() — the database's clock, read at the start of the transaction — and
+        # any skew between the two would refuse a session minted just after a reset
+        # at its first refresh, or pass one minted just before it.
+        created_at=now_utc(),
     )
     db.add(issued)
     if replaces is not None:
@@ -183,6 +249,13 @@ async def login(
     db: AsyncSession = Depends(get_db),
     _rl: None = Depends(login_limiter),
 ):
+    """Sign in with email and password and set the session cookies.
+
+    Refuses with 401 an unknown email, a wrong password, a password a reset replaced while it was being
+    verified, and a deactivated account; a mobile sign-in must also hold the mobile grant. An account that
+    must change its password is let in, and the flag in the returned payload sends the client to
+    change-password.
+    """
     # users.email is CITEXT with a UNIQUE btree index, so `==` is already
     # case-insensitive. Wrapping it in lower() made the comparison lower(email)
     # instead of email, which that index cannot serve: every sign-in — including
@@ -194,8 +267,22 @@ async def login(
         # wrong password by response latency (user-enumeration defense).
         await verify_password(body.password, _DUMMY_HASH)
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    if not await verify_password(body.password, user.password_hash):
+    verified_hash = user.password_hash
+    if not await verify_password(body.password, verified_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+    # Re-read the account under its row lock, held until the session below is
+    # issued and committed, and refuse if the password changed while bcrypt was
+    # running (batch 73 review). Unlocked, a reset committing in that window revoked
+    # every refresh row that existed at the time — not the one this login was about
+    # to insert — so a sign-in with the password the reset had just replaced came
+    # out of it holding a live 30-day session. Both resets take the same lock before
+    # they revoke anything, so whichever request locks first wins outright: this
+    # login sees the reset's new hash and is refused, or the reset waits for this
+    # commit and then revokes the session it produced.
+    locked = await lock_user_row(db, user.id)
+    if locked is None or locked.password_hash != verified_hash:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    user = locked
     if not user.is_active:
         raise HTTPException(status_code=401, detail="Account is deactivated")
     # Ordered after the password check so the mobile-approval state of an account
@@ -359,6 +446,11 @@ async def _undelivered_successor(db: AsyncSession, token: RefreshToken) -> Refre
     Every other reuse is a token someone has already spent being presented again,
     which is what a captured cookie looks like, so the family is burned rather than
     just this row.
+
+    Only for a token that WAS rotated. /refresh refuses a revoked token with no
+    successor before it gets here, without the burn: nothing spent that token, it
+    was ended on purpose, and burning the family for it signed users out of the
+    session a reset or a password change had just given them (batch 73 review).
     """
     grace = dt.timedelta(seconds=get_settings().refresh_reuse_grace_seconds)
     # FOR UPDATE, for the same reason the logout walk takes it on every node. This
@@ -407,9 +499,23 @@ async def refresh(
     db: AsyncSession = Depends(get_db),
     _rl: None = Depends(refresh_limiter),
 ):
+    """Rotate the presented refresh token into a new session and set fresh cookies.
+
+    Refuses with 401 a token that is unknown, expired, revoked without ever being rotated, created before the
+    account's last reset, or held by a deactivated account, and re-checks the mobile grant for a mobile
+    session. A rotated token replayed within the grace window is honoured once; any other replay burns that
+    client's session family.
+    """
     raw = request.cookies.get(REFRESH_COOKIE)
     if not raw:
         raise HTTPException(status_code=401, detail="Refresh token required")
+    # No explicit users-row lock on this path: it locks a refresh_tokens row first,
+    # the opposite of the order the credential paths keep, so it must never wait on
+    # an account lock they hold. The foreign-key check its insert makes does touch
+    # the users row, which lock_user_row's FOR NO KEY UPDATE is chosen to let
+    # through. A rotation racing a reset is caught by the session-epoch check below
+    # instead (batch 73 review).
+    #
     # FOR UPDATE. Rotation is a read-check-write on this row — `revoked_at` is
     # read at the branch below and written at the end — and without the lock those
     # are two transactions, so the single-use rule is not enforced under
@@ -426,10 +532,30 @@ async def refresh(
     ).scalar_one_or_none()
     if token is None:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+    if token.revoked_at is not None and token.replaced_by_id is None:
+        # Revoked and never rotated — rotation is the only writer of replaced_by_id
+        # (_issue_session(replaces=...), in the same transaction as the revocation)
+        # — so this session was ended on purpose: by a reset, a logout, a password
+        # change, a deactivation or a revoked mobile grant. Refused, and that is all
+        # (batch 73 review). It used to fall into the theft branch below, which
+        # burns every live session this user has on this client, so a stale device
+        # refreshing after an admin reset, or after the owner changed the password
+        # elsewhere, signed the user out of the session they had just made — the
+        # temporary-password sign-in, or the one change-password had re-issued.
+        # Both clients now force a refresh precisely to learn whether their session
+        # survived a change made somewhere else, so this is the ordinary answer to
+        # an ordinary question, not evidence of a stolen cookie. Info, not a
+        # warning, for the same reason; same detail as an unknown token.
+        logger.info(
+            "Refresh with a revoked, never-rotated token for user %s (%s session); refusing it",
+            token.user_id,
+            token.client or WEB_CLIENT,
+        )
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
     if token.revoked_at is not None:
         # Substituting the successor rather than returning early keeps every check
-        # below — expiry, is_active, the mobile grant — applied in the same order,
-        # to the row that is actually the live session.
+        # below — expiry, is_active, the session epoch, the mobile grant — applied
+        # in the same order, to the row that is actually the live session.
         token = await _undelivered_successor(db, token)
     expires = _as_utc(token.expires_at)
     if expires < now_utc():
@@ -441,6 +567,21 @@ async def refresh(
         token.revoked_at = now_utc()
         await db.commit()
         raise HTTPException(status_code=401, detail="Account is deactivated")
+
+    # The session epoch, for refresh rows (batch 73 review). A reset revokes every
+    # refresh row it can see and then stamps users.sessions_valid_after, but a
+    # rotation that holds the presented row's lock while the reset runs inserts its
+    # successor in a transaction the reset's revocation cannot see, so that
+    # successor came out of the reset live — a session the reset was meant to end,
+    # good for another 30 days. Any row created before the epoch belongs to a
+    # session from before the last reset, so it is revoked here and refused, the
+    # way core/deps.py refuses an access token issued before it.
+    epoch = user.sessions_valid_after
+    if epoch is not None and _as_utc(token.created_at) < _as_utc(epoch):
+        token.revoked_at = now_utc()
+        await db.commit()
+        logger.info("Refresh with a session from before the last reset for user %s; refusing it", user.id)
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     # A mobile session outlives the grant that created it unless the grant is
     # re-checked here — same reasoning as is_active directly above. The session is
@@ -482,6 +623,18 @@ async def logout(
     # would leave its refresh session live on the device it is leaving.
     user: User = Depends(get_current_user_pending_password_change),
 ):
+    """Revoke the presented refresh token and every session it was rotated into, then clear the cookies.
+
+    Reachable while a password change is pending, so a reset account can always sign out. Takes the account's
+    row lock first, and re-stamps a row the reset had already revoked so change-password will not re-issue a
+    session to this device.
+    """
+    # The account first, then its refresh row: the lock order lock_user_row
+    # documents. This route always wrote the users row (last_seen_at, below), but
+    # at commit — AFTER locking the refresh row — which is the opposite order to
+    # change-password and could deadlock against it now that change-password locks
+    # the presented row too. Refreshed, so the session epoch read below is current.
+    await lock_user_row(db, user.id)
     raw = request.cookies.get(REFRESH_COOKIE)
     if raw:
         # FOR UPDATE for the same reason /refresh takes it: this reads the row and
@@ -495,6 +648,21 @@ async def logout(
             )
         ).scalar_one_or_none()
         if token and token.user_id == user.id:
+            # A device signed in before an administrator's reset presents a row the
+            # reset already revoked, and revoking it again — the walk below only
+            # writes revoked_at where it is NULL — left it reading as "ended by the
+            # reset" (revoked_at <= the epoch). change-password re-issues a session
+            # for exactly that, so a change in flight when the user pressed sign-out
+            # still handed this device a fresh 30-day session after it had signed
+            # out (batch 73 review). Re-stamped, the row reads as ended AFTER the
+            # reset, by this logout, and _reissue_after_password_change refuses it.
+            epoch = user.sessions_valid_after
+            if (
+                token.revoked_at is not None
+                and epoch is not None
+                and _as_utc(token.revoked_at) <= _as_utc(epoch)
+            ):
+                token.revoked_at = now_utc()
             _revoked = await _revoke_rotation_chain(db, token)
             if _revoked > 1:
                 logger.info(
@@ -515,6 +683,11 @@ async def me(
     user: User = Depends(get_current_user_pending_password_change),
     db: AsyncSession = Depends(get_db),
 ):
+    """The signed-in user's profile, including must_change_password.
+
+    For every role but superadmin it adds avatar, about, presence status, last seen, mobile access, and the
+    resolved organization and department names.
+    """
     payload = _user_payload(user)
     if user.role != UserRole.superadmin:
         statuses = await presence.get_statuses([user.id])
@@ -551,7 +724,9 @@ def _reissue_after_password_change(
         users.sessions_valid_after. Both resets stamp the epoch AFTER revoking every
         refresh row, so revoked_at <= epoch means the reset (or a rotation before
         it) ended this session. A logout, or any other revocation after the last
-        reset, lands after the epoch and is respected.
+        reset, lands after the epoch and is respected — including a logout from a
+        device whose row the reset had already revoked, which re-stamps that row
+        for exactly this reason (batch 73 review).
 
     Never for a live row (it is kept, and a second session would be pointless), an
     unknown cookie, or a revoked row on an account no reset has touched.
@@ -579,12 +754,20 @@ async def change_password(
     user: User = Depends(get_current_user_pending_password_change),
     _rl: None = Depends(password_limiter),
 ):
+    """Change the caller's password after verifying the current one, and clear must_change_password.
+
+    Refuses with 400 a new password equal to the current one or failing the policy, and with 401 a wrong
+    current password or one a reset replaced while it was being verified. Revokes every other refresh session
+    and keeps the caller's, issuing a fresh one when an administrator's reset ended it or the request carried
+    no refresh cookie.
+    """
     # Rate-limited like the admin reset it mirrors: this route verifies
     # current_password, so an attacker sitting on a hijacked session could
     # otherwise brute-force it offline-fast and take the account outright.
     from app.core.security import PasswordPolicyError, enforce_password_policy, hash_password
 
-    if not await verify_password(body.current_password, user.password_hash):
+    verified_hash = user.password_hash
+    if not await verify_password(body.current_password, verified_hash):
         raise HTTPException(status_code=401, detail="Current password is incorrect")
     # After the verify, so it reveals nothing to a caller who does not already know
     # the current password. For every account, not only reset ones: "changing" a
@@ -597,7 +780,19 @@ async def change_password(
         enforce_password_policy(body.new_password)
     except PasswordPolicyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    user.password_hash = await hash_password(body.new_password)
+    new_hash = await hash_password(body.new_password)
+    # The account's row lock, taken after both bcrypt rounds so it is held only for
+    # the writes, and before any refresh_tokens row (lock_user_row). Refused if the
+    # password changed since it was verified (batch 73 review): an administrator's
+    # reset committing in that window would otherwise be overwritten by a password
+    # chosen by whoever was holding the session the reset was meant to end, and —
+    # since the reset had just revoked that session's refresh row — this route
+    # would then re-issue them a fresh one. Same answer as a wrong password: the
+    # password they proved is not the account's password any more.
+    locked = await lock_user_row(db, user.id)
+    if locked is None or locked.password_hash != verified_hash:
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    user.password_hash = new_hash
     user.must_change_password = False
     # Revoke every OTHER session on password change — the caller keeps the one
     # they are changing it from, which is the whole point of "other".
@@ -606,19 +801,31 @@ async def change_password(
     # the tab they had just used, silently: no client re-authenticates here, so
     # the session died at the next refresh, up to access_token_minutes later, with
     # no visible connection to the password change. Worse, that refresh presented
-    # a revoked token with no successor, which is indistinguishable from a replay,
+    # a revoked token with no successor, which /refresh then treated as a replay,
     # so every password change also logged a "token reuse — revoking that client's
     # session family" theft warning against an account that was never attacked.
+    # (/refresh now refuses such a token quietly, without the burn — batch 73
+    # review — but signing the caller out would still be wrong.)
     raw_refresh = request.cookies.get(REFRESH_COOKIE)
     # The row the caller presented, looked up whatever its state: whether it is live,
     # and if not who revoked it, decides below whether this request may hand out a
     # new session. Only this user's own row counts — a refresh cookie belonging to
     # another account says nothing about this one's session.
+    #
+    # FOR UPDATE, so the decision is made on the row as committed (batch 73
+    # review). Logout re-stamps a row the reset had revoked so that it stops reading
+    # as "ended by the reset", and a decision made on the row as it was before that
+    # commit re-issues a session into a device that has just signed out. Logout
+    # takes the account's lock first too, so the two already queue there; the row
+    # lock is what still holds if either route's account lock ever moves, and
+    # against /refresh, which takes no account lock at all.
     presented = None
     if raw_refresh:
         presented = (
             await db.execute(
-                select(RefreshToken).where(RefreshToken.token_hash == hash_refresh_token(raw_refresh))
+                select(RefreshToken)
+                .where(RefreshToken.token_hash == hash_refresh_token(raw_refresh))
+                .with_for_update()
             )
         ).scalar_one_or_none()
         if presented is not None and presented.user_id != user.id:

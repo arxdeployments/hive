@@ -41,6 +41,7 @@ class PasswordChangeRequiredError(CodedHTTPException):
     """
 
     def __init__(self) -> None:
+        """Build the 403 with the fixed detail and the PASSWORD_CHANGE_REQUIRED code."""
         super().__init__(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=PASSWORD_CHANGE_REQUIRED_DETAIL,
@@ -94,6 +95,11 @@ def _issued_before_session_epoch(payload: dict, user: User) -> bool:
     refusing within the reset's own second — those tokens predate this check, so
     none of them belongs to a session minted after a reset. A token with neither
     counts as issued at 0, i.e. before any reset.
+
+    The realtime hub's revalidation calls this too, on the claims its socket was
+    opened with, so a socket and a request carrying the same token always get the
+    same answer. It had its own rule, keyed on when the socket connected, and a
+    reset landing inside the handshake fell between the two (batch 73 review).
     """
     epoch = user.sessions_valid_after
     if epoch is None:
@@ -157,11 +163,15 @@ async def _authenticate(
     # — 401, which both clients answer with a refresh that fails, because the reset
     # revoked the refresh token too, and so they sign out. Ahead of the
     # password-change gate, so a pre-reset token is told its session is over rather
-    # than invited to change a password. NOT applied on the un-gated routes, or a
-    # device signed in before the reset could not finish the change it is being
-    # asked to make: me, change-password, logout and push unsubscribe still accept
-    # it, and change-password re-issues that device a session of its own.
-    if not allow_password_change_pending and _issued_before_session_epoch(payload, user):
+    # than invited to change a password. Relaxed on the un-gated routes ONLY while
+    # the change is still pending, so a device signed in before the reset can
+    # finish the change it is being asked to make (me, change-password, logout and
+    # push unsubscribe accept it, and change-password re-issues it a session of its
+    # own). Once the flag clears the exemption has no purpose, and kept, it let a
+    # token copied before the reset go on reading the full profile from /me for the
+    # rest of its life (CodeRabbit, review of 1fbc1de).
+    pending_change = allow_password_change_pending and user.must_change_password
+    if not pending_change and _issued_before_session_epoch(payload, user):
         raise _credentials_error
     if user.must_change_password and not allow_password_change_pending:
         raise PasswordChangeRequiredError()
@@ -187,6 +197,11 @@ async def _authenticate_request(
 
 
 async def get_current_user(request: Request, db: AsyncSession = Depends(get_db)) -> User:
+    """The authenticated user behind an HTTP request; the dependency every gated route uses.
+
+    Answers 401 for a failed authentication, including a token issued before the account's last reset, and 403
+    PASSWORD_CHANGE_REQUIRED while must_change_password is set.
+    """
     return await _authenticate_request(request, db)
 
 
@@ -227,13 +242,19 @@ def session_client(request: Request) -> str:
     return str(claims.get("client") or WEB_CLIENT)
 
 
-async def get_current_user_ws(websocket: WebSocket, db: AsyncSession) -> tuple[User, int, str] | None:
+async def get_current_user_ws(websocket: WebSocket, db: AsyncSession) -> tuple[User, int, str, dict] | None:
     """Cookie-authenticated WebSocket handshake.
 
-    Returns (user, token_exp, client) so the connection can enforce the
-    access-token lifetime and force a re-auth on expiry, and so its periodic
-    liveness check knows whether to re-verify the mobile grant. The query-param
-    token fallback exists only outside production.
+    Returns (user, token_exp, client, claims) so the connection can enforce the
+    access-token lifetime and force a re-auth on expiry, so its periodic liveness
+    check knows whether to re-verify the mobile grant, and so that check can apply
+    the session epoch to the token itself. The claims are the ones verified here,
+    and the hub keeps them for the life of the socket (batch 73 review): it used to
+    compare the epoch with the moment the socket connected instead, so a reset
+    landing between this check and that moment left the socket newer than the
+    epoch, and it survived once the owner changed the password while HTTP refused
+    the very same token. The query-param token fallback exists only outside
+    production.
 
     Returns None for every failed authentication, which the hub closes 4001 and the
     clients answer by refreshing — including a token issued before an administrator's
@@ -253,7 +274,7 @@ async def get_current_user_ws(websocket: WebSocket, db: AsyncSession) -> tuple[U
         raise
     except HTTPException:
         return None
-    return user, int(payload.get("exp", 0)), str(payload.get("client") or WEB_CLIENT)
+    return user, int(payload.get("exp", 0)), str(payload.get("client") or WEB_CLIENT), payload
 
 
 async def require_superadmin(user: User = Depends(get_current_user)) -> User:

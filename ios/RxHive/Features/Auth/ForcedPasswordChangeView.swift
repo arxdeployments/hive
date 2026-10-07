@@ -15,12 +15,14 @@ import SwiftUI
 struct ForcedPasswordChangeView: View {
     @EnvironmentObject private var auth: AuthStore
 
+    /// The held account's email, shown as plain text in place of an avatar.
     let email: String
 
     @State private var current = ""
     @State private var new = ""
     @State private var confirmation = ""
 
+    /// The form's first local problem, as `PasswordPolicy` ranks them.
     private var problem: PasswordPolicy.Problem? {
         PasswordPolicy.problem(current: current, new: new, confirmation: confirmation)
     }
@@ -40,6 +42,8 @@ struct ForcedPasswordChangeView: View {
         return problem.message
     }
 
+    /// The card centred on the brand background, scrolling once the keyboard needs
+    /// the room.
     var body: some View {
         ZStack {
             Theme.Color.bg.ignoresSafeArea()
@@ -65,6 +69,8 @@ struct ForcedPasswordChangeView: View {
         .animation(Theme.Motion.ease, value: message)
     }
 
+    /// The explanation, the account's email, the three password fields with the
+    /// current message, the policy caption, and the Change Password and Sign Out buttons.
     private var card: some View {
         VStack(spacing: Theme.Layout.spacing5) {
             VStack(spacing: Theme.Layout.spacing3) {
@@ -179,6 +185,8 @@ struct ForcedPasswordChangeView: View {
         .frame(maxWidth: 420)
     }
 
+    /// Hand the temporary and new passwords to `AuthStore`, if the form allows a
+    /// submit right now.
     private func submit() {
         guard canSubmit else { return }
         Task { await auth.completeRequiredPasswordChange(current: current, new: new) }
@@ -201,6 +209,7 @@ enum PasswordPolicy {
     /// `BCRYPT_MAX_PASSWORD_BYTES`. Rejected by the server rather than truncated.
     static let maximumBytes = 72
 
+    /// The one-line summary of the rules shown under the password fields.
     static let requirements =
         "At least \(minimumLength) characters, with letters and numbers."
 
@@ -209,6 +218,7 @@ enum PasswordPolicy {
     enum Problem: Equatable {
         case tooShort, tooLong, needsLetterAndDigit, incomplete, mismatch, sameAsCurrent
 
+        /// The sentence shown for this problem under the form.
         var message: String {
             switch self {
             case .tooShort: return "New password must be at least \(PasswordPolicy.minimumLength) characters."

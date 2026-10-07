@@ -114,9 +114,10 @@ def assert_conversation_access(conv: Conversation, user: User, *, is_member: boo
         raise AccountInactive(status_code=403, detail="Your account is no longer active")
     # The same reasoning for a password reset (batch 73): HTTP refuses the account at
     # the auth dependency, but a socket opened before the reset carries a User loaded
-    # back then, and the hub's revalidation only closes it within REVALIDATE_SECONDS.
-    # Every websocket send, typing frame and read receipt reaches this with a freshly
-    # loaded row, so this is what stops a reset account acting in the meantime.
+    # back then. The hub now re-checks the account before it dispatches any frame
+    # that acts, and closes the socket rather than reaching this (batch 73 review),
+    # so this is defence in depth on both transports — kept because it sits on the
+    # code path itself, where a caller added later cannot forget it.
     if user.must_change_password:
         raise PasswordChangeRequired()
     if not is_member or not conv.is_active:

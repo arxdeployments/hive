@@ -128,6 +128,8 @@ struct CurrentUser: Decodable, Identifiable, Hashable {
         return copy
     }
 
+    /// The server's snake_case keys. `displayName` has no stored property: it is the
+    /// second spelling of `name` that `init(from:)` falls back to.
     enum CodingKeys: String, CodingKey {
         case id, email, name, role
         case displayName = "display_name"

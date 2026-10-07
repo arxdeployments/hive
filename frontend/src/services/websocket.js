@@ -124,8 +124,14 @@ const SW_READY_TIMEOUT_MS = 3000;
  */
 const SW_LATE_READY_TIMEOUT_MS = 30000;
 
-// Auth rides in httpOnly cookies — the WS handshake carries them automatically
-// (same-origin in production behind Caddy, and via the Vite proxy in dev).
+/**
+ * The client for the app's one realtime socket (/api/ws), exported below as the
+ * `wsClient` singleton: chat frames and acks, typing, read receipts, call
+ * signalling, the heartbeat, and reconnecting after drops.
+ *
+ * Auth rides in httpOnly cookies — the WS handshake carries them automatically
+ * (same-origin in production behind Caddy, and via the Vite proxy in dev).
+ */
 class RxHiveWebSocket {
   constructor() {
     this.ws = null;
@@ -576,6 +582,13 @@ class RxHiveWebSocket {
     useCallStore.getState().setSignalLinkState(LINK_OK);
   }
 
+  /**
+   * Handle the socket closing: fail unacked sends, mark chat disconnected, and
+   * decide what comes next from the close code. 4403 stands the socket down and
+   * announces the forced password change (batch 73), 4001 refreshes the session
+   * and reconnects (signing out if the refresh is refused), and any other
+   * unintended close schedules a reconnect.
+   */
   async _onClose(event) {
     this._stopHeartbeat();
     // Before the await on the 4001 branch below, and before anything can
@@ -645,6 +658,10 @@ class RxHiveWebSocket {
     }
   }
 
+  /**
+   * Apply one parsed server frame to the chat and call stores, dispatching on its
+   * `type`. The `connected` frame records which user this socket belongs to.
+   */
   async _routeMessage(data) {
     const store = useChatStore.getState();
     const callStore = useCallStore;
@@ -1278,6 +1295,13 @@ class RxHiveWebSocket {
     }
   }
 
+  /**
+   * Send a frame if the socket is open right now; frames are dropped, never
+   * queued, while it is not. A dropped call frame is logged, and the ones a user
+   * triggers also toast and reconnect, but only while the socket is still wanted.
+   *
+   * @returns {boolean} whether the frame was written to the socket
+   */
   send(data) {
     // Remember that THIS client is the one answering.
     //

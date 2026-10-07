@@ -178,6 +178,9 @@ final class MockURLProtocol: URLProtocol {
         stopped.unlock()
     }
 
+    /// Hand `reply` to the loading client as a failure or a full response, unless the
+    /// request was stopped first. `onDelivery` runs just before, once the request is
+    /// known not to be cancelled.
     private func deliver(_ reply: Reply) {
         stopped.lock()
         let cancelled = isStopped

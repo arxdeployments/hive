@@ -13,6 +13,11 @@ import { generatePassword } from '../../utils/generatePassword';
 import { createRequestTicket } from '../../utils/latestRequest';
 import { apiError } from '../../utils/helpers';
 
+/**
+ * The superadmin portal's user list across every organization: org, department,
+ * status and mobile-access filters, search and paging, with the create form and
+ * the edit drawer that holds Reset Password.
+ */
 export default function UsersPage() {
   const [orgs, setOrgs] = useState([]);
   const [depts, setDepts] = useState([]);
@@ -283,6 +288,11 @@ export default function UsersPage() {
     }
   };
 
+  /**
+   * Reset the edited user's password to a server-generated temporary one, show
+   * it in the drawer and in a toast with a Copy action, and tell the admin the
+   * user must replace it at their next sign-in (batch 73).
+   */
   const handleResetPassword = async () => {
     if (!editUser) return;
     try {

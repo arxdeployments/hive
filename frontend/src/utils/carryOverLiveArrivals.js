@@ -25,6 +25,17 @@
  *    them, the rows that fell off the page compared EQUAL to its newest and were
  *    carried under it: "You created the group" drawn below the newest message.
  *
+ * A new id is not always an arrival, though: history paged in while the request
+ * was out (prependMessages, from a scroll up during a jump) is new too. It sits at
+ * the FRONT of the thread, where history goes, while arrivals are appended at the
+ * back; so only a new row that sits after the first row the thread held when it
+ * asked counts. Carried as an arrival, older history was stitched under the newest
+ * page (CodeRabbit, review of 1fbc1de, on iOS; the web jump had the same gap).
+ *
+ * Kept arrivals are placed among the page's rows by time (`mergeByTime`), not
+ * stacked after them: a send stamped before the page's newest row but committed
+ * after the page was read belongs between them, where the server will put it.
+ *
  * iOS keeps the same rows (ChatStore.threadAfterFetch, "live rows"); this is that
  * rule for the web, beside carryOverLocalOnly, which keeps what the server has
  * never seen at all.
@@ -45,12 +56,42 @@ const LOCAL_ONLY_STATUSES = new Set(['sending', 'failed']);
  */
 export function carryOverLiveArrivals(existing, fetched, heldAtRequest) {
   const onPage = new Set((fetched || []).map((m) => m._id));
-  return (existing || []).filter((m) => (
+  const rows = existing || [];
+  // Everything before this index was prepended while the request was out: history.
+  // -1 when the thread held nothing, and then every row is after it.
+  const firstHeld = rows.findIndex((m) => heldAtRequest.has(m._id));
+  return rows.filter((m, i) => (
     m._id
     && !LOCAL_ONLY_STATUSES.has(m.status)
     && !onPage.has(m._id)
     && !heldAtRequest.has(m._id)
+    && i > firstHeld
   ));
+}
+
+/**
+ * `fetched` with `arrivals` placed among its rows in time order, oldest first.
+ *
+ * Each arrival goes after the last row that is not later than it, so equal times
+ * keep the page's own rows first, and the page's order (the server's, by
+ * created_at and id) is never disturbed: only the arrivals move.
+ *
+ * @param {Array<object>} fetched - the page, oldest first.
+ * @param {Array<object>} arrivals - from carryOverLiveArrivals, in held order.
+ * @returns {Array<object>}
+ */
+export function mergeByTime(fetched, arrivals) {
+  if (!arrivals.length) return fetched;
+  const out = [...fetched];
+  for (const m of arrivals) {
+    const at = Date.parse(m.created_at);
+    let i = out.length;
+    if (Number.isFinite(at)) {
+      while (i > 0 && Date.parse(out[i - 1].created_at) > at) i -= 1;
+    }
+    out.splice(i, 0, m);
+  }
+  return out;
 }
 
 /** The ids `messages` holds now, for `carryOverLiveArrivals` once the page lands. */

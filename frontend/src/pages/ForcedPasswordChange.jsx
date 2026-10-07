@@ -5,7 +5,7 @@ import { KeyRound, Loader2, LogOut } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAuth } from '../contexts/AuthContext';
 import { FloatingInput } from '../components/common/FloatingInput';
-import client from '../api/client';
+import client, { refreshSession, sessionRejected, setSignOutReason } from '../api/client';
 import {
   MIN_PASSWORD_LENGTH,
   changePasswordErrorMessage,
@@ -66,6 +66,45 @@ export default function ForcedPasswordChange() {
   const [signingOut, setSigningOut] = useState(false);
   const [error, setError] = useState('');
 
+  /**
+   * Whether this session outlived a password change made somewhere else.
+   *
+   * The first /me can report the change already made, and WHERE it was made
+   * decides what happens next (CodeRabbit, review of 1fbc1de; iOS asks the same
+   * question in AuthStore.releaseAfterChangeElsewhere). Another tab in this
+   * browser shares the cookie jar, so its change kept or re-issued this very
+   * session. Another device's change revoked this browser's refresh token: /me
+   * still answers on the 15-minute access cookie, and letting the user in would
+   * end at that cookie's expiry as an unexplained "session expired". One refresh
+   * tells the two apart. Refused, the session is over and the user is told why;
+   * undelivered, nothing was learned, so they stay here and can try again.
+   *
+   * @returns {Promise<boolean>} true to let the user in
+   */
+  const sessionSurvivedChangeElsewhere = async () => {
+    try {
+      await refreshSession();
+      return true;
+    } catch (err) {
+      if (sessionRejected(err)) {
+        setSignOutReason('password_changed');
+        await logout();
+        navigate('/login');
+      } else {
+        setError(err?.response
+          ? 'Could not confirm your session. Please try again.'
+          : 'Could not reach the server. Check your connection and try again.');
+      }
+      return false;
+    }
+  };
+
+  /**
+   * Validate the form, then run the three-request sequence described above: /me,
+   * change-password, /me again. The user is let in only when /me itself says the
+   * flag is clear; otherwise the error is shown here, unless a change made on
+   * another device has ended the session (sessionSurvivedChangeElsewhere).
+   */
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (submitting || signingOut) return;
@@ -92,6 +131,7 @@ export default function ForcedPasswordChange() {
         // the user they mistyped a password that has simply stopped being theirs.
         // Strictly `=== false`: a body without the field says nothing, and the
         // change goes ahead as normal.
+        if (!(await sessionSurvivedChangeElsewhere())) return;
         rebindPushAfterReset();
         toast.info('Your password was already changed');
         updateUser(before);
@@ -132,6 +172,7 @@ export default function ForcedPasswordChange() {
     }
   };
 
+  /** Sign out from the forced screen and go to /login, ignoring repeat clicks. */
   const handleSignOut = async () => {
     if (signingOut) return;
     setSigningOut(true);

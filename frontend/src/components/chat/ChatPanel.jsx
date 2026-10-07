@@ -32,7 +32,7 @@ import { withDerivedStatuses } from '../../utils/messageStatus';
 import { toast } from 'sonner';
 import { apiError } from '../../utils/helpers';
 import { carryOverLocalOnly } from '../../utils/carryOverLocalOnly';
-import { carryOverLiveArrivals, heldIds } from '../../utils/carryOverLiveArrivals';
+import { carryOverLiveArrivals, heldIds, mergeByTime } from '../../utils/carryOverLiveArrivals';
 import { markThreadRead } from '../../services/readReceipts';
 
 const EMPTY_PINNED = [];
@@ -100,6 +100,11 @@ const privateQuoteFor = (msg) => {
   return `> ${who}: ${snippet}\n\n`;
 };
 
+/**
+ * The open conversation: header, message list, composer and the info, search and
+ * message-action surfaces around them. Renders EmptyChat when no conversation is
+ * selected; `onBack` closes the thread, and `isMobile` shows the back button.
+ */
 export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
   const { user } = useAuth();
 
@@ -310,8 +315,8 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // read below told their senders they had been read. See
       // utils/carryOverLiveArrivals.js.
       const live = carryOverLiveArrivals(held, fetched, heldAtRequest);
-      const kept = [...live, ...localOnly];
-      setMessages(conversationId, kept.length ? [...fetched, ...kept] : fetched);
+      const merged = mergeByTime(fetched, live);
+      setMessages(conversationId, localOnly.length ? [...merged, ...localOnly] : merged);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
       // The default window is anchored to the newest message, so by definition
       // nothing newer is missing. This also clears the flag after a "jump to
@@ -1185,11 +1190,13 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
     // paths race each other. A jump that resolves after a newer fetch (or a
     // newer jump) must not swap its window back in.
     const seq = ++fetchSeqRef.current;
-    // A jump can take the window over from a newest-page fetch still on its spinner
-    // (the pinned banner, the search and the info panels all stay clickable over
-    // it), and that fetch then bails without clearing the spinner. A jump that
-    // fails as well loads the page it interrupted, so the spinner ends in the
-    // thread or in the error strip instead of staying up until the user leaves.
+    /**
+     * A jump can take the window over from a newest-page fetch still on its spinner
+     * (the pinned banner, the search and the info panels all stay clickable over
+     * it), and that fetch then bails without clearing the spinner. A jump that
+     * fails as well loads the page it interrupted, so the spinner ends in the
+     * thread or in the error strip instead of staying up until the user leaves.
+     */
     const resumeInterruptedLoad = () => {
       if (seq === fetchSeqRef.current && loadingRef.current) fetchMessages({ force: true });
     };
@@ -1222,8 +1229,8 @@ export const ChatPanel = ({ conversationId, onBack, isMobile }) => {
       // as fetchMessages does. A slice does not: rows newer than it are the old end
       // of the thread, not arrivals (see utils/carryOverLiveArrivals.js).
       const live = data.has_newer ? [] : carryOverLiveArrivals(held, fetched, heldAtRequest);
-      const kept = [...live, ...localOnly];
-      setMessages(conversationId, kept.length ? [...fetched, ...kept] : fetched);
+      const merged = mergeByTime(fetched, live);
+      setMessages(conversationId, localOnly.length ? [...merged, ...localOnly] : merged);
       setHasMoreByConv(prev => ({ ...prev, [conversationId]: data.has_more }));
       setHasNewerByConv(prev => ({ ...prev, [conversationId]: !!data.has_newer }));
       // This window is the one on screen now, so show it, as fetchMessages shows its

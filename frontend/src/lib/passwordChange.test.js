@@ -24,6 +24,7 @@ import {
  * the form's own checks — and they are all here.
  */
 
+/** A minimal axios-shaped error carrying a response status and body. */
 const axiosError = (status, data) => ({ response: { status, data } });
 
 describe('the wire contract', () => {

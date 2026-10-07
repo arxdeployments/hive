@@ -6,6 +6,7 @@ import SwiftUI
 @MainActor
 final class AuthStore: ObservableObject {
 
+    /// Which top-level screen the app shows; `RootView` switches on it.
     enum Phase: Equatable {
         /// Splash is on screen; we haven't decided anything yet.
         case launching
@@ -40,6 +41,8 @@ final class AuthStore: ObservableObject {
     /// The forced change-password form's request state (batch 73). Owned here, not
     /// by the view, because the outcome is a phase change only this class may make.
     @Published private(set) var isChangingPassword = false
+    /// The forced change-password form's error line: the server's refusal, or a
+    /// sentence saying the change could not be confirmed.
     @Published private(set) var passwordChangeError: String?
     /// True from the moment Sign Out is pressed until it has finished (batch 73
     /// review). `signOut` waits for an in-flight password change before it logs
@@ -53,6 +56,7 @@ final class AuthStore: ObservableObject {
     private let api: APIClient
     private let log = Logger(subsystem: "ai.rhythmrx.rxhive", category: "auth")
     private var expiryObserver: NSObjectProtocol?
+    /// Token for the `passwordChangeRequiredNotification` observer (batch 73).
     private var passwordChangeObserver: NSObjectProtocol?
 
     /// Incremented by every sign-in and every completed sign-out. A teardown that
@@ -80,6 +84,8 @@ final class AuthStore: ObservableObject {
     /// session) forgets it without each having to remember to.
     private var passwordChangedHereInGeneration: Int?
 
+    /// True when this device's own `change-password` was answered 200 in the
+    /// current session generation.
     private var passwordChangedHere: Bool {
         passwordChangedHereInGeneration == sessionGeneration
     }
@@ -150,10 +156,10 @@ final class AuthStore: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.handlePasswordChangeRequired() }
+            Task { @MainActor in await self?.handlePasswordChangeRequired() }
         }
         realtime.onPasswordChangeRequired = { [weak self] in
-            Task { @MainActor in self?.handlePasswordChangeRequired() }
+            Task { @MainActor in await self?.handlePasswordChangeRequired() }
         }
     }
 
@@ -302,6 +308,9 @@ final class AuthStore: ObservableObject {
 
     // MARK: - Sign out
 
+    /// End the session from the user's side: stop the socket, wait for any forced
+    /// password change already on the wire, log out best-effort, then clear the
+    /// cookies, the remembered account and the in-memory session data.
     func signOut() async {
         isSigningOut = true
         defer { isSigningOut = false }
@@ -329,6 +338,10 @@ final class AuthStore: ObservableObject {
         sessionGeneration &+= 1
         RememberedUser.clear()
         endSessionData()
+        // Again, as a backstop: whatever opened a socket or scheduled a check while
+        // this waited on the change and the logout must not outlive the sign-out.
+        realtime.disconnect()
+        pendingRevalidation?.cancel()
         phase = .signedOut
         signInError = nil
         passwordChangeError = nil
@@ -369,12 +382,16 @@ final class AuthStore: ObservableObject {
         isChangingPassword = false
     }
 
+    /// The body of `completeRequiredPasswordChange`: the `/me`, `change-password`,
+    /// `/me` sequence, with each answer dropped if the session generation moved
+    /// while it was out, and the outcome turned into a phase or a form error.
     private func performRequiredPasswordChange(current: String, new: String) async {
         // A sign-out (or a refused refresh) mid-request must not be overruled by the
         // answer to a question asked for the session it ended.
         let generation = sessionGeneration
         var changed = false
 
+        /// The `change-password` request body, in the server's field names.
         struct Body: Encodable {
             let current_password: String
             let new_password: String
@@ -492,7 +509,8 @@ final class AuthStore: ObservableObject {
     /// restore of a remembered account and a revalidation all come through here.
     private func enterSignedIn(_ user: CurrentUser) {
         if user.mustChangePassword {
-            enterPasswordChangeRequired(user)
+            // No call can be live on the way INTO a session, so the synchronous hold.
+            holdAtPasswordChange(user)
             return
         }
         sessionGeneration &+= 1
@@ -504,24 +522,38 @@ final class AuthStore: ObservableObject {
 
     /// A coded 403 or a 4403 socket close. Only a running session moves: anywhere
     /// else either there is no session to hold back, or it is already held.
-    private func handlePasswordChangeRequired() {
+    private func handlePasswordChangeRequired() async {
         guard case .signedIn(let user) = phase else { return }
-        enterPasswordChangeRequired(user.applying(mustChangePassword: true))
+        await enterPasswordChangeRequired(user.applying(mustChangePassword: true))
+    }
+
+    /// Move a RUNNING session to the change-password screen: a coded 403, a 4403
+    /// close, or a revalidation that found the flag set.
+    ///
+    /// The call goes first, while the socket can still carry its hang-up, and is
+    /// awaited: `CallStore.endForPasswordChange` waits (at most a second) for the
+    /// hang-up frame to leave before the socket is stopped, because Apple does not
+    /// promise the close flushes it (CodeRabbit, review of 1fbc1de), and then
+    /// leaves the room. Not `endSessionData()`'s call half: that deliberately
+    /// leaves a live call alone, and here nothing may be. If anything else moved
+    /// the session on while that ran — a sign-out, another refusal that already
+    /// held it — this stands down.
+    private func enterPasswordChangeRequired(_ user: CurrentUser) async {
+        let generation = sessionGeneration
+        await calls?.endForPasswordChange()
+        guard generation == sessionGeneration, case .signedIn = phase else { return }
+        holdAtPasswordChange(user)
     }
 
     /// Hold the session at the change-password screen.
     ///
     /// Everything session-scoped stops, and the cookies stay: unlike every other
     /// exit from `.signedIn`, the session is not over — it is what the change is
-    /// made with. Safe to reach with nothing running (a flagged sign-in or
-    /// restore), since each step is a no-op then.
-    ///
-    /// The call goes first, while the socket can still carry its hang-up; see
-    /// `CallStore.endForPasswordChange`, which also does the call store's half of
-    /// `endSessionData()` once the room is left. Not `endSessionData()` itself: its
-    /// call half deliberately leaves a live call alone, and here nothing may be.
-    private func enterPasswordChangeRequired(_ user: CurrentUser) {
-        calls?.endForPasswordChange()
+    /// made with. Synchronous, for a flagged sign-in or restore, where nothing is
+    /// running and each step is a no-op; a running session comes through
+    /// `enterPasswordChangeRequired`, which ends its call first.
+    private func holdAtPasswordChange(_ user: CurrentUser) {
+        calls?.resetSessionState()
         realtime.disconnect()
         chat?.reset()
         sessionGeneration &+= 1
@@ -540,6 +572,11 @@ final class AuthStore: ObservableObject {
     /// health constantly. Reporting a missed sample as a rejection is what turned
     /// one bad moment on a lift ride into a forced re-login.
     private func revalidateSession() async -> SessionCheck {
+        // Nothing a revalidation could decide may outrun a sign-out in progress: it
+        // bumped the generation before waiting on the change, so a check started
+        // after that captures the new one and its guards would let it act (batch 73
+        // review: a release here reconnected the socket of a phone signing out).
+        guard !isSigningOut else { return .valid }
         let generation = sessionGeneration
         do {
             let user = try await api.send(.get, "/api/auth/me", as: CurrentUser.self)
@@ -557,7 +594,7 @@ final class AuthStore: ObservableObject {
                 // `.rejected`, is still the right answer to the socket that asked:
                 // the session is good, and the socket has just been stopped, so the
                 // reconnect it would make is stranded by the generation bump.
-                enterPasswordChangeRequired(user)
+                await enterPasswordChangeRequired(user)
             case .signedIn:
                 phase = .signedIn(user)
                 RememberedUser.save(user)
@@ -613,7 +650,9 @@ final class AuthStore: ObservableObject {
         let outcome = await api.refreshSession()
         // A sign-out (or a refused session) while the refresh was out must not be
         // overruled by its answer — least of all by starting the session it ended.
-        guard generation == sessionGeneration, case .passwordChangeRequired = phase else { return .valid }
+        guard generation == sessionGeneration, !isSigningOut, case .passwordChangeRequired = phase else {
+            return .valid
+        }
         switch outcome {
         case .refreshed:
             enterSignedIn(user)
@@ -703,7 +742,11 @@ final class AuthStore: ObservableObject {
         realtime.applicationDidEnterBackground()
     }
 
+    /// Resume the socket for a running session, then re-check the session with
+    /// `/me`. A held session gets the check without a socket, which is how it learns
+    /// of a change made on the web. Does nothing with no session or while signing out.
     func applicationWillEnterForeground() {
+        guard !isSigningOut else { return }
         switch phase {
         case .signedIn:
             realtime.applicationWillEnterForeground()
@@ -728,13 +771,17 @@ final class AuthStore: ObservableObject {
     }
 }
 
+/// User-facing sentences `AuthStore` sets on the sign-in and change-password forms.
 enum AuthCopy {
     static let superadminWebOnly = "Super admin accounts can only sign in on the web app."
     static let sessionExpired = "Your session expired. Please sign in again."
     /// Forced change-password screen (batch 73).
     static let temporaryPasswordWrong = "That temporary password is not right."
+    /// The change was answered, but `/me` still reports the flag set.
     static let passwordChangeUnconfirmed =
         "Your password change could not be confirmed. Please try again."
+    /// The change was accepted, but confirming it failed in a way worth retrying,
+    /// so the app keeps checking in the background.
     static let passwordChangeSavedUnconfirmed =
         "Your new password was saved, but the app could not confirm it yet. "
         + "It will keep trying — or sign out and sign in with your new password."
@@ -762,6 +809,8 @@ enum AuthCopy {
 enum RememberedUser {
     private static let key = "rxhive.rememberedUser"
 
+    /// Write the shell fields of `user`, including `must_change_password`, to
+    /// `UserDefaults` in the server's wire shape.
     static func save(_ user: CurrentUser) {
         var payload: [String: Any] = [
             "id": user.id,

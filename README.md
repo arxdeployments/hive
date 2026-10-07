@@ -66,10 +66,10 @@ sign out, and nothing else:
 - Every other HTTP route answers `403` with `code: "PASSWORD_CHANGE_REQUIRED"`,
   never `401`, which both clients would answer by refreshing and replaying.
 - The socket is refused at the handshake, with close code `4403`. An open one is
-  re-checked every 30 seconds whether or not the client sends anything, and
-  frames that start or accept a call are checked as they arrive. Not `4001`: both
-  clients answer that by refreshing and reconnecting, which succeeds for this
-  account, so it would loop.
+  re-checked every 30 seconds whether or not the client sends anything, and every
+  frame that acts (a message, typing, a receipt, any call frame but a hang-up) is
+  checked as it arrives. Not `4001`: both clients answer that by refreshing and
+  reconnecting, which succeeds for this account, so it would loop.
 - Change-password still needs the temporary password, and refuses a new password
   equal to it.
 - The reset also deletes the account's push subscriptions. An org admin cannot
@@ -159,6 +159,11 @@ the 15s conversation poll cannot satisfy, so a broken WebSocket fails the test
 instead of silently degrading to polling. `tests/global-setup.js` fails loudly
 if the API isn't healthy, rather than letting a dead stack surface as opaque
 locator timeouts.
+
+The calling specs run against a real LiveKit, pinned in CI to one release and
+its checksum (`LIVEKIT_VERSION` in `.github/workflows/ci.yml`): installed as
+"latest", it moved under the suite without a commit. Raise it deliberately, and
+let the calling specs judge the new release.
 
 All E2E traffic shares one source IP, so raise the login and password budgets
 for those runs: `RXHIVE_RATE_LIMIT_LOGIN=200 RXHIVE_RATE_LIMIT_PASSWORD=200`

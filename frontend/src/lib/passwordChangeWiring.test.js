@@ -24,6 +24,7 @@ import { join } from 'node:path';
 import { describe, it } from 'node:test';
 
 const SRC = join(import.meta.dirname, '..');
+/** The text of a source file, by its path relative to `src/`. */
 const read = (rel) => readFileSync(join(SRC, rel), 'utf8');
 
 /** The source from `start` up to and including the next `closer`. */
@@ -243,6 +244,18 @@ describe('pages/ForcedPasswordChange.jsx: the submit sequence', () => {
     assert.ok(!submit.some((l) => l.includes('setMustChangePassword(false)')), 'the flag is cleared on the client\'s word');
   });
 
+  it('re-binds push on a boot that finds a held session released, as after a reload', () => {
+    // Batch 73 review: "Reload the page to continue" (a lost confirmation) left the
+    // form without re-binding push, and the heal that runs after it never re-sends
+    // a subscription the browser still holds.
+    const auth = code(block(read('contexts/AuthContext.jsx'), '  const checkAuth = useCallback(async () => {', '\n  }, []);'));
+    const held = auth.indexOf('const wasHeld = cachedUser()?.must_change_password === true;');
+    const asked = auth.indexOf("const { data } = await client.get('/api/auth/me');");
+    const rebind = auth.indexOf('if (wasHeld && data?.must_change_password === false) rebindPushAfterReset();');
+    assert.ok(held !== -1 && held < asked, 'the held state is not read from the mirror before /me overwrites it');
+    assert.ok(rebind > asked, 'a boot that finds the password changed does not re-bind push');
+  });
+
   it('lets the user in without posting when the first /me says it was already changed', () => {
     // Batch 73 review: the answer was awaited and thrown away, so a password
     // changed in another tab or on another device posted the old temporary one
@@ -260,6 +273,24 @@ describe('pages/ForcedPasswordChange.jsx: the submit sequence', () => {
     const rebind = branch.indexOf('rebindPushAfterReset();');
     assert.ok(rebind !== -1 && rebind < enter,
       'leaving through the already-changed branch does not re-bind push before the gate opens');
+    // CodeRabbit, review of 1fbc1de: a change made on another device revoked this
+    // browser's refresh token, so the session is proven with one refresh first.
+    const proven = branch.indexOf('if (!(await sessionSurvivedChangeElsewhere())) return;');
+    assert.ok(proven !== -1 && proven < rebind && proven < enter,
+      'the already-changed branch lets the user in without proving the session survived the change');
+  });
+
+  it('proves the session with one refresh, and signs out saying why when it was refused', () => {
+    const helper = code(block(screen, '  const sessionSurvivedChangeElsewhere = async () => {', '\n  };'));
+    const refresh = helper.indexOf('await refreshSession();');
+    const refused = helper.indexOf('if (sessionRejected(err)) {');
+    assert.ok(refresh !== -1 && refused > refresh, 'the session is not proven by a refresh');
+    const why = helper.indexOf("setSignOutReason('password_changed');");
+    const out = helper.indexOf('await logout();');
+    assert.ok(why > refused && out > why, 'a refused session is not signed out with the password-change reason');
+    assert.ok(helper.includes("navigate('/login');"), 'a refused session stays on the forced screen');
+    assert.match(read('pages/Login.jsx'), /password_changed: 'Your password was changed\. Sign in with your new password\.'/,
+      'the sign-in page has no sentence for this reason');
   });
 
   it('re-binds push once the server confirms the change, before the gate opens, without waiting on it', () => {

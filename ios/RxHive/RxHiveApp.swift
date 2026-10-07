@@ -1,5 +1,7 @@
 import SwiftUI
 
+/// The app entry point. Owns the four app-wide stores, injects them into
+/// `RootView`, and forwards scene-phase changes to the stores that react to them.
 @main
 struct RxHiveApp: App {
     @StateObject private var auth = AuthStore()
@@ -9,6 +11,9 @@ struct RxHiveApp: App {
 
     @Environment(\.scenePhase) private var scenePhase
 
+    /// One window holding `RootView`. Wires the stores together and restores the
+    /// session on first appearance; on foreground it revalidates auth and, for a
+    /// running session only, reconciles call state with the server.
     var body: some Scene {
         WindowGroup {
             RootView()
@@ -68,6 +73,9 @@ struct RootView: View {
     @EnvironmentObject private var calls: CallStore
     @EnvironmentObject private var toasts: ToastCenter
 
+    /// The screen for `auth.phase`, with the call overlays and toasts layered above
+    /// whichever it is. A held account gets `ForcedPasswordChangeView` in place of
+    /// `HomeView` (batch 73).
     var body: some View {
         ZStack {
             Theme.Color.bg.ignoresSafeArea()

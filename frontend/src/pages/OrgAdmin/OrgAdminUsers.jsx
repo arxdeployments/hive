@@ -10,6 +10,11 @@ import { generatePassword as genPassword } from '../../utils/generatePassword';
 import { apiError } from '../../utils/helpers';
 import { createRequestTicket } from '../../utils/latestRequest';
 
+/**
+ * The org-admin portal's user list: search, department filter and paging over
+ * the users this admin manages (the whole organization, or their managed
+ * departments), with the create form and the edit drawer that holds Reset Password.
+ */
 export default function OrgAdminUsers() {
   const { user: me } = useAuth();
   // An empty array means organization-wide, matching the API (see
@@ -140,6 +145,11 @@ export default function OrgAdminUsers() {
     } catch (err) { toast.error(apiError(err, 'Failed')); }
   };
 
+  /**
+   * Reset the edited user's password to a server-generated temporary one, show
+   * it in the drawer and a toast, and tell the admin the user must replace it at
+   * their next sign-in (batch 73).
+   */
   const handleResetPw = async () => {
     try {
       const { data } = await client.post(`/api/org-admin/users/${editUser._id}/reset-password`);

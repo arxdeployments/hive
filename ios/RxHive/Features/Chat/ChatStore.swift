@@ -475,14 +475,46 @@ final class ChatStore: ObservableObject {
         // time, so an arrival stamped early can sit above the joint, and it was drawn
         // twice (CodeRabbit, review of 89408b2).
         let olderIDs = Set(olderRows.map(\.id))
+        // And a new row is not always an arrival. History paged in while the request
+        // was out (`loadOlderMessages`) is new too, but it is PREPENDED, while arrivals
+        // are appended (`insertIncoming` sorts by time, so an early-stamped one can land
+        // among the held rows, never above the window's first row unless it is older
+        // than the whole window). So only a new row after the first row the thread held
+        // when it asked counts; carried as an arrival, older history was stitched under
+        // the newest page and the window called current (CodeRabbit, review of 1fbc1de).
+        let firstHeld = held.firstIndex { heldAtRequest.contains($0.id) }
         let liveRows = keepingLiveRows
-            ? held.filter { row in
-                !unsent.contains(row.id) && !fetchedIDs.contains(row.id) && !olderIDs.contains(row.id)
+            ? held.enumerated().filter { index, row in
+                (firstHeld.map { index > $0 } ?? true)
+                    && !unsent.contains(row.id) && !fetchedIDs.contains(row.id) && !olderIDs.contains(row.id)
                     && !heldAtRequest.contains(row.id)
-            }
+            }.map(\.element)
             : []
         let unsentRows = held.filter { unsent.contains($0.id) && !landed.contains($0.id) }
-        return olderRows + fetched + liveRows + unsentRows
+        // Arrivals placed among the page by time, not stacked after it: a send stamped
+        // before the page's newest row but committed after the page was read belongs
+        // between them, where `insertIncoming` and the server both put it (CodeRabbit,
+        // review of 1fbc1de).
+        return olderRows + mergingByTime(fetched, liveRows) + unsentRows
+    }
+
+    /// `fetched` with `arrivals` placed among its rows in time order, oldest first.
+    /// Each arrival goes after the last row that is not later than it, so equal times
+    /// keep the page's own rows first and the page's order (the server's, by
+    /// created_at and id) is never disturbed: only the arrivals move.
+    static func mergingByTime(_ fetched: [Message], _ arrivals: [Message]) -> [Message] {
+        guard !arrivals.isEmpty else { return fetched }
+        var merged = fetched
+        for row in arrivals {
+            var index = merged.endIndex
+            if let at = row.createdAt {
+                while index > merged.startIndex, let previous = merged[index - 1].createdAt, previous > at {
+                    index -= 1
+                }
+            }
+            merged.insert(row, at: index)
+        }
+        return merged
     }
 
     /// Page backwards. Returns the id of the message that was at the top, so the

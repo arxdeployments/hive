@@ -480,7 +480,21 @@ jobs:
           # exit status of bash alone. A failed or empty download then "succeeds"
           # and the missing binary only surfaces further down.
           set -o pipefail
-          curl -sSL https://get.livekit.io | bash
+          # Pinned, with its checksum (batch 73). get.livekit.io installs whatever is
+          # newest at run time, so the SFU under the calling specs changed without a
+          # commit: v1.13.8 (2026-10-06) cuts a 1:1 callee's data channels when the
+          # server deletes the room at call end (services/calls._finalize deletes it
+          # before call:ended goes out), and calling.spec's console check, which is
+          # there to catch exactly that kind of change, went red on a branch that
+          # touched no call code. Upgrading is now a commit, reviewed against that
+          # check, like the MinIO pin. Same archive and extraction as get.livekit.io.
+          LIVEKIT_VERSION=1.13.7
+          LIVEKIT_SHA256=6634aeeb2fb1366b6723708ae4320b9d5408106a4c63457c5e845ae3979c90e2
+          curl -sSLo /tmp/livekit.tar.gz \
+            "https://github.com/livekit/livekit/releases/download/v${LIVEKIT_VERSION}/livekit_${LIVEKIT_VERSION}_linux_amd64.tar.gz"
+          echo "${LIVEKIT_SHA256}  /tmp/livekit.tar.gz" | sha256sum -c -
+          sudo tar xzf /tmp/livekit.tar.gz -C /usr/local/bin --wildcards --no-anchored "livekit*"
+          livekit-server --version
           cat > /tmp/livekit.yaml <<'YAML'
           port: 7880
           rtc:

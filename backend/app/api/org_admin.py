@@ -13,7 +13,9 @@ reset-password (batch 73): the must_change_password flag it sets is now enforced
 — the account is refused everywhere but change-password until it picks its own —
 and the reset deletes the target's push subscriptions and stamps
 users.sessions_valid_after, which keeps access tokens issued before the reset
-refused for good rather than only until the password changes. An admin cannot reset
+refused for good rather than only until the password changes. It locks the
+target's users row before revoking anything, so a sign-in racing the reset cannot
+keep a session the reset never saw (batch 73 review). An admin cannot reset
 their OWN password here: it never asks for the current one, and it would revoke
 the session making the request. Self-service is /api/auth/change-password.
 """
@@ -25,7 +27,7 @@ from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth import wire_role
+from app.api.auth import lock_user_row, wire_role
 from app.core.deps import get_current_user
 from app.core.errors import conflict_as_400
 from app.core.rate_limit import password_limiter
@@ -454,6 +456,12 @@ async def reset_user_password(
     db: AsyncSession = Depends(get_db),
     _rl: None = Depends(password_limiter),
 ):
+    """Give a member of the admin's organization a temporary password and end every session it had.
+
+    The same writes as the superadmin route in admin.py, scoped to the caller's org and rate-limited. An admin
+    targeting their own account is refused with 400 before anything is written. Returns the temporary
+    password.
+    """
     target = await _load_org_user(db, admin, user_id)
     # _load_org_user lets an admin resolve their own row, deliberately, so they can
     # edit their own profile. A reset is the exception (batch 73): it would revoke
@@ -464,7 +472,14 @@ async def reset_user_password(
     if target.id == admin.id:
         raise HTTPException(status_code=400, detail="Use Change Password to change your own password.")
     temp = generate_password()
-    target.password_hash = await hash_password(temp)
+    new_hash = await hash_password(temp)
+    # The target's row lock, held to commit and taken before the refresh tokens are
+    # revoked, so a sign-in racing this reset either sees the new password and is
+    # refused or has its session revoked below (batch 73 review); see the superadmin
+    # route in admin.py.
+    if await lock_user_row(db, target.id) is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    target.password_hash = new_hash
     # Enforced by get_current_user from the moment this commits: the account is
     # refused everywhere but change-password until it chooses its own password.
     target.must_change_password = True

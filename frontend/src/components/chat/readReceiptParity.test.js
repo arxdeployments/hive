@@ -80,12 +80,12 @@ describe('ChatPanel: the thread is marked read once its newest page is on screen
     const lines = code(fetchBlock());
     const bail = lines.indexOf('if (seq !== fetchSeqRef.current) return;');
     const live = lines.indexOf('const live = carryOverLiveArrivals(held, fetched, heldAtRequest);');
-    const write = lines.indexOf('setMessages(conversationId, kept.length ? [...fetched, ...kept] : fetched);');
+    const write = lines.indexOf('setMessages(conversationId, localOnly.length ? [...merged, ...localOnly] : merged);');
     const mark = lines.indexOf('markThreadRead(conversationId);');
     const caught = lines.indexOf('} catch (err) {');
     assert.ok(bail !== -1 && live !== -1 && write !== -1 && mark !== -1 && caught !== -1,
       'fetchMessages changed shape; re-check this guard');
-    assert.ok(lines.includes('const kept = [...live, ...localOnly];'), 'live arrivals are not written back');
+    assert.ok(lines.includes('const merged = mergeByTime(fetched, live);'), 'live arrivals are not written back in time order');
     assert.ok(bail < live && live < write, 'live arrivals are not kept when the page replaces the thread');
     assert.ok(write < mark, 'the thread is marked read before its page is written');
     assert.ok(mark < caught, 'a failed fetch marks the thread read');
@@ -125,7 +125,7 @@ describe('ChatPanel: the thread is marked read once its newest page is on screen
     // CodeRabbit, review of b789477: the jump restored currency and showed the
     // arrivals a slice had held back, but never told the server.
     const lines = code(jumpBlock());
-    const write = lines.indexOf('setMessages(conversationId, kept.length ? [...fetched, ...kept] : fetched);');
+    const write = lines.indexOf('setMessages(conversationId, localOnly.length ? [...merged, ...localOnly] : merged);');
     const mark = lines.indexOf('if (!data.has_newer) markThreadRead(conversationId);');
     assert.ok(mark !== -1, 'a jump that lands on the newest page leaves the thread unread');
     assert.ok(write !== -1 && write < mark, 'the jump marks the thread read before its window is written');
@@ -202,7 +202,9 @@ describe('chatStore: a socket drop withdraws "current" synchronously', () => {
 });
 
 describe('websocket.js: a socket that survives an outage restores chat', () => {
+  /** The code lines of websocket.js's `_noteSignalAlive`. */
   const alive = () => code(block(socket, '  _noteSignalAlive() {', '\n  }'));
+  /** Index of the bare `if (` line that opens the multi-line chat-restore guard. */
   const restoreAt = (lines) => lines.indexOf('if (');
 
   it('sets wsConnected back when an inbound frame proves the same socket alive', () => {

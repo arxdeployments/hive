@@ -24,6 +24,7 @@ authenticate a request, never filtered on.
 """
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision = "e3b9d5a7c142"
@@ -33,6 +34,7 @@ depends_on = None
 
 
 def upgrade() -> None:
+    """Add the nullable users.sessions_valid_after column, with no default and no index."""
     op.add_column(
         "users",
         sa.Column("sessions_valid_after", sa.DateTime(timezone=True), nullable=True),
@@ -40,4 +42,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Drop users.sessions_valid_after and every session epoch stored in it."""
     op.drop_column("users", "sessions_valid_after")

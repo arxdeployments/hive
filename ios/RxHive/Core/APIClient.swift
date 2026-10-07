@@ -249,6 +249,10 @@ actor APIClient {
         }
     }
 
+    /// Send a request and return its body on 2xx, mapping every other outcome to an
+    /// `APIError`. A 401 from our own API refreshes (or joins a refresh) and replays
+    /// once; a coded `PASSWORD_CHANGE_REQUIRED` 403 is announced app-wide before it
+    /// is thrown, so the first screen to hit it moves the whole app (batch 73).
     private func performRaw(_ request: URLRequest, isRetry: Bool = false) async throws -> Data {
         // Read before the request leaves, so a refresh that lands while we are in
         // flight is detectable when we come back holding a 401.
@@ -463,6 +467,8 @@ actor APIClient {
             && target.port == base.port
     }
 
+    /// Post `sessionExpiredNotification` on the main actor with the status, the
+    /// server's sentence and, for a mobile denial, its code.
     @MainActor
     private static func announceSessionEnded(status: Int, detail: String, denial: MobileDenialKind?) {
         var userInfo: [String: Any] = [statusKey: status, detailKey: detail]
@@ -476,6 +482,8 @@ actor APIClient {
         )
     }
 
+    /// Post `passwordChangeRequiredNotification` on the main actor. Carries no
+    /// `userInfo`: unlike an expiry, the listener has nothing to choose between.
     @MainActor
     private static func announcePasswordChangeRequired() {
         NotificationCenter.default.post(name: passwordChangeRequiredNotification, object: nil)

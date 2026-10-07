@@ -631,6 +631,8 @@ private struct OrgUserSheet: View {
         _user = State(initialValue: initial)
     }
 
+    /// The account's blocks in a scrolling sheet, with a self-edit warning on your
+    /// own row and the confirmation that guards a password reset.
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -822,6 +824,8 @@ private struct OrgUserSheet: View {
 
     // MARK: Password
 
+    /// The reset button and, after a reset, the one-time temporary password with a
+    /// copy button. Disabled on your own row, which the server refuses (batch 73).
     private var passwordBlock: some View {
         AdminBlock(title: "Password") {
             VStack(spacing: Theme.Layout.spacing3) {
@@ -949,6 +953,8 @@ private struct OrgUserSheet: View {
         }
     }
 
+    /// Ask the server for a temporary password for this account and show it. Does
+    /// nothing while another write is in flight or on your own row.
     private func resetPassword() {
         guard busy == nil, !isSelf else { return }
         busy = .password

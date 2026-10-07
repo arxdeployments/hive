@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { carryOverLiveArrivals, heldIds } from './carryOverLiveArrivals.js';
+import { carryOverLiveArrivals, heldIds, mergeByTime } from './carryOverLiveArrivals.js';
 
 const msg = (_id, second, extra = {}) => ({
   _id,
@@ -15,6 +15,7 @@ const msg = (_id, second, extra = {}) => ({
   ...extra,
 });
 
+/** The `_id`s of `rows`, in order, for comparing results. */
 const ids = (rows) => rows.map((m) => m._id);
 
 describe('carryOverLiveArrivals', () => {
@@ -88,5 +89,38 @@ describe('carryOverLiveArrivals', () => {
     }));
 
     assert.deepEqual(carryOverLiveArrivals(batch, batch.slice(11), heldIds(batch)), []);
+  });
+
+  it('does not carry history paged in while the request was out', () => {
+    // A scroll up during a jump prepends older rows: new ids, but at the front of
+    // the thread, where history goes. Carried as arrivals they were stitched under
+    // the newest page (CodeRabbit, review of 1fbc1de).
+    const existing = [msg('h1', 0), msg('h2', 0), msg('m1', 1), msg('m2-live', 2)];
+    const fetched = [msg('m1', 1), msg('m3', 3)];
+
+    assert.deepEqual(ids(carryOverLiveArrivals(existing, fetched, new Set(['m1']))), ['m2-live']);
+  });
+
+  it('carries every new row when the thread held nothing', () => {
+    assert.deepEqual(ids(carryOverLiveArrivals([msg('a', 1), msg('b', 2)], [], new Set())), ['a', 'b']);
+  });
+});
+
+describe('mergeByTime', () => {
+  it('places an arrival among the page by time, leaving the page in its order', () => {
+    const fetched = [msg('m1', 1), msg('m3', 3)];
+    assert.deepEqual(ids(mergeByTime(fetched, [msg('m2-late', 2)])), ['m1', 'm2-late', 'm3']);
+  });
+
+  it('keeps the page first on a tie, and puts later or undated arrivals last', () => {
+    const fetched = [msg('m2', 2)];
+    assert.deepEqual(ids(mergeByTime(fetched, [msg('twin', 2)])), ['m2', 'twin']);
+    assert.deepEqual(ids(mergeByTime(fetched, [msg('m9', 9)])), ['m2', 'm9']);
+    assert.deepEqual(ids(mergeByTime(fetched, [{ _id: 'undated' }])), ['m2', 'undated']);
+  });
+
+  it('returns the page itself when nothing arrived', () => {
+    const fetched = [msg('m1', 1)];
+    assert.equal(mergeByTime(fetched, []), fetched);
   });
 });
