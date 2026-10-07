@@ -74,6 +74,16 @@ final class ChatStore: ObservableObject {
     /// last REST payload said, which goes stale the moment someone connects.
     @Published private(set) var presence: [String: PresenceStatus] = [:]
 
+    /// Ids this store added LIVE to a thread while a window fetch for it was out:
+    /// socket arrivals (`insertIncoming`) and this device's own sends as they are
+    /// acknowledged. Opened by each fetch, consumed when it lands; `threadAfterFetch`
+    /// carries only these across the replace. No timestamp can tell a live arrival
+    /// from history `loadOlderMessages` prepended meanwhile when the two share the
+    /// page's millisecond, as a system-message batch does; this can (CodeRabbit,
+    /// review of 83e02cc). Fetches for one thread are serialised by its window queue,
+    /// so there is at most one open record per thread.
+    private var arrivedDuringFetch: [String: Set<String>] = [:]
+
     /// Optimistic sends still awaiting their `message_ack`, keyed by temp id.
     @Published private(set) var pendingSends: Set<String> = []
     /// Temp ids whose send failed — the bubble shows a retry affordance.
@@ -181,6 +191,18 @@ final class ChatStore: ObservableObject {
     }
 
     #if DEBUG
+    /// A message as the socket delivers it, through the same path a `new_message`
+    /// frame takes, for tests that need a live arrival rather than seeded state.
+    func receiveForTesting(_ message: Message) {
+        insertIncoming(message)
+    }
+
+    /// A `message_ack` for an optimistic send, through the path the frame takes.
+    func acknowledgeForTesting(tempID: String, messageID: String, createdAt: Date?) {
+        pendingSends.remove(tempID)
+        resolveAck(tempID: tempID, messageID: messageID, createdAt: createdAt)
+    }
+
     /// Seed the store directly. Every field above is `private(set)`, and the real
     /// writers need a live socket and API; `reset` is about what is in the store,
     /// not how it got there.
@@ -345,8 +367,11 @@ final class ChatStore: ObservableObject {
         admitted: Admission
     ) async -> Bool {
         let epoch = trustEpoch
-        // What the thread holds as the request goes out; see `threadAfterFetch`.
+        // What the thread holds as the request goes out, and what arrives live while it
+        // is out; see `threadAfterFetch`.
         let heldAtRequest = Set((messages[conversationID] ?? []).map(\.id))
+        arrivedDuringFetch[conversationID] = []
+        defer { arrivedDuringFetch[conversationID] = nil }
         loadingThreads.insert(conversationID)
         defer { if admitted.session == sessionGeneration { loadingThreads.remove(conversationID) } }
         do {
@@ -358,6 +383,7 @@ final class ChatStore: ObservableObject {
                 page.messages,
                 replacing: messages[conversationID] ?? [],
                 heldAtRequest: heldAtRequest,
+                arrivedLive: arrivedDuringFetch[conversationID] ?? [],
                 unsent: pendingSends.union(failedSends),
                 keepingLiveRows: true,
                 keepingHistory: keepingHistory
@@ -459,6 +485,7 @@ final class ChatStore: ObservableObject {
         _ fetched: [Message],
         replacing held: [Message],
         heldAtRequest: Set<String>,
+        arrivedLive: Set<String>,
         unsent: Set<String>,
         keepingLiveRows: Bool,
         keepingHistory: Bool = false
@@ -491,6 +518,8 @@ final class ChatStore: ObservableObject {
             ? held.filter { row in
                 !unsent.contains(row.id) && !fetchedIDs.contains(row.id) && !olderIDs.contains(row.id)
                     && !heldAtRequest.contains(row.id)
+                    // Added live while the request was out, not paged in (`arrivedDuringFetch`).
+                    && arrivedLive.contains(row.id)
                     // An undated row is not judged by a time it does not have.
                     && !(pageOldest.map { oldest in row.createdAt.map { $0 < oldest } ?? false } ?? false)
             }
@@ -561,6 +590,8 @@ final class ChatStore: ObservableObject {
             guard mayWrite(conversationID, admitted) else { return false }
             let epoch = trustEpoch
             let heldAtRequest = Set((messages[conversationID] ?? []).map(\.id))
+            arrivedDuringFetch[conversationID] = []
+            defer { arrivedDuringFetch[conversationID] = nil }
             do {
                 let page = try await RxHiveAPI.messages(
                     conversationID: conversationID, around: messageID, limit: 50, client: api
@@ -570,6 +601,7 @@ final class ChatStore: ObservableObject {
                     page.messages,
                     replacing: messages[conversationID] ?? [],
                     heldAtRequest: heldAtRequest,
+                    arrivedLive: arrivedDuringFetch[conversationID] ?? [],
                     unsent: pendingSends.union(failedSends),
                     keepingLiveRows: !page.hasNewer
                 )
@@ -1074,6 +1106,7 @@ final class ChatStore: ObservableObject {
             return
         }
         thread.append(message)
+        arrivedDuringFetch[conversationID]?.insert(message.id)
         // Sort by timestamp: a message sent while we were paging can arrive out of
         // order relative to what is already loaded.
         thread.sort { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
@@ -1103,6 +1136,8 @@ final class ChatStore: ObservableObject {
                 messages[conversationID]?[index] = thread[index].applying(
                     id: messageID, createdAt: createdAt ?? thread[index].createdAt
                 )
+                // An acknowledged send is a server message this device added live.
+                arrivedDuringFetch[conversationID]?.insert(messageID)
             }
             return
         }
@@ -1116,6 +1151,7 @@ final class ChatStore: ObservableObject {
                 thread.remove(at: index)
             } else {
                 thread[index] = saved
+                arrivedDuringFetch[conversationID]?.insert(saved.id)
             }
             messages[conversationID] = thread
         }

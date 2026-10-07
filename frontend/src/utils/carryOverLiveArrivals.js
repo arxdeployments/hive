@@ -25,8 +25,14 @@
  *    them, the rows that fell off the page compared EQUAL to its newest and were
  *    carried under it: "You created the group" drawn below the newest message.
  *
- * A new id is not always an arrival, though, and the page's own range tells them
- * apart: an arrival is never older than the page's oldest row. Anything older is
+ * A new id is not always an arrival, though. History paged in while the request
+ * was out (prependMessages, from a scroll up during a jump) is new too, and no
+ * timestamp separates it from an arrival when the two share the page's
+ * millisecond, as a system-message batch does. So an arrival must carry the
+ * store's ARRIVED_LIVE marker, which only its live paths set (the socket's
+ * addMessage, and this tab's own sends) — never a fetched page or paged history
+ * (CodeRabbit, review of 83e02cc). And it is never older than the page's oldest
+ * row. Anything older is
  * history — rows paged in while the request was out (prependMessages, from a scroll
  * up during a jump), or a message so late-committed that it predates the whole
  * page — and paging back brings it in, in its place. Carried as an arrival, older
@@ -48,6 +54,8 @@
  * newest end of the thread, not live arrivals, and stitching them on would draw
  * one list with an invisible gap. Callers pass that case nothing.
  */
+import { ARRIVED_LIVE } from '../stores/chatStore.js';
+
 const LOCAL_ONLY_STATUSES = new Set(['sending', 'failed']);
 
 /**
@@ -69,6 +77,7 @@ export function carryOverLiveArrivals(existing, fetched, heldAtRequest) {
     && !LOCAL_ONLY_STATUSES.has(m.status)
     && !onPage.has(m._id)
     && !heldAtRequest.has(m._id)
+    && m[ARRIVED_LIVE] === true
     // Not older than the page: anything older is history (see above). An undated
     // row is not judged by a time it does not have.
     && !(Date.parse(m.created_at) < oldest)

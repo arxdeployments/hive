@@ -301,7 +301,7 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m1", second: 1), try row("temp-x", second: 5)]
         let fetched = [try row("m1", second: 1)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "temp-x"], unsent: ["temp-x"],
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "temp-x"], arrivedLive: [], unsent: ["temp-x"],
                                                 keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m1", "temp-x"])
@@ -313,7 +313,7 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m1", second: 1), try row("temp-x", second: 5)]
         let fetched = [try row("m1", second: 1), try row("m2", second: 5, clientMsgId: "temp-x")]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "temp-x"], unsent: ["temp-x"],
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "temp-x"], arrivedLive: [], unsent: ["temp-x"],
                                                 keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m1", "m2"])
@@ -325,7 +325,7 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m1", second: 1), try row("m3-live", second: 3)]
         let fetched = [try row("m1", second: 1), try row("m2", second: 2)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1"], unsent: [], keepingLiveRows: true)
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1"], arrivedLive: ["m3-live"], unsent: [], keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m1", "m2", "m3-live"])
     }
@@ -336,7 +336,7 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m2", second: 2), try row("m2-twin", second: 2)]
         let fetched = [try row("m1", second: 1), try row("m2", second: 2)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m2"], unsent: [], keepingLiveRows: true)
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m2"], arrivedLive: ["m2-twin"], unsent: [], keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m1", "m2", "m2-twin"])
     }
@@ -347,7 +347,7 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m-older", second: 0), try row("m1", second: 1)]
         let fetched = [try row("m1", second: 1), try row("m2", second: 2)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m-older", "m1"], unsent: [],
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m-older", "m1"], arrivedLive: [], unsent: [],
                                                 keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m1", "m2"])
@@ -359,7 +359,7 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m8", second: 8), try row("m9", second: 9), try row("temp-x", second: 10)]
         let fetched = [try row("m2", second: 2)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m8", "m9", "temp-x"],
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m8", "m9", "temp-x"], arrivedLive: [],
                                                 unsent: ["temp-x"], keepingLiveRows: false)
 
         XCTAssertEqual(thread.map(\.id), ["m2", "temp-x"])
@@ -752,17 +752,17 @@ final class ThreadFreshnessTests: XCTestCase {
         let atRequest: Set<String> = ["m1", "m2", "temp-x"]
 
         XCTAssertEqual(
-            ChatStore.threadAfterFetch(joining, replacing: held, heldAtRequest: atRequest, unsent: ["temp-x"], keepingLiveRows: true,
+            ChatStore.threadAfterFetch(joining, replacing: held, heldAtRequest: atRequest, arrivedLive: [], unsent: ["temp-x"], keepingLiveRows: true,
                                        keepingHistory: true).map(\.id),
             ["m1", "m2", "m3", "temp-x"]
         )
         XCTAssertEqual(
-            ChatStore.threadAfterFetch(apart, replacing: held, heldAtRequest: atRequest, unsent: ["temp-x"], keepingLiveRows: true,
+            ChatStore.threadAfterFetch(apart, replacing: held, heldAtRequest: atRequest, arrivedLive: [], unsent: ["temp-x"], keepingLiveRows: true,
                                        keepingHistory: true).map(\.id),
             ["m7", "m8", "temp-x"]
         )
         XCTAssertEqual(
-            ChatStore.threadAfterFetch(joining, replacing: held, heldAtRequest: atRequest, unsent: ["temp-x"], keepingLiveRows: true,
+            ChatStore.threadAfterFetch(joining, replacing: held, heldAtRequest: atRequest, arrivedLive: [], unsent: ["temp-x"], keepingLiveRows: true,
                                        keepingHistory: false).map(\.id),
             ["m2", "m3", "temp-x"]
         )
@@ -781,11 +781,11 @@ final class ThreadFreshnessTests: XCTestCase {
         let page = Array(batch[11...])
         let atRequest = Set(batch.map(\.id))
 
-        let replaced = ChatStore.threadAfterFetch(page, replacing: batch, heldAtRequest: atRequest, unsent: [],
+        let replaced = ChatStore.threadAfterFetch(page, replacing: batch, heldAtRequest: atRequest, arrivedLive: [], unsent: [],
                                                   keepingLiveRows: true)
         XCTAssertEqual(replaced.map(\.id), page.map(\.id))
 
-        let kept = ChatStore.threadAfterFetch(page, replacing: batch, heldAtRequest: atRequest, unsent: [],
+        let kept = ChatStore.threadAfterFetch(page, replacing: batch, heldAtRequest: atRequest, arrivedLive: [], unsent: [],
                                               keepingLiveRows: true, keepingHistory: true)
         XCTAssertEqual(kept.map(\.id), batch.map(\.id))
     }
@@ -797,7 +797,7 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m1", second: 1), try row("m2-late", second: 2), try row("m3", second: 3)]
         let fetched = [try row("m1", second: 1), try row("m3", second: 3)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "m3"], unsent: [],
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1", "m3"], arrivedLive: ["m2-late"], unsent: [],
                                                 keepingLiveRows: true)
 
         // In time order, between the two it was stamped between (CodeRabbit, 1fbc1de).
@@ -814,7 +814,7 @@ final class ThreadFreshnessTests: XCTestCase {
                     try row("m2", second: 2)]
         let fetched = [try row("m1", second: 1), try row("m3", second: 3)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["h0", "m1", "m2"],
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["h0", "m1", "m2"], arrivedLive: ["a-late"],
                                                 unsent: [], keepingLiveRows: true, keepingHistory: true)
 
         XCTAssertEqual(thread.map(\.id), ["h0", "a-late", "m1", "m3"])
@@ -827,14 +827,49 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("h0", second: 0), try row("m1", second: 1), try row("m2-live", second: 2)]
         let fetched = [try row("m1", second: 1), try row("m3", second: 3)]
 
-        let replaced = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1"], unsent: [],
+        let replaced = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1"], arrivedLive: ["m2-live"], unsent: [],
                                                   keepingLiveRows: true)
         XCTAssertEqual(replaced.map(\.id), ["m1", "m2-live", "m3"])
 
         // Kept as what it is when a reconnect keeps the history above the page.
-        let kept = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1"], unsent: [],
+        let kept = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m1"], arrivedLive: ["m2-live"], unsent: [],
                                               keepingLiveRows: true, keepingHistory: true)
         XCTAssertEqual(kept.map(\.id), ["h0", "m1", "m2-live", "m3"])
+    }
+
+    /// A send acknowledged while the page was out is a server message this device added
+    /// live; the page, read before it committed, cannot carry it (CodeRabbit, review of
+    /// 83e02cc).
+    func testASendAcknowledgedDuringTheFetchSurvivesIt() async throws {
+        let page = pageJSON([messageJSON("m1", second: 1)])
+        MockURLProtocol.install { _, _ in .json(200, page, delay: 0.5) }
+        let chat = makeStore()
+        chat.applyForTesting(messages: [conv: [try row("m1", second: 1), try row("temp-x", second: 2)]],
+                             pendingSends: ["temp-x"])
+
+        let load = Task { await chat.loadMessages(conversationID: conv, force: true) }
+        try await Task.sleep(for: .milliseconds(100))
+        chat.acknowledgeForTesting(tempID: "temp-x", messageID: "m2-mine", createdAt: nil)
+        _ = await load.value
+
+        XCTAssertEqual(ids(chat), ["m1", "m2-mine"])
+    }
+
+    /// A system-message batch is stamped a microsecond apart, so history paged in while
+    /// the request was out can share the page's oldest millisecond and pass any time
+    /// bound. Only the record of what arrived live tells it from an arrival (CodeRabbit,
+    /// review of 83e02cc).
+    func testHistorySharingThePagesMillisecondIsNotCarried() throws {
+        let stamp = { (i: Int) in String(format: "2026-09-30T08:00:00.412%03dZ", i) }
+        let pagedIn = try row("sys-older", createdAt: stamp(0))
+        let page = [try row("sys-1", createdAt: stamp(1)), try row("sys-2", createdAt: stamp(2))]
+        let arrival = try row("arrived", createdAt: stamp(3))
+
+        let thread = ChatStore.threadAfterFetch(page, replacing: [pagedIn] + page + [arrival],
+                                                heldAtRequest: ["sys-1", "sys-2"], arrivedLive: ["arrived"],
+                                                unsent: [], keepingLiveRows: true)
+
+        XCTAssertEqual(thread.map(\.id), ["sys-1", "sys-2", "arrived"])
     }
 
     /// A late arrival older than the whole page is history: left to paging back, so the
@@ -844,7 +879,7 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m5", second: 5), try row("m0-late", second: 0)]
         let fetched = [try row("m2", second: 2), try row("m5", second: 5)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m5"], unsent: [],
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m5"], arrivedLive: ["m0-late"], unsent: [],
                                                 keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m2", "m5"])
@@ -856,7 +891,7 @@ final class ThreadFreshnessTests: XCTestCase {
         let held = [try row("m3-late", second: 3), try row("m8", second: 8)]
         let fetched = [try row("m1", second: 1), try row("m8", second: 8)]
 
-        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m8"], unsent: [],
+        let thread = ChatStore.threadAfterFetch(fetched, replacing: held, heldAtRequest: ["m8"], arrivedLive: ["m3-late"], unsent: [],
                                                 keepingLiveRows: true)
 
         XCTAssertEqual(thread.map(\.id), ["m1", "m3-late", "m8"])
@@ -889,7 +924,7 @@ final class ThreadFreshnessTests: XCTestCase {
 
         let load = Task { await chat.loadMessages(conversationID: conv, force: true) }
         try await Task.sleep(for: .milliseconds(100))
-        chat.applyForTesting(messages: [conv: [try row("m-old", second: 0), try row("m2-late", second: 2)]])
+        chat.receiveForTesting(try row("m2-late", second: 2))
         _ = await load.value
 
         XCTAssertEqual(ids(chat), ["m1", "m2-late", "m3"])
@@ -904,7 +939,7 @@ final class ThreadFreshnessTests: XCTestCase {
 
         let jump = Task { await chat.loadWindow(conversationID: conv, around: "m1") }
         try await Task.sleep(for: .milliseconds(100))
-        chat.applyForTesting(messages: [conv: [try row("m-old", second: 0), try row("m2-late", second: 2)]])
+        chat.receiveForTesting(try row("m2-late", second: 2))
         _ = await jump.value
 
         XCTAssertEqual(ids(chat), ["m1", "m2-late", "m3"])
