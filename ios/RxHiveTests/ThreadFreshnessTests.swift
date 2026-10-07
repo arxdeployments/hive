@@ -855,6 +855,27 @@ final class ThreadFreshnessTests: XCTestCase {
         XCTAssertEqual(ids(chat), ["m1", "m2-mine"])
     }
 
+    /// A fetch that outlives a sign-out must not clear the arrival record a new session's
+    /// fetch of the same thread has opened since, or that fetch drops a live message and
+    /// still calls the window current (CodeRabbit, review of 50f3094).
+    func testAFetchOutlivingASignOutLeavesTheNextSessionsArrivalsAlone() async throws {
+        let page = pageJSON([messageJSON("m1", second: 1)])
+        MockURLProtocol.install { _, ordinal in
+            .json(200, page, delay: ordinal == 1 ? 0.3 : 0.8)
+        }
+        let chat = makeStore()
+
+        let stale = Task { await chat.loadMessages(conversationID: conv, force: true) }
+        try await Task.sleep(for: .milliseconds(50))
+        chat.reset()
+        let fresh = Task { await chat.loadMessages(conversationID: conv, force: true) }
+        _ = await stale.value
+        chat.receiveForTesting(try row("m2-live", second: 2))
+        _ = await fresh.value
+
+        XCTAssertEqual(ids(chat), ["m1", "m2-live"])
+    }
+
     /// A system-message batch is stamped a microsecond apart, so history paged in while
     /// the request was out can share the page's oldest millisecond and pass any time
     /// bound. Only the record of what arrived live tells it from an arrival (CodeRabbit,

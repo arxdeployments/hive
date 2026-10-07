@@ -175,6 +175,9 @@ final class ChatStore: ObservableObject {
         visibleThreads = [:]
         trustLostToGap = []
         windowQueues = [:]
+        // A fetch from this session may still be in flight; its record goes with the
+        // session (CodeRabbit, review of 50f3094).
+        arrivedDuringFetch = [:]
         threadGenerations = [:]
         sessionGeneration &+= 1
         typingUsers = [:]
@@ -371,7 +374,10 @@ final class ChatStore: ObservableObject {
         // is out; see `threadAfterFetch`.
         let heldAtRequest = Set((messages[conversationID] ?? []).map(\.id))
         arrivedDuringFetch[conversationID] = []
-        defer { arrivedDuringFetch[conversationID] = nil }
+        // Only this session's record: a fetch that outlives a sign-out must not clear the
+        // one a new session's fetch of the same thread has since opened (CodeRabbit,
+        // review of 50f3094) — the same guard the loading flag below has.
+        defer { if admitted.session == sessionGeneration { arrivedDuringFetch[conversationID] = nil } }
         loadingThreads.insert(conversationID)
         defer { if admitted.session == sessionGeneration { loadingThreads.remove(conversationID) } }
         do {
@@ -591,7 +597,7 @@ final class ChatStore: ObservableObject {
             let epoch = trustEpoch
             let heldAtRequest = Set((messages[conversationID] ?? []).map(\.id))
             arrivedDuringFetch[conversationID] = []
-            defer { arrivedDuringFetch[conversationID] = nil }
+            defer { if admitted.session == sessionGeneration { arrivedDuringFetch[conversationID] = nil } }
             do {
                 let page = try await RxHiveAPI.messages(
                     conversationID: conversationID, around: messageID, limit: 50, client: api
