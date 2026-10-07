@@ -63,7 +63,8 @@ While `users.must_change_password` is set, a session signed in with the temporar
 password can sign in, refresh, read `GET /api/auth/me`, change its password and
 sign out, and nothing else:
 
-- Every other HTTP route answers `403` with `code: "PASSWORD_CHANGE_REQUIRED"`,
+- Every other authenticated HTTP route answers `403` with
+  `code: "PASSWORD_CHANGE_REQUIRED"`,
   never `401`, which both clients would answer by refreshing and replaying.
 - The socket is refused at the handshake, with close code `4403`. An open one is
   re-checked every 30 seconds whether or not the client sends anything, and every

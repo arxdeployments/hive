@@ -13,11 +13,18 @@ new SFU before anyone has to trust it.
 import pathlib
 import re
 
+import pytest
+
 CI = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
 
 
 def test_livekit_is_pinned_to_a_version_and_its_checksum():
     """The e2e job installs a pinned, checksum-verified LiveKit instead of piping get.livekit.io to sh."""
+    # The backend can be built and tested on its own (a container build, a checkout of
+    # backend/ alone), where the workflow is not in the tree; CI always has it
+    # (CodeRabbit, review of 3bdf4ee).
+    if not CI.is_file():
+        pytest.skip("the CI workflow is outside this backend tree")
     text = CI.read_text()
     # The command, not the name: the comment beside the pin explains why it left.
     piped = re.search(r"get\.livekit\.io\S*\s*\|\s*(sudo\s+)?(ba)?sh", text)
