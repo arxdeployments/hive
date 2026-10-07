@@ -2,6 +2,8 @@ import { createContext, useContext, useState, useEffect, useCallback } from 'rea
 import client, { setSignOutReason } from '../api/client';
 import useChatStore from '../stores/chatStore';
 import { tearDownPush } from '../lib/pushTeardown';
+import { onPasswordChangeRequired } from '../lib/passwordChange';
+import { rebindPushAfterReset } from '../lib/pwa';
 
 /**
  * Both sign-outs that stay inside the SPA end up here.
@@ -38,14 +40,35 @@ export const useAuth = () => {
   return context;
 };
 
+/**
+ * Owns the signed-in user for the whole app: proves the session with /me on
+ * mount, mirrors the user to localStorage, and exposes login, logout and the
+ * setters that move the app onto and off the forced password change (batch 73).
+ */
 export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
 
+  /**
+   * Ask /api/auth/me who is signed in and store the answer. A 401 or 403 ends the
+   * session; any other failure keeps the cached user, so a boot without network
+   * does not sign out a session whose cookies are still good. Re-binds push when
+   * the cache was held at the forced password change and /me now says it is done.
+   */
   const checkAuth = useCallback(async () => {
     try {
+      // Held at the forced password change when this tab last knew (batch 73)?
+      const wasHeld = cachedUser()?.must_change_password === true;
       // Session lives in httpOnly cookies; /me is the source of truth.
       const { data } = await client.get('/api/auth/me');
+      // Released since, so the password was changed: by this tab before a reload
+      // (the forced screen asks for one when the server's confirmation was lost)
+      // or by another. The reset deleted this account's push rows while the
+      // browser kept its subscription, and the heal that runs next never re-sends
+      // one the browser still holds, so push would stay dead with Settings showing
+      // it on. Re-bound here as the forced screen does; not awaited (batch 73
+      // review).
+      if (wasHeld && data?.must_change_password === false) rebindPushAfterReset();
       setUser(data);
       localStorage.setItem('user', JSON.stringify(data));
     } catch (err) {
@@ -84,6 +107,52 @@ export const AuthProvider = ({ children }) => {
     checkAuth();
   }, [checkAuth]);
 
+  /**
+   * Replace the signed-in user, keeping the localStorage mirror in step.
+   *
+   * The two have to move together: websocket.js reads the session's id from the
+   * mirror, and an offline boot restores from it — so a flag set in state alone
+   * would be forgotten by the next boot that could not reach /me, and that boot
+   * would render the app the server is refusing.
+   */
+  const updateUser = useCallback((next) => {
+    localStorage.setItem('user', JSON.stringify(next));
+    setUser(next);
+  }, []);
+
+  /**
+   * Set or clear the pending password change (batch 73) on the current user.
+   *
+   * App.jsx gates the whole session on `user.must_change_password`, so this is
+   * how the app enters and leaves the forced change-password screen. A no-op
+   * with nobody signed in, and when the flag already has that value — every
+   * refused request announces, so a screen that fired five at once calls this
+   * five times, and only the first may cost a render.
+   *
+   * The updater stays pure; the localStorage mirror is written by the effect
+   * below, from the value React actually committed (CodeRabbit, review of
+   * 70495a4).
+   */
+  const setMustChangePassword = useCallback((required) => {
+    setUser((prev) => (
+      !prev || Boolean(prev.must_change_password) === required
+        ? prev
+        : { ...prev, must_change_password: required }
+    ));
+  }, []);
+
+  // The mirror follows the committed user, so whatever changed it — above all the
+  // flag, which an offline boot must not forget — is what the next boot restores.
+  // Signing out removes the mirror itself; a null user writes nothing here.
+  useEffect(() => {
+    if (user) localStorage.setItem('user', JSON.stringify(user));
+  }, [user]);
+
+  // The API refusing this session until its password is changed, whoever saw it
+  // first: the axios interceptor for a 403 carrying PASSWORD_CHANGE_REQUIRED, or
+  // the socket for a 4403 close. Neither signs anybody out; both land here.
+  useEffect(() => onPasswordChangeRequired(() => setMustChangePassword(true)), [setMustChangePassword]);
+
   const login = async (email, password) => {
     const { data } = await client.post('/api/auth/login', { email, password });
     // Belt as well as braces. Signing out clears this, so by here it is normally
@@ -121,7 +190,7 @@ export const AuthProvider = ({ children }) => {
   };
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout, checkAuth }}>
+    <AuthContext.Provider value={{ user, loading, login, logout, checkAuth, updateUser, setMustChangePassword }}>
       {children}
     </AuthContext.Provider>
   );

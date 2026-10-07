@@ -113,6 +113,58 @@ ticket, none of which is the problem.
 
 Backend coverage: `backend/tests/test_mobile_access.py` (20 tests).
 
+## A reset password must be changed first
+
+An admin password reset (super admin, or an org admin from **Organisation Admin**)
+shows the admin the temporary password, so the server holds the account until its
+owner picks a new one: `users.must_change_password` is set, it rides in the `user`
+object of login, refresh and `/me`, and every other route answers
+`403 {"code": "PASSWORD_CHANGE_REQUIRED"}`. The socket is accepted and closed with
+**4403** — not 4001, which this app answers by refreshing and reconnecting, and the
+refresh succeeds for a held account, so it would loop.
+
+The app gives that its own auth phase, `AuthStore.Phase.passwordChangeRequired`,
+rather than a flag inside `.signedIn`:
+
+- **Entered** from a flagged sign-in, restore, offline restore of a remembered
+  account (`RememberedUser` keeps the flag), or `/me` revalidation — all through
+  `enterSignedIn` — and from a running session by the first coded 403 on any request
+  (`APIClient.passwordChangeRequiredNotification`) or a 4403 close
+  (`RealtimeClient.onPasswordChangeRequired`).
+- **Nothing session-scoped runs** while in it: `currentUser` is nil, so no store sees
+  a signed-in user; the socket is stopped and does not reconnect; the foreground call
+  reconcile is skipped; a live call is hung up and its LiveKit room left
+  (`CallStore.endForPasswordChange`) so the microphone is not left published.
+- **The cookies are kept.** The code is deliberately not a `MobileDenialKind`: a
+  denial ends the session and wipes them, and this session is the one the change is
+  made with. Only a refused session (`handleSessionLost`, or the refused refresh
+  after a change made on another device, below) or Sign Out ends it.
+- **Leaving it** (`ForcedPasswordChangeView` → `completeRequiredPasswordChange`):
+  `GET /me` first, because it refreshes and `change-password` does not, so a lapsed
+  access cookie cannot masquerade as a wrong temporary password; then
+  `POST /api/auth/change-password`; then `GET /me`, and the session starts only if it
+  reports the flag clear. This device's own change starts the session directly, even
+  when only a later `/me` confirms it: the 200 re-issued this device's session.
+- **Changed on another device** (the web app, another phone): the held session does
+  *not* survive that. The change revokes this phone's refresh token, and `/me` keeps
+  answering only until the 15-minute access cookie lapses. So when `/me` (the
+  foreground check, or the first step above) reports the flag clear and this device
+  did not make the change, the app forces one refresh through the client's
+  single-flight coordinator (`APIClient.refreshSession`) before deciding. Refreshed:
+  the session starts. Refused: the session ends and sign-in says "Your password was
+  changed. Sign in with your new password." (`AuthCopy.passwordChangedElsewhere`)
+  instead of a later, unexplained "session expired". Unreachable: it stays held and
+  asks again.
+- **Sign Out mid-change** waits for the in-flight `change-password` to be answered
+  before it sends `POST /api/auth/logout`. Cancelling would not undo a change the
+  server had already committed, and that answer carries the new session's cookies;
+  waiting means the logout revokes that session and the cookie clear removes it. The
+  change form is refused while a sign-out is in progress.
+
+The org-admin sheet disables Reset Password on the admin's own row (the server
+refuses it with a 400) and tells the admin the person will have to choose a new
+password the next time they sign in.
+
 ## Design system
 
 `DesignSystem/Theme.swift` transcribes the web tokens from

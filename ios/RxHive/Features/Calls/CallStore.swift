@@ -288,6 +288,42 @@ final class CallStore: ObservableObject {
         pendingInvitees = []
     }
 
+    /// End whatever call is live, because the session carrying it has to stop: an
+    /// administrator reset this account's password and it must be changed first
+    /// (batch 73).
+    ///
+    /// The opposite of `resetSessionState`'s rule, and for a reason that rule does
+    /// not cover. A sign-out leaves a live call alone because the call can outlive
+    /// it; here nothing can — every call route now answers 403, the socket is
+    /// about to be stopped, and the change-password screen has no call UI behind
+    /// it. Left alone, the LiveKit room would keep the microphone published with
+    /// nobody able to hang up.
+    ///
+    /// The hang-up frame goes out before the caller stops the socket, because on
+    /// the 403 path the socket is still open and that frame is the only way the
+    /// peer hears a hang-up rather than waiting out the server's reconnect grace
+    /// window. And it is awaited (at most a second), not just handed over: Apple
+    /// does not promise that the close right behind it flushes a send still
+    /// pending (CodeRabbit, review of 1fbc1de). `reportEnded` is not used: it
+    /// needs a signed-in user and its REST call would only be refused. Then the
+    /// room is left and the session-scoped state cleared.
+    func endForPasswordChange() async {
+        if hasLiveCall, let callID = currentCallID, let realtime = auth?.realtime {
+            switch phase {
+            case .outgoing:
+                await realtime.sendAndWait(.callCancel(callID: callID))
+            case .incoming where !isConnecting:
+                await realtime.sendAndWait(.callDecline(callID: callID))
+            default:
+                await realtime.sendAndWait(.callEnd(callID: callID))
+            }
+        }
+        // Re-read rather than assumed: the room can have been lost, and torn down
+        // to `.ended`, while the hang-up was on its way.
+        if hasLiveCall { await teardown(to: .idle) }
+        resetSessionState()
+    }
+
     #if DEBUG
     /// Seed the session-scoped fields directly; they are all `private(set)` and
     /// their real writers need a socket and an SFU.
@@ -1219,6 +1255,9 @@ final class CallStore: ObservableObject {
 
     // MARK: - Joining the room
 
+    /// Fetch a LiveKit token for `callID`, join its room and enter the active call,
+    /// reporting any failure through `failJoin`. After every await it checks that
+    /// this call is still the one being joined and stands down if not (batch 73).
     private func join(callID: String) async {
         // A second `call:accepted` (both sides get one, and a reconnect can replay
         // it) must not tear down a room we are already in.
@@ -1249,6 +1288,13 @@ final class CallStore: ObservableObject {
         do {
             token = try await RxHiveAPI.callToken(callID: callID, deviceID: Self.deviceID)
         } catch let error as APIError {
+            // Every continuation below asks first whether this call is still the one
+            // being joined (CodeRabbit, review of 1fbc1de). `endForPasswordChange` can
+            // take the store to `.idle` while a join awaits its token or the room —
+            // and the token request is refused for exactly that reason — after which
+            // a stale join would report an error over the change-password screen,
+            // send another `call:end`, or enter a call that no longer exists.
+            guard isStillJoining(callID) else { return }
             // 404/400 both mean "that call is not joinable", which is a different
             // sentence from "we could not authorise the call".
             let reason: CallJoinFailure
@@ -1259,9 +1305,11 @@ final class CallStore: ObservableObject {
             await failJoin(reason, callID: callID, underlying: error)
             return
         } catch {
+            guard isStillJoining(callID) else { return }
             await failJoin(.tokenFailed, callID: callID, underlying: error)
             return
         }
+        guard isStillJoining(callID) else { return }
 
         do {
             let outcome = try await session.join(
@@ -1270,17 +1318,33 @@ final class CallStore: ObservableObject {
                 wantVideo: wantVideo,
                 speaker: isSpeakerOn
             )
+            guard isStillJoining(callID) else {
+                // Joined a room for a call that ended while the join ran. Leave it, but
+                // only if the session still belongs to that call: a newer call may own it.
+                // `endingCall` stays true: the call is over, so no rejoin may follow.
+                if session.callID == callID { await session.leave() }
+                return
+            }
             if outcome.cameraUnavailable {
                 isCameraOn = false
                 toasts?.warning((outcome.cameraFailure ?? .mediaFailed).cameraFallbackMessage)
             }
             enterActive(callID: callID, room: token.room)
         } catch let error as CallJoinError {
+            guard isStillJoining(callID) else { return }
             log.error("Join failed (\(error.reason.rawValue, privacy: .public)): \(error.detail, privacy: .public)")
             await failJoin(error.reason, callID: callID, underlying: error.underlying)
         } catch {
+            guard isStillJoining(callID) else { return }
             await failJoin(.unknown, callID: callID, underlying: error)
         }
+    }
+
+    /// Whether `callID` is still the live call this store is joining. False once the
+    /// call was torn down while a join awaited (a password-change hold, a hang-up, or
+    /// a newer call), so the stale join stands down instead of acting on it.
+    private func isStillJoining(_ callID: String) -> Bool {
+        currentCallID == callID && hasLiveCall
     }
 
     private func failJoin(_ reason: CallJoinFailure, callID: String, underlying: Error?) async {

@@ -1,5 +1,7 @@
 import SwiftUI
 
+/// The app entry point. Owns the four app-wide stores, injects them into
+/// `RootView`, and forwards scene-phase changes to the stores that react to them.
 @main
 struct RxHiveApp: App {
     @StateObject private var auth = AuthStore()
@@ -9,6 +11,9 @@ struct RxHiveApp: App {
 
     @Environment(\.scenePhase) private var scenePhase
 
+    /// One window holding `RootView`. Wires the stores together and restores the
+    /// session on first appearance; on foreground it revalidates auth and, for a
+    /// running session only, reconciles call state with the server.
     var body: some Scene {
         WindowGroup {
             RootView()
@@ -41,7 +46,16 @@ struct RxHiveApp: App {
                 // any `call:*` frame published in that window went to a channel with no
                 // subscriber and is gone. Asking the server is the only way to find out
                 // that a call is ringing right now.
-                Task { await calls.reconcileWithServer() }
+                //
+                // Only for a running session. `currentUser` is nil while the account
+                // is held at the change-password screen (batch 73), where every call
+                // route answers 403 and nothing session-scoped may start. A cold
+                // launch, where it is nil too, loses nothing: the socket's `connected`
+                // frame runs this same reconcile once the session is up
+                // (`CallStore.attach`, `onReconnected`).
+                if auth.currentUser != nil {
+                    Task { await calls.reconcileWithServer() }
+                }
             default:
                 break
             }
@@ -59,6 +73,9 @@ struct RootView: View {
     @EnvironmentObject private var calls: CallStore
     @EnvironmentObject private var toasts: ToastCenter
 
+    /// The screen for `auth.phase`, with the call overlays and toasts layered above
+    /// whichever it is. A held account gets `ForcedPasswordChangeView` in place of
+    /// `HomeView` (batch 73).
     var body: some View {
         ZStack {
             Theme.Color.bg.ignoresSafeArea()
@@ -77,6 +94,12 @@ struct RootView: View {
                     auth.dismissAccessDenied()
                 }
                 .transition(.opacity)
+
+            case .passwordChangeRequired(let user):
+                // Instead of the app, not over it: `HomeView` and everything it
+                // starts must not exist while the server refuses all of it.
+                ForcedPasswordChangeView(email: user.email)
+                    .transition(.opacity)
 
             case .signedIn:
                 HomeView()

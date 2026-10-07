@@ -14,6 +14,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.deps import PasswordChangeRequiredError
 from app.db.models import (
     Conversation,
     ConversationParticipant,
@@ -73,6 +74,19 @@ class AccountInactive(SendError):
     """
 
 
+class PasswordChangeRequired(AccountInactive, PasswordChangeRequiredError):
+    """The actor's account was reset by an administrator and has not chosen a new password.
+
+    An AccountInactive so `_require_message_access` passes it through as the account
+    refusal it is, rather than collapsing it into a 404 "Message not found" the way
+    it does every plain SendError (batch 73). Also the deps-layer
+    PasswordChangeRequiredError, so it carries the same 403, detail and
+    PASSWORD_CHANGE_REQUIRED code wherever it surfaces — over HTTP the coded
+    handler serialises the code, which is what tells a client to show the
+    change-password screen instead of a generic failure.
+    """
+
+
 def assert_conversation_access(conv: Conversation, user: User, *, is_member: bool) -> None:
     """May this user interact with this conversation AT ALL. Raises SendError.
 
@@ -98,6 +112,14 @@ def assert_conversation_access(conv: Conversation, user: User, *, is_member: boo
     # caught up. That revalidation is the backstop; this is the actual gate.
     if not user.is_active:
         raise AccountInactive(status_code=403, detail="Your account is no longer active")
+    # The same reasoning for a password reset (batch 73): HTTP refuses the account at
+    # the auth dependency, but a socket opened before the reset carries a User loaded
+    # back then. The hub now re-checks the account before it dispatches any frame
+    # that acts, and closes the socket rather than reaching this (batch 73 review),
+    # so this is defence in depth on both transports — kept because it sits on the
+    # code path itself, where a caller added later cannot forget it.
+    if user.must_change_password:
+        raise PasswordChangeRequired()
     if not is_member or not conv.is_active:
         raise SendError(status_code=404, detail="Conversation not found")
     # Org isolation: non-cross-org conversations must match the user's org.

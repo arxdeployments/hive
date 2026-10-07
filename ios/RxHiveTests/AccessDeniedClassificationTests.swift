@@ -33,6 +33,20 @@ final class AccessDeniedClassificationTests: XCTestCase {
         XCTAssertEqual(MobileDenialKind(rawValue: Self.notApprovedCode), .notApproved)
     }
 
+    /// The admin-reset hold (batch 73) is coded too, and must stay out of this enum:
+    /// a mobile denial ends the session and shows "Mobile access not enabled", and
+    /// the hold needs the session kept so the password can be changed with it.
+    func test_thePasswordChangeCodeIsNotAMobileDenial() throws {
+        // core/deps.py: PASSWORD_CHANGE_REQUIRED_CODE
+        XCTAssertEqual(APIError.passwordChangeRequiredCode, "PASSWORD_CHANGE_REQUIRED")
+        XCTAssertNil(MobileDenialKind(rawValue: "PASSWORD_CHANGE_REQUIRED"))
+
+        let json = #"{"detail":"You must change your password before continuing.","code":"PASSWORD_CHANGE_REQUIRED"}"#
+        let body = try JSONDecoder().decode(APIErrorBody.self, from: Data(json.utf8))
+        XCTAssertEqual(body.code, "PASSWORD_CHANGE_REQUIRED")
+        XCTAssertNil(body.code.flatMap(MobileDenialKind.init(rawValue:)))
+    }
+
     /// A code from a future backend must not be guessed into one of the two screens
     /// this build actually has copy for.
     func test_anUnknownCodeClassifiesAsNothing() {

@@ -10,6 +10,11 @@ import { generatePassword as genPassword } from '../../utils/generatePassword';
 import { apiError } from '../../utils/helpers';
 import { createRequestTicket } from '../../utils/latestRequest';
 
+/**
+ * The org-admin portal's user list: search, department filter and paging over
+ * the users this admin manages (the whole organization, or their managed
+ * departments), with the create form and the edit drawer that holds Reset Password.
+ */
 export default function OrgAdminUsers() {
   const { user: me } = useAuth();
   // An empty array means organization-wide, matching the API (see
@@ -140,13 +145,30 @@ export default function OrgAdminUsers() {
     } catch (err) { toast.error(apiError(err, 'Failed')); }
   };
 
+  /**
+   * Reset the edited user's password to a server-generated temporary one, show
+   * it in the drawer and a toast, and tell the admin the user must replace it at
+   * their next sign-in (batch 73).
+   */
   const handleResetPw = async () => {
     try {
       const { data } = await client.post(`/api/org-admin/users/${editUser._id}/reset-password`);
       setResetPw(data.temporary_password);
-      toast.success('Password reset', { description: data.temporary_password, duration: 10000 });
-    } catch { toast.error('Failed'); }
+      // What happens next, not just the password (batch 73): the account is now
+      // refused everywhere until its owner replaces it.
+      toast.success('Password reset', {
+        description: `Temporary password: ${data.temporary_password}. They will be asked to choose a new password the next time they sign in.`,
+        duration: 10000,
+      });
+    } catch (err) { toast.error(apiError(err, 'Failed to reset password')); }
   };
+
+  // An org admin resetting their OWN password here would hand themselves a
+  // temporary one and lock their own session behind the forced change (batch
+  // 73), so the API refuses it with 400 and points at Change Password instead.
+  // The button says the same thing up front rather than inviting the refusal.
+  // Both ids are the user's UUID as a string: `_id` from this list, `id` from /me.
+  const isSelf = Boolean(editUser && me?.id && editUser._id === me.id);
 
   const totalPages = Math.ceil(total / limit);
 
@@ -385,18 +407,30 @@ export default function OrgAdminUsers() {
                         not. The word is the state; it belongs in the name. */}
                     <span id="orgadminusers-09-status-state" className={`text-sm ${editActive ? 'text-[#10B981]' : 'text-[#EF4444]'}`}>{editActive ? 'Active' : 'Inactive'}</span>
                   </button></div>
-                <button onClick={handleResetPw}
-                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-[6px] text-sm font-medium bg-[#1A1A1A] border border-[#2D2D2D] text-[#F59E0B] hover:bg-[#F59E0B]/10 transition-colors">
+                <button onClick={handleResetPw} disabled={isSelf}
+                  data-testid="org-admin-reset-password-button"
+                  title={isSelf ? 'Use Change Password in Settings to change your own password' : undefined}
+                  className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-[6px] text-sm font-medium bg-[#1A1A1A] border transition-colors ${
+                    isSelf ? 'border-[#1F1F1F] text-[#5A5A5A] cursor-not-allowed'
+                    : 'border-[#2D2D2D] text-[#F59E0B] hover:bg-[#F59E0B]/10'}`}>
                   <RefreshCw size={14} /> Reset Password
                 </button>
+                {isSelf && (
+                  <p data-testid="org-admin-reset-password-self-note" className="text-xs text-[#5A5A5A] -mt-2">
+                    To change your own password, use Change Password in Settings.
+                  </p>
+                )}
                 {resetPw && (
                   <div className="p-3 bg-[#10B981]/5 border border-[#10B981]/20 rounded-[6px]">
-                    <p className="text-xs text-[#A3A3A3] mb-1">New password:</p>
+                    <p className="text-xs text-[#A3A3A3] mb-1">Temporary password:</p>
                     <div className="flex items-center gap-2">
                       <code className="flex-1 text-sm font-mono text-[#10B981]">{resetPw}</code>
                       <button onClick={() => { navigator.clipboard.writeText(resetPw); toast.success('Copied!'); }}
                         className="p-1.5 text-[#A3A3A3] hover:text-[#10B981]"><Copy size={14} /></button>
                     </div>
+                    <p className="mt-2 text-xs text-[#A3A3A3]">
+                      Give this to the user. They will be asked to choose a new password the next time they sign in.
+                    </p>
                   </div>
                 )}
                 <div className="flex gap-3 pt-4">

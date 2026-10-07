@@ -8,16 +8,26 @@ session revocation on deactivate/reset-password, password policy on create,
 per-org department name uniqueness on rename, and global slug uniqueness on
 org rename. Every query is org-scoped — objects outside the caller's tenant
 404 without revealing existence.
+
+reset-password (batch 73): the must_change_password flag it sets is now enforced
+— the account is refused everywhere but change-password until it picks its own —
+and the reset deletes the target's push subscriptions and stamps
+users.sessions_valid_after, which keeps access tokens issued before the reset
+refused for good rather than only until the password changes. It locks the
+target's users row before revoking anything, so a sign-in racing the reset cannot
+keep a session the reset never saw (batch 73 review). An admin cannot reset
+their OWN password here: it never asks for the current one, and it would revoke
+the session making the request. Self-service is /api/auth/change-password.
 """
 
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.auth import wire_role
+from app.api.auth import lock_user_row, wire_role
 from app.core.deps import get_current_user
 from app.core.errors import conflict_as_400
 from app.core.rate_limit import password_limiter
@@ -27,6 +37,7 @@ from app.db.models import (
     Conversation,
     Department,
     Organization,
+    PushSubscription,
     RefreshToken,
     User,
     UserRole,
@@ -445,11 +456,51 @@ async def reset_user_password(
     db: AsyncSession = Depends(get_db),
     _rl: None = Depends(password_limiter),
 ):
+    """Give a member of the admin's organization a temporary password and end every session it had.
+
+    The same writes as the superadmin route in admin.py, scoped to the caller's org and rate-limited. An admin
+    targeting their own account is refused with 400 before anything is written. Returns the temporary
+    password.
+    """
     target = await _load_org_user(db, admin, user_id)
+    # _load_org_user lets an admin resolve their own row, deliberately, so they can
+    # edit their own profile. A reset is the exception (batch 73): it would revoke
+    # every session the admin has, including the one making this request, and lock
+    # their own account behind a temporary password shown on the screen they are
+    # looking at. Self-service lives in /api/auth/change-password, which checks the
+    # current password first. Refused before anything is written.
+    if target.id == admin.id:
+        raise HTTPException(status_code=400, detail="Use Change Password to change your own password.")
     temp = generate_password()
-    target.password_hash = await hash_password(temp)
+    new_hash = await hash_password(temp)
+    # The target's row lock, held to commit and taken before the refresh tokens are
+    # revoked, so a sign-in racing this reset either sees the new password and is
+    # refused or has its session revoked below (batch 73 review); see the superadmin
+    # route in admin.py.
+    locked = await lock_user_row(db, target.id)
+    # And the scope checks again, on the row as it is under that lock (CodeRabbit,
+    # review of 70495a4). _load_org_user judged the row as read before the bcrypt
+    # round; a superadmin moving the target to another org, or promoting it to
+    # admin, in that window would otherwise have this route write — and return to
+    # the caller — a temporary password for an account outside their reach. Same
+    # answers as _load_org_user's own.
+    if locked is None or locked.org_id != admin.org_id:
+        raise HTTPException(status_code=404, detail="User not found")
+    if locked.role is not UserRole.member:
+        raise HTTPException(status_code=403, detail="Only a superadmin can manage another admin's account")
+    target.password_hash = new_hash
+    # Enforced by get_current_user from the moment this commits: the account is
+    # refused everywhere but change-password until it chooses its own password.
     target.must_change_password = True
     await _revoke_refresh_tokens(db, target.id)
+    # And the session epoch, so the target's pre-reset access token stays refused
+    # after they change the password rather than only until then (batch 73 review).
+    # After the revocation, for the ordering change-password depends on; see the
+    # superadmin route in admin.py.
+    target.sessions_valid_after = now_utc()
+    # Push is the one channel the flag cannot gate, because the server is the one
+    # sending. Same transaction as the reset; see the superadmin route in admin.py.
+    await db.execute(delete(PushSubscription).where(PushSubscription.user_id == target.id))
     await log_audit(
         db,
         actor_id=admin.id,

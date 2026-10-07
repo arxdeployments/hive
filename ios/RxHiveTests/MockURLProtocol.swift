@@ -26,6 +26,20 @@ final class MockURLProtocol: URLProtocol {
         /// Held for this long before answering. Used to keep a refresh in flight long
         /// enough for concurrent 401s to arrive and join the same single-flight.
         var delay: TimeInterval = 0
+        /// Run at the moment the answer is delivered, after any `delay`, before the
+        /// client sees it. Lets a test act as the server does when it answers — set
+        /// the cookies a `Set-Cookie` would, or note that the answer has gone out —
+        /// so it can assert what happened before and after that moment (batch 73
+        /// review: a logout must not overtake a password change's answer). Not run
+        /// for a request cancelled before its answer was due.
+        var onDelivery: (() -> Void)?
+
+        /// This reply, with `hook` run as it is delivered.
+        func whenDelivered(_ hook: @escaping () -> Void) -> Reply {
+            var copy = self
+            copy.onDelivery = hook
+            return copy
+        }
 
         static func json(
             _ status: Int,
@@ -164,11 +178,16 @@ final class MockURLProtocol: URLProtocol {
         stopped.unlock()
     }
 
+    /// Hand `reply` to the loading client as a failure or a full response, unless the
+    /// request was stopped first. `onDelivery` runs just before, once the request is
+    /// known not to be cancelled.
     private func deliver(_ reply: Reply) {
         stopped.lock()
         let cancelled = isStopped
         stopped.unlock()
         guard !cancelled else { return }
+
+        reply.onDelivery?()
 
         if let failure = reply.failure {
             client?.urlProtocol(self, didFailWithError: failure)
