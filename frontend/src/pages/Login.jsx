@@ -18,6 +18,9 @@ import { takeSignOutReason } from '../api/client';
 const SIGNOUT_COPY = {
   expired: 'Your session expired. Please sign in again.',
   inactive: 'Your account is no longer active. Contact your administrator.',
+  // A password changed on another device while this one waited on the forced
+  // change screen ended this browser's session (batch 73).
+  password_changed: 'Your password was changed. Sign in with your new password.',
 };
 
 export default function Login() {

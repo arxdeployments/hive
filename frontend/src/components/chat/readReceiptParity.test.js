@@ -79,13 +79,13 @@ describe('ChatPanel: the thread is marked read once its newest page is on screen
   it('marks read after a successful fetch has written the page — with live arrivals kept — not before, not on failure', () => {
     const lines = code(fetchBlock());
     const bail = lines.indexOf('if (seq !== fetchSeqRef.current) return;');
-    const live = lines.indexOf('const live = carryOverLiveArrivals(held, fetched);');
-    const write = lines.indexOf('setMessages(conversationId, kept.length ? [...fetched, ...kept] : fetched);');
+    const live = lines.indexOf('const live = carryOverLiveArrivals(held, fetched, heldAtRequest);');
+    const write = lines.indexOf('setMessages(conversationId, localOnly.length ? [...merged, ...localOnly] : merged);');
     const mark = lines.indexOf('markThreadRead(conversationId);');
     const caught = lines.indexOf('} catch (err) {');
     assert.ok(bail !== -1 && live !== -1 && write !== -1 && mark !== -1 && caught !== -1,
       'fetchMessages changed shape; re-check this guard');
-    assert.ok(lines.includes('const kept = [...live, ...localOnly];'), 'live arrivals are not written back');
+    assert.ok(lines.includes('const merged = mergeByTime(fetched, live);'), 'live arrivals are not written back in time order');
     assert.ok(bail < live && live < write, 'live arrivals are not kept when the page replaces the thread');
     assert.ok(write < mark, 'the thread is marked read before its page is written');
     assert.ok(mark < caught, 'a failed fetch marks the thread read');
@@ -125,18 +125,71 @@ describe('ChatPanel: the thread is marked read once its newest page is on screen
     // CodeRabbit, review of b789477: the jump restored currency and showed the
     // arrivals a slice had held back, but never told the server.
     const lines = code(jumpBlock());
-    const write = lines.indexOf('setMessages(conversationId, kept.length ? [...fetched, ...kept] : fetched);');
+    const write = lines.indexOf('setMessages(conversationId, localOnly.length ? [...merged, ...localOnly] : merged);');
     const mark = lines.indexOf('if (!data.has_newer) markThreadRead(conversationId);');
     assert.ok(mark !== -1, 'a jump that lands on the newest page leaves the thread unread');
     assert.ok(write !== -1 && write < mark, 'the jump marks the thread read before its window is written');
   });
 
+  it('shows the window it wrote, clearing a spinner it took over, before marking it read', () => {
+    // Review of PR #112's carry-over: a jump that superseded a newest-page fetch still
+    // loading left that fetch's spinner up for good (the superseded fetch's finally
+    // leaves it alone, and the jump never touched it), and the mark above then called
+    // a thread read that the user was looking at a spinner over.
+    const lines = code(jumpBlock());
+    const shown = lines.indexOf('setLoading(false);');
+    const mark = lines.indexOf('if (!data.has_newer) markThreadRead(conversationId);');
+    assert.ok(shown !== -1 && shown < mark,
+      'a jump leaves a spinner it took over on screen, and marks the thread under it read');
+    assert.ok(lines.includes(
+      'setLoadErrorByConv(prev => (prev[conversationId] ? { ...prev, [conversationId]: false } : prev));'),
+    'a jump that loaded leaves the previous failure\'s error strip up');
+  });
+
+  it('loads the page it interrupted when it fails, instead of leaving the spinner up', () => {
+    const whole = code(block(panel, 'const handleJumpToMessage = useCallback(',
+      '}, [conversationId, scrollToLoaded, setMessages, myUserId, fetchMessages]);'));
+    assert.ok(whole.includes('if (seq === fetchSeqRef.current && loadingRef.current) fetchMessages({ force: true });'),
+      'a failed jump does not reload the newest page it took over from');
+    for (const failure of ["toast.error('That message is no longer available');", "toast.error('Could not load that message');"]) {
+      const at = whole.indexOf(failure);
+      assert.ok(at !== -1 && whole[at + 1] === 'resumeInterruptedLoad();',
+        `after ${failure} the spinner of the fetch the jump took over stays up`);
+    }
+    assert.ok(code(panel).includes('loadingRef.current = loading;'), 'the jump reads a stale loading flag');
+  });
+
   it('keeps live arrivals for a jump that reaches the newest message, never for a slice', () => {
     const lines = code(jumpBlock());
-    assert.ok(lines.includes('const live = data.has_newer ? [] : carryOverLiveArrivals(held, fetched);'),
+    assert.ok(lines.includes('const live = data.has_newer ? [] : carryOverLiveArrivals(held, fetched, heldAtRequest);'),
       'a jump drops live arrivals, or stitches the old end onto a slice');
     assert.ok(lines.includes('setWindowCurrent(conversationId, !data.has_newer && connected);'),
       'a jump\'s slice is recorded as current');
+  });
+});
+
+describe('ChatPanel: live arrivals are what the thread did not hold when it asked', () => {
+  // Review of PR #112: decided by timestamps, an arrival stamped before the page's
+  // newest row was dropped, and a system batch in one millisecond was carried under
+  // the page. The ids must be taken BEFORE the request, or an arrival during it
+  // counts as held and is dropped.
+  const snapshot = 'const heldAtRequest = heldIds(useChatStore.getState().messages[conversationId]);';
+
+  it('takes the ids before the newest-page request, and decides by them', () => {
+    const lines = code(fetchBlock());
+    const taken = lines.indexOf(snapshot);
+    const asked = lines.findIndex((l) => l.startsWith('const { data } = await client.get('));
+    assert.ok(taken !== -1 && asked !== -1 && taken < asked, 'the newest-page fetch takes its ids after asking');
+    assert.ok(lines.includes('const live = carryOverLiveArrivals(held, fetched, heldAtRequest);'),
+      'the newest-page fetch does not decide arrivals by what it held when it asked');
+  });
+
+  it('takes the ids before a jump\'s request', () => {
+    const whole = code(block(panel, 'const handleJumpToMessage = useCallback(',
+      '}, [conversationId, scrollToLoaded, setMessages, myUserId, fetchMessages]);'));
+    const taken = whole.indexOf(snapshot);
+    const asked = whole.findIndex((l) => l.startsWith('const { data } = await client.get('));
+    assert.ok(taken !== -1 && asked !== -1 && taken < asked, 'a jump takes its ids after asking');
   });
 });
 
@@ -149,16 +202,57 @@ describe('chatStore: a socket drop withdraws "current" synchronously', () => {
 });
 
 describe('websocket.js: a socket that survives an outage restores chat', () => {
+  /** The code lines of websocket.js's `_noteSignalAlive`. */
+  const alive = () => code(block(socket, '  _noteSignalAlive() {', '\n  }'));
+  /** Index of the bare `if (` line that opens the multi-line chat-restore guard. */
+  const restoreAt = (lines) => lines.indexOf('if (');
+
   it('sets wsConnected back when an inbound frame proves the same socket alive', () => {
     // CodeRabbit, review of b789477: the offline listener sets wsConnected false; a
     // socket that survives never re-runs _onOpen, so receipts stayed withheld and
     // ChatPanel's reconnect re-fetch never ran.
-    const alive = code(block(socket, '  _noteSignalAlive() {', '\n  }'));
-    const restore = alive.indexOf('if (!useChatStore.getState().wsConnected && this.isOpen()) {');
-    assert.ok(restore !== -1 && alive[restore + 1] === 'useChatStore.getState().setWsConnected(true);',
-      'a socket that comes back from an outage leaves chat believing it is down');
-    const callGate = alive.indexOf('if (useCallStore.getState().signalLinkState !== LINK_RECONNECTING) return;');
-    assert.ok(callGate !== -1 && restore < callGate, 'the chat restore sits behind the call-state early return');
+    const lines = alive();
+    const at = restoreAt(lines);
+    const set = lines.indexOf('useChatStore.getState().setWsConnected(true);');
+    assert.ok(at !== -1 && set > at, 'a socket that comes back from an outage leaves chat believing it is down');
+    const callGate = lines.indexOf('if (useCallStore.getState().signalLinkState !== LINK_RECONNECTING) return;');
+    assert.ok(callGate !== -1 && set < callGate, 'the chat restore sits behind the call-state early return');
+  });
+
+  it('undoes only the offline listener\'s withdrawal, on that socket, for the user it belongs to', () => {
+    // Review of PR #112: a sign-out's store reset also leaves wsConnected false over an
+    // open socket, one a live call keeps for the PREVIOUS user. Restoring that made
+    // the next user's chat trust a socket that never delivers their messages.
+    const lines = alive();
+    const at = restoreAt(lines);
+    const set = lines.indexOf('useChatStore.getState().setWsConnected(true);');
+    const guard = lines.slice(at, set);
+    for (const cond of [
+      '!useChatStore.getState().wsConnected',
+      '&& this.isOpen()',
+      '&& this._offlineWithdrewFor === this.ws',
+      '&& owner?.ws === this.ws',
+      '&& owner.userId === this._currentUserId()',
+    ]) {
+      assert.ok(guard.includes(cond), `the restore no longer checks ${cond}`);
+    }
+    const offline = code(block(socket, "window.addEventListener('offline', () => {", '    });'));
+    const withdrew = offline.indexOf('useChatStore.getState().setWsConnected(false);');
+    assert.ok(withdrew !== -1 && offline[withdrew + 1] === 'this._offlineWithdrewFor = this.ws;',
+      'the offline listener does not record which socket it withdrew chat from');
+    const connected = code(block(socket, "      case 'connected':", '        break;'));
+    assert.ok(connected.includes('this._socketOwner = { ws: this.ws, userId: data.user_id };'),
+      'nothing records whose socket this is');
+  });
+
+  it('does the rest of what a reconnect does when it restores', () => {
+    // CodeRabbit, review of 89408b2: the conversation list and the call (whose media
+    // connection can drop in an outage the socket survives) were left as they were.
+    const lines = alive();
+    const set = lines.indexOf('useChatStore.getState().setWsConnected(true);');
+    assert.equal(lines[set - 1], 'this._offlineWithdrewFor = null;', 'one withdrawal can be undone twice');
+    assert.equal(lines[set + 1], 'this._syncAfterReconnect();', 'a restore leaves the conversation list as it was');
+    assert.equal(lines[set + 2], 'this._resumeCallState();', 'a restore does not rejoin a call the outage dropped');
   });
 });
 

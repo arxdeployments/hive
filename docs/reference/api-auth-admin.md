@@ -1,5 +1,11 @@
 # API contract — 1
 
+> **Legacy snapshot.** This describes the Mongo build (RxHivexx) the backend was
+> ported from, including its holes. Where the current build deliberately differs,
+> the module docstrings in `backend/app/api/` say so. Notably, a password reset now
+> forces a change on next sign-in (batch 73): see "After an admin resets a
+> password" in the root `README.md`.
+
 MOUNTING (main.py): every router is included with app.include_router(<module>.router) and NO extra prefix, so the full path is exactly the APIRouter prefix + route path: auth.py → prefix \"/api/auth\", admin.py → \"/api/admin\", org_admin.py → \"/api/org-admin\" (hyphen, not underscore). main.py also defines unauthenticated GET /api/health returning { status: \"healthy\"|\"unhealthy\", version: \"1.0.0\", service: \"RxHive API\", timestamp: ISO, database: \"connected\"|\"not initialized\"|\"disconnected\" } with 503 when unhealthy. Login rate limiting is applied in main.py by mutating auth router's /login route.endpoint with slowapi limiter.limit(\"5/minute\") BEFORE include_router — this works only because include_router rebuilds routes from route.endpoint, and only /login is limited (refresh is not); `original_login = auth.router.routes` is dead code.
 
 SERIALIZATION CONVENTION (app/utils/serializers.py serialize_doc): ObjectIds → strings, datetimes → ISO-8601 with \"Z\" suffix, recursive. CRITICAL: serialize_doc KEEPS the key `_id` (string value) — it does not rename to `id`. So all admin/org-admin CRUD responses expose `_id`, while the hand-built responses (auth /login, /me, and GET /api/admin/organizations/{org_id}/users) expose `id`. A rebuild must preserve this split exactly or normalize it deliberately on both sides.
@@ -155,7 +161,7 @@ CONVENTION INCONSISTENCIES a rebuild must decide on: pagination envelope {data, 
 - auth: superadmin
 - request: No body. Path: user_id.
 - response: { temporary_password: str } — 12 chars from [A-Za-z0-9!@#$%]. 400 "Invalid user ID", 404 "User not found".
-- behavior: Overwrites password_hash with a generated password and RETURNS IT IN PLAINTEXT in the response (by design — admin relays it out-of-band). No force-change-on-next-login flag exists. Does not revoke existing sessions (refresh_jti untouched). Audit log reset_password (logs the target email in details).
+- behavior: Overwrites password_hash with a generated password and RETURNS IT IN PLAINTEXT in the response (by design — admin relays it out-of-band). No force-change-on-next-login flag exists. Does not revoke existing sessions (refresh_jti untouched). *(Current build: sets and enforces `must_change_password`, revokes refresh tokens, deletes push subscriptions; see the README.)* Audit log reset_password (logs the target email in details).
 
 ## POST /api/admin/users/bulk-action
 - file: /Users/adhityasathyakuamr/Documents/HIVE/RxHivexx-main/backend/app/routes/admin.py
@@ -218,7 +224,7 @@ CONVENTION INCONSISTENCIES a rebuild must decide on: pagination envelope {data, 
 - auth: org_admin
 - request: No body. Path: user_id.
 - response: { temporary_password: str } (12 chars, plaintext in response). 400 "Invalid user ID", 404 "User not found".
-- behavior: Org-scoped ({_id, org_id} lookup). Same plaintext-return and no-session-revocation caveats as the superadmin version. Audit log "password_reset". Note: an org admin can reset ANOTHER org admin's password — lateral account takeover within the org is possible by design.
+- behavior: Org-scoped ({_id, org_id} lookup). Same plaintext-return and no-session-revocation caveats as the superadmin version. *(Current build: as the superadmin reset, and an org admin cannot reset their own password here.)* Audit log "password_reset". Note: an org admin can reset ANOTHER org admin's password — lateral account takeover within the org is possible by design.
 
 ## GET /api/org-admin/departments
 - file: /Users/adhityasathyakuamr/Documents/HIVE/RxHivexx-main/backend/app/routes/org_admin.py

@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { hasPushSubscription, restorePushSubscription, shouldRestorePush } from './pushRestore.js';
+import {
+  hasPushSubscription,
+  rebindPushSubscription,
+  restorePushSubscription,
+  shouldRestorePush,
+} from './pushRestore.js';
 import { isExplicitOff, isExplicitOn } from '../utils/notificationPrefs.js';
 
 /**
@@ -344,5 +349,95 @@ describe('restorePushSubscription', () => {
       },
     });
     assert.equal(await restorePushSubscription(d), false);
+  });
+});
+
+describe('rebindPushSubscription', () => {
+  /**
+   * Batch 73 review. An admin password reset deletes the account's
+   * push_subscriptions rows on the server but leaves the browser's subscription
+   * alone, so restorePushSubscription sees one and does nothing, and push stays
+   * dead behind a Settings toggle that says it is on. This re-sends the
+   * subscription regardless of what the browser holds — and keeps every other
+   * rule the restore has.
+   */
+  function deps(overrides = {}) {
+    const calls = [];
+    return {
+      pushSupported: true,
+      getPermission: () => 'granted',
+      wantsPush: () => true,
+      subscribe: async () => {
+        calls.push('subscribe');
+      },
+      tearDown: async () => {
+        calls.push('tearDown');
+      },
+      calls,
+      ...overrides,
+    };
+  }
+
+  it('re-sends the subscription without asking whether the browser has one', async () => {
+    // No `nav` at all: the existence lookup is exactly what answers "yes" here
+    // and stops the restore, so it must not be consulted.
+    const d = deps();
+    assert.equal(await rebindPushSubscription(d), true);
+    assert.deepEqual(d.calls, ['subscribe']);
+  });
+
+  it('does not treat an absent preference as consent', async () => {
+    // Same rule as the restore, and for the same reason: the sign-out teardown
+    // clears the key, so unset is the normal state of whoever signed in next.
+    const d = deps({ wantsPush: () => false });
+    assert.equal(await rebindPushSubscription(d), false);
+    assert.deepEqual(d.calls, []);
+  });
+
+  it('never prompts: no granted permission, no re-bind', async () => {
+    for (const permission of ['default', 'denied', undefined]) {
+      const d = deps({ getPermission: () => permission });
+      assert.equal(await rebindPushSubscription(d), false, String(permission));
+      assert.deepEqual(d.calls, [], `subscribed with permission ${String(permission)}`);
+    }
+  });
+
+  it('does nothing where push is unsupported', async () => {
+    const d = deps({ pushSupported: false });
+    assert.equal(await rebindPushSubscription(d), false);
+    assert.deepEqual(d.calls, []);
+  });
+
+  it('tears down what it re-bound when a sign-out clears the preference mid-flight', async () => {
+    // subscribe() is three round trips. A sign-out inside them runs its teardown
+    // before this POST lands, so without the re-check the subscription would end
+    // up bound to the user who had just left.
+    let wanted = true;
+    const d = deps({ wantsPush: () => wanted });
+    d.subscribe = async () => {
+      d.calls.push('subscribe');
+      wanted = false;
+    };
+    assert.equal(await rebindPushSubscription(d), false);
+    assert.deepEqual(d.calls, ['subscribe', 'tearDown']);
+  });
+
+  it('reports false rather than throwing, whatever fails', async () => {
+    // Fired and forgotten from the forced password screen: a rejection there
+    // would be an unhandled one, and must never stand between the user and the app.
+    const failingSubscribe = deps({
+      subscribe: async () => {
+        throw new Error('Push is not configured on the server');
+      },
+    });
+    assert.equal(await rebindPushSubscription(failingSubscribe), false);
+    // localStorage can throw outright when site data is blocked.
+    const blockedStorage = deps({
+      wantsPush: () => {
+        throw new Error('SecurityError');
+      },
+    });
+    assert.equal(await rebindPushSubscription(blockedStorage), false);
+    assert.deepEqual(blockedStorage.calls, []);
   });
 });

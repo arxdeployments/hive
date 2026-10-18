@@ -84,6 +84,11 @@ def create_access_token(
     org_id: uuid.UUID | None,
     client: str = WEB_CLIENT,
 ) -> str:
+    """Mint a signed access JWT for a user, valid for access_token_minutes.
+
+    It carries the role, the org, the client it was minted for, and `iat_ms` beside `iat` so the session epoch
+    can be compared to the millisecond.
+    """
     settings = get_settings()
     now = dt.datetime.now(dt.UTC)
     payload = {
@@ -91,6 +96,12 @@ def create_access_token(
         "role": role,
         "org_id": str(org_id) if org_id else None,
         "iat": now,
+        # The same instant in milliseconds. `iat` is whole seconds (PyJWT encodes
+        # a NumericDate as an integer), which is too coarse for the session epoch an
+        # admin reset stamps (core/deps.py): a token minted in the same second as
+        # the reset could not be told from one minted just after it (batch 73
+        # review). Unregistered claims are ignored by every JWT consumer.
+        "iat_ms": int(now.timestamp() * 1000),
         # Which client this token was minted for. Signed, so it is trustworthy —
         # which is what lets every request re-check the mobile grant instead of
         # only the refresh path, so a revoked grant does not stay usable for the

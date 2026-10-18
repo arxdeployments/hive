@@ -93,6 +93,21 @@ final class APIErrorSessionTests: XCTestCase {
         }
     }
 
+    /// The admin-reset hold (batch 73) is a 403 that must cost nothing: the session it
+    /// arrives on is the one the password change has to be made with. Read as a
+    /// session-ender it would wipe the cookies; read as a mobile denial it would also
+    /// put "Mobile access not enabled" in front of someone whose access is fine.
+    func test_passwordChangeRequired_neitherEndsTheSessionNorNamesADenial() {
+        let held = APIError.passwordChangeRequired(detail: "You must change your password before continuing.")
+        XCTAssertFalse(held.endsSession, "the hold would discard the credential needed to lift it")
+        XCTAssertFalse(held.isMobileAccessDenied)
+        XCTAssertNil(held.mobileDenial)
+        XCTAssertFalse(held.isRetryable, "retrying is refused identically until the password is changed")
+        XCTAssertEqual(held.userMessage, "You must change your password before continuing.")
+        XCTAssertEqual(APIError.passwordChangeRequired(detail: "").userMessage,
+                       "You must change your password before continuing.")
+    }
+
     /// `isRetryable` and `endsSession` must never both be true — retrying a request
     /// whose session is over is pointless, and discarding a credential over something
     /// retryable is the bug this whole classification exists to prevent.
@@ -104,6 +119,7 @@ final class APIErrorSessionTests: XCTestCase {
             .forbidden(detail: "Not a member", denial: nil),
             .sessionRefused(detail: Self.mobileDenied, denial: .notApproved),
             .sessionRefused(detail: "", denial: nil),
+            .passwordChangeRequired(detail: "You must change your password before continuing."),
             .notFound,
             .validation(detail: "email: value is not a valid email address"),
             .rateLimited(retryAfter: nil),

@@ -20,10 +20,16 @@ What IS covered is the gate the hoist backstops: a deactivated user cannot send,
 checked per message against the live row. Revalidation bounds how long a revoked
 session keeps RECEIVING; the check below is what stops it SENDING, and it is the
 security-relevant half.
+
+The loop itself is driven since batch 73 through a stub socket, which needs no
+second event loop (tests/test_must_change_password.py has the account checks).
+The heartbeat tests at the bottom use it: a slow handler must not drop a client
+whose frames are waiting in the buffer, and a silent client must still be dropped.
 """
 
 import asyncio
 import json
+import time
 import uuid
 
 from httpx import ASGITransport, AsyncClient
@@ -35,6 +41,7 @@ from app.realtime import hub
 from app.realtime.redis_bus import publish_to_users
 from app.services.messaging import SendError, send_message
 from tests.conftest import CSRF, login, make_org, make_user
+from tests.test_must_change_password import _SilentSocketStub, _SocketStub, _token_for
 
 
 async def _deactivate(user_id):
@@ -324,3 +331,57 @@ async def test_send_to_reaches_the_socket_and_reports_an_unknown_one():
         assert await registry.send_to(gone, "conn", "x") is False
     finally:
         await registry.stop()
+
+
+# ---------------------------------------------------------------------------
+# The heartbeat (batch 73 review)
+# ---------------------------------------------------------------------------
+
+
+class _LingeringSocketStub(_SocketStub):
+    """Stays open for a moment after its last frame, so what the endpoint queued for
+    it — the pong — is written by the socket's writer task before the disconnect
+    tears that task down."""
+
+    async def receive_text(self) -> str:
+        """Wait briefly once the frames run out, then disconnect as the base stub does."""
+        if not self._frames:
+            await asyncio.sleep(0.05)  # well inside the heartbeat the tests set
+        return await super().receive_text()
+
+
+async def test_a_slow_handler_does_not_drop_a_client_whose_ping_is_buffered(client, monkeypatch):
+    """The heartbeat used to be decided at the top of the loop, before any receive,
+    from the time since the last frame — which includes however long that frame took
+    to HANDLE. A handler that took HEARTBEAT_TIMEOUT dropped the client while its
+    next ping sat in the buffer, unread. It is decided now only when a receive has
+    actually come back empty."""
+    user = await make_user("slow-handler@x.com")
+    monkeypatch.setattr(hub, "HEARTBEAT_TIMEOUT", 0.2)
+
+    async def _slow(_user, _data):
+        """Take twice the heartbeat to handle a frame."""
+        await asyncio.sleep(0.4)  # twice the heartbeat
+
+    monkeypatch.setattr(hub, "_handle_inbound", _slow)
+    frames = [json.dumps({"type": "typing_start", "conversation_id": str(uuid.uuid4())}), '{"type": "ping"}']
+    ws = _LingeringSocketStub(_token_for(user), frames=frames)
+    await asyncio.wait_for(hub.websocket_endpoint(ws), timeout=5)
+
+    assert [f["type"] for f in ws.sent] == ["connected", "pong"], "the buffered ping was never answered"
+    assert ws.closed is None
+
+
+async def test_a_silent_client_is_still_dropped_at_the_heartbeat(client, monkeypatch):
+    """The other half: deciding the heartbeat after the receive must not stop it
+    deciding at all."""
+    user = await make_user("silent-heartbeat@x.com")
+    monkeypatch.setattr(hub, "HEARTBEAT_TIMEOUT", 0.2)
+    ws = _SilentSocketStub(_token_for(user))
+    started = time.monotonic()
+    await asyncio.wait_for(hub.websocket_endpoint(ws), timeout=5)
+    assert time.monotonic() - started >= 0.2
+    assert [f["type"] for f in ws.sent] == ["connected"]
+    # Dropped, not closed with a code: a client that stopped answering is not told why.
+    assert ws.closed is None
+    assert str(user.id) not in hub.registry.connections

@@ -175,3 +175,66 @@ export async function restorePushSubscription({
     return false;
   }
 }
+
+/**
+ * Register this browser's subscription with the server again, even though the
+ * browser still holds it (batch 73 review).
+ *
+ * WHY THE RESTORE ABOVE IS NOT ENOUGH HERE
+ *
+ * An admin password reset deletes every push_subscriptions row the account had
+ * (api/admin.py and api/org_admin.py), so a device that kept a session on the
+ * old password stops receiving pushes. The BROWSER is never told: its
+ * PushManager subscription is untouched. So once the forced password change is
+ * done, restorePushSubscription asks hasPushSubscription, hears `true`, and
+ * correctly decides there is nothing to restore — while the server has no row to
+ * deliver to. Settings reads the same browser-side answer and shows push as on.
+ * Nothing arrives and nothing says so, until the user happens to toggle it off
+ * and on again.
+ *
+ * The existence lookup is therefore skipped on purpose and the subscribe run
+ * anyway. subscribeToPush is safe to repeat: pushManager.subscribe() hands back
+ * the existing subscription when its key matches, and POST
+ * /api/notifications/subscribe upserts by endpoint. Every other rule of
+ * shouldRestorePush still applies — an explicit yes, permission already granted
+ * (never a prompt; there is no gesture behind this), push supported — which is
+ * why it is called with `hasSubscription: false` rather than re-implemented.
+ *
+ * The preference is re-read after the subscribe for the reason the restore
+ * re-reads it: subscribe() is several round trips, a sign-out can land inside
+ * them, and the sign-out teardown clears the preference. If it has gone, the
+ * subscription this created (or re-bound) belongs to a session that has ended,
+ * so it is torn down rather than left bound to the user who just left.
+ *
+ * Never throws, so the caller can fire it and forget it.
+ *
+ * @returns {Promise<boolean>} whether the subscription was re-registered
+ */
+export async function rebindPushSubscription({
+  pushSupported,
+  getPermission,
+  wantsPush,
+  subscribe,
+  tearDown,
+}) {
+  try {
+    const rebind = shouldRestorePush({
+      intentIsExplicit: wantsPush(),
+      permission: getPermission(),
+      hasSubscription: false,
+      pushSupported,
+    });
+    if (!rebind) return false;
+
+    await subscribe();
+
+    if (!wantsPush()) {
+      if (tearDown) await tearDown();
+      return false;
+    }
+    return true;
+  } catch {
+    // The Settings toggle is still there as the user's own fallback.
+    return false;
+  }
+}

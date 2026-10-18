@@ -243,6 +243,7 @@ async def make_user(
     password: str = "TestPass1234",
     display_name: str | None = None,
     mobile_access: bool = False,
+    must_change_password: bool = False,
 ) -> User:
     """Create a user.
 
@@ -262,6 +263,7 @@ async def make_user(
             dept_id=dept_id,
             is_active=True,
             mobile_access=mobile_access,
+            must_change_password=must_change_password,
         )
         db.add(user)
         await db.commit()

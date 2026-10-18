@@ -34,6 +34,19 @@ enum APIError: Error, Equatable {
     ///
     /// `denial` still carries the code when there is one, so routing is unchanged.
     case sessionRefused(detail: String, denial: MobileDenialKind?)
+    /// A 403 coded `PASSWORD_CHANGE_REQUIRED`: an administrator reset this account's
+    /// password, and until its owner chooses a new one the server refuses every
+    /// route but changing it (batch 73).
+    ///
+    /// Its own case, and deliberately not a `MobileDenialKind`. A denial ends the
+    /// session — `endsSession` is true for it, so the cookies are wiped and the
+    /// screen says "Mobile access not enabled" — whereas this session is perfectly
+    /// good, and is the very thing the change-password call has to be made with.
+    /// Wiping it would leave the user typing the temporary password into sign-in
+    /// only to land back here. Not `.forbidden` either: that is one endpoint
+    /// refusing one resource, and this is every endpoint refusing until one thing
+    /// is done, which `AuthStore` has to hear about wherever it turned up.
+    case passwordChangeRequired(detail: String)
     case notFound
     /// 400/409/422 — the server explained what was wrong with the request.
     case validation(detail: String)
@@ -62,6 +75,8 @@ enum APIError: Error, Equatable {
             // Same prose when the server sent some. With none, this is an expiry the
             // user has to act on, not a resource they cannot reach.
             return detail.isEmpty ? "Your session expired. Please sign in again." : detail
+        case .passwordChangeRequired(let detail):
+            return detail.isEmpty ? "You must change your password before continuing." : detail
         case .notFound:
             return "That's no longer available."
         case .validation(let detail):
@@ -84,7 +99,8 @@ enum APIError: Error, Equatable {
     var isRetryable: Bool {
         switch self {
         case .transport, .server, .rateLimited: return true
-        case .unauthorized, .credentials, .forbidden, .sessionRefused, .notFound, .validation, .decoding:
+        case .unauthorized, .credentials, .forbidden, .sessionRefused, .passwordChangeRequired,
+             .notFound, .validation, .decoding:
             return false
         }
     }
@@ -101,6 +117,10 @@ enum APIError: Error, Equatable {
         // mobile denial is the exception: it says this account cannot use the app at
         // all, so a credential for it is worth dropping wherever it turned up.
         case .forbidden: return isMobileAccessDenied
+        // Named rather than left to `default`, because it is the one 403 that looks
+        // most like a reason to sign out and is the one that must not: the session
+        // is how the user gets out of it (batch 73).
+        case .passwordChangeRequired: return false
         default: return false
         }
     }
@@ -130,6 +150,12 @@ enum APIError: Error, Equatable {
         default: return nil
         }
     }
+
+    /// The backend's code for `passwordChangeRequired` (`core/deps.py`:
+    /// `PASSWORD_CHANGE_REQUIRED_CODE`), from its `CodedHTTPException` envelope.
+    /// Kept beside the case rather than in `MobileDenialKind`, which is exactly
+    /// where it must never be decoded.
+    static let passwordChangeRequiredCode = "PASSWORD_CHANGE_REQUIRED"
 }
 
 /// Which of the two mobile 403s a denial is, and therefore which remedy to offer.

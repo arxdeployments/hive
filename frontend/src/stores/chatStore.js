@@ -64,6 +64,16 @@ export const sortConversations = (convs) => {
  * one of them is not restored, so a field added outside this object is caught
  * rather than discovered.
  */
+/**
+ * Marks a message this tab added LIVE — delivered by the socket (`addMessage`) or
+ * sent from here (`addOptimisticMessage`) — as opposed to one a fetched page or a
+ * page of history put there. utils/carryOverLiveArrivals.js keeps only marked rows
+ * across a newest-page replace: no timestamp can tell a live arrival from paged
+ * history that shares the page's millisecond (a system-message batch), and a marker
+ * can (CodeRabbit, review of 83e02cc). Client-only; nothing sends it to the server.
+ */
+export const ARRIVED_LIVE = '_arrivedLive';
+
 const emptyState = () => ({
   conversations: [],
   activeConversationId: null,
@@ -143,7 +153,7 @@ const useChatStore = create((set) => ({
     return {
       messages: {
         ...state.messages,
-        [convId]: [...base, message]
+        [convId]: [...base, { ...message, [ARRIVED_LIVE]: true }]
       }
     };
   }),
@@ -153,7 +163,10 @@ const useChatStore = create((set) => ({
     return {
       messages: {
         ...state.messages,
-        [convId]: [...existing, message]
+        // Marked as the socket's arrivals are: once acknowledged (the marker survives
+        // replaceOptimisticMessage's spread) it is a server message this tab added
+        // live, which a newest-page fetch read too early to carry.
+        [convId]: [...existing, { ...message, [ARRIVED_LIVE]: true }]
       }
     };
   }),

@@ -16,9 +16,14 @@ The rules these tests pin down:
   4. Family revocation stops at the client boundary: a stolen mobile token must
      not sign the same person out of the browser they are working in.
   5. A Redis outage on the limiter in front of /refresh does not end sessions.
+  6. A revoked token that was never rotated — no successor, so a logout, a reset,
+     a password change or a deactivation ended it — is refused and nothing else:
+     no family burn, no theft warning (batch 73 review). A device signed out by a
+     change made elsewhere must not sign out the device that made it.
 """
 
 import datetime as dt
+import logging
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -191,6 +196,41 @@ async def test_unknown_and_pre_migration_tokens_are_still_rejected(client):
     assert (await _refresh_with(client, logged_out)).status_code == 401
     assert (await _refresh_with(client, "not-a-real-token")).status_code == 401
     assert await _live_tokens(user.id) == []
+
+
+async def test_a_device_signed_out_by_a_password_change_does_not_sign_out_the_one_that_changed_it(
+    client, caplog
+):
+    """Rule 6. change-password revokes every OTHER session, so device B's next
+    refresh presents a revoked row with no successor. That used to land in the theft
+    branch, which burned the user's live web sessions — A's included, the one that
+    had just changed the password — and logged a theft warning for an account
+    nobody had attacked."""
+    user = await make_user("rot10@x.com")
+    transport = ASGITransport(app=app)
+    async with (
+        AsyncClient(transport=transport, base_url="http://test") as a,
+        AsyncClient(transport=transport, base_url="http://test") as b,
+    ):
+        a.headers.update(CSRF)
+        b.headers.update(CSRF)
+        await login(a, "rot10@x.com")
+        await login(b, "rot10@x.com")
+        resp = await a.post(
+            "/api/auth/change-password",
+            json={"current_password": "TestPass1234", "new_password": "BrandNewPass99"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        with caplog.at_level(logging.INFO, logger="app.api.auth"):
+            resp = await b.post("/api/auth/refresh")
+        assert resp.status_code == 401
+        assert resp.json()["detail"] == "Invalid refresh token"
+        assert "Refresh token reuse" not in caplog.text
+        assert "never-rotated" in caplog.text
+
+        assert (await a.post("/api/auth/refresh")).status_code == 200
+        assert len(await _live_tokens(user.id)) == 1
 
 
 async def test_family_revocation_spares_the_other_client(client):

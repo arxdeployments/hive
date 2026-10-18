@@ -74,6 +74,16 @@ final class ChatStore: ObservableObject {
     /// last REST payload said, which goes stale the moment someone connects.
     @Published private(set) var presence: [String: PresenceStatus] = [:]
 
+    /// Ids this store added LIVE to a thread while a window fetch for it was out:
+    /// socket arrivals (`insertIncoming`) and this device's own sends as they are
+    /// acknowledged. Opened by each fetch, consumed when it lands; `threadAfterFetch`
+    /// carries only these across the replace. No timestamp can tell a live arrival
+    /// from history `loadOlderMessages` prepended meanwhile when the two share the
+    /// page's millisecond, as a system-message batch does; this can (CodeRabbit,
+    /// review of 83e02cc). Fetches for one thread are serialised by its window queue,
+    /// so there is at most one open record per thread.
+    private var arrivedDuringFetch: [String: Set<String>] = [:]
+
     /// Optimistic sends still awaiting their `message_ack`, keyed by temp id.
     @Published private(set) var pendingSends: Set<String> = []
     /// Temp ids whose send failed — the bubble shows a retry affordance.
@@ -165,6 +175,9 @@ final class ChatStore: ObservableObject {
         visibleThreads = [:]
         trustLostToGap = []
         windowQueues = [:]
+        // A fetch from this session may still be in flight; its record goes with the
+        // session (CodeRabbit, review of 50f3094).
+        arrivedDuringFetch = [:]
         threadGenerations = [:]
         sessionGeneration &+= 1
         typingUsers = [:]
@@ -181,6 +194,18 @@ final class ChatStore: ObservableObject {
     }
 
     #if DEBUG
+    /// A message as the socket delivers it, through the same path a `new_message`
+    /// frame takes, for tests that need a live arrival rather than seeded state.
+    func receiveForTesting(_ message: Message) {
+        insertIncoming(message)
+    }
+
+    /// A `message_ack` for an optimistic send, through the path the frame takes.
+    func acknowledgeForTesting(tempID: String, messageID: String, createdAt: Date?) {
+        pendingSends.remove(tempID)
+        resolveAck(tempID: tempID, messageID: messageID, createdAt: createdAt)
+    }
+
     /// Seed the store directly. Every field above is `private(set)`, and the real
     /// writers need a live socket and API; `reset` is about what is in the store,
     /// not how it got there.
@@ -345,6 +370,14 @@ final class ChatStore: ObservableObject {
         admitted: Admission
     ) async -> Bool {
         let epoch = trustEpoch
+        // What the thread holds as the request goes out, and what arrives live while it
+        // is out; see `threadAfterFetch`.
+        let heldAtRequest = Set((messages[conversationID] ?? []).map(\.id))
+        arrivedDuringFetch[conversationID] = []
+        // Only this session's record: a fetch that outlives a sign-out must not clear the
+        // one a new session's fetch of the same thread has since opened (CodeRabbit,
+        // review of 50f3094) — the same guard the loading flag below has.
+        defer { if admitted.session == sessionGeneration { arrivedDuringFetch[conversationID] = nil } }
         loadingThreads.insert(conversationID)
         defer { if admitted.session == sessionGeneration { loadingThreads.remove(conversationID) } }
         do {
@@ -355,6 +388,8 @@ final class ChatStore: ObservableObject {
             let thread = Self.threadAfterFetch(
                 page.messages,
                 replacing: messages[conversationID] ?? [],
+                heldAtRequest: heldAtRequest,
+                arrivedLive: arrivedDuringFetch[conversationID] ?? [],
                 unsent: pendingSends.union(failedSends),
                 keepingLiveRows: true,
                 keepingHistory: keepingHistory
@@ -423,8 +458,20 @@ final class ChatStore: ObservableObject {
     ///   sending before its first page lands was enough. A FAILED send goes the same
     ///   way, taking its retry with it. The web fixed this in batch 67
     ///   (`utils/carryOverLocalOnly.js`); this is the same rule.
-    /// * **A message that arrived live while the page was in flight.** The page was
-    ///   read before it was sent, so it is newer than anything on the page.
+    /// * **A message that arrived live while the page was in flight.** Decided by
+    ///   identity, not time: a held row the thread did NOT hold when the request went
+    ///   out (`heldAtRequest`) arrived meanwhile, so it is kept unless the page has it.
+    ///   A row it DID hold was on the server by then, so the page has it if it is newer
+    ///   than the page's oldest row, and otherwise it is the old window.
+    ///
+    ///   Batch 72 compared timestamps (at or after the page's newest), and review of
+    ///   PR #112 found both ways that is wrong. The server stamps `created_at` before
+    ///   it commits (`services/messaging.py`, `send_message`), so a media send stamped
+    ///   before the page's newest row can commit after the page was read: dropped, then
+    ///   marked read. And a system-message batch (group create, add members) stamps one
+    ///   row per member a microsecond apart while a `Date` from `RxDate` keeps
+    ///   milliseconds, so with more than a page of them the rows that fell off the page
+    ///   compared EQUAL to its newest and were carried under it.
     ///
     /// A carried send that DID land is dropped: the page's row for it carries its
     /// `temp_id` as `client_msg_id`, and showing both would invite a resend.
@@ -443,29 +490,71 @@ final class ChatStore: ObservableObject {
     static func threadAfterFetch(
         _ fetched: [Message],
         replacing held: [Message],
+        heldAtRequest: Set<String>,
+        arrivedLive: Set<String>,
         unsent: Set<String>,
         keepingLiveRows: Bool,
         keepingHistory: Bool = false
     ) -> [Message] {
         let fetchedIDs = Set(fetched.map(\.id))
         let landed = Set(fetched.compactMap(\.clientMsgId))
-        let newestFetched = fetched.compactMap(\.createdAt).max()
 
         var olderRows: [Message] = []
         if keepingHistory, let firstID = fetched.first?.id,
            let joint = held.firstIndex(where: { $0.id == firstID }) {
             olderRows = held[..<joint].filter { !unsent.contains($0.id) && !fetchedIDs.contains($0.id) }
         }
+        // A held row is history or a live arrival, never both: `insertIncoming` sorts by
+        // time, so an arrival stamped early can sit above the joint, and it was drawn
+        // twice (CodeRabbit, review of 89408b2).
+        let olderIDs = Set(olderRows.map(\.id))
+        // And a new row is not always an arrival; the page's own range tells them apart.
+        // An arrival is never older than the page's oldest row. Anything older is
+        // history — rows `loadOlderMessages` prepended while the request was out, or a
+        // message so late-committed that it predates the whole page — and paging back
+        // brings it in, in its place. Carried as an arrival, older history was stitched
+        // under the newest page (CodeRabbit, review of 1fbc1de). Judged by row position
+        // instead, a late arrival that `insertIncoming` sorted above every row the thread
+        // held was dropped although the page could not contain it; and one older than
+        // the page merged to the very top, where `loadOlderMessages` takes the first row
+        // as its cursor and would have skipped the rows between (CodeRabbit, review of
+        // 70495a4). Bounded by the page, every kept arrival merges after its first row.
+        let pageOldest = fetched.compactMap(\.createdAt).min()
         let liveRows = keepingLiveRows
             ? held.filter { row in
-                !unsent.contains(row.id) && !fetchedIDs.contains(row.id)
-                    // At or after: two messages can share a timestamp, and the page's
-                    // own rows are already excluded by id.
-                    && (newestFetched.map { newest in (row.createdAt ?? .distantPast) >= newest } ?? true)
+                !unsent.contains(row.id) && !fetchedIDs.contains(row.id) && !olderIDs.contains(row.id)
+                    && !heldAtRequest.contains(row.id)
+                    // Added live while the request was out, not paged in (`arrivedDuringFetch`).
+                    && arrivedLive.contains(row.id)
+                    // An undated row is not judged by a time it does not have.
+                    && !(pageOldest.map { oldest in row.createdAt.map { $0 < oldest } ?? false } ?? false)
             }
             : []
         let unsentRows = held.filter { unsent.contains($0.id) && !landed.contains($0.id) }
-        return olderRows + fetched + liveRows + unsentRows
+        // Arrivals placed among the page by time, not stacked after it: a send stamped
+        // before the page's newest row but committed after the page was read belongs
+        // between them, where `insertIncoming` and the server both put it (CodeRabbit,
+        // review of 1fbc1de).
+        return olderRows + mergingByTime(fetched, liveRows) + unsentRows
+    }
+
+    /// `fetched` with `arrivals` placed among its rows in time order, oldest first.
+    /// Each arrival goes after the last row that is not later than it, so equal times
+    /// keep the page's own rows first and the page's order (the server's, by
+    /// created_at and id) is never disturbed: only the arrivals move.
+    static func mergingByTime(_ fetched: [Message], _ arrivals: [Message]) -> [Message] {
+        guard !arrivals.isEmpty else { return fetched }
+        var merged = fetched
+        for row in arrivals {
+            var index = merged.endIndex
+            if let at = row.createdAt {
+                while index > merged.startIndex, let previous = merged[index - 1].createdAt, previous > at {
+                    index -= 1
+                }
+            }
+            merged.insert(row, at: index)
+        }
+        return merged
     }
 
     /// Page backwards. Returns the id of the message that was at the top, so the
@@ -506,6 +595,9 @@ final class ChatStore: ObservableObject {
         return await inWindowQueue(conversationID) { [self] in
             guard mayWrite(conversationID, admitted) else { return false }
             let epoch = trustEpoch
+            let heldAtRequest = Set((messages[conversationID] ?? []).map(\.id))
+            arrivedDuringFetch[conversationID] = []
+            defer { if admitted.session == sessionGeneration { arrivedDuringFetch[conversationID] = nil } }
             do {
                 let page = try await RxHiveAPI.messages(
                     conversationID: conversationID, around: messageID, limit: 50, client: api
@@ -514,6 +606,8 @@ final class ChatStore: ObservableObject {
                 messages[conversationID] = Self.threadAfterFetch(
                     page.messages,
                     replacing: messages[conversationID] ?? [],
+                    heldAtRequest: heldAtRequest,
+                    arrivedLive: arrivedDuringFetch[conversationID] ?? [],
                     unsent: pendingSends.union(failedSends),
                     keepingLiveRows: !page.hasNewer
                 )
@@ -1018,6 +1112,7 @@ final class ChatStore: ObservableObject {
             return
         }
         thread.append(message)
+        arrivedDuringFetch[conversationID]?.insert(message.id)
         // Sort by timestamp: a message sent while we were paging can arrive out of
         // order relative to what is already loaded.
         thread.sort { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
@@ -1047,6 +1142,8 @@ final class ChatStore: ObservableObject {
                 messages[conversationID]?[index] = thread[index].applying(
                     id: messageID, createdAt: createdAt ?? thread[index].createdAt
                 )
+                // An acknowledged send is a server message this device added live.
+                arrivedDuringFetch[conversationID]?.insert(messageID)
             }
             return
         }
@@ -1060,6 +1157,7 @@ final class ChatStore: ObservableObject {
                 thread.remove(at: index)
             } else {
                 thread[index] = saved
+                arrivedDuringFetch[conversationID]?.insert(saved.id)
             }
             messages[conversationID] = thread
         }

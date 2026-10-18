@@ -631,6 +631,8 @@ private struct OrgUserSheet: View {
         _user = State(initialValue: initial)
     }
 
+    /// The account's blocks in a scrolling sheet, with a self-edit warning on your
+    /// own row and the confirmation that guards a password reset.
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -675,8 +677,12 @@ private struct OrgUserSheet: View {
             Button("Reset Password", role: .destructive) { resetPassword() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("\(user.displayName) will be signed out everywhere and must use the temporary "
-                 + "password you're about to be shown.")
+            // The server now holds the account until it is changed (batch 73), so the
+            // admin is told what the person will meet rather than left to field the
+            // question later.
+            Text("\(user.displayName) will be signed out everywhere. They'll sign in with the "
+                 + "temporary password you're about to be shown, and will have to choose a new "
+                 + "password the next time they sign in.")
         }
     }
 
@@ -818,6 +824,8 @@ private struct OrgUserSheet: View {
 
     // MARK: Password
 
+    /// The reset button and, after a reset, the one-time temporary password with a
+    /// copy button. Disabled on your own row, which the server refuses (batch 73).
     private var passwordBlock: some View {
         AdminBlock(title: "Password") {
             VStack(spacing: Theme.Layout.spacing3) {
@@ -846,7 +854,20 @@ private struct OrgUserSheet: View {
                     )
                 }
                 .buttonStyle(PressScaleStyle())
-                .disabled(busy != nil)
+                // Your own row is refused by the server (400, "Use Change Password to
+                // change your own password.", batch 73): a reset made by you would
+                // show you a password you already know and hold your own account at
+                // the change-password screen. Disabled, like the other self-edits
+                // above, with the way that does work named underneath.
+                .disabled(isSelf || busy != nil)
+
+                if isSelf {
+                    Text("To change your own password, use Change Password in Settings.")
+                        .font(Theme.Typography.caption)
+                        .foregroundStyle(Theme.Color.textMuted)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 if let temporaryPassword {
                     VStack(alignment: .leading, spacing: Theme.Layout.spacing2) {
@@ -878,7 +899,8 @@ private struct OrgUserSheet: View {
                         // The server hashes and discards it; there is no endpoint that
                         // can read it back. Closing this sheet loses it for good.
                         Text("Shown once. Copy it now and give it to \(user.displayName) — it can't "
-                             + "be retrieved again, and they'll be asked to change it when they sign in.")
+                             + "be retrieved again. They'll have to choose a new password the next "
+                             + "time they sign in.")
                             .font(Theme.Typography.caption)
                             .foregroundStyle(Theme.Color.warning)
                             .fixedSize(horizontal: false, vertical: true)
@@ -931,8 +953,10 @@ private struct OrgUserSheet: View {
         }
     }
 
+    /// Ask the server for a temporary password for this account and show it. Does
+    /// nothing while another write is in flight or on your own row.
     private func resetPassword() {
-        guard busy == nil else { return }
+        guard busy == nil, !isSelf else { return }
         busy = .password
         temporaryPassword = nil
         Task {

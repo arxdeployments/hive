@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, describe, it } from 'node:test';
 
-import useChatStore from './chatStore.js';
+import useChatStore, { ARRIVED_LIVE } from './chatStore.js';
 
 /**
  * Store-level tests, run by Node's own test runner (`npm run test:unit`).
@@ -184,5 +184,27 @@ describe('chatStore.setWindowCurrent', () => {
     store().reset();
 
     assert.deepEqual(store().windowCurrent, {});
+  });
+});
+
+describe('chatStore: which rows count as arriving live', () => {
+  // utils/carryOverLiveArrivals.js keeps only rows the live paths marked; no
+  // timestamp can tell them from paged history (CodeRabbit, review of 83e02cc).
+  const conv = 'conv-live';
+
+  it('marks socket arrivals and this tab\'s own sends, through their acknowledgement', () => {
+    useChatStore.getState().setActiveConversation(conv);
+    useChatStore.getState().addMessage(conv, { _id: 'm-socket', created_at: '2026-10-01T08:00:01Z' });
+    useChatStore.getState().addOptimisticMessage(conv, { _id: 'temp-1', temp_id: 'temp-1', status: 'sending' });
+    useChatStore.getState().replaceOptimisticMessage(conv, 'temp-1', { _id: 'm-mine', status: 'sent' });
+    const rows = useChatStore.getState().messages[conv];
+    assert.deepEqual(rows.map((m) => [m._id, m[ARRIVED_LIVE]]), [['m-socket', true], ['m-mine', true]]);
+  });
+
+  it('never marks a fetched page or a page of history', () => {
+    useChatStore.getState().setMessages(conv, [{ _id: 'm-page', created_at: '2026-10-01T08:00:02Z' }]);
+    useChatStore.getState().prependMessages(conv, [{ _id: 'm-history', created_at: '2026-10-01T08:00:00Z' }]);
+    const rows = useChatStore.getState().messages[conv];
+    assert.deepEqual(rows.map((m) => [m._id, m[ARRIVED_LIVE]]), [['m-history', undefined], ['m-page', undefined]]);
   });
 });

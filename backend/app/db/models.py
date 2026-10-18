@@ -110,6 +110,11 @@ class Department(Base):
 
 
 class User(Base):
+    """A person who signs in, with their organization, department, role, password hash and account flags.
+
+    must_change_password and sessions_valid_after are what an administrator's password reset sets.
+    """
+
     __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = _uuid_pk()
@@ -132,6 +137,15 @@ class User(Base):
     # the admin portal is web-only (see api/auth.py:_assert_mobile_allowed).
     mobile_access: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
     must_change_password: Mapped[bool] = mapped_column(default=False)
+    # The session epoch (batch 73 review). An access token issued before this moment
+    # is refused on every gated route and at the websocket handshake, so the sessions
+    # an administrator's reset ends stay ended: before it existed, a pre-reset access
+    # token was only refused while must_change_password was set, and came back to
+    # life the moment the owner chose a new password. Stamped by both admin resets
+    # and nothing else; NULL means no reset has ever ended this account's sessions.
+    # Nullable with no default on purpose — every existing row is correctly "never
+    # reset", and the ALTER stays a metadata-only change.
+    sessions_valid_after: Mapped[dt.datetime | None]
     last_seen_at: Mapped[dt.datetime | None]
     created_by: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     created_at: Mapped[dt.datetime] = _now()
