@@ -36,7 +36,7 @@ x-logging: &logging
 
 services:
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     restart: unless-stopped
     logging: *logging
     # Presence, pub/sub fan-out and rate-limit counters only. All of it is
